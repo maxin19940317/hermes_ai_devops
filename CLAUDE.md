@@ -260,6 +260,11 @@ Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, star
 
 1. `contracts/` 三个 JSON Schema + 两个 OpenAPI,附正反例测试。
 2. `ci/` 四个脚本(gen_manifest / variants.yaml / write_meta / gen_bundle)+ 业务仓库 `.gitlab-ci.yml` 增量改造(见 §6)。
+   **Algo_Super_SDK 适配门禁**：按
+   `docs/assessments/algo-super-sdk-packaging.md` 关闭全部 P0 整改项；代表性 Android
+   测试包必须通过静态契约检查和原生 Windows 实机验收，之后 Trigger 才能将该业务
+   仓库产物派发给 Client Agent。SDK 发布包不得未经裁剪和测试入口适配直接进入设备
+   测试链路。
 3. **`agent-cli` 先行**:不做 RPC Server,先做命令行
    `agent-cli run --package-url ... --sha256 ... --serial ...`,
    完整实现:下载 → 整包 sha256 校验 → 解压 → Manifest Schema 校验 → 设备预检(getprop 属性/df 空间)→ 清理旧现场 → adb push → chmod/env → 执行(超时控制,超时 kill 但仍收集)→ adb pull collect 列表 → 本地产出结果目录。
