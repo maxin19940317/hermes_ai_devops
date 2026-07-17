@@ -90,24 +90,24 @@ Hermes 文件。
 
 ## 测试包布局
 
-所有变体使用相同布局：
+所有变体使用相同布局。契约文件位于归档根目录，业务 payload 使用单一顶层目录：
 
 ```text
+manifest.yaml                # gen_manifest.py 注入，Agent 从归档根读取
+files.sha256                 # gen_manifest.py 注入
 <single-top-directory>/
-├── run.sh
-├── bin/
-│   └── <smoke executable>
-├── lib/
-│   ├── *.so
-│   └── dsp/                 # 仅需要 DSP 运行时的 SNPE 变体
-├── models/
-│   └── <suite-specific files>
-├── config/
-│   └── smoke.json
-├── testdata/
-│   └── <fixed input image>
-├── manifest.yaml            # gen_manifest.py 注入
-└── files.sha256             # gen_manifest.py 注入
+  ├── run.sh
+  ├── bin/
+  │   └── <smoke executable>
+  ├── lib/
+  │   ├── *.so
+  │   └── dsp/               # 仅需要 DSP 运行时的 SNPE 变体
+  ├── models/
+  │   └── <suite-specific files>
+  ├── config/
+  │   └── smoke.json
+  └── testdata/
+      └── <fixed input image>
 ```
 
 不允许测试包部署 `include/`、`example/`、SDK README、`CONTENTS.txt` 或其他只服务于
