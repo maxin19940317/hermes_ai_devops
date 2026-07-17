@@ -1,0 +1,18 @@
+# dst 含 ".." 越出 workdir,必须拒绝
+manifest_version: 1
+artifact:
+  project: algo-super-sdk
+  commit: a1b2c3d
+  pipeline_id: 1
+  platform: aarch64_Android_SNPE_2.21
+  build_type: Release
+requirements: { os: android, abi: arm64-v8a }
+deploy:
+  workdir: /data/local/tmp/x
+  files:
+    - { src: run.sh, dst: ../../system/bin/run.sh, mode: "0755", sha256: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef }
+test:
+  entry: ./run.sh
+  timeout_sec: 60
+  success: { exit_code: 0 }
+collect: [results/result.json]

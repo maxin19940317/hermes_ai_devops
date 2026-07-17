@@ -1,0 +1,92 @@
+# algo-super-sdk/.gitlab-ci.yml 增量改造示例(CLAUDE.md §6 待改造三件事)。
+# 只展示新增/改动部分,现有 rebuild/release_pack/双轨逻辑保持不变。
+#
+# 前置:
+#   1. 业务仓库以 submodule 或 CI 内 git clone 方式引入本仓库的 ci/ 与 contracts/
+#      (下文假设路径为 hermes-devops/)。
+#   2. Runner 环境有 python3(>=3.9) + pip install pyyaml jsonschema。
+#
+# 变化点:
+#   A. 包文件名唯一化: {NAME}-{variant}-g{SHORT_SHA}-p{PIPELINE_IID}.tar.gz,
+#      解决"版本号不变导致新构建被 400 skip 静默丢弃"(§6.1)。
+#      URL 仍确定性可寻址,重跑同一 job 产生同名文件,400 skip 变回安全幂等。
+#   B. 打包后注入 manifest.yaml + files.sha256,Schema 不过则 fail(§6.2)。
+#   C. 每 job 产出 dist/meta/{variant}.json;publish:bundle 聚合,8 个不齐不发(§6.3)。
+
+variables:
+  RELEASE_PACKAGE_NAME: algo-super-sdk
+  # RELEASE_VERSION 沿用现状:master 取 CMakeLists 的 X.Y.Z,tag 时取 tag
+
+# ---- 每个构建 job 的 script 尾部追加(以一个变体为例,其余 7 个同构) ----
+build:aarch64_Android_SNPE_2.21:
+  stage: build
+  interruptible: true
+  script:
+    - ./rebuild.sh aarch64_Android_SNPE_2.21
+    - ./release_pack.sh --platform aarch64_Android_SNPE_2.21 --output-dir dist
+    # B: 注入契约文件并重命名(gen_manifest 校验失败会直接 fail pipeline)
+    - ORIG_PKG=$(ls dist/*.tar.gz | head -1)
+    - python3 hermes-devops/ci/gen_manifest.py
+        --package "$ORIG_PKG"
+        --variant aarch64_Android_SNPE_2.21
+        --variants-file hermes-devops/ci/variants.yaml
+        --schema hermes-devops/contracts/manifest.schema.json
+        --project "$CI_PROJECT_PATH"
+        --commit "$CI_COMMIT_SHORT_SHA"
+        --pipeline-iid "$CI_PIPELINE_IID"
+        --build-type Release
+        --package-name "$RELEASE_PACKAGE_NAME"
+        --outdir dist/final
+        --info-out dist/manifest-info.json
+    # C: 生成 meta(job artifact,供 publish:bundle 聚合)
+    - python3 hermes-devops/ci/write_meta.py
+        --info dist/manifest-info.json
+        --variant aarch64_Android_SNPE_2.21
+        --project "$CI_PROJECT_PATH"
+        --version "$RELEASE_VERSION"
+        --commit "$CI_COMMIT_SHORT_SHA"
+        --pipeline-iid "$CI_PIPELINE_IID"
+        --package-name "$RELEASE_PACKAGE_NAME"
+        --registry-project-url "$CI_API_V4_URL/projects/$CI_PROJECT_ID"
+        --outdir dist/meta
+    # A: 上传唯一文件名的包。文件名含 commit+iid,重复只会发生在同 job 重跑,
+    #    此时 400 already-exists → skip 是安全幂等,保留现有处理。
+    - PKG_FILE=$(basename dist/final/*.tar.gz)
+    - >
+      curl --fail --silent --show-error
+      --header "JOB-TOKEN: $CI_JOB_TOKEN"
+      --upload-file "dist/final/$PKG_FILE"
+      "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$RELEASE_PACKAGE_NAME/$RELEASE_VERSION/$PKG_FILE"
+      || echo "upload skipped (already exists)"
+  artifacts:
+    paths: [dist/meta/]
+    expire_in: 1 week
+
+# ---- 新增聚合 job:8 个 meta 齐全才发 bundle,Trigger 服务只认 bundle ----
+publish:bundle:
+  stage: publish
+  interruptible: false
+  needs:
+    - build:aarch64_Linux_SNPE_1.68
+    - build:aarch64_Android_SNPE_1.68
+    - build:aarch64_Linux_SNPE_2.21
+    - build:aarch64_Android_SNPE_2.21
+    - build:aarch64_Linux_RKNN_2.3.2
+    - build:aarch64_Android_RKNN_2.3.2
+    - build:aarch64_Linux_TFLite_2.21.0
+    - build:aarch64_Android_TFLite_2.21.0
+  script:
+    - python3 hermes-devops/ci/gen_bundle.py
+        --meta-dir dist/meta
+        --variants-file hermes-devops/ci/variants.yaml
+        --schema hermes-devops/contracts/bundle.schema.json
+        --outdir dist
+    - BUNDLE_FILE=$(basename dist/bundle-*.json)
+    - >
+      curl --fail --silent --show-error
+      --header "JOB-TOKEN: $CI_JOB_TOKEN"
+      --upload-file "dist/$BUNDLE_FILE"
+      "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$RELEASE_PACKAGE_NAME/$RELEASE_VERSION/$BUNDLE_FILE"
+      || echo "upload skipped (already exists)"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'

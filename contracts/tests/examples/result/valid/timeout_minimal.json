@@ -1,0 +1,9 @@
+{
+  "result_version": 1,
+  "task_id": "tsk_wf003_t1_a2",
+  "attempt": 2,
+  "status": "TIMEOUT",
+  "exit_code": -1,
+  "duration_sec": 900,
+  "cases": { "total": 0, "passed": 0, "failed": 0, "skipped": 0 }
+}

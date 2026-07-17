@@ -1,0 +1,264 @@
+# Runtime → Client Agent API v1 (CLAUDE.md §8.1)
+# 局域网 HTTPS + mTLS。Client 只认 Runtime 一个上游,不存在 Hermes 概念。
+openapi: 3.1.0
+info:
+  title: Hermes DevOps Client Agent API
+  version: 1.0.0
+  description: |
+    Runtime 对 Client Agent 的派单/取消/查询/设备/诊断接口。
+    - 派单返回 202 仅表示"已入本地队列",执行进度经 callbacks-api 回传。
+    - 幂等:重复 idempotency_key 返回已有任务状态,不重复执行。
+    - 诊断只提供白名单探测,禁止任意 shell(红线 §14)。
+security:
+  - mtls: []
+paths:
+  /api/v1/tasks:
+    post:
+      operationId: dispatchTask
+      summary: 派单(异步,仅确认入队)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskDispatchRequest'
+      responses:
+        '202':
+          description: 已入本地队列(或重复幂等键时返回既有任务当前状态)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: 同 task_id 但幂等键不一致(契约冲突,拒绝)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: 版本协商失败(Agent 版本低于 Runtime 要求的最低版本)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/tasks/{task_id}:
+    parameters:
+      - name: task_id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getTask
+      summary: 查询本地任务状态
+      responses:
+        '200':
+          description: 任务当前状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskStatus'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      operationId: cancelTask
+      summary: 取消任务(尽力而为:kill 设备进程 + 清理)
+      responses:
+        '202':
+          description: 取消已受理,最终以 task-events/results 回调的终态为准
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskStatus'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/devices:
+    get:
+      operationId: listDevices
+      summary: 本 Client 所辖设备列表
+      responses:
+        '200':
+          description: 设备列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Device'
+  /api/v1/diagnostics:
+    post:
+      operationId: runDiagnostics
+      summary: 白名单探测(非任意 shell)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiagnosticsRequest'
+      responses:
+        '200':
+          description: 探测输出(截断到 max_bytes)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /healthz:
+    get:
+      operationId: healthz
+      summary: 健康检查
+      security: []
+      responses:
+        '200':
+          description: Agent 存活
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, agent_version]
+                properties:
+                  status: { const: ok }
+                  agent_version: { type: string }
+                  adb_server_port: { type: integer, const: 5137 }
+components:
+  securitySchemes:
+    mtls:
+      type: mutualTLS
+      description: Phase 3 强制双向 mTLS;Phase 1 允许自签部署,契约先行声明。
+  responses:
+    BadRequest:
+      description: 请求不合法(未过 Schema 校验)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: 任务不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+    TaskDispatchRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - task_id
+        - idempotency_key
+        - attempt
+        - artifact
+        - manifest_digest
+        - device_serial
+        - callback_base_url
+      properties:
+        task_id: { type: string, minLength: 1, maxLength: 128 }
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: "{workflow_id}:{task_id}:{attempt},跨组件幂等的唯一依据"
+        attempt: { type: integer, minimum: 1 }
+        artifact:
+          type: object
+          additionalProperties: false
+          required: [url, sha256, auth]
+          properties:
+            url: { type: string, format: uri, description: GitLab Generic Registry 确定性 URL }
+            sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: 整包校验和,下载后必须校验 }
+            # CONTRACT-ISSUE: CLAUDE.md §8.1 原文为 auth: bearer|job_token,只有类型没有凭据。
+            # 此处物化为 { type, token }:type 决定请求头形态(PRIVATE-TOKEN / JOB-TOKEN),token 为短期凭据。
+            auth:
+              type: object
+              additionalProperties: false
+              required: [type, token]
+              properties:
+                type: { enum: [bearer, job_token] }
+                token: { type: string, minLength: 1 }
+        manifest_digest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: 包内 manifest.yaml 的 sha256,Client 解包后核对,防止包被替换
+        device_serial: { type: string, minLength: 1 }
+        callback_base_url: { type: string, format: uri }
+        presigned_uploads:
+          type: array
+          default: []
+          description: MinIO 预签名上传地址,附件直传不经 Runtime(红线 §14)
+          items:
+            type: object
+            additionalProperties: false
+            required: [object_key, url]
+            properties:
+              object_key: { type: string, minLength: 1 }
+              url: { type: string, format: uri }
+              expires_at: { type: string, format: date-time }
+    TaskStatus:
+      type: object
+      required: [task_id, state, attempt]
+      properties:
+        task_id: { type: string }
+        idempotency_key: { type: string }
+        attempt: { type: integer, minimum: 1 }
+        state:
+          description: Client 本地生命周期状态(§9 status 的 Client 可见子集)
+          enum:
+            - QUEUED
+            - ACCEPTED
+            - PREPARING
+            - DOWNLOADING
+            - DEPLOYING
+            - RUNNING
+            - COLLECTING
+            - COMPLETED
+            - FAILED
+            - TIMEOUT
+            - CANCELED
+        detail: { type: string }
+        updated_at: { type: string, format: date-time, description: UTC 毫秒精度 }
+    Device:
+      type: object
+      required: [serial, state]
+      properties:
+        serial: { type: string }
+        state: { enum: [IDLE, BUSY, OFFLINE] }
+        props:
+          type: object
+          properties:
+            soc: { type: string }
+            abi: { type: string }
+            android: { type: string }
+            capabilities:
+              type: array
+              items: { type: string }
+        workdir_free_mb: { type: integer, minimum: 0 }
+    DiagnosticsRequest:
+      type: object
+      additionalProperties: false
+      required: [probe]
+      properties:
+        probe:
+          description: 探测白名单,不可扩展为任意命令
+          enum: [adb_devices, logcat_tail, df, getprop]
+        args:
+          type: object
+          additionalProperties: false
+          description: 受限参数,仅白名单键
+          properties:
+            serial: { type: string }
+            lines: { type: integer, minimum: 1, maximum: 1000 }
+            prop_name: { type: string, maxLength: 128 }
+    DiagnosticsResponse:
+      type: object
+      required: [probe, output]
+      properties:
+        probe: { type: string }
+        output: { type: string, description: 文本输出,超长截断 }
+        truncated: { type: boolean, default: false }

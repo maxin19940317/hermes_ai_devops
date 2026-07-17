@@ -1,0 +1,12 @@
+# 构建产物(二进制与 smoke 包由 build 脚本重新生成)
+agent/dist/
+
+# agent-cli 本地运行结果
+agent-runs/
+
+# Python
+__pycache__/
+.pytest_cache/
+
+# 本地私有配置
+.claude/settings.local.json

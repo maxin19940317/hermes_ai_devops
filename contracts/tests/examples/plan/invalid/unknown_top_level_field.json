@@ -1,0 +1,9 @@
+{
+  "plan_version": 1,
+  "plan_id": "pln_20260716_008",
+  "origin": { "type": "manual_nl" },
+  "goal_summary": "顶层出现未声明字段(Hermes 输入必须严格受 Schema 约束)",
+  "build": { "project": "algo-super-sdk", "ref": "master", "targets": ["aarch64_Android_SNPE_2.21"] },
+  "tests": [ { "test_id": "t1", "suite": "snpe-smoke" } ],
+  "adb_command": "adb shell rm -rf /data"
+}

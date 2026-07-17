@@ -1,0 +1,19 @@
+{
+  "result_version": 1,
+  "task_id": "tsk_wf002_t1_a1",
+  "attempt": 1,
+  "status": "FAILED",
+  "exit_code": 1,
+  "duration_sec": 97,
+  "cases": {
+    "total": 38, "passed": 30, "failed": 8, "skipped": 0,
+    "failures": [
+      { "name": "test_hexagon_delegate_conv2d", "message": "output mismatch: max_abs_diff=0.42" }
+    ]
+  },
+  "signatures_hit": ["cpu_fallback"],
+  "metrics": { "latency_ms_p50": 55.1 },
+  "environment": { "serial": "R5CT10XXXXX", "soc": "QCM6125", "android": "12" },
+  "artifact": { "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "pipeline_id": 4321 },
+  "attachments": []
+}

@@ -1,0 +1,9 @@
+{
+  "result_version": 1,
+  "task_id": "tsk_x",
+  "attempt": 1,
+  "status": "COMPLETED",
+  "exit_code": 0,
+  "duration_sec": 1,
+  "cases": { "total": "38", "passed": "38", "failed": "0", "skipped": "0" }
+}

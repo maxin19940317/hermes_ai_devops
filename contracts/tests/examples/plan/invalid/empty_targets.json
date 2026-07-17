@@ -1,0 +1,8 @@
+{
+  "plan_version": 1,
+  "plan_id": "pln_20260716_005",
+  "origin": { "type": "template" },
+  "goal_summary": "build.targets 为空数组",
+  "build": { "project": "algo-super-sdk", "ref": "master", "targets": [] },
+  "tests": [ { "test_id": "t1", "suite": "snpe-smoke" } ]
+}

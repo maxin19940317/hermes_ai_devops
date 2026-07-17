@@ -1,0 +1,34 @@
+{
+  "plan_version": 1,
+  "plan_id": "pln_20260716_001",
+  "origin": { "type": "manual_nl", "user": "maxin", "raw_text": "在 QCM6125 上跑一遍 SNPE 2.21 冒烟" },
+  "goal_summary": "验证 master 最新提交在 SNPE 2.21 Android 变体上的冒烟测试",
+  "build": {
+    "project": "algo-super-sdk",
+    "ref": "master",
+    "targets": ["aarch64_Android_SNPE_2.21"],
+    "build_type": "Release"
+  },
+  "tests": [
+    {
+      "test_id": "t1",
+      "suite": "snpe-smoke",
+      "device_selector": { "soc": "QCM6125", "capabilities": ["hexagon"] },
+      "depends_on": []
+    }
+  ],
+  "policies": {
+    "on_infra_error": { "retry": { "max_attempts": 2, "backoff_sec": 30 } },
+    "on_signature": [
+      { "signature_id": "cpu_fallback", "retry": false, "actions": ["analyze", "notify"] }
+    ],
+    "on_perf_regression": {
+      "baseline": "branch_last_n_passed:5",
+      "threshold_pct": 10,
+      "action": "block_and_notify"
+    },
+    "on_test_failed": { "retry": false, "actions": ["analyze", "notify"] }
+  },
+  "notify": { "channels": ["feishu:oc_xxx"], "on": ["terminal_state"] },
+  "constraints": { "deadline_min": 60, "max_devices": 1 }
+}

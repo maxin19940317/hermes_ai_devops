@@ -1,0 +1,26 @@
+{
+  "bundle_version": 1,
+  "project": "algo-super-sdk",
+  "commit": "deadbee1",
+  "pipeline_id": 42,
+  "version": "1.2.3",
+  "created_at": "2026-07-16T08:00:00.000Z",
+  "packages": [
+    {
+      "variant": "aarch64_Android_SNPE_2.21",
+      "package_file": "algo-super-sdk-aarch64_Android_SNPE_2.21-gdeadbee1-p42.tar.gz",
+      "url": "https://gitlab.example.com/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/algo-super-sdk-aarch64_Android_SNPE_2.21-gdeadbee1-p42.tar.gz",
+      "sha256": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "size": 10485760,
+      "manifest_digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+    },
+    {
+      "variant": "aarch64_Linux_SNPE_2.21",
+      "package_file": "algo-super-sdk-aarch64_Linux_SNPE_2.21-gdeadbee1-p42.tar.gz",
+      "url": "https://gitlab.example.com/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/algo-super-sdk-aarch64_Linux_SNPE_2.21-gdeadbee1-p42.tar.gz",
+      "sha256": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "size": 9437184,
+      "manifest_digest": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+    }
+  ]
+}

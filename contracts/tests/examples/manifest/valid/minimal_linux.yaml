@@ -1,0 +1,23 @@
+# Linux 变体第一阶段不进设备测试链路,但 Manifest 照常生成(CLAUDE.md §6.4)
+manifest_version: 1
+artifact:
+  project: algo-super-sdk
+  commit: a1b2c3d
+  pipeline_id: 4322
+  platform: aarch64_Linux_TFLite_2.21.0
+  build_type: Release
+requirements:
+  os: linux
+  abi: arm64-v8a
+deploy:
+  workdir: /opt/algo-super-sdk
+  files:
+    - { src: run.sh, dst: run.sh, mode: "0755", sha256: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef }
+test:
+  entry: ./run.sh
+  timeout_sec: 600
+  success:
+    exit_code: 0
+    require_files: [results/result.json]
+collect:
+  - results/result.json

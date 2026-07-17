@@ -1,0 +1,8 @@
+# conda env: hermes-devops (python 3.10)
+# 创建: conda create -n hermes-devops python=3.10 -y
+#       ~/anaconda3/envs/hermes-devops/bin/pip install -r requirements.txt
+# 运行: ~/anaconda3/envs/hermes-devops/bin/python -m pytest contracts/tests
+jsonschema>=4.21
+pyyaml>=6.0
+pytest>=8.0
+openapi-spec-validator>=0.7

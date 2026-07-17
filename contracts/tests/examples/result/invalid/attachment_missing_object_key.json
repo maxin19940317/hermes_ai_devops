@@ -1,0 +1,12 @@
+{
+  "result_version": 1,
+  "task_id": "tsk_x",
+  "attempt": 1,
+  "status": "COMPLETED",
+  "exit_code": 0,
+  "duration_sec": 1,
+  "cases": { "total": 0, "passed": 0, "failed": 0, "skipped": 0 },
+  "attachments": [
+    { "name": "logcat.txt", "sha256": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0", "size": 10 }
+  ]
+}

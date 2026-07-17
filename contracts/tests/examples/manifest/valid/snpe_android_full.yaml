@@ -1,0 +1,40 @@
+manifest_version: 1
+artifact:
+  project: algo-super-sdk
+  commit: a1b2c3d4e5f60718293a4b5c6d7e8f9012345678
+  pipeline_id: 4321
+  platform: aarch64_Android_SNPE_2.21
+  build_type: Release
+requirements:
+  os: android
+  abi: arm64-v8a
+  soc: [QCM6125]
+  capabilities: [hexagon]
+  min_free_storage_mb: 512
+deploy:
+  workdir: /data/local/tmp/algo-super-sdk
+  files:
+    - { src: bin/snpe_bench, dst: bin/snpe_bench, mode: "0755", sha256: 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0 }
+    - { src: lib/libSNPE.so, dst: lib/libSNPE.so, mode: "0644", sha256: ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100 }
+    - { src: run.sh, dst: run.sh, mode: "0755", sha256: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef }
+  env:
+    LD_LIBRARY_PATH: "{workdir}/lib"
+    ADSP_LIBRARY_PATH: "{workdir}/lib/dsp;/system/lib/rfsa/adsp"
+test:
+  entry: ./run.sh
+  args: ["--suite", "snpe-smoke", "--output", "results/"]
+  timeout_sec: 900
+  success:
+    exit_code: 0
+    require_files: [results/result.json]
+  failure_signatures:
+    - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
+    - { id: native_crash, where: logcat, pattern: "Fatal signal|tombstone", classify: CODE }
+collect:
+  - results/result.json
+  - results/junit.xml
+  - logs/*.log
+  - dumps/**
+cleanup:
+  remove_workdir: true
+  keep_on_failure: true

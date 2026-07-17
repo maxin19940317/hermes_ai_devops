@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-devops/contracts/bundle.schema.json",
+  "title": "bundle-g{sha}.json v1",
+  "description": "publish:bundle job 聚合 8 个变体 meta 后上传 Registry 的清单,Trigger 服务只认 bundle(CLAUDE.md §6.3)。'8 个变体齐全'由 ci/gen_bundle.py 语义校验,Schema 只管结构。version 受 GitLab 13.8 Generic Registry 限制,强制 strict X.Y.Z;产物唯一性由 package_file 文件名编码(commit + pipeline iid)。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["bundle_version", "project", "commit", "pipeline_id", "version", "created_at", "packages"],
+  "properties": {
+    "bundle_version": { "const": 1 },
+    "project": { "type": "string", "minLength": 1 },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+    "pipeline_id": { "type": "integer", "minimum": 1, "description": "CI_PIPELINE_IID" },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "Registry 路径版本号,GitLab 13.8 不接受 + 与预发布后缀"
+    },
+    "created_at": { "type": "string", "format": "date-time", "description": "UTC" },
+    "packages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["variant", "package_file", "url", "sha256", "size", "manifest_digest"],
+        "properties": {
+          "variant": { "type": "string", "pattern": "^[A-Za-z0-9._]+$" },
+          "package_file": { "type": "string", "minLength": 1 },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Generic Registry 确定性可寻址 URL"
+          },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "size": { "type": "integer", "minimum": 0 },
+          "manifest_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "包内 manifest.yaml 的 sha256,派单时透传给 Client 核对"
+          }
+        }
+      }
+    }
+  }
+}

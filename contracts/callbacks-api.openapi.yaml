@@ -1,0 +1,159 @@
+# Client → Runtime 回调 API v1 (CLAUDE.md §8.2)
+# 回调可能重发:Runtime 按 idempotency_key + seq 去重,Temporal signal 只投递一次。
+openapi: 3.1.0
+info:
+  title: Hermes DevOps Runtime Callbacks API
+  version: 1.0.0
+  description: |
+    Client Agent 上报心跳/状态迁移事件/终态结果的回调接口。
+    - heartbeat 每 10s 一次,同时充当任务租约续期(租约 120s)。
+    - 所有回调均幂等,重发返回 200 且不产生副作用。
+security:
+  - mtls: []
+paths:
+  /callbacks/v1/heartbeat:
+    post:
+      operationId: heartbeat
+      summary: 心跳 + 设备状态 + 进行中任务(租约续期)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Heartbeat'
+      responses:
+        '200':
+          description: 已记录
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeartbeatAck'
+  /callbacks/v1/task-events:
+    post:
+      operationId: reportTaskEvent
+      summary: 任务状态迁移事件
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskEvent'
+      responses:
+        '200':
+          description: 已接收(含重复事件,按 idempotency_key+seq 去重)
+        '400':
+          description: 事件不合法
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /callbacks/v1/results:
+    post:
+      operationId: reportResult
+      summary: 终态结果(附件已直传 MinIO,只传对象键清单)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResultReport'
+      responses:
+        '200':
+          description: 已接收(重复上报幂等)
+        '400':
+          description: result 未通过 result.schema.json 校验
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    mtls:
+      type: mutualTLS
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+    Heartbeat:
+      type: object
+      additionalProperties: false
+      required: [client_id, agent_version, ts, devices, active_task_ids]
+      properties:
+        client_id: { type: string, minLength: 1 }
+        agent_version: { type: string }
+        ts: { type: string, format: date-time, description: UTC 毫秒精度 }
+        devices:
+          type: array
+          items:
+            type: object
+            required: [serial, state]
+            properties:
+              serial: { type: string }
+              state: { enum: [IDLE, BUSY, OFFLINE] }
+              props:
+                type: object
+                properties:
+                  soc: { type: string }
+                  abi: { type: string }
+                  android: { type: string }
+                  capabilities:
+                    type: array
+                    items: { type: string }
+              workdir_free_mb: { type: integer, minimum: 0 }
+        active_task_ids:
+          type: array
+          items: { type: string }
+          description: 进行中任务列表,即租约续期依据
+    HeartbeatAck:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        min_agent_version:
+          type: string
+          description: Runtime 要求的最低 Agent 版本,低于此版本将被拒绝派单
+        cancel_task_ids:
+          type: array
+          items: { type: string }
+          description: Runtime 侧已判死(如租约易主)、要求 Client 停止的任务
+    TaskEvent:
+      type: object
+      additionalProperties: false
+      required: [task_id, idempotency_key, seq, from, to, ts]
+      properties:
+        task_id: { type: string, minLength: 1 }
+        idempotency_key: { type: string, minLength: 1 }
+        seq:
+          type: integer
+          minimum: 1
+          description: 单任务内单调递增,与 idempotency_key 联合去重
+        from: { $ref: '#/components/schemas/TaskState' }
+        to: { $ref: '#/components/schemas/TaskState' }
+        ts: { type: string, format: date-time }
+        detail: { type: string, maxLength: 2000 }
+    TaskState:
+      enum:
+        - QUEUED
+        - ACCEPTED
+        - PREPARING
+        - DOWNLOADING
+        - DEPLOYING
+        - RUNNING
+        - COLLECTING
+        - COMPLETED
+        - FAILED
+        - TIMEOUT
+        - CANCELED
+    ResultReport:
+      type: object
+      additionalProperties: false
+      required: [task_id, idempotency_key, result]
+      properties:
+        task_id: { type: string, minLength: 1 }
+        idempotency_key: { type: string, minLength: 1 }
+        result:
+          type: object
+          description: result.json v1 全文,Runtime 消费前必须用 contracts/result.schema.json 校验(红线 §14)

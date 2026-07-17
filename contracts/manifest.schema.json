@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-devops/contracts/manifest.schema.json",
+  "title": "Manifest v1",
+  "description": "打包期由 ci/gen_manifest.py 生成、注入包内的 manifest.yaml(校验时先 yaml.safe_load 为对象)。Client Agent 严格照此执行,设备上执行什么由本文件在打包期声明,任何字段拼写错误都应 fail pipeline,故 additionalProperties=false。所有 pattern 不使用 lookahead(Go RE2 兼容)。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifest_version", "artifact", "requirements", "deploy", "test", "collect"],
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project", "commit", "pipeline_id", "platform", "build_type"],
+      "properties": {
+        "project": { "type": "string", "minLength": 1 },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "pipeline_id": { "type": "integer", "minimum": 1 },
+        "platform": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._]+$",
+          "description": "构建变体名,与 ci/variants.yaml 的键一致"
+        },
+        "build_type": { "enum": ["Release", "Debug"] }
+      }
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "abi"],
+      "properties": {
+        "os": { "enum": ["android", "linux"] },
+        "abi": { "enum": ["arm64-v8a", "armeabi-v7a", "x86_64"] },
+        "soc": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "允许运行的 SoC 白名单;缺省不限"
+        },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "min_free_storage_mb": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "deploy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workdir", "files"],
+      "properties": {
+        "workdir": {
+          "type": "string",
+          "pattern": "^/[A-Za-z0-9._/-]+$",
+          "not": { "pattern": "\\.\\." },
+          "description": "设备上的绝对路径"
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["src", "dst", "sha256"],
+            "properties": {
+              "src": {
+                "$ref": "#/$defs/relativePath",
+                "description": "包内相对路径"
+              },
+              "dst": {
+                "$ref": "#/$defs/relativePath",
+                "description": "workdir 相对路径,禁止越出 workdir"
+              },
+              "mode": { "type": "string", "pattern": "^0[0-7]{3}$", "default": "0644" },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "值中 {workdir} 由 Client 在部署时替换为实际 workdir"
+        }
+      }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry", "timeout_sec", "success"],
+      "properties": {
+        "entry": {
+          "type": "string",
+          "pattern": "^\\./[A-Za-z0-9._/-]+$",
+          "not": { "pattern": "\\.\\." },
+          "description": "workdir 内的入口脚本,必须以 ./ 开头;Client 不提供任意 shell,只执行 entry"
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 512 },
+          "default": []
+        },
+        "timeout_sec": { "type": "integer", "minimum": 1, "maximum": 86400 },
+        "success": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["exit_code"],
+          "properties": {
+            "exit_code": { "type": "integer" },
+            "require_files": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/relativePath" },
+              "default": []
+            }
+          }
+        },
+        "failure_signatures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "where", "pattern", "classify"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "description": "与 Plan 的 policies.on_signature[].signature_id 关联"
+              },
+              "where": { "enum": ["logcat", "stdout", "stderr", "file"] },
+              "pattern": { "type": "string", "minLength": 1, "maxLength": 1024 },
+              "classify": { "$ref": "#/$defs/errorCategory" }
+            }
+          },
+          "default": []
+        }
+      }
+    },
+    "collect": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._*-][A-Za-z0-9._*/-]*$",
+        "not": { "pattern": "\\.\\." },
+        "description": "workdir 相对 glob,支持 * 与 **"
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "remove_workdir": { "type": "boolean", "default": true },
+        "keep_on_failure": { "type": "boolean", "default": true }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-][A-Za-z0-9._/-]*$",
+      "not": { "pattern": "\\.\\." },
+      "maxLength": 512,
+      "description": "相对路径:不以 / 开头,不含 .."
+    },
+    "errorCategory": {
+      "description": "错误分类枚举(CLAUDE.md §9)",
+      "enum": ["INFRA", "BUILD", "CODE", "MODEL", "DELEGATE", "DEVICE", "PERF", "UNKNOWN"]
+    }
+  }
+}

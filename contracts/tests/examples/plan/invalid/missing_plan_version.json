@@ -1,0 +1,7 @@
+{
+  "plan_id": "pln_20260716_003",
+  "origin": { "type": "template" },
+  "goal_summary": "缺 plan_version",
+  "build": { "project": "algo-super-sdk", "ref": "master", "targets": ["aarch64_Android_SNPE_2.21"] },
+  "tests": [ { "test_id": "t1", "suite": "snpe-smoke" } ]
+}

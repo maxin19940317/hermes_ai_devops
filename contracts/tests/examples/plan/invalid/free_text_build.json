@@ -1,0 +1,8 @@
+{
+  "plan_version": 1,
+  "plan_id": "pln_20260716_007",
+  "origin": { "type": "manual_nl", "raw_text": "帮我编译一下" },
+  "goal_summary": "build 是自由文本而非结构化对象(违反规则2: Runtime 拒绝自由文本)",
+  "build": "请编译 master 分支的所有变体",
+  "tests": [ { "test_id": "t1", "suite": "snpe-smoke" } ]
+}

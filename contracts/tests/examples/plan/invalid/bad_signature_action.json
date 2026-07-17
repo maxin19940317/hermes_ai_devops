@@ -1,0 +1,13 @@
+{
+  "plan_version": 1,
+  "plan_id": "pln_20260716_009",
+  "origin": { "type": "template" },
+  "goal_summary": "on_signature.actions 含未定义动作",
+  "build": { "project": "algo-super-sdk", "ref": "master", "targets": ["aarch64_Android_SNPE_2.21"] },
+  "tests": [ { "test_id": "t1", "suite": "snpe-smoke" } ],
+  "policies": {
+    "on_signature": [
+      { "signature_id": "cpu_fallback", "retry": false, "actions": ["run_arbitrary_shell"] }
+    ]
+  }
+}

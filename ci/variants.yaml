@@ -1,0 +1,107 @@
+# 8 个构建变体 → Manifest 参数映射(CLAUDE.md §6)。
+# gen_manifest.py 按此渲染包内 manifest.yaml;deploy.files 由脚本扫描包内容生成,不在此声明。
+# 约定:
+#   - env 值中的 {workdir} 占位符由 Client Agent 部署时替换,此处原样保留。
+#   - Linux 变体第一阶段不进设备测试链路,但 Manifest 照常生成(§6.4)。
+#   - soc/capabilities 为设备调度约束;TFLite 走 CPU/GPU,不限 soc。
+
+defaults:
+  deploy:
+    workdir_android: /data/local/tmp/algo-super-sdk
+    workdir_linux: /opt/algo-super-sdk
+  test:
+    entry: ./run.sh
+    timeout_sec: 900
+    success:
+      exit_code: 0
+      require_files: [results/result.json]
+  collect:
+    - results/result.json
+    - results/junit.xml
+    - logs/*.log
+    - dumps/**
+  cleanup:
+    remove_workdir: true
+    keep_on_failure: true
+  # 所有 Android 变体共有的失败签名
+  signatures_common_android:
+    - { id: native_crash, where: logcat, pattern: "Fatal signal|tombstone", classify: CODE }
+  signatures_common_linux:
+    - { id: native_crash, where: stderr, pattern: "Segmentation fault|core dumped", classify: CODE }
+
+variants:
+  aarch64_Android_SNPE_1.68:
+    requirements: { os: android, abi: arm64-v8a, soc: [QCM6125], capabilities: [hexagon], min_free_storage_mb: 512 }
+    env:
+      LD_LIBRARY_PATH: "{workdir}/lib"
+      ADSP_LIBRARY_PATH: "{workdir}/lib/dsp;/system/lib/rfsa/adsp"
+    test:
+      args: ["--suite", "snpe-smoke", "--output", "results/"]
+    signatures:
+      - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
+
+  aarch64_Android_SNPE_2.21:
+    requirements: { os: android, abi: arm64-v8a, soc: [QCM6125], capabilities: [hexagon], min_free_storage_mb: 512 }
+    env:
+      LD_LIBRARY_PATH: "{workdir}/lib"
+      ADSP_LIBRARY_PATH: "{workdir}/lib/dsp;/system/lib/rfsa/adsp"
+    test:
+      args: ["--suite", "snpe-smoke", "--output", "results/"]
+    signatures:
+      - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
+
+  aarch64_Android_RKNN_2.3.2:
+    requirements: { os: android, abi: arm64-v8a, soc: [RK3588, RK3566], capabilities: [rknpu], min_free_storage_mb: 512 }
+    env:
+      LD_LIBRARY_PATH: "{workdir}/lib"
+    test:
+      args: ["--suite", "rknn-smoke", "--output", "results/"]
+    signatures:
+      - { id: rknn_init_fail, where: logcat, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }
+
+  aarch64_Android_TFLite_2.21.0:
+    requirements: { os: android, abi: arm64-v8a, min_free_storage_mb: 512 }
+    env:
+      LD_LIBRARY_PATH: "{workdir}/lib"
+    test:
+      args: ["--suite", "tflite-smoke", "--output", "results/"]
+    signatures:
+      - { id: delegate_fallback, where: logcat, pattern: "falling back to CPU|Delegate creation failed", classify: DELEGATE }
+
+  aarch64_Linux_SNPE_1.68:
+    requirements: { os: linux, abi: arm64-v8a, min_free_storage_mb: 512 }
+    env:
+      LD_LIBRARY_PATH: "{workdir}/lib"
+      ADSP_LIBRARY_PATH: "{workdir}/lib/dsp"
+    test:
+      args: ["--suite", "snpe-smoke", "--output", "results/"]
+    signatures:
+      - { id: cpu_fallback, where: stderr, pattern: "Falling back to CPU", classify: MODEL }
+
+  aarch64_Linux_SNPE_2.21:
+    requirements: { os: linux, abi: arm64-v8a, min_free_storage_mb: 512 }
+    env:
+      LD_LIBRARY_PATH: "{workdir}/lib"
+      ADSP_LIBRARY_PATH: "{workdir}/lib/dsp"
+    test:
+      args: ["--suite", "snpe-smoke", "--output", "results/"]
+    signatures:
+      - { id: cpu_fallback, where: stderr, pattern: "Falling back to CPU", classify: MODEL }
+
+  aarch64_Linux_RKNN_2.3.2:
+    requirements: { os: linux, abi: arm64-v8a, min_free_storage_mb: 512 }
+    env:
+      LD_LIBRARY_PATH: "{workdir}/lib"
+    test:
+      args: ["--suite", "rknn-smoke", "--output", "results/"]
+    signatures:
+      - { id: rknn_init_fail, where: stderr, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }
+
+  aarch64_Linux_TFLite_2.21.0:
+    requirements: { os: linux, abi: arm64-v8a, min_free_storage_mb: 512 }
+    env:
+      LD_LIBRARY_PATH: "{workdir}/lib"
+    test:
+      args: ["--suite", "tflite-smoke", "--output", "results/"]
+    signatures:
+      - { id: delegate_fallback, where: stderr, pattern: "falling back to CPU|Delegate creation failed", classify: DELEGATE }

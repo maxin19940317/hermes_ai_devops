@@ -1,0 +1,14 @@
+{
+  "plan_version": 1,
+  "plan_id": "pln_20260716_002",
+  "origin": { "type": "gitlab_event" },
+  "goal_summary": "master push 自动冒烟",
+  "build": {
+    "project": "algo-super-sdk",
+    "ref": "master",
+    "targets": ["aarch64_Android_SNPE_1.68", "aarch64_Android_RKNN_2.3.2"]
+  },
+  "tests": [
+    { "test_id": "smoke", "suite": "default-smoke" }
+  ]
+}
