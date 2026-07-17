@@ -1,6 +1,21 @@
 # runtime — Temporal Worker + Trigger + REST API(Go)
 
-当前内容:Phase 1.4 **Temporal spike**(CLAUDE.md §12),已完成,结论 **GO**。
+当前内容:Phase 1.4 **Temporal spike**(完成,结论 GO)+ Phase 1.5 **Trigger 服务**。
+
+## Trigger 服务(Phase 1.5)
+
+`cmd/trigger`:GitLab pipeline webhook(Secret Token 验签,恒定时间比较)
+→ Packages API 定位并拉取 `bundle-g{sha}.json`(webhook 不携带 Registry 版本号,
+按 package_name 倒序逐版本探测)→ Schema 校验(内嵌 bundle.schema.json,防漂移测试)
+→ 登记 artifacts 表(幂等 upsert)→ 按名启动 DeviceTestWorkflow。
+
+去重语义:workflow ID = `device-test-{project}-g{commit}-p{iid}`,
+复用策略 AllowDuplicateFailedOnly——webhook 重复投递不重跑,
+上次失败的 bundle 可通过重新投递重触发。无 bundle 的成功 pipeline(如 MR 构建)
+安静跳过(200)。配置见 `cmd/trigger/main.go` 头注释(环境变量)。
+
+Postgres 集成测试由 `TEST_DATABASE_URL` 门控(本机跳过,服务器部署后必须跑通);
+其余测试含真实 dev server 上的启动/去重 e2e(`internal/testtemporal` 拉起)。
 
 ## Spike 结论(2026-07-17)
 
@@ -38,6 +53,11 @@ cd runtime && go test ./spike/ -v
 ```text
 spike/                  # go/no-go 三场景(workflow/activity + e2e 测试)
 cmd/spike-worker/       # 独立 worker 进程,供 SIGKILL 场景使用
+cmd/trigger/            # Trigger 服务(webhook → bundle → artifacts → workflow)
+internal/trigger/       # handler / bundle 校验 / GitLab 客户端 / Temporal starter
+internal/store/         # Postgres 访问层(schema.sql + 内存实现)
+internal/workflow/      # DeviceTestWorkflow 输入契约(本体属 Phase 1.6)
+internal/testtemporal/  # 测试用 dev server 拉起助手
 ```
 
-后续(§12):1.5 Trigger 服务、1.6 DeviceTestWorkflow 主干 + 规则引擎。
+后续(§12):1.6 DeviceTestWorkflow 主干 + 规则引擎。

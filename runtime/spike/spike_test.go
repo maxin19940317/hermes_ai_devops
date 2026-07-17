@@ -2,8 +2,6 @@ package spike_test
 
 import (
 	"context"
-	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,58 +12,11 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 
+	"hermes-devops/runtime/internal/testtemporal"
 	"hermes-devops/runtime/spike"
 )
 
-// ---- 基础设施:dev server / client / worker 进程 ----
-
-func freePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
-}
-
-// startDevServer 拉起 temporal dev server(单二进制 + SQLite),返回 gRPC 地址。
-func startDevServer(t *testing.T) string {
-	t.Helper()
-	if _, err := exec.LookPath("temporal"); err != nil {
-		t.Skip("temporal CLI 不在 PATH,跳过 spike(安装: temporal.download/cli)")
-	}
-	grpcPort := freePort(t)
-	cmd := exec.Command("temporal", "server", "start-dev",
-		"--headless", "--log-level", "error",
-		"--ip", "127.0.0.1",
-		"--port", fmt.Sprint(grpcPort),
-		"--http-port", fmt.Sprint(freePort(t)),
-		"--metrics-port", fmt.Sprint(freePort(t)),
-		"--db-filename", filepath.Join(t.TempDir(), "spike.db"),
-	)
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start dev server: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	})
-
-	addr := fmt.Sprintf("127.0.0.1:%d", grpcPort)
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := client.Dial(client.Options{HostPort: addr}) // Dial 自带健康检查
-		if err == nil {
-			c.Close()
-			return addr
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatal("dev server 30s 内未就绪")
-	return ""
-}
+// ---- 基础设施:client / worker 进程(dev server 见 internal/testtemporal) ----
 
 func dial(t *testing.T, addr string) client.Client {
 	t.Helper()
@@ -106,7 +57,7 @@ func startWorkerProc(t *testing.T, bin, addr string) *exec.Cmd {
 // ---- 场景 1+2:signal 接收 与 Activity 重试 ----
 
 func TestSignalDeliveryAndActivityRetry(t *testing.T) {
-	addr := startDevServer(t)
+	addr := testtemporal.StartDevServer(t)
 	c := dial(t, addr)
 
 	w := worker.New(c, spike.TaskQueue, worker.Options{})
@@ -152,7 +103,7 @@ func TestSignalDeliveryAndActivityRetry(t *testing.T) {
 // ---- 场景 3:SIGKILL worker 后重放恢复,activity 不重复执行 ----
 
 func TestWorkerKillThenReplayRecovery(t *testing.T) {
-	addr := startDevServer(t)
+	addr := testtemporal.StartDevServer(t)
 	c := dial(t, addr)
 	bin := buildWorkerBinary(t)
 
