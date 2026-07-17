@@ -70,6 +70,20 @@ agent-cli run --package-file smoke-pkg-ok.tar.gz --sha256 <打印的sha256> `
   超时 kill 后**仍收集**;非零退出码/超时是客观结局不是 error;
   逐文件 sha256 复核后才 push;status 与 verdict 正交,本层不判 verdict。
 
+## 实机踩坑记录(2026-07-17,trinket/QCM6125 板)
+
+- **USB 传输层 serial 可能为 `?`**:板子的 USB gadget 未设置 iSerial 描述符,
+  `adb devices` 显示 `?`,`-s` 无法寻址(`ro.serialno` 是系统属性,与此无关)。
+  修复:`adb root` 后
+  `echo 513cd3de > /config/usb_gadget/g1/strings/0x409/serialnumber`,拔插 USB 生效。
+  **重启后丢失**,长期需 init 脚本持久化。启示:设备注册不能假设 USB serial 总是可用。
+- **WSL 下跑 Linux 版 agent-cli + adb.exe 时,`ANDROID_ADB_SERVER_PORT` 不会传给
+  Windows 进程**(WSL interop 需 WSLENV 显式声明),即私有 5137 端口静默失效,
+  实际连的是 5037 —— 违反 §14 红线。实机验证必须用原生 Windows 的 agent-cli.exe。
+- precheck 的 getprop 曾忽略 adb 退出码,设备不可寻址时误报为
+  `abi mismatch: device=`(已修:ExitCode != 0 时带 stderr 报错,
+  回归测试 `TestPrecheckSurfacesADBErrorWhenDeviceUnaddressable`)。
+
 ## 尚未覆盖(后续阶段)
 
 - RPC 服务壳(§8.1)、心跳/事件/结果回调、MinIO 直传、Windows Service 化 → Phase 1.7

@@ -182,6 +182,12 @@ func (e *Executor) precheck(ctx context.Context, serial string, m *manifest.Mani
 		if err != nil {
 			return "", err
 		}
+		// 非零退出码通常是设备不可寻址(not found/unauthorized/offline),
+		// 必须带出 adb stderr,不能让空 stdout 伪装成属性值
+		if res.ExitCode != 0 {
+			return "", fmt.Errorf("adb getprop %s: exit=%d: %s",
+				prop, res.ExitCode, strings.TrimSpace(res.Stderr))
+		}
 		return strings.TrimSpace(res.Stdout), nil
 	}
 

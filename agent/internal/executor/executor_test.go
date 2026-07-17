@@ -80,12 +80,13 @@ cleanup: {remove_workdir: true, keep_on_failure: true}
 
 // fakeADB 以 argv 模式匹配模拟设备行为,记录全部调用。
 type fakeADB struct {
-	mu        sync.Mutex
-	calls     [][]string
-	props     map[string]string
-	dfAvailKB int
-	runExit   int
-	runBlocks bool
+	mu            sync.Mutex
+	calls         [][]string
+	props         map[string]string
+	dfAvailKB     int
+	runExit       int
+	runBlocks     bool
+	deviceMissing bool // 模拟 -s 寻址不到设备:所有命令 exit=1 + stderr
 }
 
 func defaultProps() map[string]string {
@@ -100,6 +101,10 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, args)
 	f.mu.Unlock()
+
+	if f.deviceMissing {
+		return adb.Result{ExitCode: 1, Stderr: "adb: device '" + serial + "' not found\n"}, nil
+	}
 
 	cmd := args[2]
 	switch {
@@ -259,6 +264,22 @@ func TestPrecheckABIMismatchFailsBeforeDeploy(t *testing.T) {
 		if s == StatusDeploying {
 			t.Error("预检失败后不得进入 DEPLOYING")
 		}
+	}
+}
+
+// 实机踩坑回归(2026-07-17):设备不可寻址时 adb 以非零退出码失败,
+// 预检必须把 adb 的 stderr 带出来,而不是把空 stdout 误报成 ABI 不匹配。
+func TestPrecheckSurfacesADBErrorWhenDeviceUnaddressable(t *testing.T) {
+	f := &fakeADB{props: defaultProps(), dfAvailKB: 1 << 20, deviceMissing: true}
+	sum, err, _ := run(t, f, Options{PackagePath: buildPackage(t, 900), Serial: serial, OutDir: t.TempDir()})
+	if err == nil || sum.Status != StatusFailed {
+		t.Fatalf("expected precheck failure, got %+v, err=%v", sum, err)
+	}
+	if strings.Contains(err.Error(), "abi mismatch") {
+		t.Errorf("设备不可寻址不是 ABI 问题,报错误导: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("报错应包含 adb stderr 原文: %v", err)
 	}
 }
 
