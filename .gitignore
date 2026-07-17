@@ -1,7 +1,3 @@
-# 构建产物(二进制与 smoke 包由 build 脚本重新生成)
-agent/dist/*
-!agent/dist/README.md
-
 # agent-cli 本地运行结果
 agent-runs/
 
