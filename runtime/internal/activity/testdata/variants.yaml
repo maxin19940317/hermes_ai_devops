@@ -1,0 +1,15 @@
+defaults:
+  test:
+    timeout_sec: 900
+  signatures_common_android:
+    - { id: native_crash, where: logcat, pattern: "Fatal signal|tombstone", classify: CODE }
+
+variants:
+  aarch64_Android_SNPE_2.21:
+    requirements: { os: android, abi: arm64-v8a, soc: [QCM6125], capabilities: [hexagon], min_free_storage_mb: 512 }
+    test:
+      args: ["--suite", "snpe-smoke", "--output", "results/"]
+    signatures:
+      - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
+  aarch64_Linux_SNPE_2.21:
+    requirements: { os: linux, abi: aarch64 }
