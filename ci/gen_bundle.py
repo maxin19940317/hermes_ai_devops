@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""gen_bundle.py — 聚合 8 个变体 meta 为 bundle-g{sha}.json(CLAUDE.md §6.3)。
+"""gen_bundle.py — 聚合 8 个变体 meta 为 bundle-g{sha}-p{global_id}.json(CLAUDE.md §6.3)。
 
 规则:
   - variants.yaml 中声明的每个变体都必须有 meta,缺任何一个拒绝发 bundle
     (挡住被 interruptible 打断的残缺构建);
-  - 所有 meta 的 project/commit/pipeline_id/version 必须一致;
+  - 所有 meta 的 project/commit/pipeline_id/pipeline_global_id/version 必须一致;
   - 输出前用 contracts/bundle.schema.json 校验。
 Trigger 服务只认 bundle。
 """
@@ -22,10 +22,24 @@ except ImportError:  # pragma: no cover
     sys.exit("gen_bundle.py requires jsonschema: pip install jsonschema")
 
 PACKAGE_FIELDS = ("variant", "package_file", "url", "sha256", "size", "manifest_digest")
-SHARED_FIELDS = ("project", "commit", "pipeline_id", "version")
+SHARED_FIELDS = (
+    "project", "commit", "pipeline_id", "pipeline_global_id", "version",
+)
 
 
-def gen_bundle(*, meta_dir, variants_file, schema_file, outdir) -> Path:
+def _normalize_created_at(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SystemExit(f"invalid created_at: {value!r}") from exc
+    if parsed.tzinfo is None:
+        raise SystemExit("created_at must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+
+
+def gen_bundle(*, meta_dir, variants_file, schema_file, outdir, created_at) -> Path:
     meta_dir = Path(meta_dir)
     variants = sorted(yaml.safe_load(Path(variants_file).read_text(encoding="utf-8"))["variants"])
 
@@ -48,9 +62,7 @@ def gen_bundle(*, meta_dir, variants_file, schema_file, outdir) -> Path:
     bundle = {
         "bundle_version": 1,
         **shared,
-        "created_at": datetime.now(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z"),
+        "created_at": _normalize_created_at(created_at),
         "packages": [
             {k: metas[v][k] for k in PACKAGE_FIELDS} for v in variants
         ],
@@ -66,7 +78,9 @@ def gen_bundle(*, meta_dir, variants_file, schema_file, outdir) -> Path:
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    out = outdir / f"bundle-g{shared['commit']}.json"
+    out = outdir / (
+        f"bundle-g{shared['commit']}-p{shared['pipeline_global_id']}.json"
+    )
     out.write_text(json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8")
     return out
 
@@ -78,11 +92,16 @@ def main(argv):
     parser.add_argument("--schema", required=True, type=Path,
                         help="contracts/bundle.schema.json")
     parser.add_argument("--outdir", required=True, type=Path)
+    parser.add_argument(
+        "--created-at", required=True,
+        help="stable RFC3339 timestamp; CI uses CI_COMMIT_TIMESTAMP",
+    )
     args = parser.parse_args(argv)
 
     out = gen_bundle(
         meta_dir=args.meta_dir, variants_file=args.variants_file,
         schema_file=args.schema, outdir=args.outdir,
+        created_at=args.created_at,
     )
     print(out)
     return 0
