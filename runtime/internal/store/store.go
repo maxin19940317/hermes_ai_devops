@@ -6,6 +6,8 @@ import (
 	"context"
 	"strconv"
 	"sync"
+
+	wf "hermes-devops/runtime/internal/workflow"
 )
 
 // Artifact 对应 artifacts 表一行(§11)。
@@ -31,12 +33,24 @@ type ArtifactStore interface {
 
 // MemStore 是进程内实现,供单测与无数据库的开发模式使用。
 type MemStore struct {
-	mu   sync.Mutex
-	rows map[string]Artifact
+	mu      sync.Mutex
+	rows    map[string]Artifact
+	clients map[string]Client
+	devices map[string]*deviceRow
+	tasks   map[string]*taskRecord
+	events  map[string]TaskEvent
+	results map[string]wf.ResultRecord
 }
 
 func NewMemStore() *MemStore {
-	return &MemStore{rows: map[string]Artifact{}}
+	return &MemStore{
+		rows:    map[string]Artifact{},
+		clients: map[string]Client{},
+		devices: map[string]*deviceRow{},
+		tasks:   map[string]*taskRecord{},
+		events:  map[string]TaskEvent{},
+		results: map[string]wf.ResultRecord{},
+	}
 }
 
 func (s *MemStore) RegisterArtifacts(_ context.Context, arts []Artifact) error {

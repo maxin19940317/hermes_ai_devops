@@ -3,11 +3,14 @@ module hermes-devops/runtime
 go 1.26.5
 
 require (
+	github.com/fergusstrange/embedded-postgres v1.31.0
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/lib/pq v1.10.9
 	github.com/rs/zerolog v1.35.1
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	go.temporal.io/api v1.63.0
 	go.temporal.io/sdk v1.46.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -29,6 +32,7 @@ require (
 	github.com/robfig/cron v1.2.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
+	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
@@ -38,5 +42,4 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect
 	google.golang.org/grpc v1.79.3 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

@@ -83,6 +83,13 @@ components:
       required: [client_id, agent_version, ts, devices, active_task_ids]
       properties:
         client_id: { type: string, minLength: 1 }
+        base_url:
+          type: string
+          format: uri
+          description: |
+            本 Client 的 API 基地址(https://host:port),Runtime 派单用。
+            CONTRACT-ISSUE: §8.2 原文心跳载荷未含派单地址,Runtime 无从得知
+            Client API 端点;按"只加字段不删字段"新增可选字段。
         agent_version: { type: string }
         ts: { type: string, format: date-time, description: UTC 毫秒精度 }
         devices:
