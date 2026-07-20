@@ -47,8 +47,9 @@ func TestFetchBundleFindsAcrossVersions(t *testing.T) {
 		"/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/bundle-gabcd1234-p42001.json": bundle,
 	})
 	gl := &GitLabClient{BaseURL: srv.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: srv.Client()}
+	var projectID, pipelineGlobalID int64 = 7, 42001
 
-	raw, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001)
+	raw, found, err := gl.FetchBundle(context.Background(), projectID, "abcd1234", pipelineGlobalID)
 	if err != nil || !found {
 		t.Fatalf("found=%v err=%v", found, err)
 	}
@@ -71,6 +72,21 @@ func TestFetchBundleNotFound(t *testing.T) {
 	}
 	if found {
 		t.Error("found = true, want false")
+	}
+}
+
+func TestFetchBundleDoesNotFallBackToLegacyName(t *testing.T) {
+	srv, _ := fakeGitLab(t, []string{"1.2.3"}, map[string][]byte{
+		"/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/bundle-gabcd1234.json": []byte(`{"legacy":true}`),
+	})
+	gl := &GitLabClient{BaseURL: srv.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: srv.Client()}
+
+	_, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001)
+	if err != nil {
+		t.Fatalf("qualified lookup: %v", err)
+	}
+	if found {
+		t.Error("found legacy commit-only bundle, want false")
 	}
 }
 

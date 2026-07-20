@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -20,7 +21,7 @@ import (
 // bundle-g{sha}-p{pipelineGlobalID}.json。
 // found=false 表示该 pipeline 没有发布 bundle(如 MR 构建),不是错误。
 type BundleFetcher interface {
-	FetchBundle(ctx context.Context, projectID int, shortSHA string, pipelineGlobalID int) (raw []byte, found bool, err error)
+	FetchBundle(ctx context.Context, projectID int64, shortSHA string, pipelineGlobalID int64) (raw []byte, found bool, err error)
 }
 
 // WorkflowStarter 启动 DeviceTestWorkflow。
@@ -57,19 +58,21 @@ func New(cfg Config, fetcher BundleFetcher, st store.ArtifactStore, starter Work
 type pipelineEvent struct {
 	ObjectKind       string `json:"object_kind"`
 	ObjectAttributes struct {
-		ID     int    `json:"id"` // GitLab 13.8 全局 ID,等于 CI_PIPELINE_ID(非 IID),对应 bundle.pipeline_global_id
+		ID     int64  `json:"id"` // GitLab 13.8 全局 ID,等于 CI_PIPELINE_ID(非 IID),对应 bundle.pipeline_global_id
 		Ref    string `json:"ref"`
 		Tag    bool   `json:"tag"`
 		SHA    string `json:"sha"` // 全长 40 位
 		Status string `json:"status"`
 	} `json:"object_attributes"`
 	Project struct {
-		ID                int    `json:"id"`
+		ID                int64  `json:"id"`
 		PathWithNamespace string `json:"path_with_namespace"`
 	} `json:"project"`
 }
 
 const shortSHALen = 8 // CI_COMMIT_SHORT_SHA 固定 8 位,bundle 文件名以此编码
+
+var fullSHARegexp = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -92,13 +95,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if len(ev.ObjectAttributes.SHA) < shortSHALen {
+	if ev.Project.ID <= 0 || ev.ObjectAttributes.ID <= 0 {
+		http.Error(w, "bad pipeline identity", http.StatusBadRequest)
+		return
+	}
+	if !fullSHARegexp.MatchString(ev.ObjectAttributes.SHA) {
 		http.Error(w, "bad sha", http.StatusBadRequest)
 		return
 	}
 	shortSHA := ev.ObjectAttributes.SHA[:shortSHALen]
 	log := h.log.With().Str("project", ev.Project.PathWithNamespace).
-		Int("pipeline", ev.ObjectAttributes.ID).Str("sha", shortSHA).Logger()
+		Int64("pipeline", ev.ObjectAttributes.ID).Str("sha", shortSHA).Logger()
 
 	// ---- 拉 bundle(Trigger 只认 bundle,§6.3) ----
 	raw, found, err := h.fetcher.FetchBundle(r.Context(), ev.Project.ID, shortSHA, ev.ObjectAttributes.ID)
@@ -118,9 +125,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid bundle: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
+	if b.Project != ev.Project.PathWithNamespace {
+		log.Error().Str("bundle_project", b.Project).
+			Str("event_project", ev.Project.PathWithNamespace).Msg("bundle project mismatch")
+		http.Error(w, "bundle project mismatch", http.StatusUnprocessableEntity)
+		return
+	}
 	if b.PipelineGlobalID != ev.ObjectAttributes.ID {
-		log.Error().Int("bundle_pipeline_global_id", b.PipelineGlobalID).
-			Int("event_pipeline_global_id", ev.ObjectAttributes.ID).Msg("bundle pipeline mismatch")
+		log.Error().Int64("bundle_pipeline_global_id", b.PipelineGlobalID).
+			Int64("event_pipeline_global_id", ev.ObjectAttributes.ID).Msg("bundle pipeline mismatch")
 		http.Error(w, "bundle pipeline mismatch", http.StatusUnprocessableEntity)
 		return
 	}

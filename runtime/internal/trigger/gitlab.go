@@ -44,7 +44,7 @@ func (g *GitLabClient) get(ctx context.Context, url string) (*http.Response, err
 }
 
 // FetchBundle 实现 BundleFetcher。found=false 表示该 pipeline 无 bundle(不是错误)。
-func (g *GitLabClient) FetchBundle(ctx context.Context, projectID int, shortSHA string, pipelineGlobalID int) ([]byte, bool, error) {
+func (g *GitLabClient) FetchBundle(ctx context.Context, projectID int64, shortSHA string, pipelineGlobalID int64) ([]byte, bool, error) {
 	versions, err := g.listVersions(ctx, projectID)
 	if err != nil {
 		return nil, false, fmt.Errorf("list packages: %w", err)
@@ -77,7 +77,7 @@ func (g *GitLabClient) FetchBundle(ctx context.Context, projectID int, shortSHA 
 }
 
 // listVersions 返回该包名下按创建时间倒序去重的版本列表(最多 maxVersionProbes 个)。
-func (g *GitLabClient) listVersions(ctx context.Context, projectID int) ([]string, error) {
+func (g *GitLabClient) listVersions(ctx context.Context, projectID int64) ([]string, error) {
 	u := fmt.Sprintf("%s/api/v4/projects/%d/packages?package_name=%s&order_by=created_at&sort=desc&per_page=%d",
 		g.BaseURL, projectID, url.QueryEscape(g.PackageName), 20)
 	resp, err := g.get(ctx, u)

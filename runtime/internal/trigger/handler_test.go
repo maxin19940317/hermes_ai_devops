@@ -55,11 +55,15 @@ func mustJSON(t *testing.T, v any) []byte {
 
 // pipelineEvent 构造 GitLab 13.8 Pipeline Hook payload。
 func pipelinePayload(status, ref, sha string) []byte {
+	return pipelinePayloadWithIDs(status, ref, sha, "42001", "7")
+}
+
+func pipelinePayloadWithIDs(status, ref, sha, pipelineID, projectID string) []byte {
 	return []byte(fmt.Sprintf(`{
 		"object_kind": "pipeline",
-		"object_attributes": {"id": 42001, "ref": %q, "tag": false, "sha": %q, "status": %q},
-		"project": {"id": 7, "path_with_namespace": "grp/algo-super-sdk"}
-	}`, ref, sha, status))
+		"object_attributes": {"id": %s, "ref": %q, "tag": false, "sha": %q, "status": %q},
+		"project": {"id": %s, "path_with_namespace": "grp/algo-super-sdk"}
+	}`, pipelineID, ref, sha, status, projectID))
 }
 
 const fullSHA = "abcd1234deadbeefabcd1234deadbeefabcd1234"
@@ -71,11 +75,11 @@ type fakeFetcher struct {
 	err                 error
 	calls               int
 	gotSHA              string
-	gotProj             int
-	gotPipelineGlobalID int
+	gotProj             int64
+	gotPipelineGlobalID int64
 }
 
-func (f *fakeFetcher) FetchBundle(_ context.Context, projectID int, shortSHA string, pipelineGlobalID int) ([]byte, bool, error) {
+func (f *fakeFetcher) FetchBundle(_ context.Context, projectID int64, shortSHA string, pipelineGlobalID int64) ([]byte, bool, error) {
 	f.calls++
 	f.gotProj, f.gotSHA, f.gotPipelineGlobalID = projectID, shortSHA, pipelineGlobalID
 	if f.err != nil {
@@ -155,6 +159,62 @@ func TestIgnoresNonPipelineAndNonSuccess(t *testing.T) {
 		if fetcher.calls != 0 || starter.calls != 0 {
 			t.Errorf("%s: 不得触发下游", name)
 		}
+	}
+}
+
+func TestRejectsInvalidSHAWithoutFetching(t *testing.T) {
+	cases := map[string]string{
+		"short":     fullSHA[:len(fullSHA)-1],
+		"long":      fullSHA + "a",
+		"question":  "abcd123?deadbeefabcd1234deadbeefabcd1234",
+		"fragment":  "abcd123#deadbeefabcd1234deadbeefabcd1234",
+		"slash":     "abcd123/deadbeefabcd1234deadbeefabcd1234",
+		"uppercase": "Abcd1234deadbeefabcd1234deadbeefabcd1234",
+		"non-hex":   "zbcd1234deadbeefabcd1234deadbeefabcd1234",
+	}
+	for name, sha := range cases {
+		t.Run(name, func(t *testing.T) {
+			fetcher, starter := &fakeFetcher{}, &fakeStarter{}
+			h, _ := newTestHandler(fetcher, starter)
+			rec := post(h, testSecret, pipelinePayload("success", "master", sha))
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("code=%d body=%s, want 400", rec.Code, rec.Body)
+			}
+			if fetcher.calls != 0 {
+				t.Errorf("fetch calls=%d, want 0", fetcher.calls)
+			}
+		})
+	}
+}
+
+func TestRejectsInvalidIDsWithoutFetching(t *testing.T) {
+	valid := pipelinePayload("success", "master", fullSHA)
+	cases := map[string][]byte{
+		"missing pipeline id": bytes.Replace(valid, []byte(`"id": 42001, `), nil, 1),
+		"zero pipeline id":    pipelinePayloadWithIDs("success", "master", fullSHA, "0", "7"),
+		"negative pipeline id": pipelinePayloadWithIDs("success", "master", fullSHA,
+			"-1", "7"),
+		"pipeline id int64 overflow": pipelinePayloadWithIDs("success", "master", fullSHA,
+			"9223372036854775808", "7"),
+		"missing project id": bytes.Replace(valid, []byte(`"id": 7, `), nil, 1),
+		"zero project id":    pipelinePayloadWithIDs("success", "master", fullSHA, "42001", "0"),
+		"negative project id": pipelinePayloadWithIDs("success", "master", fullSHA,
+			"42001", "-1"),
+		"project id int64 overflow": pipelinePayloadWithIDs("success", "master", fullSHA,
+			"42001", "9223372036854775808"),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			fetcher, starter := &fakeFetcher{}, &fakeStarter{}
+			h, _ := newTestHandler(fetcher, starter)
+			rec := post(h, testSecret, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("code=%d body=%s, want 400", rec.Code, rec.Body)
+			}
+			if fetcher.calls != 0 {
+				t.Errorf("fetch calls=%d, want 0", fetcher.calls)
+			}
+		})
 	}
 }
 
@@ -274,6 +334,25 @@ func TestBundlePipelineMismatchRejected(t *testing.T) {
 	}
 	if starter.calls != 0 || len(st.Artifacts()) != 0 {
 		t.Error("pipeline global ID 不一致不得登记 artifact 或启动 workflow")
+	}
+}
+
+func TestBundleProjectMismatchRejected(t *testing.T) {
+	bundle := validBundle()
+	bundle["project"] = "other/algo-super-sdk"
+	fetcher := &fakeFetcher{bundle: mustJSON(t, bundle)}
+	starter := &fakeStarter{}
+	h, st := newTestHandler(fetcher, starter)
+
+	rec := post(h, testSecret, pipelinePayload("success", "master", fullSHA))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("code=%d body=%s, want 422", rec.Code, rec.Body)
+	}
+	if strings.TrimSpace(rec.Body.String()) != "bundle project mismatch" {
+		t.Errorf("body=%q, want bundle project mismatch", rec.Body.String())
+	}
+	if starter.calls != 0 || len(st.Artifacts()) != 0 {
+		t.Error("project 不一致不得登记 artifact 或启动 workflow")
 	}
 }
 

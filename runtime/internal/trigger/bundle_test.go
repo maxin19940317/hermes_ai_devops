@@ -14,6 +14,10 @@ func TestParseBundleValid(t *testing.T) {
 		b.Project != "grp/algo-super-sdk" || len(b.Packages) != 2 {
 		t.Errorf("parsed = %+v", b)
 	}
+	var pipelineGlobalID int64 = b.PipelineGlobalID
+	if pipelineGlobalID != 42001 {
+		t.Errorf("pipeline global ID = %d", pipelineGlobalID)
+	}
 	if b.Packages[0].Variant != "aarch64_Android_SNPE_2.21" {
 		t.Errorf("package[0] = %+v", b.Packages[0])
 	}
