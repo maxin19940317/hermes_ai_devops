@@ -13,11 +13,6 @@ import (
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
-// Acts 承载全部活动;字段随任务推进补齐(Store/Cfg/HTTP 见后续任务)。
-type Acts struct {
-	SpecCfg *SpecConfig
-}
-
 // SpecDefaults 是 TestSpec 调度参数缺省值(§10)。
 type SpecDefaults struct {
 	MaxInfraRetries   int // 缺省 2(仅 INFRA)
