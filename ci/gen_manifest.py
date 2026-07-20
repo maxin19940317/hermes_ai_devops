@@ -207,6 +207,7 @@ def inject_manifest(*, package, variant, variants_file, schema_file,
                         out_tar.addfile(normalized, tar.extractfile(member))
                     else:
                         out_tar.addfile(normalized, io.BytesIO(data))
+            temporary_path.chmod(0o644)
             temporary_path.replace(out_path)
         except BaseException:
             temporary_path.unlink(missing_ok=True)

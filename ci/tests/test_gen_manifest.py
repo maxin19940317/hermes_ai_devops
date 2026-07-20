@@ -1,6 +1,7 @@
 """gen_manifest.py:解包 → 注入 manifest.yaml + files.sha256 → 校验 → 重打包重命名。"""
 import hashlib
 import io
+import stat
 import tarfile
 from pathlib import Path
 
@@ -104,6 +105,12 @@ def test_info_digests_match_package(fake_package, tmp_path):
     with tarfile.open(out, "r:gz") as tar:
         manifest_bytes = tar.extractfile("manifest.yaml").read()
     assert info["manifest_digest"] == hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def test_output_archive_has_published_permissions(fake_package, tmp_path):
+    info, _ = inject(fake_package, tmp_path)
+    mode = stat.S_IMODE(Path(info["package_path"]).stat().st_mode)
+    assert mode == 0o644
 
 
 def test_unknown_variant_fails(fake_package, tmp_path):
