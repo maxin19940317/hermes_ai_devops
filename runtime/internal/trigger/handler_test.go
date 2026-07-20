@@ -57,7 +57,7 @@ func mustJSON(t *testing.T, v any) []byte {
 func pipelinePayload(status, ref, sha string) []byte {
 	return []byte(fmt.Sprintf(`{
 		"object_kind": "pipeline",
-		"object_attributes": {"id": 9001, "ref": %q, "tag": false, "sha": %q, "status": %q},
+		"object_attributes": {"id": 42001, "ref": %q, "tag": false, "sha": %q, "status": %q},
 		"project": {"id": 7, "path_with_namespace": "grp/algo-super-sdk"}
 	}`, ref, sha, status))
 }
@@ -67,16 +67,17 @@ const fullSHA = "abcd1234deadbeefabcd1234deadbeefabcd1234"
 // ---- fakes ----
 
 type fakeFetcher struct {
-	bundle  []byte // nil = 404(未找到)
-	err     error
-	calls   int
-	gotSHA  string
-	gotProj int
+	bundle              []byte // nil = 404(未找到)
+	err                 error
+	calls               int
+	gotSHA              string
+	gotProj             int
+	gotPipelineGlobalID int
 }
 
-func (f *fakeFetcher) FetchBundle(_ context.Context, projectID int, shortSHA string) ([]byte, bool, error) {
+func (f *fakeFetcher) FetchBundle(_ context.Context, projectID int, shortSHA string, pipelineGlobalID int) ([]byte, bool, error) {
 	f.calls++
-	f.gotProj, f.gotSHA = projectID, shortSHA
+	f.gotProj, f.gotSHA, f.gotPipelineGlobalID = projectID, shortSHA, pipelineGlobalID
 	if f.err != nil {
 		return nil, false, f.err
 	}
@@ -167,8 +168,8 @@ func TestSuccessPipelineStartsWorkflowAndRegistersArtifacts(t *testing.T) {
 		t.Fatalf("code=%d body=%s, want 202", rec.Code, rec.Body)
 	}
 	// bundle 用 short sha(前 8 位)定位
-	if fetcher.gotSHA != "abcd1234" || fetcher.gotProj != 7 {
-		t.Errorf("fetch args = (%d, %q)", fetcher.gotProj, fetcher.gotSHA)
+	if fetcher.gotSHA != "abcd1234" || fetcher.gotProj != 7 || fetcher.gotPipelineGlobalID != 42001 {
+		t.Errorf("fetch args = (%d, %q, %d)", fetcher.gotProj, fetcher.gotSHA, fetcher.gotPipelineGlobalID)
 	}
 	// artifacts 全量登记
 	arts := st.Artifacts()
@@ -254,6 +255,25 @@ func TestBundleCommitMismatchRejected(t *testing.T) {
 	}
 	if starter.calls != 0 {
 		t.Error("commit 不一致不得启动 workflow")
+	}
+}
+
+func TestBundlePipelineMismatchRejected(t *testing.T) {
+	bundle := validBundle() // pipeline_global_id=42001
+	fetcher := &fakeFetcher{bundle: mustJSON(t, bundle)}
+	starter := &fakeStarter{}
+	h, st := newTestHandler(fetcher, starter)
+	body := bytes.Replace(pipelinePayload("success", "master", fullSHA), []byte(`"id": 42001`), []byte(`"id": 42002`), 1)
+
+	rec := post(h, testSecret, body)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("code=%d body=%s, want 422(bundle.pipeline_global_id 必须等于事件 object_attributes.id)", rec.Code, rec.Body)
+	}
+	if strings.TrimSpace(rec.Body.String()) != "bundle pipeline mismatch" {
+		t.Errorf("body=%q, want bundle pipeline mismatch", rec.Body.String())
+	}
+	if starter.calls != 0 || len(st.Artifacts()) != 0 {
+		t.Error("pipeline global ID 不一致不得登记 artifact 或启动 workflow")
 	}
 }
 

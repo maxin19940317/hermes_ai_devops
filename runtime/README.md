@@ -5,8 +5,10 @@
 ## Trigger 服务(Phase 1.5)
 
 `cmd/trigger`:GitLab pipeline webhook(Secret Token 验签,恒定时间比较)
-→ Packages API 定位并拉取 `bundle-g{sha}.json`(webhook 不携带 Registry 版本号,
-按 package_name 倒序逐版本探测)→ Schema 校验(内嵌 bundle.schema.json,防漂移测试)
+→ Packages API 定位并拉取 `bundle-g{sha}-p{pipeline_global_id}.json`(GitLab 13.8
+Pipeline Hook 的 `object_attributes.id` 是与 `CI_PIPELINE_ID` 相同的全局 pipeline ID;
+webhook 不携带 Registry 版本号,按 package_name 倒序逐版本探测)
+→ Schema 校验(内嵌 bundle.schema.json,防漂移测试)
 → 登记 artifacts 表(幂等 upsert)→ 按名启动 DeviceTestWorkflow。
 
 去重语义:workflow ID = `device-test-{project}-g{commit}-p{iid}`,
