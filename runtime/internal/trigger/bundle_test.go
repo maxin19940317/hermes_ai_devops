@@ -10,7 +10,7 @@ func TestParseBundleValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid bundle rejected: %v", err)
 	}
-	if b.Commit != "abcd1234" || b.PipelineID != 42 || b.Version != "1.2.3" ||
+	if b.Commit != "abcd1234" || b.PipelineID != 42 || b.PipelineGlobalID != 42001 || b.Version != "1.2.3" ||
 		b.Project != "grp/algo-super-sdk" || len(b.Packages) != 2 {
 		t.Errorf("parsed = %+v", b)
 	}
@@ -21,11 +21,12 @@ func TestParseBundleValid(t *testing.T) {
 
 func TestParseBundleInvalid(t *testing.T) {
 	cases := map[string]func(m map[string]any){
-		"missing packages":  func(m map[string]any) { delete(m, "packages") },
-		"empty packages":    func(m map[string]any) { m["packages"] = []any{} },
-		"bad version":       func(m map[string]any) { m["version"] = "1.2.3-rc.1" },
-		"bad commit":        func(m map[string]any) { m["commit"] = "XYZ" },
-		"unknown top field": func(m map[string]any) { m["extra"] = 1 },
+		"missing pipeline global id": func(m map[string]any) { delete(m, "pipeline_global_id") },
+		"missing packages":           func(m map[string]any) { delete(m, "packages") },
+		"empty packages":             func(m map[string]any) { m["packages"] = []any{} },
+		"bad version":                func(m map[string]any) { m["version"] = "1.2.3-rc.1" },
+		"bad commit":                 func(m map[string]any) { m["commit"] = "XYZ" },
+		"unknown top field":          func(m map[string]any) { m["extra"] = 1 },
 	}
 	for name, mutate := range cases {
 		m := validBundle()

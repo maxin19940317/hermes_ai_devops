@@ -12,8 +12,9 @@ import sys
 from pathlib import Path
 
 
-def write_meta(*, info_file, variant, project, version, commit,
-               pipeline_iid, package_name, registry_project_url, outdir) -> Path:
+def write_meta(*, info_file, variant, project, version, commit, pipeline_iid,
+               pipeline_global_id, package_name, registry_project_url,
+               outdir) -> Path:
     info = json.loads(Path(info_file).read_text(encoding="utf-8"))
     url = (f"{registry_project_url.rstrip('/')}/packages/generic/"
            f"{package_name}/{version}/{info['package_file']}")
@@ -28,6 +29,7 @@ def write_meta(*, info_file, variant, project, version, commit,
         "project": project,
         "commit": commit,
         "pipeline_id": pipeline_iid,
+        "pipeline_global_id": pipeline_global_id,
     }
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -45,6 +47,8 @@ def main(argv):
     parser.add_argument("--version", required=True, help="X.Y.Z(GitLab 13.8 strict)")
     parser.add_argument("--commit", required=True, help="CI_COMMIT_SHORT_SHA")
     parser.add_argument("--pipeline-iid", required=True, type=int, help="CI_PIPELINE_IID")
+    parser.add_argument("--pipeline-global-id", required=True, type=int,
+                        help="CI_PIPELINE_ID")
     parser.add_argument("--package-name", required=True, help="RELEASE_PACKAGE_NAME")
     parser.add_argument("--registry-project-url", required=True,
                         help="{CI_API_V4_URL}/projects/{CI_PROJECT_ID}")
@@ -54,7 +58,7 @@ def main(argv):
     out = write_meta(
         info_file=args.info, variant=args.variant, project=args.project,
         version=args.version, commit=args.commit, pipeline_iid=args.pipeline_iid,
-        package_name=args.package_name,
+        pipeline_global_id=args.pipeline_global_id, package_name=args.package_name,
         registry_project_url=args.registry_project_url, outdir=args.outdir,
     )
     print(out)

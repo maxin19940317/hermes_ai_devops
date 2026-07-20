@@ -5,12 +5,13 @@
   "description": "publish:bundle job 聚合 8 个变体 meta 后上传 Registry 的清单,Trigger 服务只认 bundle(CLAUDE.md §6.3)。'8 个变体齐全'由 ci/gen_bundle.py 语义校验,Schema 只管结构。version 受 GitLab 13.8 Generic Registry 限制,强制 strict X.Y.Z;产物唯一性由 package_file 文件名编码(commit + pipeline iid)。",
   "type": "object",
   "additionalProperties": false,
-  "required": ["bundle_version", "project", "commit", "pipeline_id", "version", "created_at", "packages"],
+  "required": ["bundle_version", "project", "commit", "pipeline_id", "pipeline_global_id", "version", "created_at", "packages"],
   "properties": {
     "bundle_version": { "const": 1 },
     "project": { "type": "string", "minLength": 1 },
     "commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
     "pipeline_id": { "type": "integer", "minimum": 1, "description": "CI_PIPELINE_IID" },
+    "pipeline_global_id": { "type": "integer", "minimum": 1, "description": "GitLab instance-global CI_PIPELINE_ID; used by Pipeline Hook lookup" },
     "version": {
       "type": "string",
       "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",

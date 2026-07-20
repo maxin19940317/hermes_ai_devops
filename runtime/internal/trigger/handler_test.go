@@ -30,12 +30,13 @@ func validBundle() map[string]any {
 		}
 	}
 	return map[string]any{
-		"bundle_version": 1,
-		"project":        "grp/algo-super-sdk",
-		"commit":         "abcd1234",
-		"pipeline_id":    42,
-		"version":        "1.2.3",
-		"created_at":     "2026-07-17T08:00:00.000Z",
+		"bundle_version":     1,
+		"project":            "grp/algo-super-sdk",
+		"commit":             "abcd1234",
+		"pipeline_id":        42,
+		"pipeline_global_id": 42001,
+		"version":            "1.2.3",
+		"created_at":         "2026-07-17T08:00:00.000Z",
 		"packages": []any{
 			pkg("aarch64_Android_SNPE_2.21"),
 			pkg("aarch64_Linux_SNPE_2.21"),
