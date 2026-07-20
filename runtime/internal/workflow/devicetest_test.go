@@ -27,7 +27,6 @@ type fakeActs struct {
 	created       []TaskRow
 	dispatched    []DispatchRequest
 	canceled      []CancelRequest
-	recorded      []ResultRecord
 	finished      []FinishRequest
 	released      []ReleaseRequest
 	notifications []string
@@ -70,12 +69,6 @@ func (f *fakeActs) CancelTask(_ context.Context, c CancelRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.canceled = append(f.canceled, c)
-	return nil
-}
-func (f *fakeActs) RecordResult(_ context.Context, r ResultRecord) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.recorded = append(f.recorded, r)
 	return nil
 }
 func (f *fakeActs) FinishTask(_ context.Context, fr FinishRequest) error {
@@ -161,8 +154,8 @@ func TestHappyPathPassed(t *testing.T) {
 	if len(f.released) != 1 || f.released[0].InfraFail {
 		t.Errorf("released = %+v(通过不得计入 fail_streak)", f.released)
 	}
-	if len(f.recorded) != 1 || len(f.finished) != 1 || f.finished[0].Verdict != "PASSED" {
-		t.Errorf("recorded=%d finished=%+v", len(f.recorded), f.finished)
+	if len(f.finished) != 1 || f.finished[0].Verdict != "PASSED" {
+		t.Errorf("finished=%+v", f.finished)
 	}
 	if len(f.notifications) != 1 ||
 		!strings.Contains(f.notifications[0], "PASSED") ||

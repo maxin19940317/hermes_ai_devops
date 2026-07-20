@@ -105,6 +105,8 @@ type CancelRequest struct {
 	ClientBaseURL string `json:"client_base_url"`
 }
 
+// ResultRecord 是 results 表一行;由回调服务在投 signal 前落库(SaveResult 去重),
+// workflow 不再经手结果持久化。
 type ResultRecord struct {
 	TaskID string           `json:"task_id"`
 	Result TaskResultSignal `json:"result"`
@@ -269,11 +271,7 @@ func runAttempt(ctx workflow.Context, spec TestSpec, attempt int, resultCh, hbCh
 		return infra(infraReason, true)
 	}
 
-	// ---- 落结果 + 规则引擎判 verdict ----
-	if err := workflow.ExecuteActivity(ctx, "RecordResult",
-		ResultRecord{TaskID: taskID, Result: *res}).Get(ctx, nil); err != nil {
-		workflow.GetLogger(ctx).Error("record result failed", "error", err)
-	}
+	// ---- 规则引擎判 verdict(结果本体已由回调服务 SaveResult 落库,§8.2) ----
 	d := rules.Decide(rules.Input{
 		Status: res.Status, ExitCode: res.ExitCode, CasesFailed: res.CasesFailed,
 		SignaturesHit: res.SignaturesHit, SignatureCategory: spec.SignatureCategory,
