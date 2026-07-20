@@ -9,11 +9,15 @@
 在 GitLab Runner 上运行,依赖: python3 >= 3.9, pyyaml, jsonschema。
 """
 import argparse
+import copy
+import gzip
 import hashlib
 import io
 import json
 import sys
 import tarfile
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import yaml
@@ -25,6 +29,42 @@ except ImportError:  # pragma: no cover
 
 # 注入的契约文件,不属于部署内容,重跑时也要跳过
 INJECTED_FILES = {"manifest.yaml", "files.sha256"}
+HASH_CHUNK_SIZE = 1024 * 1024
+
+
+def _hash_stream(stream):
+    """逐块读取并返回 SHA-256 十六进制摘要。"""
+    digest = hashlib.sha256()
+    while True:
+        chunk = stream.read(HASH_CHUNK_SIZE)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+
+
+def _normalized_member(member: tarfile.TarInfo, epoch: int):
+    """复制 TarInfo 并清除会导致包字节不稳定的元数据。"""
+    normalized = copy.copy(member)
+    normalized.uid = 0
+    normalized.gid = 0
+    normalized.uname = ""
+    normalized.gname = ""
+    normalized.mtime = epoch
+    normalized.pax_headers = {}
+    return normalized
+
+
+@contextmanager
+def _deterministic_tar_writer(path: Path, epoch: int):
+    """创建 gzip 和 tar 头都可重现的归档写入器。"""
+    with Path(path).open("wb") as raw:
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=raw, mtime=epoch
+        ) as zipped:
+            with tarfile.open(
+                fileobj=zipped, mode="w", format=tarfile.GNU_FORMAT
+            ) as archive:
+                yield archive
 
 
 def load_variants(path: Path):
@@ -91,7 +131,7 @@ def _scan_package(tar: tarfile.TarFile):
 
     entries = []
     for m in sorted(members, key=lambda m: m.name):
-        digest = hashlib.sha256(tar.extractfile(m).read()).hexdigest()
+        digest = _hash_stream(tar.extractfile(m))
         dst = m.name[len(topdir) + 1:] if topdir else m.name
         entries.append({
             "src": m.name,
@@ -115,8 +155,11 @@ def _validate_or_die(manifest: dict, schema_file: Path):
 
 def inject_manifest(*, package, variant, variants_file, schema_file,
                     project, commit, pipeline_iid, build_type,
-                    package_name, outdir):
+                    package_name, outdir, source_date_epoch):
     """执行注入与重打包,返回 info 字典供 write_meta.py 消费。"""
+    if source_date_epoch < 0:
+        raise ValueError("source_date_epoch must be non-negative")
+
     defaults, variants = load_variants(variants_file)
     if variant not in variants:
         raise SystemExit(f"unknown variant {variant!r}, not in {variants_file}")
@@ -142,20 +185,40 @@ def inject_manifest(*, package, variant, variants_file, schema_file,
             f"{e['sha256']}  {e['src']}\n" for e in file_entries
         ).encode("utf-8")
 
-        with tarfile.open(out_path, "w:gz") as out_tar:
-            for m in members:
-                out_tar.addfile(m, tar.extractfile(m))
-            for name, data in (("manifest.yaml", manifest_bytes),
-                               ("files.sha256", checksum_bytes)):
-                info = tarfile.TarInfo(name)
-                info.size = len(data)
-                info.mode = 0o644
-                out_tar.addfile(info, io.BytesIO(data))
+        output_members = [(m.name, m, None) for m in members]
+        for name, data in (("manifest.yaml", manifest_bytes),
+                           ("files.sha256", checksum_bytes)):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o644
+            output_members.append((name, info, data))
+
+        with tempfile.NamedTemporaryFile(
+            dir=outdir, prefix=f".{out_name}.", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        try:
+            with _deterministic_tar_writer(
+                temporary_path, source_date_epoch
+            ) as out_tar:
+                for _, member, data in sorted(output_members, key=lambda item: item[0]):
+                    normalized = _normalized_member(member, source_date_epoch)
+                    if data is None:
+                        out_tar.addfile(normalized, tar.extractfile(member))
+                    else:
+                        out_tar.addfile(normalized, io.BytesIO(data))
+            temporary_path.replace(out_path)
+        except BaseException:
+            temporary_path.unlink(missing_ok=True)
+            raise
+
+    with out_path.open("rb") as package_stream:
+        package_sha256 = _hash_stream(package_stream)
 
     return {
         "package_file": out_name,
         "package_path": str(out_path),
-        "package_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
+        "package_sha256": package_sha256,
         "size": out_path.stat().st_size,
         "manifest_digest": hashlib.sha256(manifest_bytes).hexdigest(),
     }
@@ -170,6 +233,7 @@ def main(argv):
     parser.add_argument("--project", required=True)
     parser.add_argument("--commit", required=True, help="CI_COMMIT_SHORT_SHA")
     parser.add_argument("--pipeline-iid", required=True, type=int, help="CI_PIPELINE_IID")
+    parser.add_argument("--source-date-epoch", required=True, type=int)
     parser.add_argument("--build-type", default="Release", choices=["Release", "Debug"])
     parser.add_argument("--package-name", required=True, help="RELEASE_PACKAGE_NAME")
     parser.add_argument("--outdir", required=True, type=Path)
@@ -183,6 +247,7 @@ def main(argv):
         project=args.project, commit=args.commit,
         pipeline_iid=args.pipeline_iid, build_type=args.build_type,
         package_name=args.package_name, outdir=args.outdir,
+        source_date_epoch=args.source_date_epoch,
     )
     if args.info_out:
         args.info_out.write_text(json.dumps(info, indent=2), encoding="utf-8")
