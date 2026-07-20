@@ -22,12 +22,15 @@ def test_meta_file_content(tmp_path):
         version="1.2.3",
         commit="deadbee1",
         pipeline_iid=42,
+        pipeline_global_id=42001,
         package_name="algo-super-sdk",
         registry_project_url="https://gitlab.example.com/api/v4/projects/7",
         outdir=outdir,
     )
     assert out == outdir / "aarch64_Android_SNPE_2.21.json"
     meta = json.loads(out.read_text(encoding="utf-8"))
+    assert meta["pipeline_id"] == 42
+    assert meta["pipeline_global_id"] == 42001
     assert meta == {
         "variant": "aarch64_Android_SNPE_2.21",
         "package_file": INFO["package_file"],
@@ -40,4 +43,5 @@ def test_meta_file_content(tmp_path):
         "project": "algo-super-sdk",
         "commit": "deadbee1",
         "pipeline_id": 42,
+        "pipeline_global_id": 42001,
     }

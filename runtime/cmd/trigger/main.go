@@ -76,7 +76,7 @@ func main() {
 	}
 	defer tc.Close()
 
-	h := trigger.New(trigger.Config{
+	h, err := trigger.New(trigger.Config{
 		WebhookSecret: secret,
 		Refs:          strings.Split(env("TRIGGER_REFS", "master"), ","),
 		Logger:        &log,
@@ -90,6 +90,9 @@ func main() {
 		Client:    tc,
 		TaskQueue: env("TEMPORAL_TASK_QUEUE", "device-test"),
 	})
+	if err != nil {
+		log.Fatal().Err(err).Msg("configure trigger")
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/gitlab", h)

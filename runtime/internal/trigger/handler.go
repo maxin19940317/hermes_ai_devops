@@ -6,7 +6,9 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -16,10 +18,11 @@ import (
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
-// BundleFetcher 按 (projectID, shortSHA) 定位并下载 bundle-g{sha}.json。
+// BundleFetcher 按 (projectID, shortSHA, pipelineGlobalID) 定位并下载
+// bundle-g{sha}-p{pipelineGlobalID}.json。
 // found=false 表示该 pipeline 没有发布 bundle(如 MR 构建),不是错误。
 type BundleFetcher interface {
-	FetchBundle(ctx context.Context, projectID int, shortSHA string) (raw []byte, found bool, err error)
+	FetchBundle(ctx context.Context, projectID int64, shortSHA string, pipelineGlobalID int64) (raw []byte, found bool, err error)
 }
 
 // WorkflowStarter 启动 DeviceTestWorkflow。
@@ -44,31 +47,36 @@ type Handler struct {
 	log     zerolog.Logger
 }
 
-func New(cfg Config, fetcher BundleFetcher, st store.ArtifactStore, starter WorkflowStarter) *Handler {
+func New(cfg Config, fetcher BundleFetcher, st store.ArtifactStore, starter WorkflowStarter) (*Handler, error) {
+	if cfg.WebhookSecret == "" {
+		return nil, errors.New("webhook secret is required")
+	}
 	logger := zerolog.Nop()
 	if cfg.Logger != nil {
 		logger = *cfg.Logger
 	}
-	return &Handler{cfg: cfg, fetcher: fetcher, store: st, starter: starter, log: logger}
+	return &Handler{cfg: cfg, fetcher: fetcher, store: st, starter: starter, log: logger}, nil
 }
 
 // pipelineEvent 是 GitLab 13.8 Pipeline Hook payload 的消费子集。
 type pipelineEvent struct {
 	ObjectKind       string `json:"object_kind"`
 	ObjectAttributes struct {
-		ID     int    `json:"id"` // 全局 pipeline id(非 IID,不与 bundle.pipeline_id 比较)
+		ID     int64  `json:"id"` // GitLab 13.8 全局 ID,等于 CI_PIPELINE_ID(非 IID),对应 bundle.pipeline_global_id
 		Ref    string `json:"ref"`
 		Tag    bool   `json:"tag"`
 		SHA    string `json:"sha"` // 全长 40 位
 		Status string `json:"status"`
 	} `json:"object_attributes"`
 	Project struct {
-		ID                int    `json:"id"`
+		ID                int64  `json:"id"`
 		PathWithNamespace string `json:"path_with_namespace"`
 	} `json:"project"`
 }
 
 const shortSHALen = 8 // CI_COMMIT_SHORT_SHA 固定 8 位,bundle 文件名以此编码
+
+var fullSHARegexp = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -91,16 +99,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if len(ev.ObjectAttributes.SHA) < shortSHALen {
+	if ev.Project.ID <= 0 || ev.ObjectAttributes.ID <= 0 {
+		http.Error(w, "bad pipeline identity", http.StatusBadRequest)
+		return
+	}
+	if !fullSHARegexp.MatchString(ev.ObjectAttributes.SHA) {
 		http.Error(w, "bad sha", http.StatusBadRequest)
 		return
 	}
 	shortSHA := ev.ObjectAttributes.SHA[:shortSHALen]
 	log := h.log.With().Str("project", ev.Project.PathWithNamespace).
-		Int("pipeline", ev.ObjectAttributes.ID).Str("sha", shortSHA).Logger()
+		Int64("pipeline", ev.ObjectAttributes.ID).Str("sha", shortSHA).Logger()
 
 	// ---- 拉 bundle(Trigger 只认 bundle,§6.3) ----
-	raw, found, err := h.fetcher.FetchBundle(r.Context(), ev.Project.ID, shortSHA)
+	raw, found, err := h.fetcher.FetchBundle(r.Context(), ev.Project.ID, shortSHA, ev.ObjectAttributes.ID)
 	if err != nil {
 		log.Error().Err(err).Msg("fetch bundle")
 		http.Error(w, "bundle fetch failed", http.StatusBadGateway)
@@ -115,6 +127,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Error().Err(err).Msg("invalid bundle")
 		http.Error(w, "invalid bundle: "+err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	if b.Project != ev.Project.PathWithNamespace {
+		log.Error().Str("bundle_project", b.Project).
+			Str("event_project", ev.Project.PathWithNamespace).Msg("bundle project mismatch")
+		http.Error(w, "bundle project mismatch", http.StatusUnprocessableEntity)
+		return
+	}
+	if b.PipelineGlobalID != ev.ObjectAttributes.ID {
+		log.Error().Int64("bundle_pipeline_global_id", b.PipelineGlobalID).
+			Int64("event_pipeline_global_id", ev.ObjectAttributes.ID).Msg("bundle pipeline mismatch")
+		http.Error(w, "bundle pipeline mismatch", http.StatusUnprocessableEntity)
 		return
 	}
 	// bundle.commit(short)必须是事件 sha 的前缀,防串包

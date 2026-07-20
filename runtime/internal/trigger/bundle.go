@@ -28,15 +28,16 @@ func mustCompileBundleSchema() *jsonschema.Schema {
 	return c.MustCompile("bundle.schema.json")
 }
 
-// Bundle 是 bundle-g{sha}.json 的解析结果(contracts/bundle.schema.json)。
+// Bundle 是 bundle-g{sha}-p{global_id}.json 的解析结果(contracts/bundle.schema.json)。
 type Bundle struct {
-	BundleVersion int             `json:"bundle_version"`
-	Project       string          `json:"project"`
-	Commit        string          `json:"commit"`
-	PipelineID    int             `json:"pipeline_id"`
-	Version       string          `json:"version"`
-	CreatedAt     string          `json:"created_at"`
-	Packages      []wf.PackageRef `json:"packages"`
+	BundleVersion    int             `json:"bundle_version"`
+	Project          string          `json:"project"`
+	Commit           string          `json:"commit"`
+	PipelineID       int             `json:"pipeline_id"`
+	PipelineGlobalID int64           `json:"pipeline_global_id"`
+	Version          string          `json:"version"`
+	CreatedAt        string          `json:"created_at"`
+	Packages         []wf.PackageRef `json:"packages"`
 }
 
 // ParseBundle 先过 Schema 再反序列化(红线:未经校验不消费)。

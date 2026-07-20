@@ -36,7 +36,7 @@ variants:
       LD_LIBRARY_PATH: "{workdir}/lib"
       ADSP_LIBRARY_PATH: "{workdir}/lib/dsp;/system/lib/rfsa/adsp"
     test:
-      args: ["--suite", "snpe-smoke", "--output", "results/"]
+      args: []
     signatures:
       - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
 
@@ -46,7 +46,7 @@ variants:
       LD_LIBRARY_PATH: "{workdir}/lib"
       ADSP_LIBRARY_PATH: "{workdir}/lib/dsp;/system/lib/rfsa/adsp"
     test:
-      args: ["--suite", "snpe-smoke", "--output", "results/"]
+      args: []
     signatures:
       - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
 
@@ -55,7 +55,7 @@ variants:
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
     test:
-      args: ["--suite", "rknn-smoke", "--output", "results/"]
+      args: []
     signatures:
       - { id: rknn_init_fail, where: logcat, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }
 
@@ -64,7 +64,7 @@ variants:
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
     test:
-      args: ["--suite", "tflite-smoke", "--output", "results/"]
+      args: []
     signatures:
       - { id: delegate_fallback, where: logcat, pattern: "falling back to CPU|Delegate creation failed", classify: DELEGATE }
 
@@ -74,7 +74,7 @@ variants:
       LD_LIBRARY_PATH: "{workdir}/lib"
       ADSP_LIBRARY_PATH: "{workdir}/lib/dsp"
     test:
-      args: ["--suite", "snpe-smoke", "--output", "results/"]
+      args: []
     signatures:
       - { id: cpu_fallback, where: stderr, pattern: "Falling back to CPU", classify: MODEL }
 
@@ -84,7 +84,7 @@ variants:
       LD_LIBRARY_PATH: "{workdir}/lib"
       ADSP_LIBRARY_PATH: "{workdir}/lib/dsp"
     test:
-      args: ["--suite", "snpe-smoke", "--output", "results/"]
+      args: []
     signatures:
       - { id: cpu_fallback, where: stderr, pattern: "Falling back to CPU", classify: MODEL }
 
@@ -93,7 +93,7 @@ variants:
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
     test:
-      args: ["--suite", "rknn-smoke", "--output", "results/"]
+      args: []
     signatures:
       - { id: rknn_init_fail, where: stderr, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }
 
@@ -102,6 +102,6 @@ variants:
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
     test:
-      args: ["--suite", "tflite-smoke", "--output", "results/"]
+      args: []
     signatures:
       - { id: delegate_fallback, where: stderr, pattern: "falling back to CPU|Delegate creation failed", classify: DELEGATE }

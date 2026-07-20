@@ -44,11 +44,12 @@ func TestFetchBundleFindsAcrossVersions(t *testing.T) {
 	bundle := []byte(`{"fake":"bundle"}`)
 	// 最新版本 2.0.0 没有该 sha 的 bundle,1.2.3 有 → 逐版本探测
 	srv, seenAuth := fakeGitLab(t, []string{"2.0.0", "1.2.3", "2.0.0"}, map[string][]byte{
-		"/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/bundle-gabcd1234.json": bundle,
+		"/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/bundle-gabcd1234-p42001.json": bundle,
 	})
 	gl := &GitLabClient{BaseURL: srv.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: srv.Client()}
+	var projectID, pipelineGlobalID int64 = 7, 42001
 
-	raw, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234")
+	raw, found, err := gl.FetchBundle(context.Background(), projectID, "abcd1234", pipelineGlobalID)
 	if err != nil || !found {
 		t.Fatalf("found=%v err=%v", found, err)
 	}
@@ -65,7 +66,7 @@ func TestFetchBundleFindsAcrossVersions(t *testing.T) {
 func TestFetchBundleNotFound(t *testing.T) {
 	srv, _ := fakeGitLab(t, []string{"1.2.3"}, nil)
 	gl := &GitLabClient{BaseURL: srv.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: srv.Client()}
-	_, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234")
+	_, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001)
 	if err != nil {
 		t.Fatalf("全 404 不是错误: %v", err)
 	}
@@ -74,10 +75,25 @@ func TestFetchBundleNotFound(t *testing.T) {
 	}
 }
 
+func TestFetchBundleDoesNotFallBackToLegacyName(t *testing.T) {
+	srv, _ := fakeGitLab(t, []string{"1.2.3"}, map[string][]byte{
+		"/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/bundle-gabcd1234.json": []byte(`{"legacy":true}`),
+	})
+	gl := &GitLabClient{BaseURL: srv.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: srv.Client()}
+
+	_, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001)
+	if err != nil {
+		t.Fatalf("qualified lookup: %v", err)
+	}
+	if found {
+		t.Error("found legacy commit-only bundle, want false")
+	}
+}
+
 func TestFetchBundleNoVersions(t *testing.T) {
 	srv, _ := fakeGitLab(t, nil, nil)
 	gl := &GitLabClient{BaseURL: srv.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: srv.Client()}
-	_, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234")
+	_, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001)
 	if err != nil || found {
 		t.Fatalf("found=%v err=%v, want false,nil", found, err)
 	}
@@ -89,7 +105,74 @@ func TestFetchBundleServerErrorPropagates(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	gl := &GitLabClient{BaseURL: srv.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: srv.Client()}
-	if _, _, err := gl.FetchBundle(context.Background(), 7, "abcd1234"); err == nil {
+	if _, _, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001); err == nil {
 		t.Error("500 应报错")
+	}
+}
+
+func TestFetchBundleDoesNotForwardTokenAcrossOriginRedirect(t *testing.T) {
+	var redirectedToken string
+	objectStore := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectedToken = r.Header.Get("PRIVATE-TOKEN")
+		_, _ = w.Write([]byte(`{"fake":"bundle"}`))
+	}))
+	t.Cleanup(objectStore.Close)
+
+	gitlab := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v4/projects/7/packages":
+			_, _ = w.Write([]byte(`[{"version":"1.2.3"}]`))
+		case "/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/bundle-gabcd1234-p42001.json":
+			http.Redirect(w, r, objectStore.URL+"/bundle.json", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(gitlab.Close)
+
+	client := gitlab.Client()
+	client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+		req.Header.Set("PRIVATE-TOKEN", "re-added")
+		return nil
+	}
+	gl := &GitLabClient{
+		BaseURL: gitlab.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: client,
+	}
+	_, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001)
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if redirectedToken != "" {
+		t.Fatalf("cross-origin redirect leaked PRIVATE-TOKEN: %q", redirectedToken)
+	}
+}
+
+func TestFetchBundlePreservesDefaultRedirectLimit(t *testing.T) {
+	redirects := 0
+	gitlab := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v4/projects/7/packages":
+			_, _ = w.Write([]byte(`[{"version":"1.2.3"}]`))
+		case "/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/bundle-gabcd1234-p42001.json":
+			redirects++
+			if redirects > 12 {
+				http.Error(w, "redirect limit missing", http.StatusInternalServerError)
+				return
+			}
+			http.Redirect(w, r, r.URL.String(), http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(gitlab.Close)
+
+	gl := &GitLabClient{
+		BaseURL: gitlab.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: gitlab.Client(),
+	}
+	if _, _, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001); err == nil {
+		t.Fatal("redirect loop did not fail")
+	}
+	if redirects != 10 {
+		t.Fatalf("redirect requests = %d, want default limit 10", redirects)
 	}
 }

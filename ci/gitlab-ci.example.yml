@@ -23,6 +23,8 @@ build:aarch64_Android_SNPE_2.21:
   interruptible: true
   script:
     - ./rebuild.sh aarch64_Android_SNPE_2.21
+    # GitLab 13.8 用 commit 时间固定归档元数据。
+    - export SOURCE_DATE_EPOCH="$(date --date="${CI_COMMIT_TIMESTAMP}" +%s)"
     - ./release_pack.sh --platform aarch64_Android_SNPE_2.21 --output-dir dist
     # B: 注入契约文件并重命名(gen_manifest 校验失败会直接 fail pipeline)
     - ORIG_PKG=$(ls dist/*.tar.gz | head -1)
@@ -36,6 +38,7 @@ build:aarch64_Android_SNPE_2.21:
         --pipeline-iid "$CI_PIPELINE_IID"
         --build-type Release
         --package-name "$RELEASE_PACKAGE_NAME"
+        --source-date-epoch "${SOURCE_DATE_EPOCH}"
         --outdir dist/final
         --info-out dist/manifest-info.json
     # C: 生成 meta(job artifact,供 publish:bundle 聚合)
@@ -46,6 +49,7 @@ build:aarch64_Android_SNPE_2.21:
         --version "$RELEASE_VERSION"
         --commit "$CI_COMMIT_SHORT_SHA"
         --pipeline-iid "$CI_PIPELINE_IID"
+        --pipeline-global-id "${CI_PIPELINE_ID}"
         --package-name "$RELEASE_PACKAGE_NAME"
         --registry-project-url "$CI_API_V4_URL/projects/$CI_PROJECT_ID"
         --outdir dist/meta
@@ -81,11 +85,12 @@ publish:bundle:
         --variants-file hermes-devops/ci/variants.yaml
         --schema hermes-devops/contracts/bundle.schema.json
         --outdir dist
-    - BUNDLE_FILE=$(basename dist/bundle-*.json)
+        --created-at "${CI_COMMIT_TIMESTAMP}"
+    - BUNDLE_FILE="bundle-g${CI_COMMIT_SHORT_SHA}-p${CI_PIPELINE_ID}.json"
     - >
       curl --fail --silent --show-error
       --header "JOB-TOKEN: $CI_JOB_TOKEN"
-      --upload-file "dist/$BUNDLE_FILE"
+      --upload-file "dist/${BUNDLE_FILE}"
       "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$RELEASE_PACKAGE_NAME/$RELEASE_VERSION/$BUNDLE_FILE"
       || echo "upload skipped (already exists)"
   rules:

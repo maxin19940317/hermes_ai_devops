@@ -30,12 +30,13 @@ func validBundle() map[string]any {
 		}
 	}
 	return map[string]any{
-		"bundle_version": 1,
-		"project":        "grp/algo-super-sdk",
-		"commit":         "abcd1234",
-		"pipeline_id":    42,
-		"version":        "1.2.3",
-		"created_at":     "2026-07-17T08:00:00.000Z",
+		"bundle_version":     1,
+		"project":            "grp/algo-super-sdk",
+		"commit":             "abcd1234",
+		"pipeline_id":        42,
+		"pipeline_global_id": 42001,
+		"version":            "1.2.3",
+		"created_at":         "2026-07-17T08:00:00.000Z",
 		"packages": []any{
 			pkg("aarch64_Android_SNPE_2.21"),
 			pkg("aarch64_Linux_SNPE_2.21"),
@@ -54,11 +55,15 @@ func mustJSON(t *testing.T, v any) []byte {
 
 // pipelineEvent 构造 GitLab 13.8 Pipeline Hook payload。
 func pipelinePayload(status, ref, sha string) []byte {
+	return pipelinePayloadWithIDs(status, ref, sha, "42001", "7")
+}
+
+func pipelinePayloadWithIDs(status, ref, sha, pipelineID, projectID string) []byte {
 	return []byte(fmt.Sprintf(`{
 		"object_kind": "pipeline",
-		"object_attributes": {"id": 9001, "ref": %q, "tag": false, "sha": %q, "status": %q},
-		"project": {"id": 7, "path_with_namespace": "grp/algo-super-sdk"}
-	}`, ref, sha, status))
+		"object_attributes": {"id": %s, "ref": %q, "tag": false, "sha": %q, "status": %q},
+		"project": {"id": %s, "path_with_namespace": "grp/algo-super-sdk"}
+	}`, pipelineID, ref, sha, status, projectID))
 }
 
 const fullSHA = "abcd1234deadbeefabcd1234deadbeefabcd1234"
@@ -66,16 +71,17 @@ const fullSHA = "abcd1234deadbeefabcd1234deadbeefabcd1234"
 // ---- fakes ----
 
 type fakeFetcher struct {
-	bundle  []byte // nil = 404(未找到)
-	err     error
-	calls   int
-	gotSHA  string
-	gotProj int
+	bundle              []byte // nil = 404(未找到)
+	err                 error
+	calls               int
+	gotSHA              string
+	gotProj             int64
+	gotPipelineGlobalID int64
 }
 
-func (f *fakeFetcher) FetchBundle(_ context.Context, projectID int, shortSHA string) ([]byte, bool, error) {
+func (f *fakeFetcher) FetchBundle(_ context.Context, projectID int64, shortSHA string, pipelineGlobalID int64) ([]byte, bool, error) {
 	f.calls++
-	f.gotProj, f.gotSHA = projectID, shortSHA
+	f.gotProj, f.gotSHA, f.gotPipelineGlobalID = projectID, shortSHA, pipelineGlobalID
 	if f.err != nil {
 		return nil, false, f.err
 	}
@@ -106,7 +112,10 @@ func (f *fakeStarter) StartDeviceTest(_ context.Context, in wf.DeviceTestInput) 
 
 func newTestHandler(fetcher *fakeFetcher, starter *fakeStarter) (*Handler, *store.MemStore) {
 	st := store.NewMemStore()
-	h := New(Config{WebhookSecret: testSecret, Refs: []string{"master"}}, fetcher, st, starter)
+	h, err := New(Config{WebhookSecret: testSecret, Refs: []string{"master"}}, fetcher, st, starter)
+	if err != nil {
+		panic(err)
+	}
 	return h, st
 }
 
@@ -121,6 +130,12 @@ func post(h http.Handler, token string, body []byte) *httptest.ResponseRecorder 
 }
 
 // ---- tests ----
+
+func TestNewRejectsEmptyWebhookSecret(t *testing.T) {
+	if _, err := New(Config{}, nil, nil, nil); err == nil {
+		t.Fatal("New accepted an empty webhook secret")
+	}
+}
 
 func TestRejectsBadToken(t *testing.T) {
 	fetcher, starter := &fakeFetcher{}, &fakeStarter{}
@@ -156,6 +171,62 @@ func TestIgnoresNonPipelineAndNonSuccess(t *testing.T) {
 	}
 }
 
+func TestRejectsInvalidSHAWithoutFetching(t *testing.T) {
+	cases := map[string]string{
+		"short":     fullSHA[:len(fullSHA)-1],
+		"long":      fullSHA + "a",
+		"question":  "abcd123?deadbeefabcd1234deadbeefabcd1234",
+		"fragment":  "abcd123#deadbeefabcd1234deadbeefabcd1234",
+		"slash":     "abcd123/deadbeefabcd1234deadbeefabcd1234",
+		"uppercase": "Abcd1234deadbeefabcd1234deadbeefabcd1234",
+		"non-hex":   "zbcd1234deadbeefabcd1234deadbeefabcd1234",
+	}
+	for name, sha := range cases {
+		t.Run(name, func(t *testing.T) {
+			fetcher, starter := &fakeFetcher{}, &fakeStarter{}
+			h, _ := newTestHandler(fetcher, starter)
+			rec := post(h, testSecret, pipelinePayload("success", "master", sha))
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("code=%d body=%s, want 400", rec.Code, rec.Body)
+			}
+			if fetcher.calls != 0 {
+				t.Errorf("fetch calls=%d, want 0", fetcher.calls)
+			}
+		})
+	}
+}
+
+func TestRejectsInvalidIDsWithoutFetching(t *testing.T) {
+	valid := pipelinePayload("success", "master", fullSHA)
+	cases := map[string][]byte{
+		"missing pipeline id": bytes.Replace(valid, []byte(`"id": 42001, `), nil, 1),
+		"zero pipeline id":    pipelinePayloadWithIDs("success", "master", fullSHA, "0", "7"),
+		"negative pipeline id": pipelinePayloadWithIDs("success", "master", fullSHA,
+			"-1", "7"),
+		"pipeline id int64 overflow": pipelinePayloadWithIDs("success", "master", fullSHA,
+			"9223372036854775808", "7"),
+		"missing project id": bytes.Replace(valid, []byte(`"id": 7, `), nil, 1),
+		"zero project id":    pipelinePayloadWithIDs("success", "master", fullSHA, "42001", "0"),
+		"negative project id": pipelinePayloadWithIDs("success", "master", fullSHA,
+			"42001", "-1"),
+		"project id int64 overflow": pipelinePayloadWithIDs("success", "master", fullSHA,
+			"42001", "9223372036854775808"),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			fetcher, starter := &fakeFetcher{}, &fakeStarter{}
+			h, _ := newTestHandler(fetcher, starter)
+			rec := post(h, testSecret, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("code=%d body=%s, want 400", rec.Code, rec.Body)
+			}
+			if fetcher.calls != 0 {
+				t.Errorf("fetch calls=%d, want 0", fetcher.calls)
+			}
+		})
+	}
+}
+
 func TestSuccessPipelineStartsWorkflowAndRegistersArtifacts(t *testing.T) {
 	fetcher := &fakeFetcher{bundle: mustJSON(t, validBundle())}
 	starter := &fakeStarter{started: true}
@@ -166,8 +237,8 @@ func TestSuccessPipelineStartsWorkflowAndRegistersArtifacts(t *testing.T) {
 		t.Fatalf("code=%d body=%s, want 202", rec.Code, rec.Body)
 	}
 	// bundle 用 short sha(前 8 位)定位
-	if fetcher.gotSHA != "abcd1234" || fetcher.gotProj != 7 {
-		t.Errorf("fetch args = (%d, %q)", fetcher.gotProj, fetcher.gotSHA)
+	if fetcher.gotSHA != "abcd1234" || fetcher.gotProj != 7 || fetcher.gotPipelineGlobalID != 42001 {
+		t.Errorf("fetch args = (%d, %q, %d)", fetcher.gotProj, fetcher.gotSHA, fetcher.gotPipelineGlobalID)
 	}
 	// artifacts 全量登记
 	arts := st.Artifacts()
@@ -253,6 +324,44 @@ func TestBundleCommitMismatchRejected(t *testing.T) {
 	}
 	if starter.calls != 0 {
 		t.Error("commit 不一致不得启动 workflow")
+	}
+}
+
+func TestBundlePipelineMismatchRejected(t *testing.T) {
+	bundle := validBundle() // pipeline_global_id=42001
+	fetcher := &fakeFetcher{bundle: mustJSON(t, bundle)}
+	starter := &fakeStarter{}
+	h, st := newTestHandler(fetcher, starter)
+	body := bytes.Replace(pipelinePayload("success", "master", fullSHA), []byte(`"id": 42001`), []byte(`"id": 42002`), 1)
+
+	rec := post(h, testSecret, body)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("code=%d body=%s, want 422(bundle.pipeline_global_id 必须等于事件 object_attributes.id)", rec.Code, rec.Body)
+	}
+	if strings.TrimSpace(rec.Body.String()) != "bundle pipeline mismatch" {
+		t.Errorf("body=%q, want bundle pipeline mismatch", rec.Body.String())
+	}
+	if starter.calls != 0 || len(st.Artifacts()) != 0 {
+		t.Error("pipeline global ID 不一致不得登记 artifact 或启动 workflow")
+	}
+}
+
+func TestBundleProjectMismatchRejected(t *testing.T) {
+	bundle := validBundle()
+	bundle["project"] = "other/algo-super-sdk"
+	fetcher := &fakeFetcher{bundle: mustJSON(t, bundle)}
+	starter := &fakeStarter{}
+	h, st := newTestHandler(fetcher, starter)
+
+	rec := post(h, testSecret, pipelinePayload("success", "master", fullSHA))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("code=%d body=%s, want 422", rec.Code, rec.Body)
+	}
+	if strings.TrimSpace(rec.Body.String()) != "bundle project mismatch" {
+		t.Errorf("body=%q, want bundle project mismatch", rec.Body.String())
+	}
+	if starter.calls != 0 || len(st.Artifacts()) != 0 {
+		t.Error("project 不一致不得登记 artifact 或启动 workflow")
 	}
 }
 

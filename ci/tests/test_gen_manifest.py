@@ -1,5 +1,9 @@
 """gen_manifest.py:解包 → 注入 manifest.yaml + files.sha256 → 校验 → 重打包重命名。"""
+import hashlib
+import io
+import stat
 import tarfile
+from pathlib import Path
 
 import pytest
 import yaml
@@ -13,6 +17,7 @@ from ci_helpers import (
 )
 
 VARIANT = "aarch64_Android_SNPE_2.21"
+SOURCE_DATE_EPOCH = 1_700_000_000
 
 
 def inject(fake_package, tmp_path, topdir=None):
@@ -30,6 +35,7 @@ def inject(fake_package, tmp_path, topdir=None):
         build_type="Release",
         package_name="algo-super-sdk",
         outdir=outdir,
+        source_date_epoch=SOURCE_DATE_EPOCH,
     )
     return info, outdir
 
@@ -92,8 +98,6 @@ def test_topdir_layout_keeps_src_strips_dst(fake_package, tmp_path):
 
 
 def test_info_digests_match_package(fake_package, tmp_path):
-    import hashlib
-
     info, outdir = inject(fake_package, tmp_path)
     out = outdir / info["package_file"]
     assert info["package_sha256"] == hashlib.sha256(out.read_bytes()).hexdigest()
@@ -101,6 +105,12 @@ def test_info_digests_match_package(fake_package, tmp_path):
     with tarfile.open(out, "r:gz") as tar:
         manifest_bytes = tar.extractfile("manifest.yaml").read()
     assert info["manifest_digest"] == hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def test_output_archive_has_published_permissions(fake_package, tmp_path):
+    info, _ = inject(fake_package, tmp_path)
+    mode = stat.S_IMODE(Path(info["package_path"]).stat().st_mode)
+    assert mode == 0o644
 
 
 def test_unknown_variant_fails(fake_package, tmp_path):
@@ -111,6 +121,7 @@ def test_unknown_variant_fails(fake_package, tmp_path):
             variants_file=VARIANTS_FILE, schema_file=MANIFEST_SCHEMA,
             project="p", commit="deadbee1", pipeline_iid=1,
             build_type="Release", package_name="p", outdir=tmp_path,
+            source_date_epoch=SOURCE_DATE_EPOCH,
         )
 
 
@@ -126,7 +137,79 @@ def test_invalid_rendered_manifest_fails_pipeline(fake_package, tmp_path):
             package=pkg, variant=VARIANT, variants_file=broken_file,
             schema_file=MANIFEST_SCHEMA, project="p", commit="deadbee1",
             pipeline_iid=1, build_type="Release", package_name="p", outdir=tmp_path,
+            source_date_epoch=SOURCE_DATE_EPOCH,
         )
+
+
+def test_repeated_injection_is_byte_identical(fake_package, tmp_path):
+    package = fake_package()
+    kwargs = {
+        "package": package,
+        "variant": VARIANT,
+        "variants_file": VARIANTS_FILE,
+        "schema_file": MANIFEST_SCHEMA,
+        "project": "algo-super-sdk",
+        "commit": "deadbee1",
+        "pipeline_iid": 42,
+        "build_type": "Release",
+        "package_name": "algo-super-sdk",
+        "source_date_epoch": SOURCE_DATE_EPOCH,
+    }
+    first = gen_manifest.inject_manifest(outdir=tmp_path / "first", **kwargs)
+    second = gen_manifest.inject_manifest(outdir=tmp_path / "second", **kwargs)
+
+    assert Path(first["package_path"]).read_bytes() == Path(
+        second["package_path"]
+    ).read_bytes()
+    assert first["package_sha256"] == second["package_sha256"]
+
+
+def test_hash_stream_reads_in_bounded_chunks():
+    data = b"x" * (2 * 1024 * 1024 + 17)
+
+    class BoundedReader(io.BytesIO):
+        def read(self, size=-1):
+            assert 0 <= size <= 1024 * 1024
+            return super().read(size)
+
+    assert gen_manifest._hash_stream(BoundedReader(data)) == hashlib.sha256(
+        data
+    ).hexdigest()
+
+
+def test_negative_source_date_epoch_is_rejected(fake_package, tmp_path):
+    with pytest.raises(ValueError, match="source_date_epoch"):
+        gen_manifest.inject_manifest(
+            package=fake_package(), variant=VARIANT,
+            variants_file=VARIANTS_FILE, schema_file=MANIFEST_SCHEMA,
+            project="p", commit="deadbee1", pipeline_iid=1,
+            build_type="Release", package_name="p", outdir=tmp_path,
+            source_date_epoch=-1,
+        )
+
+
+def test_failed_write_leaves_no_completed_output(fake_package, tmp_path, monkeypatch):
+    package = fake_package()
+    original_addfile = tarfile.TarFile.addfile
+
+    def fail_writes(self, tarinfo, fileobj=None):
+        if self.mode == "w":
+            raise OSError("simulated write failure")
+        return original_addfile(self, tarinfo, fileobj)
+
+    monkeypatch.setattr(tarfile.TarFile, "addfile", fail_writes)
+    with pytest.raises(OSError, match="simulated write failure"):
+        gen_manifest.inject_manifest(
+            package=package, variant=VARIANT,
+            variants_file=VARIANTS_FILE, schema_file=MANIFEST_SCHEMA,
+            project="p", commit="deadbee1", pipeline_iid=1,
+            build_type="Release", package_name="p", outdir=tmp_path,
+            source_date_epoch=SOURCE_DATE_EPOCH,
+        )
+
+    out_name = f"p-{VARIANT}-gdeadbee1-p1.tar.gz"
+    assert not (tmp_path / out_name).exists()
+    assert not list(tmp_path.glob(f".{out_name}.*.tmp"))
 
 
 def test_main_cli_writes_info_file(fake_package, tmp_path):
@@ -142,6 +225,7 @@ def test_main_cli_writes_info_file(fake_package, tmp_path):
         "--project", "algo-super-sdk",
         "--commit", "deadbee1",
         "--pipeline-iid", "42",
+        "--source-date-epoch", str(SOURCE_DATE_EPOCH),
         "--build-type", "Release",
         "--package-name", "algo-super-sdk",
         "--outdir", str(outdir),
