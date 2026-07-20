@@ -109,3 +109,70 @@ func TestFetchBundleServerErrorPropagates(t *testing.T) {
 		t.Error("500 应报错")
 	}
 }
+
+func TestFetchBundleDoesNotForwardTokenAcrossOriginRedirect(t *testing.T) {
+	var redirectedToken string
+	objectStore := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectedToken = r.Header.Get("PRIVATE-TOKEN")
+		_, _ = w.Write([]byte(`{"fake":"bundle"}`))
+	}))
+	t.Cleanup(objectStore.Close)
+
+	gitlab := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v4/projects/7/packages":
+			_, _ = w.Write([]byte(`[{"version":"1.2.3"}]`))
+		case "/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/bundle-gabcd1234-p42001.json":
+			http.Redirect(w, r, objectStore.URL+"/bundle.json", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(gitlab.Close)
+
+	client := gitlab.Client()
+	client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+		req.Header.Set("PRIVATE-TOKEN", "re-added")
+		return nil
+	}
+	gl := &GitLabClient{
+		BaseURL: gitlab.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: client,
+	}
+	_, found, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001)
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if redirectedToken != "" {
+		t.Fatalf("cross-origin redirect leaked PRIVATE-TOKEN: %q", redirectedToken)
+	}
+}
+
+func TestFetchBundlePreservesDefaultRedirectLimit(t *testing.T) {
+	redirects := 0
+	gitlab := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v4/projects/7/packages":
+			_, _ = w.Write([]byte(`[{"version":"1.2.3"}]`))
+		case "/api/v4/projects/7/packages/generic/algo-super-sdk/1.2.3/bundle-gabcd1234-p42001.json":
+			redirects++
+			if redirects > 12 {
+				http.Error(w, "redirect limit missing", http.StatusInternalServerError)
+				return
+			}
+			http.Redirect(w, r, r.URL.String(), http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(gitlab.Close)
+
+	gl := &GitLabClient{
+		BaseURL: gitlab.URL, Token: "tok", PackageName: "algo-super-sdk", HTTP: gitlab.Client(),
+	}
+	if _, _, err := gl.FetchBundle(context.Background(), 7, "abcd1234", 42001); err == nil {
+		t.Fatal("redirect loop did not fail")
+	}
+	if redirects != 10 {
+		t.Fatalf("redirect requests = %d, want default limit 10", redirects)
+	}
+}

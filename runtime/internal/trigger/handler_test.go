@@ -112,7 +112,10 @@ func (f *fakeStarter) StartDeviceTest(_ context.Context, in wf.DeviceTestInput) 
 
 func newTestHandler(fetcher *fakeFetcher, starter *fakeStarter) (*Handler, *store.MemStore) {
 	st := store.NewMemStore()
-	h := New(Config{WebhookSecret: testSecret, Refs: []string{"master"}}, fetcher, st, starter)
+	h, err := New(Config{WebhookSecret: testSecret, Refs: []string{"master"}}, fetcher, st, starter)
+	if err != nil {
+		panic(err)
+	}
 	return h, st
 }
 
@@ -127,6 +130,12 @@ func post(h http.Handler, token string, body []byte) *httptest.ResponseRecorder 
 }
 
 // ---- tests ----
+
+func TestNewRejectsEmptyWebhookSecret(t *testing.T) {
+	if _, err := New(Config{}, nil, nil, nil); err == nil {
+		t.Fatal("New accepted an empty webhook secret")
+	}
+}
 
 func TestRejectsBadToken(t *testing.T) {
 	fetcher, starter := &fakeFetcher{}, &fakeStarter{}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"regexp"
 	"slices"
@@ -46,12 +47,15 @@ type Handler struct {
 	log     zerolog.Logger
 }
 
-func New(cfg Config, fetcher BundleFetcher, st store.ArtifactStore, starter WorkflowStarter) *Handler {
+func New(cfg Config, fetcher BundleFetcher, st store.ArtifactStore, starter WorkflowStarter) (*Handler, error) {
+	if cfg.WebhookSecret == "" {
+		return nil, errors.New("webhook secret is required")
+	}
 	logger := zerolog.Nop()
 	if cfg.Logger != nil {
 		logger = *cfg.Logger
 	}
-	return &Handler{cfg: cfg, fetcher: fetcher, store: st, starter: starter, log: logger}
+	return &Handler{cfg: cfg, fetcher: fetcher, store: st, starter: starter, log: logger}, nil
 }
 
 // pipelineEvent 是 GitLab 13.8 Pipeline Hook payload 的消费子集。

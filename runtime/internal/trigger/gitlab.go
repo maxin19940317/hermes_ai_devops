@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // maxVersionProbes 限制逐版本探测的上限(正常情况 bundle 在最新 1~2 个版本里)。
@@ -40,7 +41,23 @@ func (g *GitLabClient) get(ctx context.Context, url string) (*http.Response, err
 		header = "PRIVATE-TOKEN"
 	}
 	req.Header.Set(header, g.Token)
-	return g.http().Do(req)
+	client := *g.http()
+	previousCheckRedirect := client.CheckRedirect
+	client.CheckRedirect = func(redirect *http.Request, via []*http.Request) error {
+		if previousCheckRedirect != nil {
+			if err := previousCheckRedirect(redirect, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		if len(via) > 0 && (redirect.URL.Scheme != via[0].URL.Scheme ||
+			!strings.EqualFold(redirect.URL.Host, via[0].URL.Host)) {
+			redirect.Header.Del(header)
+		}
+		return nil
+	}
+	return client.Do(req)
 }
 
 // FetchBundle 实现 BundleFetcher。found=false 表示该 pipeline 无 bundle(不是错误)。
