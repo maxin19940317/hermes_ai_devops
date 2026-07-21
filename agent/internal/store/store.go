@@ -286,6 +286,25 @@ FROM events WHERE reported = 0 ORDER BY task_id, seq`)
 	return evs, nil
 }
 
+// LatestEvent 返回任务 seq 最大的一条事件;无事件时 ok=false。
+// 供 server 组装 TaskStatus 的 updated_at / detail。
+func (s *Store) LatestEvent(ctx context.Context, taskID string) (Event, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT task_id, seq, from_state, to_state, ts, detail, reported
+FROM events WHERE task_id = ? ORDER BY seq DESC LIMIT 1`, taskID)
+	if err != nil {
+		return Event{}, false, fmt.Errorf("query latest event %q: %w", taskID, err)
+	}
+	evs, err := scanEvents(rows)
+	if err != nil {
+		return Event{}, false, fmt.Errorf("scan latest event %q: %w", taskID, err)
+	}
+	if len(evs) == 0 {
+		return Event{}, false, nil
+	}
+	return evs[0], true, nil
+}
+
 // ResultRecorded 报告指定任务的结果是否已标记上报(去重检查,§4)。
 func (s *Store) ResultRecorded(ctx context.Context, taskID string) (bool, error) {
 	t, err := s.GetTask(ctx, taskID)

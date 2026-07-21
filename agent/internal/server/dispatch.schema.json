@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dispatch.schema.json",
+  "title": "TaskDispatchRequest",
+  "description": "由 contracts/client-agent-api.openapi.yaml 的 TaskDispatchRequest 组件忠实派生;一致性由 TestEmbeddedSchemaMatchesContract 防漂移。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "idempotency_key",
+    "attempt",
+    "artifact",
+    "manifest_digest",
+    "device_serial",
+    "callback_base_url"
+  ],
+  "properties": {
+    "task_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "{workflow_id}:{task_id}:{attempt},跨组件幂等的唯一依据"
+    },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "sha256", "auth"],
+      "properties": {
+        "url": { "type": "string", "format": "uri", "description": "GitLab Generic Registry 确定性 URL" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "整包校验和,下载后必须校验" },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "token"],
+          "properties": {
+            "type": { "enum": ["bearer", "job_token"] },
+            "token": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "manifest_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "包内 manifest.yaml 的 sha256,Client 解包后核对,防止包被替换"
+    },
+    "device_serial": { "type": "string", "minLength": 1 },
+    "callback_base_url": { "type": "string", "format": "uri" },
+    "presigned_uploads": {
+      "type": "array",
+      "default": [],
+      "description": "MinIO 预签名上传地址,附件直传不经 Runtime(红线 §14)",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["object_key", "url"],
+        "properties": {
+          "object_key": { "type": "string", "minLength": 1 },
+          "url": { "type": "string", "format": "uri" },
+          "expires_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  }
+}

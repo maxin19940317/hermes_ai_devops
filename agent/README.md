@@ -84,8 +84,30 @@ agent-cli run --package-file smoke-pkg-ok.tar.gz --sha256 <打印的sha256> `
   `abi mismatch: device=`(已修:ExitCode != 0 时带 stderr 报错,
   回归测试 `TestPrecheckSurfacesADBErrorWhenDeviceUnaddressable`)。
 
+## 服务模式(cmd/agent,Phase 1.7)
+
+`agent` 在 executor 上套 RPC 壳(设计 §3.5/§3.6,契约
+`contracts/client-agent-api.openapi.yaml`):HTTP Server 接收 Runtime 派单并异步执行,
+心跳/事件/结果经 callbacks-api 回流,附件按预签名 URL 直传 MinIO,
+SQLite(`AGENT_DB_PATH`)支撑幂等与崩溃恢复补报。
+
+```bash
+go build ./cmd/agent
+agent run -config agent.conf     # 前台(默认子命令);Ctrl-C / SIGTERM 优雅停机
+agent install|uninstall|start|stop   # Windows Service / systemd(kardianos/service)
+```
+
+配置:环境变量 + 可选 `-config` 文件(`KEY=VALUE` 每行一条,`#` 注释;
+环境变量优先)。必填 `AGENT_CLIENT_ID`、`AGENT_RUNTIME_CALLBACK_URL`、
+`AGENT_BASE_URL`、`AGENT_ADB_PATH`;可选 `AGENT_LISTEN_ADDR`(默认 `:8480`)、
+`AGENT_VERSION`(默认 `dev`)、`AGENT_RUNS_ROOT`(默认 `./agent-runs`)、
+`AGENT_DB_PATH`(默认 `./agent.db`)、`AGENT_HEARTBEAT_INTERVAL`(默认 `10s`)。
+
+启动恢复(§4):上次进程的非终态任务统一置 FAILED(事件+合成摘要结果回流),
+随后补报未上报的终态结果与事件。
+
 ## 尚未覆盖(后续阶段)
 
-- RPC 服务壳(§8.1)、心跳/事件/结果回调、MinIO 直传、Windows Service 化 → Phase 1.7
-- Agent 自带固定版本 adb 并自管 server 生命周期(当前用 `--adb` 指定)
+- ~~RPC 服务壳(§8.1)、心跳/事件/结果回调、MinIO 直传、Windows Service 化~~ → 已交付(cmd/agent,Phase 1.7)
+- Agent 自带固定版本 adb 并自管 server 生命周期(当前用 `--adb` / `AGENT_ADB_PATH` 指定)
 - 真实设备验证需在 Windows Client 上进行(本仓库单测用 fake Runner 全覆盖流水线)
