@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strconv"
+	"time"
 
 	"hermes-devops/runtime/internal/activity"
 )
@@ -39,6 +40,17 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		}
 		return n, nil
 	}
+	envDuration := func(key string, def time.Duration) (time.Duration, error) {
+		v := getenv(key)
+		if v == "" {
+			return def, nil
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s: 非法时长 %q: %w", key, v, err)
+		}
+		return d, nil
+	}
 
 	variantsPath := getenv("VARIANTS_CONFIG")
 	if variantsPath == "" {
@@ -73,6 +85,10 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	presignTTL, err := envDuration("MINIO_PRESIGN_TTL", time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		TemporalAddress:    env("TEMPORAL_ADDRESS", "127.0.0.1:7233"),
@@ -87,6 +103,13 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			ArtifactAuthType:  env("ARTIFACT_AUTH_TYPE", "job_token"),
 			ArtifactAuthToken: getenv("ARTIFACT_AUTH_TOKEN"),
 			FeishuWebhookURL:  getenv("FEISHU_WEBHOOK_URL"),
+			// §3.7:MINIO_ENDPOINT 或凭据为空即禁用预签名(优雅降级)。
+			MinIOEndpoint:       getenv("MINIO_ENDPOINT"),
+			MinIOPublicEndpoint: getenv("MINIO_PUBLIC_ENDPOINT"),
+			MinIOAccessKey:      getenv("MINIO_ACCESS_KEY"),
+			MinIOSecretKey:      getenv("MINIO_SECRET_KEY"),
+			MinIOBucket:         env("MINIO_BUCKET", "hermes-evidence"),
+			MinIOPresignTTL:     presignTTL,
 		},
 		SpecDefaults: activity.SpecDefaults{
 			MaxInfraRetries:   maxInfraRetries,

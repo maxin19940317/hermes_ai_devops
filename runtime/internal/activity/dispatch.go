@@ -27,7 +27,7 @@ func (a *Acts) Dispatch(ctx context.Context, req wf.DispatchRequest) error {
 		"manifest_digest":   req.ManifestDigest,
 		"device_serial":     req.DeviceSerial,
 		"callback_base_url": a.Cfg.CallbackBaseURL,
-		"presigned_uploads": []any{}, // MinIO 预签名直传属 Phase 1.7
+		"presigned_uploads": a.presignedUploads(ctx, req.TaskID), // §3.7;禁用时为空集降级
 	}
 	return a.post(ctx, req.ClientBaseURL+"/api/v1/tasks", payload, http.StatusAccepted)
 }

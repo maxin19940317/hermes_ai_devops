@@ -19,6 +19,12 @@
 //	ARTIFACT_AUTH_TYPE      缺省 job_token
 //	ARTIFACT_AUTH_TOKEN     可选
 //	FEISHU_WEBHOOK_URL      可选;缺省 Notify 静默成功(开发模式)
+//	MINIO_ENDPOINT          集群内 endpoint(如 minio:9000);空 → 禁用预签名(§3.7 降级)
+//	MINIO_PUBLIC_ENDPOINT   预签名 URL 的 host,须 Client 可达;空 → 用 MINIO_ENDPOINT
+//	MINIO_ACCESS_KEY        空 → 禁用预签名
+//	MINIO_SECRET_KEY        空 → 禁用预签名
+//	MINIO_BUCKET            缺省 hermes-evidence
+//	MINIO_PRESIGN_TTL       缺省 1h(Go duration)
 package main
 
 import (
@@ -90,6 +96,7 @@ func main() {
 		Cfg:     cfg.Activity,
 		HTTP:    &http.Client{Timeout: 30 * time.Second},
 		SpecCfg: specCfg,
+		Log:     &log,
 	}
 
 	w := worker.New(tc, cfg.TemporalTaskQueue, worker.Options{})
