@@ -25,6 +25,11 @@ type Prober struct {
 	// (如 trinket → QCM6125)。设备固件通常只暴露平台代号,而 variants.yaml
 	// 的调度约束用 SoC 型号;没有别名时 SNPE 变体永远匹配不到设备。
 	SOCAliases map[string]string
+
+	// Capabilities 声明本 Client 全部设备的能力(如 hexagon/rknpu),
+	// 用于调度约束子集匹配。adb 没有可靠的通用能力探测手段,
+	// 由运维按设备实际配置显式声明(同 SOCAliases 的显式原则)。
+	Capabilities []string
 }
 
 func (p *Prober) deviceWorkdir() string {
@@ -83,6 +88,9 @@ func (p *Prober) probeDevice(ctx context.Context, serial string, isBusy bool) De
 		soc = alias
 	}
 	props.SOC = soc
+	if len(p.Capabilities) > 0 {
+		props.Capabilities = append([]string(nil), p.Capabilities...)
+	}
 	dev.Props = props
 
 	if res, err := p.Runner.Run(ctx, adb.DiskFreeKB(serial, p.deviceWorkdir())); err == nil && res.ExitCode == 0 {

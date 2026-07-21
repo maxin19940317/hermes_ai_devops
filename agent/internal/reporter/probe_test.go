@@ -44,3 +44,25 @@ func TestProbeDevicesWithoutSOCAlias(t *testing.T) {
 		}
 	}
 }
+
+// Capabilities 声明透传到设备属性(调度子集匹配的依据)。
+func TestProbeDevicesCapabilities(t *testing.T) {
+	with := &Prober{Runner: heartbeatRunner(), Capabilities: []string{"hexagon"}}
+	for _, d := range with.ProbeDevices(context.Background(), map[string]bool{}) {
+		if d.Serial != "SERIAL1" {
+			continue
+		}
+		if len(d.Props.Capabilities) != 1 || d.Props.Capabilities[0] != "hexagon" {
+			t.Errorf("capabilities = %v, want [hexagon]", d.Props.Capabilities)
+		}
+	}
+	without := &Prober{Runner: heartbeatRunner()}
+	for _, d := range without.ProbeDevices(context.Background(), map[string]bool{}) {
+		if d.Props == nil { // OFFLINE 设备无属性
+			continue
+		}
+		if len(d.Props.Capabilities) != 0 {
+			t.Errorf("no caps configured, got %v", d.Props.Capabilities)
+		}
+	}
+}

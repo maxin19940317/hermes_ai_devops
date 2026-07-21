@@ -77,6 +77,7 @@ type Config struct {
 	AgentVersion  string
 	DeviceWorkdir string            // 设备 df 探测路径;空 → reporter.DefaultDeviceWorkdir
 	SOCAliases    map[string]string // 平台代号 → SoC 型号(如 trinket→QCM6125)
+	Capabilities  []string          // 设备能力声明(如 hexagon),调度子集匹配用
 	HTTP          *http.Client      // executor 下载用;nil → http.DefaultClient
 
 	DiagnosticsMaxBytes int // 诊断输出截断上限;0 → DefaultDiagnosticsMaxBytes

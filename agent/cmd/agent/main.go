@@ -21,6 +21,7 @@
 //	AGENT_DB_PATH                可选,SQLite 路径(默认 ./agent.db)
 //	AGENT_HEARTBEAT_INTERVAL     可选,心跳周期,Go duration(默认 10s)
 //	AGENT_SOC_ALIASES            可选,平台代号→SoC 型号别名(如 trinket:QCM6125,多个用逗号分隔)
+//	AGENT_DEVICE_CAPABILITIES    可选,设备能力声明(如 hexagon,多个用逗号分隔;调度子集匹配用)
 package main
 
 import (
@@ -58,6 +59,18 @@ type Config struct {
 	DBPath             string
 	HeartbeatInterval  time.Duration
 	SOCAliases         map[string]string
+	Capabilities       []string
+}
+
+// parseCSV 解析逗号分隔列表(AGENT_DEVICE_CAPABILITIES),去空白;空串返回 nil。
+func parseCSV(raw string) []string {
+	var out []string
+	for _, item := range strings.Split(raw, ",") {
+		if v := strings.TrimSpace(item); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // parseSOCAliases 解析 "trinket:QCM6125,kalama:SM8550" 形式的
@@ -198,6 +211,7 @@ func loadConfig(path string, getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.SOCAliases = aliases
+	cfg.Capabilities = parseCSV(get("AGENT_DEVICE_CAPABILITIES"))
 
 	var missing []string
 	for _, req := range []struct {
@@ -286,6 +300,7 @@ func runAgent(ctx context.Context, cfg Config) error {
 		RunsRoot:     cfg.RunsRoot,
 		AgentVersion: cfg.Version,
 		SOCAliases:   cfg.SOCAliases,
+		Capabilities: cfg.Capabilities,
 		Logf:         logf,
 	})
 	httpSrv := &http.Server{
@@ -297,7 +312,7 @@ func runAgent(ctx context.Context, cfg Config) error {
 	hb := &reporter.Heartbeat{
 		Runner: runner, Store: st, Client: client, Logf: logf,
 		ClientID: cfg.ClientID, AgentVersion: cfg.Version, BaseURL: cfg.BaseURL,
-		Interval: cfg.HeartbeatInterval, SOCAliases: cfg.SOCAliases,
+		Interval: cfg.HeartbeatInterval, SOCAliases: cfg.SOCAliases, Capabilities: cfg.Capabilities,
 	}
 
 	var wg sync.WaitGroup
