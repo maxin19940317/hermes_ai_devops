@@ -1,6 +1,7 @@
 # runtime — Temporal Worker + Trigger + REST API(Go)
 
-当前内容:Phase 1.4 **Temporal spike**(完成,结论 GO)+ Phase 1.5 **Trigger 服务**。
+当前内容：Phase 1.4 Temporal spike、Phase 1.5 Trigger、Phase 1.6
+DeviceTestWorkflow/Worker 主干。q-uat 容器部署见 [`../deploy/README.md`](../deploy/README.md)。
 
 ## Trigger 服务(Phase 1.5)
 
@@ -62,4 +63,4 @@ internal/workflow/      # DeviceTestWorkflow 输入契约(本体属 Phase 1.6)
 internal/testtemporal/  # 测试用 dev server 拉起助手
 ```
 
-后续(§12):1.6 DeviceTestWorkflow 主干 + 规则引擎。
+后续：Client Agent RPC/心跳接入、MinIO 预签名直传，以及生产 HTTPS/mTLS 硬化。
