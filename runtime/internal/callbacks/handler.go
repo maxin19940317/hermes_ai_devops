@@ -62,6 +62,10 @@ func New(s Store, sig Signaler, log *zerolog.Logger) *Handler {
 
 func (h *Handler) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
 	mux.HandleFunc("POST /callbacks/v1/heartbeat", h.heartbeat)
 	mux.HandleFunc("POST /callbacks/v1/task-events", h.taskEvent)
 	mux.HandleFunc("POST /callbacks/v1/results", h.result)
