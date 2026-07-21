@@ -13,6 +13,7 @@ ENV_EXAMPLE = ROOT / "deploy" / ".env.example"
 INIT_DB = ROOT / "deploy" / "postgres" / "init" / "10-runtime-db.sh"
 LOCK_IMAGES = ROOT / "deploy" / "scripts" / "lock-images.sh"
 VALIDATE_ENV = ROOT / "deploy" / "scripts" / "validate-env.sh"
+VERIFY_PIPELINE = ROOT / "deploy" / "scripts" / "verify-pipeline.sh"
 
 
 class SecretExclusionContracts(unittest.TestCase):
@@ -223,6 +224,21 @@ class ComposeContracts(unittest.TestCase):
         ):
             self.assertRegex(text, rf"(?m)^{key}=\s*$")
         self.assertNotIn("PRIVATE-TOKEN:", text)
+
+
+class PipelineVerificationContracts(unittest.TestCase):
+    def test_verifier_checks_health_registry_database_temporal_and_dedup(self):
+        text = VERIFY_PIPELINE.read_text(encoding="utf-8")
+        for marker in (
+            "/healthz",
+            "/api/v4/projects/$project_id/pipelines/$pipeline_id",
+            "/webhooks/gitlab",
+            "SELECT count(*) FROM artifacts",
+            "workflow describe",
+            "taskqueue describe",
+            ".started == false",
+        ):
+            self.assertIn(marker, text)
 
 
 if __name__ == "__main__":
