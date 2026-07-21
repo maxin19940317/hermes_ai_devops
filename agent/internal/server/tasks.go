@@ -177,9 +177,10 @@ func (s *Server) newExecutor() *executor.Executor {
 		return s.cfg.NewExecutor()
 	}
 	return &executor.Executor{
-		Runner: s.cfg.Runner,
-		HTTP:   s.cfg.HTTP,
-		Logf:   s.cfg.Logf,
+		Runner:     s.cfg.Runner,
+		HTTP:       s.cfg.HTTP,
+		Logf:       s.cfg.Logf,
+		SOCAliases: s.cfg.SOCAliases,
 	}
 }
 

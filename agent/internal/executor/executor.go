@@ -70,6 +70,11 @@ type Executor struct {
 	Logf         func(format string, args ...any)
 	OnTransition func(to Status)
 
+	// SOCAliases 把设备固件上报的平台代号(如 trinket)映射为
+	// manifest 调度约束使用的 SoC 型号(如 QCM6125),precheck 的
+	// soc 匹配在映射后进行;nil 表示不映射。
+	SOCAliases map[string]string
+
 	mu              sync.Mutex
 	status          Status             // 当前状态(供 Cancel 判断终态)
 	cancelRequested bool               // 取消标志(置位后不可复位)
@@ -273,8 +278,17 @@ func (e *Executor) precheck(ctx context.Context, serial string, m *manifest.Mani
 		matched := ""
 		for _, want := range m.Requirements.SOC {
 			for _, got := range []string{platform, board} {
-				if got != "" && strings.EqualFold(got, want) {
+				if got == "" {
+					continue
+				}
+				if strings.EqualFold(got, want) {
 					matched = got
+					continue
+				}
+				// 平台代号 → SoC 型号别名(trinket → QCM6125):
+				// 固件只暴露代号,manifest 约束用型号
+				if alias, ok := e.SOCAliases[got]; ok && strings.EqualFold(alias, want) {
+					matched = alias
 				}
 			}
 		}

@@ -456,3 +456,30 @@ func TestCancelDuringRunningKillsThenCollects(t *testing.T) {
 		t.Errorf("取消后仍须落盘 logcat: %v", err)
 	}
 }
+
+// 固件只报平台代号(trinket)时,SOCAliases 使命名约束(QCM6125)匹配成功;
+// 无别名则应按 soc mismatch 失败(回归)。
+func TestPrecheckSOCAlias(t *testing.T) {
+	props := defaultProps()
+	props["ro.board.platform"] = "trinket"
+	props["ro.product.board"] = "trinket"
+
+	// 无别名:soc mismatch
+	f1 := &fakeADB{props: props, dfAvailKB: 1 << 20}
+	_, err1, _ := run(t, f1, Options{PackagePath: buildPackage(t, 900), Serial: serial, OutDir: t.TempDir()})
+	if err1 == nil || !strings.Contains(err1.Error(), "soc mismatch") {
+		t.Fatalf("无别名应 soc mismatch, got %v", err1)
+	}
+
+	// 有别名:trinket→QCM6125 匹配通过
+	f2 := &fakeADB{props: props, dfAvailKB: 1 << 20}
+	e, _ := newExecutor(f2)
+	e.SOCAliases = map[string]string{"trinket": "QCM6125"}
+	sum, err := e.Execute(context.Background(), Options{PackagePath: buildPackage(t, 900), Serial: serial, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("有别名不应失败: %v", err)
+	}
+	if sum.Environment["soc"] != "QCM6125" {
+		t.Errorf("environment soc = %q, want QCM6125", sum.Environment["soc"])
+	}
+}
