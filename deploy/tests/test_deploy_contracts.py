@@ -35,54 +35,112 @@ class SecretExclusionContracts(unittest.TestCase):
                 self.assertNotEqual(0, returncode)
 
 
+def dockerfile_instructions(text):
+    """Parse a Dockerfile into logical instructions.
+
+    Skips blank lines and full-line comments, joins backslash continuations,
+    and collapses internal whitespace to single spaces so assertions match
+    instruction semantics instead of physical layout. Raises ValueError on an
+    unterminated continuation at end of file.
+    """
+    instructions = []
+    buffer = ""
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not buffer and (not stripped or stripped.startswith("#")):
+            continue
+        continued = stripped.endswith("\\")
+        buffer += stripped[:-1] + " " if continued else stripped
+        if continued:
+            continue
+        instructions.append(" ".join(buffer.split()))
+        buffer = ""
+    if buffer:
+        raise ValueError("unterminated continuation at end of Dockerfile")
+    return instructions
+
+
+class DockerfileParserContracts(unittest.TestCase):
+    def test_parser_skips_layout_noise_and_joins_continuations(self):
+        text = (
+            "# leading comment\n"
+            "\n"
+            "ARG A=1\n"
+            "RUN apk add \\\n"
+            "  wget  curl\n"
+            "# trailing comment\n"
+        )
+        self.assertEqual(
+            ["ARG A=1", "RUN apk add wget curl"],
+            dockerfile_instructions(text),
+        )
+
+    def test_parser_rejects_unterminated_continuation(self):
+        with self.assertRaises(ValueError):
+            dockerfile_instructions("RUN echo \\\n")
+
+
 class RuntimeImageContracts(unittest.TestCase):
     def test_runtime_image_is_non_root_and_builds_both_commands(self):
-        text = DOCKERFILE.read_text(encoding="utf-8")
-        instructions = [
-            line.strip()
-            for line in text.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
+        instructions = dockerfile_instructions(
+            DOCKERFILE.read_text(encoding="utf-8")
+        )
 
         self.assertEqual("ARG GO_IMAGE=golang:1.26.5-bookworm", instructions[0])
         self.assertEqual(
             "ARG RUNTIME_BASE_IMAGE=alpine:3.22.1", instructions[1]
         )
-        build_from = instructions.index("FROM ${GO_IMAGE} AS build")
-        runtime_from = instructions.index("FROM ${RUNTIME_BASE_IMAGE}")
-        self.assertLess(build_from, runtime_from)
-        self.assertIn("WORKDIR /src/runtime", instructions)
-        self.assertIn("COPY runtime/go.mod runtime/go.sum ./", instructions)
-        self.assertIn("RUN go mod download", instructions)
-        self.assertIn("COPY runtime/ ./", instructions)
+        self.assertEqual(
+            ["FROM ${GO_IMAGE} AS build", "FROM ${RUNTIME_BASE_IMAGE}"],
+            [i for i in instructions if i.startswith("FROM ")],
+        )
+
+        build_stage = instructions[
+            instructions.index("FROM ${GO_IMAGE} AS build")
+            + 1 : instructions.index("FROM ${RUNTIME_BASE_IMAGE}")
+        ]
+        runtime_stage = instructions[
+            instructions.index("FROM ${RUNTIME_BASE_IMAGE}") + 1 :
+        ]
+
+        for expected in (
+            "WORKDIR /src/runtime",
+            "COPY runtime/go.mod runtime/go.sum ./",
+            "RUN go mod download",
+            "COPY runtime/ ./",
+        ):
+            self.assertIn(expected, build_stage)
 
         build_prefix = (
-            'CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w"'
+            "RUN CGO_ENABLED=0 GOOS=linux go build -trimpath "
+            '-ldflags="-s -w"'
         )
+        build_runs = [i for i in instructions if "go build" in i]
+        self.assertEqual(1, len(build_runs), build_runs)
+        dual_build = build_runs[0]
+        self.assertTrue(dual_build.startswith(build_prefix), dual_build)
+        self.assertIn(dual_build, build_stage)
+        for binary, cmd in (
+            ("hermes-trigger", "./cmd/trigger"),
+            ("hermes-worker", "./cmd/worker"),
+        ):
+            self.assertIn(f"-o /out/{binary} {cmd}", dual_build)
+
         self.assertIn(
-            f"{build_prefix} -o /out/hermes-trigger ./cmd/trigger", text
+            "RUN apk add --no-cache ca-certificates wget && addgroup -S hermes"
+            " && adduser -S -G hermes -h /nonexistent -s /sbin/nologin hermes",
+            runtime_stage,
         )
-        self.assertIn(
-            f"{build_prefix} -o /out/hermes-worker ./cmd/worker", text
+        for expected in (
+            "COPY --from=build /out/hermes-trigger /app/hermes-trigger",
+            "COPY --from=build /out/hermes-worker /app/hermes-worker",
+            "COPY ci/variants.yaml /etc/hermes/variants.yaml",
+        ):
+            self.assertIn(expected, runtime_stage)
+        self.assertNotIn(
+            "go build", " ".join(runtime_stage)
         )
 
-        runtime_instructions = instructions[runtime_from + 1 :]
-        self.assertIn(
-            "RUN apk add --no-cache ca-certificates wget \\",
-            runtime_instructions,
-        )
-        self.assertIn(
-            "COPY --from=build /out/hermes-trigger /app/hermes-trigger",
-            runtime_instructions,
-        )
-        self.assertIn(
-            "COPY --from=build /out/hermes-worker /app/hermes-worker",
-            runtime_instructions,
-        )
-        self.assertIn(
-            "COPY ci/variants.yaml /etc/hermes/variants.yaml",
-            runtime_instructions,
-        )
         self.assertEqual(
             [
                 "USER hermes",
