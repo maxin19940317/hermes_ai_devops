@@ -17,6 +17,25 @@ import (
 	"hermes-devops/agent/internal/uploader"
 )
 
+// safeOutDirName 把 task_id 净化为单级安全目录名:仅保留
+// [A-Za-z0-9._-],其余字符(含 '/' ':' '\')一律替换为 '_';
+// 结果为空、"." 或 ".." 时返回 "_",保证 join 后不越出 RunsRoot。
+func safeOutDirName(taskID string) string {
+	name := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, taskID)
+	if name == "" || name == "." || name == ".." {
+		return "_"
+	}
+	return name
+}
+
 // Dispatch 是契约 TaskDispatchRequest(已过嵌入 Schema 校验后解码)。
 type Dispatch struct {
 	TaskID         string `json:"task_id"`
@@ -58,12 +77,10 @@ func (s *Server) dispatchTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	// task_id 直接拼进 out_dir 路径,拒绝路径穿越字符(纵深防御;
-	// 契约层 task_id 由 Runtime 生成,此处不信任输入)
-	if d.TaskID == "." || d.TaskID == ".." || strings.ContainsAny(d.TaskID, `/\`) {
-		writeErr(w, http.StatusBadRequest, "bad_request", "task_id contains path separators")
-		return
-	}
+	// task_id 由 Runtime 按 {workflow_id}:{test_id}:a{attempt} 生成,
+	// 含项目路径 '/' 与分隔符 ':'(合法);只有文件系统路径需要净化:
+	// out_dir 用safe 化目录名,杜绝路径穿越,同时兼容 Windows 禁用的 ':'。
+	outDir := filepath.Join(s.cfg.RunsRoot, safeOutDirName(d.TaskID))
 
 	ctx := r.Context()
 	// 同幂等键 → 返回既有任务当前状态,不重复执行(§4)
@@ -81,7 +98,6 @@ func (s *Server) dispatchTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outDir := filepath.Join(s.cfg.RunsRoot, d.TaskID)
 	task := store.Task{
 		TaskID:         d.TaskID,
 		IdempotencyKey: d.IdempotencyKey,
