@@ -11,3 +11,7 @@ __pycache__/
 
 # Git worktrees
 .worktrees/
+
+# Runtime deployment secrets and platform-specific image digests
+/deploy/.env
+/deploy/images.lock.env
