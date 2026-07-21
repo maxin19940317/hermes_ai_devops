@@ -20,6 +20,7 @@
 //	AGENT_RUNS_ROOT              可选,本地结果根目录(默认 ./agent-runs)
 //	AGENT_DB_PATH                可选,SQLite 路径(默认 ./agent.db)
 //	AGENT_HEARTBEAT_INTERVAL     可选,心跳周期,Go duration(默认 10s)
+//	AGENT_SOC_ALIASES            可选,平台代号→SoC 型号别名(如 trinket:QCM6125,多个用逗号分隔)
 package main
 
 import (
@@ -56,6 +57,24 @@ type Config struct {
 	RunsRoot           string
 	DBPath             string
 	HeartbeatInterval  time.Duration
+	SOCAliases         map[string]string
+}
+
+// parseSOCAliases 解析 "trinket:QCM6125,kalama:SM8550" 形式的
+// 平台代号→SoC 型号别名表(AGENT_SOC_ALIASES)。空串返回 nil。
+func parseSOCAliases(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	aliases := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		from, to, ok := strings.Cut(strings.TrimSpace(pair), ":")
+		if !ok || from == "" || strings.TrimSpace(to) == "" {
+			return nil, fmt.Errorf("AGENT_SOC_ALIASES 项 %q 非法(要 from:to)", pair)
+		}
+		aliases[from] = strings.TrimSpace(to)
+	}
+	return aliases, nil
 }
 
 func main() {
@@ -174,6 +193,11 @@ func loadConfig(path string, getenv func(string) string) (Config, error) {
 		}
 		cfg.HeartbeatInterval = d
 	}
+	aliases, err := parseSOCAliases(get("AGENT_SOC_ALIASES"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.SOCAliases = aliases
 
 	var missing []string
 	for _, req := range []struct {
@@ -261,6 +285,7 @@ func runAgent(ctx context.Context, cfg Config) error {
 		Uploader:     &uploader.Uploader{Logf: logf},
 		RunsRoot:     cfg.RunsRoot,
 		AgentVersion: cfg.Version,
+		SOCAliases:   cfg.SOCAliases,
 		Logf:         logf,
 	})
 	httpSrv := &http.Server{
@@ -272,7 +297,7 @@ func runAgent(ctx context.Context, cfg Config) error {
 	hb := &reporter.Heartbeat{
 		Runner: runner, Store: st, Client: client, Logf: logf,
 		ClientID: cfg.ClientID, AgentVersion: cfg.Version, BaseURL: cfg.BaseURL,
-		Interval: cfg.HeartbeatInterval,
+		Interval: cfg.HeartbeatInterval, SOCAliases: cfg.SOCAliases,
 	}
 
 	var wg sync.WaitGroup

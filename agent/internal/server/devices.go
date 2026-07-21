@@ -22,6 +22,7 @@ func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
 		Runner:        s.cfg.Runner,
 		Logf:          s.cfg.Logf,
 		DeviceWorkdir: s.cfg.DeviceWorkdir,
+		SOCAliases:    s.cfg.SOCAliases,
 	}
 	devices := prober.ProbeDevices(ctx, busy)
 	writeJSON(w, http.StatusOK, devices)

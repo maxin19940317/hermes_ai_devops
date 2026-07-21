@@ -85,3 +85,38 @@ func TestLoadConfigBadDuration(t *testing.T) {
 		t.Fatal("非法 duration 应报错")
 	}
 }
+
+func TestParseSOCAliases(t *testing.T) {
+	cases := []struct {
+		raw     string
+		want    map[string]string
+		wantErr bool
+	}{
+		{"", nil, false},
+		{"  ", nil, false},
+		{"trinket:QCM6125", map[string]string{"trinket": "QCM6125"}, false},
+		{"trinket:QCM6125, kalama:SM8550", map[string]string{"trinket": "QCM6125", "kalama": "SM8550"}, false},
+		{"trinket", nil, true},
+		{"trinket:", nil, true},
+		{":QCM6125", nil, true},
+	}
+	for _, c := range cases {
+		got, err := parseSOCAliases(c.raw)
+		if (err != nil) != c.wantErr {
+			t.Errorf("parseSOCAliases(%q) err = %v, wantErr %v", c.raw, err, c.wantErr)
+			continue
+		}
+		if c.wantErr {
+			continue
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("parseSOCAliases(%q) = %v, want %v", c.raw, got, c.want)
+			continue
+		}
+		for k, v := range c.want {
+			if got[k] != v {
+				t.Errorf("parseSOCAliases(%q)[%q] = %q, want %q", c.raw, k, got[k], v)
+			}
+		}
+	}
+}

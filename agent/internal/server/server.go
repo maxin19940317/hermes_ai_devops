@@ -75,8 +75,9 @@ type Config struct {
 
 	RunsRoot      string // out_dir = RunsRoot/<task_id>
 	AgentVersion  string
-	DeviceWorkdir string       // 设备 df 探测路径;空 → reporter.DefaultDeviceWorkdir
-	HTTP          *http.Client // executor 下载用;nil → http.DefaultClient
+	DeviceWorkdir string            // 设备 df 探测路径;空 → reporter.DefaultDeviceWorkdir
+	SOCAliases    map[string]string // 平台代号 → SoC 型号(如 trinket→QCM6125)
+	HTTP          *http.Client      // executor 下载用;nil → http.DefaultClient
 
 	DiagnosticsMaxBytes int // 诊断输出截断上限;0 → DefaultDiagnosticsMaxBytes
 

@@ -20,6 +20,11 @@ type Prober struct {
 	Logf   func(format string, args ...any) // nil → 静默
 
 	DeviceWorkdir string // df 探测路径;空 → DefaultDeviceWorkdir
+
+	// SOCAliases 把 getprop 探测到的平台代号映射为调度约束使用的 SoC 名
+	// (如 trinket → QCM6125)。设备固件通常只暴露平台代号,而 variants.yaml
+	// 的调度约束用 SoC 型号;没有别名时 SNPE 变体永远匹配不到设备。
+	SOCAliases map[string]string
 }
 
 func (p *Prober) deviceWorkdir() string {
@@ -72,6 +77,10 @@ func (p *Prober) probeDevice(ctx context.Context, serial string, isBusy bool) De
 	soc, _ := p.getprop(ctx, serial, "ro.board.platform")
 	if soc == "" {
 		soc, _ = p.getprop(ctx, serial, "ro.product.board")
+	}
+	if alias, ok := p.SOCAliases[soc]; ok {
+		p.logf("probe: %s soc %s -> %s (alias)", serial, soc, alias)
+		soc = alias
 	}
 	props.SOC = soc
 	dev.Props = props
