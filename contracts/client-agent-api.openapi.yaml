@@ -172,7 +172,7 @@ components:
           required: [url, sha256, auth]
           properties:
             url: { type: string, format: uri, description: GitLab Generic Registry 确定性 URL }
-            sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: 整包校验和,下载后必须校验 }
+            sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: "整包校验和,下载后必须校验" }
             # CONTRACT-ISSUE: CLAUDE.md §8.1 原文为 auth: bearer|job_token,只有类型没有凭据。
             # 此处物化为 { type, token }:type 决定请求头形态(PRIVATE-TOKEN / JOB-TOKEN),token 为短期凭据。
             auth:
