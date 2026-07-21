@@ -11,12 +11,12 @@ set -a
 . "$lock_file"
 set +a
 
-for key in POSTGRES_ADMIN_PASSWORD RUNTIME_DB_PASSWORD GITLAB_TOKEN TRIGGER_WEBHOOK_SECRET; do
+for key in POSTGRES_ADMIN_PASSWORD RUNTIME_DB_PASSWORD GITLAB_TOKEN TRIGGER_WEBHOOK_SECRET MINIO_ROOT_PASSWORD; do
   eval "value=\${$key:-}"
   test -n "$value" || { echo "ERROR: $key is empty" >&2; exit 1; }
 done
 
-for key in POSTGRES_IMAGE TEMPORAL_IMAGE TEMPORAL_UI_IMAGE GO_IMAGE RUNTIME_BASE_IMAGE; do
+for key in POSTGRES_IMAGE TEMPORAL_IMAGE TEMPORAL_UI_IMAGE GO_IMAGE RUNTIME_BASE_IMAGE MINIO_IMAGE MINIO_MC_IMAGE; do
   eval "value=\${$key:-}"
   case "$value" in
     *@sha256:*) ;;

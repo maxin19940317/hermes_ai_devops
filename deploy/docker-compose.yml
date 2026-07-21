@@ -119,14 +119,62 @@ services:
       ARTIFACT_AUTH_TYPE: ${ARTIFACT_AUTH_TYPE:-job_token}
       ARTIFACT_AUTH_TOKEN: ${ARTIFACT_AUTH_TOKEN:-}
       FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
+      # §3.7 预签名直传;worker 不 depends_on minio——MinIO 缺失时优雅降级为空
+      # presigned_uploads。签名覆盖 Host,故预签名 client 用 PUBLIC endpoint 构造。
+      MINIO_ENDPOINT: minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://127.0.0.1:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      MINIO_BUCKET: ${MINIO_BUCKET:-hermes-evidence}
+      MINIO_PRESIGN_TTL: ${MINIO_PRESIGN_TTL:-1h}
     ports:
-      - "127.0.0.1:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091"
+      - "${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091"
     healthcheck:
       test: [CMD, wget, -qO-, http://127.0.0.1:8091/healthz]
       interval: 5s
       timeout: 3s
       retries: 20
       start_period: 10s
+
+  minio:
+    image: ${MINIO_IMAGE:?MINIO_IMAGE must come from images.lock.env}
+    restart: unless-stopped
+    networks: [runtime]
+    # --console-address 固定控制台端口,否则每次启动随机端口,9001 映射失效。
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    volumes:
+      - minio-data:/data
+    ports:
+      # 决策 2:UAT 期间 9000 绑测试网段供 Windows Client 直传;控制台保持 localhost。
+      - "${MINIO_BIND_IP:-0.0.0.0}:${MINIO_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      # minio 镜像内置 curl(无 wget);/minio/health/live 为官方存活探针。
+      test: [CMD-SHELL, "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  minio-init:
+    image: ${MINIO_MC_IMAGE:?MINIO_MC_IMAGE must come from images.lock.env}
+    networks: [runtime]
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      MINIO_BUCKET: ${MINIO_BUCKET:-hermes-evidence}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc alias set hermes http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        && mc mb --ignore-existing "hermes/$$MINIO_BUCKET"
 
 networks:
   runtime:
@@ -135,3 +183,5 @@ networks:
 volumes:
   postgres-data:
     name: hermes-runtime-postgres
+  minio-data:
+    name: hermes-runtime-minio

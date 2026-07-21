@@ -183,18 +183,30 @@ class ComposeContracts(unittest.TestCase):
 
     def test_compose_isolated_services_and_ports(self):
         text = COMPOSE.read_text(encoding="utf-8")
-        for service in ("postgres:", "temporal:", "temporal-ui:", "trigger:", "worker:"):
+        for service in (
+            "postgres:", "temporal:", "temporal-ui:", "trigger:", "worker:",
+            "minio:", "minio-init:",
+        ):
             self.assertIn(service, text)
         self.assertIn(
             '${TRIGGER_BIND_IP:-0.0.0.0}:${TRIGGER_HOST_PORT:-18090}:8090',
             text,
         )
+        # 决策 2(UAT LAN 暴露):worker callbacks 绑 IP 变量化,缺省 0.0.0.0。
         self.assertIn(
-            '127.0.0.1:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091',
+            '${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091',
             text,
         )
         self.assertIn(
             '127.0.0.1:${TEMPORAL_UI_HOST_PORT:-18080}:8080',
+            text,
+        )
+        self.assertIn(
+            '${MINIO_BIND_IP:-0.0.0.0}:${MINIO_HOST_PORT:-9000}:9000',
+            text,
+        )
+        self.assertIn(
+            '127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001',
             text,
         )
         self.assertIn("TEMPORAL_ADDRESS: temporal:7233", text)
@@ -207,15 +219,42 @@ class ComposeContracts(unittest.TestCase):
         # PostgreSQL and Temporal gRPC must stay inside the Compose network.
         self.assertNotIn("5432:5432", text)
         self.assertNotIn("7233:7233", text)
-        # Every published port mapping for worker callbacks and Temporal UI
-        # must bind localhost; adding a 0.0.0.0 mapping alongside the pinned
-        # 127.0.0.1 one must fail this contract.
+        # 决策 2:8091(worker callbacks)改为参数化 bind IP,不再强制 localhost;
+        # 但 bind IP 必须来自变量,不得硬编码。
+        self.assertIn(
+            '${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091',
+            text,
+        )
+        # Temporal UI(8080)与 MinIO 控制台(9001)仍必须绑 localhost;
+        # 为它们添加 0.0.0.0 映射必须使本契约失败。
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("- ") and (
-                ":8091" in stripped or ":8080" in stripped
+                ":8080" in stripped or ":9001" in stripped
             ):
                 self.assertIn("127.0.0.1:", stripped, stripped)
+
+    def test_compose_minio_services(self):
+        text = COMPOSE.read_text(encoding="utf-8")
+        for marker in (
+            "minio:",
+            "minio-init:",
+            "MINIO_IMAGE",
+            "MINIO_MC_IMAGE",
+            "server /data",
+            "mc mb --ignore-existing",
+            'restart: "no"',
+            "hermes-runtime-minio",
+            "/minio/health/live",
+            "condition: service_healthy",
+        ):
+            self.assertIn(marker, text)
+        # worker 不 depends_on minio:预签名缺失时优雅降级(§3.7)。
+        worker_block = text.split("  worker:", 1)[1].split("  minio:", 1)[0]
+        self.assertNotRegex(
+            worker_block,
+            re.compile(r"depends_on:\n(\s+\w+:\n\s+condition: service_healthy\n)*\s+minio:"),
+        )
 
     def test_compose_health_chain_and_in_container_probes(self):
         text = COMPOSE.read_text(encoding="utf-8")
@@ -239,6 +278,8 @@ class ComposeContracts(unittest.TestCase):
             "TEMPORAL_UI_IMAGE",
             "GO_IMAGE",
             "RUNTIME_BASE_IMAGE",
+            "MINIO_IMAGE",
+            "MINIO_MC_IMAGE",
         ):
             self.assertIn(variable, text)
         self.assertNotRegex(text, re.compile(r"image:\s+[^$\n]*:latest(?:\s|$)"))
@@ -250,6 +291,7 @@ class ComposeContracts(unittest.TestCase):
             "RUNTIME_DB_PASSWORD",
             "GITLAB_TOKEN",
             "TRIGGER_WEBHOOK_SECRET",
+            "MINIO_ROOT_PASSWORD",
         ):
             self.assertRegex(text, rf"(?m)^{key}=\s*$")
         self.assertNotIn("PRIVATE-TOKEN:", text)
