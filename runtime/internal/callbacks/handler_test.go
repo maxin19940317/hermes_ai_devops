@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -44,6 +45,25 @@ func newEnv(t *testing.T) (*store.MemStore, *fakeSignaler, *httptest.Server) {
 	srv := httptest.NewServer(h.Mux())
 	t.Cleanup(srv.Close)
 	return s, sig, srv
+}
+
+func TestHealthz(t *testing.T) {
+	_, _, srv := newEnv(t)
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "ok" {
+		t.Errorf("body = %q, want %q", body, "ok")
+	}
 }
 
 func post(t *testing.T, url string, body any) *http.Response {

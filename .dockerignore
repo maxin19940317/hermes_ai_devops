@@ -1,0 +1,9 @@
+.git
+.worktrees
+.venv
+__pycache__
+.pytest_cache
+agent-runs
+deploy/.env
+deploy/images.lock.env
+docs
