@@ -42,8 +42,8 @@
 |---|---|---|
 | Workflow Runtime | **Temporal 自托管** + 自研 Worker | Workflow/Activity 用 Go SDK |
 | 服务端语言 | Go(Runtime Worker、Trigger 服务、API) | |
-| Hermes | **Anthropic API + 自研轻量 Agent 循环** | 不用重型 Agent 框架;工具白名单 + JSON Schema 输出校验 |
-| LLM 模型 | Sonnet(Planner/Analyzer),Haiku(路由/摘要) | prompt 版本化,进 Git |
+| Hermes | **复用现有 hermes-agent 平台**(q-uat 上 nousresearch/hermes-agent) | 2026-07-21 决策变更:不自研 Agent 循环;§3 硬性边界不变,工具白名单 + JSON Schema 输出校验仍必须落地 |
+| LLM 模型 | 由 hermes-agent 平台配置(原 Sonnet/Haiku 分工不再适用) | prompt 版本化,进 Git |
 | Client Agent | **Go**,Windows Service(kardianos/service) | 单二进制分发 |
 | 服务器↔Client 通信 | **REST + JSON over HTTPS + mTLS** | 不用 gRPC(留给后期日志流) |
 | 数据库 | PostgreSQL 15+(与 Temporal 共实例分库) | Client 本地用 SQLite(WAL) |
@@ -277,6 +277,12 @@ Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, star
 **Phase 1 DoD**:push 一次代码 → 15 分钟内飞书收到含 verdict 与日志链接的通知;三项故障注入(拔 USB / 杀 Agent 进程 / 重启 Runtime)均收敛到正确终态,零重复执行。
 
 ### Phase 2 — Hermes 接入
+
+> 2026-07-21 决策变更:Hermes 层**复用 q-uat 现有 hermes-agent 服务**(见 §4),不再自研
+> Agent 循环。Phase 2 设计需先明确:专用实例还是复用现有实例(albinsu/eason/rocklin
+> 为个人实例,宜另起专用实例)、工具白名单与 Schema 输出校验在该平台上的落地方式。
+> §3 硬性边界(Hermes 只经 Runtime、结构化输入、不在执行关键路径)不因复用而放宽。
+
 Evidence Extractor 完整化(签名匹配 + 匹配处 ±50 行上下文 + junit 失败 + 指标差值 → evidence.json,几十 KB 级);Analyzer(LLM 分析 evidence → 结构化结论 → decisions 落库;Hermes 超时/不可用 → 规则引擎保底);飞书交互卡片(重试/忽略/隔离按钮 → Runtime signal);Planner v1(自然语言 → Plan DSL,服务端 Schema 校验不过打回重试 ≤3 次)。
 **严禁把原始日志全量灌入 LLM;Hermes 按需通过 `fetch_log_range(attachment, start, end)` 工具取片段。**
 
