@@ -10,6 +10,11 @@ Webhook Secret Token. Worker callbacks bind to localhost because the callback ha
 not yet enforce the mTLS declared by the OpenAPI contract. Do not expose port 18091 until
 HTTPS/mTLS or a test-subnet firewall rule is in place.
 
+`CALLBACK_BASE_URL` defaults to `http://127.0.0.1:18091`, which is only valid while no
+Client Agent exists: the Runtime hands this URL to Clients as `callback_base_url`, and a
+real Client would POST callbacks to itself. When a Windows Client joins, set it to the
+server LAN address in `deploy/.env` — only after the exposure conditions above are met.
+
 ## Configure
 
 ```bash
@@ -19,6 +24,11 @@ chmod 0600 deploy/.env
 deploy/scripts/lock-images.sh deploy/.env deploy/images.lock.env
 deploy/scripts/validate-env.sh deploy/.env deploy/images.lock.env
 ```
+
+Note: `deploy/postgres/init/10-runtime-db.sh` runs only on the first initialization of the
+`hermes-runtime-postgres` volume. Changing `RUNTIME_DB_PASSWORD` afterwards does not update
+the existing role; rotate it manually with `ALTER ROLE hermes_runtime PASSWORD ...` via
+`docker compose exec postgres psql`, or recreate the volume if no state is worth keeping.
 
 ## Start
 

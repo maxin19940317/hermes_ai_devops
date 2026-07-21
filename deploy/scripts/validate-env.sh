@@ -24,9 +24,14 @@ for key in POSTGRES_IMAGE TEMPORAL_IMAGE TEMPORAL_UI_IMAGE GO_IMAGE RUNTIME_BASE
   esac
 done
 
-if ss -ltnH "sport = :${TRIGGER_HOST_PORT:-18090}" | grep -q .; then
-  echo "ERROR: trigger host port ${TRIGGER_HOST_PORT:-18090} is occupied" >&2
-  exit 1
-fi
+for spec in "TRIGGER_HOST_PORT 18090" "WORKER_CALLBACKS_HOST_PORT 18091" "TEMPORAL_UI_HOST_PORT 18080"; do
+  var=${spec% *}
+  def=${spec#* }
+  eval "port=\${$var:-$def}"
+  if ss -ltnH "sport = :$port" | grep -q .; then
+    echo "ERROR: $var port $port is occupied" >&2
+    exit 1
+  fi
+done
 
 echo "Deployment environment is valid"

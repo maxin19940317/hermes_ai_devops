@@ -202,6 +202,34 @@ class ComposeContracts(unittest.TestCase):
         self.assertNotIn("network_mode: host", text)
         self.assertNotIn("container_name:", text)
 
+    def test_compose_never_publishes_internal_ports(self):
+        text = COMPOSE.read_text(encoding="utf-8")
+        # PostgreSQL and Temporal gRPC must stay inside the Compose network.
+        self.assertNotIn("5432:5432", text)
+        self.assertNotIn("7233:7233", text)
+        # Every published port mapping for worker callbacks and Temporal UI
+        # must bind localhost; adding a 0.0.0.0 mapping alongside the pinned
+        # 127.0.0.1 one must fail this contract.
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- ") and (
+                ":8091" in stripped or ":8080" in stripped
+            ):
+                self.assertIn("127.0.0.1:", stripped, stripped)
+
+    def test_compose_health_chain_and_in_container_probes(self):
+        text = COMPOSE.read_text(encoding="utf-8")
+        # postgres → temporal → trigger → worker, plus temporal-ui → temporal.
+        self.assertGreaterEqual(text.count("condition: service_healthy"), 4)
+        for probe in (
+            "pg_isready",
+            "tctl --address 127.0.0.1:7233 cluster health",
+            "wget, -qO-, http://127.0.0.1:8090/healthz",
+            "wget, -qO-, http://127.0.0.1:8091/healthz",
+        ):
+            self.assertIn(probe, text)
+        self.assertNotIn("sleep ", text)
+
     def test_compose_requires_locked_third_party_images(self):
         text = COMPOSE.read_text(encoding="utf-8")
         for variable in (
