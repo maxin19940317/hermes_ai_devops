@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-devops/contracts/result.schema.json",
+  "title": "result.json v1",
+  "description": "测试脚本在设备上产出、Client 补全并经 /callbacks/v1/results 回传的终态结果。与 Plan/Manifest 不同,本契约对未知字段宽容(允许 additionalProperties):测试套件可能携带额外信息,消费方(Runtime)按已知字段消费即可;已知字段类型仍严格校验。",
+  "type": "object",
+  "required": ["result_version", "task_id", "attempt", "status", "exit_code", "duration_sec", "cases"],
+  "properties": {
+    "result_version": { "const": 1 },
+    "task_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "status": {
+      "description": "Client 侧终态(status 生命周期的终态子集,§9);verdict 由 Runtime 判定,不在本契约中",
+      "enum": ["COMPLETED", "FAILED", "TIMEOUT", "CANCELED"]
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "被 kill(超时/取消)时为负值(-signal)或 -1"
+    },
+    "duration_sec": { "type": "number", "minimum": 0 },
+    "cases": {
+      "type": "object",
+      "required": ["total", "passed", "failed", "skipped"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "message": { "type": "string" }
+            }
+          },
+          "default": []
+        }
+      }
+    },
+    "signatures_hit": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+      "default": [],
+      "description": "命中的 Manifest failure_signatures[].id"
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "type": "number" },
+      "description": "指标名 → 数值;入 metrics 表作性能基线"
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "serial": { "type": "string" },
+        "soc": { "type": "string" },
+        "android": { "type": "string" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "properties": {
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "pipeline_id": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "attachments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "object_key", "sha256", "size"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "object_key": {
+            "type": "string",
+            "minLength": 1,
+            "description": "MinIO 对象键;附件已由 Client 预签名直传,不经 Runtime 中转"
+          },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "size": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "default": []
+    }
+  }
+}
