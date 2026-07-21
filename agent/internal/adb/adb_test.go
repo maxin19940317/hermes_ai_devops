@@ -20,6 +20,7 @@ func TestBuildersAlwaysPinSerial(t *testing.T) {
 		ShellPkill(serial, "run.sh"),
 		LogcatClear(serial),
 		LogcatDump(serial),
+		LogcatTail(serial, 100),
 		ShellListGlob(serial, "/data/local/tmp/x", "results/*.json"),
 		ShellRunEntry(serial, "/d", nil, "./run.sh", nil),
 	}
@@ -54,6 +55,8 @@ func TestBuilderArgv(t *testing.T) {
 			[]string{"-s", serial, "shell", "pkill -f 'run.sh'"}},
 		{"logcat-c", LogcatClear(serial), []string{"-s", serial, "logcat", "-c"}},
 		{"logcat-d", LogcatDump(serial), []string{"-s", serial, "logcat", "-d"}},
+		{"logcat-tail", LogcatTail(serial, 200), []string{"-s", serial, "logcat", "-d", "-t", "200"}},
+		{"devices", Devices(), []string{"devices", "-l"}},
 		{"ls-glob", ShellListGlob(serial, "/data/local/tmp/x", "results/*.json"),
 			[]string{"-s", serial, "shell", "cd '/data/local/tmp/x' && ls -1d results/*.json"}},
 	}
@@ -82,6 +85,56 @@ func TestQuoteNeutralizesSingleQuotes(t *testing.T) {
 	want := `'a'\''; rm -rf / #'`
 	if got != want {
 		t.Errorf("Quote = %s, want %s", got, want)
+	}
+}
+
+// lines 按契约(client-agent-api openapi)钳制到 1..1000。
+func TestLogcatTailClampsLines(t *testing.T) {
+	tests := []struct {
+		lines int
+		want  string
+	}{
+		{0, "1"},
+		{-5, "1"},
+		{1, "1"},
+		{42, "42"},
+		{1000, "1000"},
+		{5000, "1000"},
+	}
+	for _, tt := range tests {
+		got := LogcatTail(serial, tt.lines)
+		want := []string{"-s", serial, "logcat", "-d", "-t", tt.want}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("LogcatTail(%d):\n got %q\nwant %q", tt.lines, got, want)
+		}
+	}
+}
+
+func TestParseDevices(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		want []string
+	}{
+		{"空输出", "", []string{}},
+		{"仅表头", "List of devices attached\n", []string{}},
+		{"单个在线设备", "List of devices attached\nR5CT10XXXXX\tdevice usb:1-1 product:trinket model:QCM6125 device:trinket\n",
+			[]string{"R5CT10XXXXX"}},
+		{"多设备混合状态", `List of devices attached
+R5CT10XXXXX	device usb:1-1 product:trinket model:QCM6125 device:trinket
+emulator-5554	device product:sdk model:emu device:generic
+ABCDEF	unauthorized usb:1-2
+GHIJKL	offline
+?	device usb:1-3
+
+`, []string{"R5CT10XXXXX", "emulator-5554"}},
+		{"全部不可用", "List of devices attached\nABC\toffline\nDEF\tunauthorized\n", []string{}},
+	}
+	for _, tt := range tests {
+		got := ParseDevices(tt.out)
+		if !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("%s: ParseDevices = %q, want %q", tt.name, got, tt.want)
+		}
 	}
 }
 
