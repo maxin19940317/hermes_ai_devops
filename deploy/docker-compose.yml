@@ -53,7 +53,8 @@ services:
       DBNAME: temporal
       VISIBILITY_DBNAME: temporal_visibility
     healthcheck:
-      test: [CMD-SHELL, "tctl --address 127.0.0.1:7233 cluster health >/dev/null 2>&1"]
+      # auto-setup binds the frontend to the container IP, not 127.0.0.1.
+      test: [CMD-SHELL, "tctl --address \"$$(hostname -i):7233\" cluster health >/dev/null 2>&1"]
       interval: 5s
       timeout: 5s
       retries: 60

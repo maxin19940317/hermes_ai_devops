@@ -223,7 +223,8 @@ class ComposeContracts(unittest.TestCase):
         self.assertGreaterEqual(text.count("condition: service_healthy"), 4)
         for probe in (
             "pg_isready",
-            "tctl --address 127.0.0.1:7233 cluster health",
+            # auto-setup binds the frontend to the container IP, not 127.0.0.1.
+            'tctl --address \\"$$(hostname -i):7233\\" cluster health',
             "wget, -qO-, http://127.0.0.1:8090/healthz",
             "wget, -qO-, http://127.0.0.1:8091/healthz",
         ):
