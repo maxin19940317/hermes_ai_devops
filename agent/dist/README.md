@@ -1,17 +1,65 @@
-# agent-cli 分发包使用说明
+# agent 分发包使用说明
 
 本目录用于在原生 Windows 客户端通过 USB/ADB 执行 Android 开发板测试。
-首次使用请先完成“ADB 5137 准备”，再运行 Smoke Test。
+首次使用请先完成“ADB 5137 准备”。
 
 ## 目录内容
 
 | 文件 | 用途 |
 |---|---|
-| `agent-cli.exe` | Windows x86-64 CLI，实机测试使用此文件 |
+| `agent.exe` | Windows x86-64 **服务模式** Agent（Phase 1.7，接 Runtime 派单） |
+| `agent-cli.exe` | Windows x86-64 CLI，手动实机测试使用 |
 | `agent-cli` | Linux x86-64 CLI，仅用于 Linux 本地验证 |
 | `smoke-pkg-ok.tar.gz` | 正常完成场景，CLI 预期退出码 0 |
 | `smoke-pkg-fail.tar.gz` | 测试脚本主动失败，CLI 预期退出码 2 |
 | `smoke-pkg-timeout.tar.gz` | 测试超时场景，CLI 预期退出码 3 |
+
+## 服务模式（agent.exe，接入 Runtime 全链路）
+
+完成“1. 准备私有 ADB Server（5137）”后，先**前台模式**验证，再考虑服务安装。
+
+### 配置（环境变量）
+
+```powershell
+$env:AGENT_CLIENT_ID            = "windows-client-01"
+$env:AGENT_RUNTIME_CALLBACK_URL = "http://10.88.118.251:18091"   # q-uat Worker 回调
+$env:AGENT_BASE_URL             = "http://<本机LAN-IP>:8480"      # Runtime 派单回连地址
+$env:AGENT_ADB_PATH             = $adb                            # 见上文变量
+# 可选: AGENT_LISTEN_ADDR(:8480) AGENT_VERSION AGENT_RUNS_ROOT AGENT_DB_PATH AGENT_HEARTBEAT_INTERVAL(10s)
+```
+
+### 前台运行与自检
+
+```powershell
+.\agent.exe run
+```
+
+另开一个 PowerShell：
+
+```powershell
+curl.exe http://127.0.0.1:8480/healthz
+# 期望: {"status":"ok","agent_version":"dev","adb_server_port":5137}
+curl.exe http://127.0.0.1:8480/api/v1/devices
+# 期望: 返回开发板 [{serial, state:"IDLE", props:{...}, workdir_free_mb}]
+```
+
+服务端核对（q-uat）：`docker logs hermes-runtime-worker-1` 应每 10s 出现心跳登记；
+`devices` 表出现该开发板。
+
+### 安装为 Windows 服务（验证通过后，管理员 PowerShell）
+
+```powershell
+.\agent.exe install
+.\agent.exe start
+# 停止/卸载: .\agent.exe stop ; .\agent.exe uninstall
+```
+
+服务模式的环境变量需在安装前写入**系统**环境变量（setx /M），或先在当前会话设置再 install
+（kardianos 会继承安装时环境）。
+
+## agent-cli 手动模式（保留，用于排障）
+
+首次使用请先完成“ADB 5137 准备”，再运行 Smoke Test。
 
 ## 前置条件
 
