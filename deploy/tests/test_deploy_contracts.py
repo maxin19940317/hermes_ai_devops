@@ -1,3 +1,4 @@
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -7,6 +8,11 @@ ROOT = Path(__file__).resolve().parents[2]
 GITIGNORE = ROOT / ".gitignore"
 DOCKERFILE = ROOT / "runtime" / "Dockerfile"
 DOCKERIGNORE = ROOT / ".dockerignore"
+COMPOSE = ROOT / "deploy" / "docker-compose.yml"
+ENV_EXAMPLE = ROOT / "deploy" / ".env.example"
+INIT_DB = ROOT / "deploy" / "postgres" / "init" / "10-runtime-db.sh"
+LOCK_IMAGES = ROOT / "deploy" / "scripts" / "lock-images.sh"
+VALIDATE_ENV = ROOT / "deploy" / "scripts" / "validate-env.sh"
 
 
 class SecretExclusionContracts(unittest.TestCase):
@@ -167,6 +173,56 @@ class RuntimeImageContracts(unittest.TestCase):
             ],
             lines,
         )
+
+
+class ComposeContracts(unittest.TestCase):
+    def test_required_compose_files_exist(self):
+        for path in (COMPOSE, ENV_EXAMPLE, INIT_DB, LOCK_IMAGES, VALIDATE_ENV):
+            self.assertTrue(path.is_file(), path)
+
+    def test_compose_isolated_services_and_ports(self):
+        text = COMPOSE.read_text(encoding="utf-8")
+        for service in ("postgres:", "temporal:", "temporal-ui:", "trigger:", "worker:"):
+            self.assertIn(service, text)
+        self.assertIn(
+            '${TRIGGER_BIND_IP:-0.0.0.0}:${TRIGGER_HOST_PORT:-18090}:8090',
+            text,
+        )
+        self.assertIn(
+            '127.0.0.1:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091',
+            text,
+        )
+        self.assertIn(
+            '127.0.0.1:${TEMPORAL_UI_HOST_PORT:-18080}:8080',
+            text,
+        )
+        self.assertIn("TEMPORAL_ADDRESS: temporal:7233", text)
+        self.assertIn("TEMPORAL_TASK_QUEUE: device-test", text)
+        self.assertNotIn("network_mode: host", text)
+        self.assertNotIn("container_name:", text)
+
+    def test_compose_requires_locked_third_party_images(self):
+        text = COMPOSE.read_text(encoding="utf-8")
+        for variable in (
+            "POSTGRES_IMAGE",
+            "TEMPORAL_IMAGE",
+            "TEMPORAL_UI_IMAGE",
+            "GO_IMAGE",
+            "RUNTIME_BASE_IMAGE",
+        ):
+            self.assertIn(variable, text)
+        self.assertNotRegex(text, re.compile(r"image:\s+[^$\n]*:latest(?:\s|$)"))
+
+    def test_example_contains_no_real_secret(self):
+        text = ENV_EXAMPLE.read_text(encoding="utf-8")
+        for key in (
+            "POSTGRES_ADMIN_PASSWORD",
+            "RUNTIME_DB_PASSWORD",
+            "GITLAB_TOKEN",
+            "TRIGGER_WEBHOOK_SECRET",
+        ):
+            self.assertRegex(text, rf"(?m)^{key}=\s*$")
+        self.assertNotIn("PRIVATE-TOKEN:", text)
 
 
 if __name__ == "__main__":
