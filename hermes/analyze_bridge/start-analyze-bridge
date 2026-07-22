@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# start-analyze-bridge — 在专用 hermes-agent 实例内启动 analyze_bridge。
+# 形态与 /opt/data/bin/start-queinfer-gitlab-bridge 一致:env 文件 + pidfile +
+# nohup uvicorn,重复执行幂等(健康则直接返回)。
+set -euo pipefail
+ENV_FILE=/opt/data/analyze_bridge.env
+PID_FILE=/opt/data/logs/analyze-bridge-8643.pid
+LOG_FILE=/opt/data/logs/analyze-bridge-8643.log
+APP_DIR=/opt/data/bin
+APP_MODULE=analyze_bridge:app
+PORT=8643
+
+if [ ! -f "$ENV_FILE" ]; then
+  echo "missing $ENV_FILE (需要 ANALYZE_BRIDGE_TOKEN=...)" >&2
+  exit 2
+fi
+# shellcheck disable=SC1090
+set -a
+. "$ENV_FILE"
+set +a
+
+# hermes -z 从进程环境取 provider key(不读 /opt/data/.env);
+# 用 grep 提取而非 source,兼容 .env 中 shell 无法解析的行。
+if [ -z "${DEEPSEEK_API_KEY:-}" ] && [ -f /opt/data/.env ]; then
+  export DEEPSEEK_API_KEY
+  DEEPSEEK_API_KEY=$(grep '^DEEPSEEK_API_KEY=' /opt/data/.env | head -1 | cut -d= -f2-)
+fi
+
+mkdir -p /opt/data/logs
+if [ -f "$PID_FILE" ]; then
+  old_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  if [ -n "${old_pid:-}" ] && kill -0 "$old_pid" 2>/dev/null; then
+    if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+      echo "analyze bridge already running: $old_pid"
+      exit 0
+    fi
+    kill "$old_pid" 2>/dev/null || true
+    sleep 1
+  fi
+fi
+
+cd "$APP_DIR"
+nohup /opt/hermes/.venv/bin/uvicorn "$APP_MODULE" --host 0.0.0.0 --port "$PORT" \
+  >>"$LOG_FILE" 2>&1 &
+echo $! >"$PID_FILE"
+sleep 1
+curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
+echo "analyze bridge started: $(cat "$PID_FILE") (port $PORT)"

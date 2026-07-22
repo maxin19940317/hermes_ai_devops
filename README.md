@@ -35,6 +35,7 @@ contracts/   契约优先:plan/manifest/result/bundle JSON Schema + 两个 OpenA
 ci/          业务仓库(algo-super-sdk)CI 脚本:gen_manifest / write_meta / gen_bundle / variants.yaml
 agent/       Windows Client Agent(Go):agent-cli 先行,后套 RPC 壳
 runtime/     Temporal Worker + Trigger 服务 + REST API(Go)
+hermes/      hermes-agent 平台侧组件:analyze_bridge(Analyzer HTTP 适配层,Phase 2)
 docs/        设计 spec、实施 plan、SDK 打包适配评估
 ```
 
