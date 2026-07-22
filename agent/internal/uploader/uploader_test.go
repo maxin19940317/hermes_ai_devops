@@ -1,6 +1,7 @@
 package uploader
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -243,5 +244,39 @@ func TestUploadDeterministicOrder(t *testing.T) {
 				t.Fatalf("round %d: order[%d] = %s, want %s", i, j, atts[j].ObjectKey, k)
 			}
 		}
+	}
+}
+
+// 0 字节文件也必须显式发送 Content-Length: 0(Go 默认对空 body 改用
+// chunked,S3/MinIO 会回 411)。回归验收:p44-rerun4 stdout.log 0 字节上传失败。
+func TestUploadEmptyFileSendsContentLengthZero(t *testing.T) {
+	var gotLen string
+	var gotTE []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLen = r.Header.Get("Content-Length")
+		gotTE = r.TransferEncoding
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	empty := filepath.Join(t.TempDir(), "empty.log")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{Client: srv.Client()}
+	atts := u.Upload(context.Background(),
+		[]PresignedUpload{{ObjectKey: "runs/t/stdout.log", URL: srv.URL}},
+		map[string]string{"runs/t/stdout.log": empty})
+	if len(atts) != 1 {
+		t.Fatalf("attachments = %d, want 1", len(atts))
+	}
+	if gotLen != "0" {
+		t.Errorf("Content-Length = %q, want 0", gotLen)
+	}
+	if len(gotTE) != 0 {
+		t.Errorf("TransferEncoding = %v, want none", gotTE)
+	}
+	if atts[0].Size != 0 {
+		t.Errorf("size = %d, want 0", atts[0].Size)
 	}
 }

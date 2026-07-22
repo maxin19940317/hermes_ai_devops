@@ -30,7 +30,7 @@ type PresignedUpload struct {
 // Uploader 按 dispatch 载荷的 presigned_uploads[] 逐项 PUT 附件。
 // 预签名 URL 携带签名,严禁落日志——所有日志只记 object_key(§6)。
 type Uploader struct {
-	Client *http.Client                  // nil → http.DefaultClient
+	Client *http.Client                     // nil → http.DefaultClient
 	Logf   func(format string, args ...any) // nil → 静默
 
 	Timeout time.Duration // 单项上传超时;0 → DefaultUploadTimeout
@@ -133,6 +133,12 @@ func (u *Uploader) put(ctx context.Context, p PresignedUpload, path string, size
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.ContentLength = size
+	if size == 0 {
+		// Go 对"非 nil 但长度为 0 的 body"按未知长度处理,改用 chunked
+		// 编码;S3/MinIO 对 chunked PUT 一律 411。换成 NoBody 后客户端
+		// 显式发送 Content-Length: 0。
+		req.Body = http.NoBody
+	}
 
 	resp, err := u.client().Do(req)
 	if err != nil {
