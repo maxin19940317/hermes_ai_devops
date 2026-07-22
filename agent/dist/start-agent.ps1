@@ -47,4 +47,6 @@ try {
 
 Write-Host "`n==> 4/4 Start agent (foreground, Ctrl+C to stop; output tee'd to agent-console.log)" -ForegroundColor Cyan
 # PS 5.1 quirks: native stderr lines become ErrorRecords; ToString() flattens them.
-.\agent.exe run 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath agent-console.log
+# Resolve the exe relative to THIS script, not the caller's working directory.
+Set-Location $PSScriptRoot
+& "$PSScriptRoot\agent.exe" run 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath agent-console.log
