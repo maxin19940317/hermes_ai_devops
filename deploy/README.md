@@ -18,6 +18,19 @@ in `.env.example`): the Runtime hands this URL to Clients as `callback_base_url`
 Clients POST callbacks to it. Keep it aligned with the actual bind address in
 `deploy/.env`.
 
+## Networking
+
+The `hermes-runtime` bridge network uses an explicit subnet
+(`RUNTIME_SUBNET`, default `172.31.240.0/24`). Do not leave it to Docker's
+auto-assignment: an auto-assigned range once hijacked the host route for real
+`172.22.0.0/16` devices on the corporate network. If the pinned range ever
+conflicts, change `RUNTIME_SUBNET` in `deploy/.env` and recreate the stack
+(`down` then `up -d`; named volumes persist).
+
+Artifact downloads use `ARTIFACT_AUTH_TYPE=bearer` by default (a GitLab PAT in
+`ARTIFACT_AUTH_TOKEN`). `job_token` is only for CI job tokens; sending a PAT in a
+`JOB-TOKEN` header fails with 401.
+
 ## MinIO evidence uploads
 
 The `minio` service stores run evidence (result.json, junit.xml, logcat.txt,

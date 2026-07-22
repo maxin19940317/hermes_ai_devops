@@ -49,9 +49,13 @@ docs/        设计 spec、实施 plan、SDK 打包适配评估
 | 2. ci 四脚本 + 业务仓库 CI 改造 | ✅(SDK 适配门禁见 `docs/assessments/algo-super-sdk-packaging.md`) |
 | 3. agent-cli(下载→校验→部署→执行→收集) | ✅ Windows 实机已验证 |
 | 4. Temporal spike(signal/重试/杀进程重放) | ✅ 结论 GO |
-| 5. Trigger 服务(webhook → bundle → artifacts → workflow) | ✅ |
-| 6. DeviceTestWorkflow 主干 + 规则引擎 | 🚧 进行中 |
-| 7. agent 套 RPC 壳 + 回调 + MinIO 直传 + 服务化 | 待做 |
+| 5. Trigger 服务(webhook → bundle → artifacts → workflow) | ✅ q-uat 容器化部署 |
+| 6. DeviceTestWorkflow 主干 + 规则引擎 | ✅ |
+| 7. agent 套 RPC 壳 + 回调 + MinIO 直传 + 服务化 | ✅ |
+
+**Phase 1 DoD 已达成**(2026-07-22,workflow `device-test-aios/algo_super_sdk-g108e0d72-p46`):
+push → CI → webhook → 派单 → QCM6125 开发板实测 → SNPE 1.68 / SNPE 2.21 / TFLite 全部
+PASSED(exit 0,真实推理耗时)→ MinIO 附件直传 → 飞书通知,全程无人工干预、零重复执行。
 
 完整阶段规划(Phase 0–4)与 DoD 见 CLAUDE.md §12。
 
