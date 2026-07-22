@@ -41,6 +41,14 @@ powershell -ExecutionPolicy Bypass -File .\dist\start-agent.ps1
 # 或手动: agent.exe run | install | start | stop | uninstall (kardianos/service)
 ```
 
+运维注意:
+
+- **服务停止即中止进行中任务**:`stop`/Ctrl+C 不强杀设备进程,但 agent 进程退出后
+  任务无法继续;重启时恢复逻辑把非终态任务置 FAILED 并补报(Runtime 侧按
+  租约过期判 INFRA,会机械重试)。
+- 本地 SQLite(`AGENT_DB_PATH`)的 `dispatch_json` 含派单时的产物下载 token
+  (短期凭据,随任务过期);文件权限按 0600 管理,不要外发。
+
 ### 交叉编译
 
 ```bash

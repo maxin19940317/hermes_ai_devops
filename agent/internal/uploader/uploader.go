@@ -5,8 +5,10 @@ package uploader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -142,6 +144,12 @@ func (u *Uploader) put(ctx context.Context, p PresignedUpload, path string, size
 
 	resp, err := u.client().Do(req)
 	if err != nil {
+		// url.Error 的 Error() 内嵌完整请求 URL(含 X-Amz-Signature),
+		// 预签名 URL 永不落日志(设计 §6),解包后只带底层错误。
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return fmt.Errorf("put: %w", ue.Err)
+		}
 		return fmt.Errorf("put: %w", err)
 	}
 	defer resp.Body.Close()

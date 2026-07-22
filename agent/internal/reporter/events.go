@@ -60,6 +60,20 @@ func (r *EventReporter) OnTransition(taskID string, from, to executor.Status, de
 		return
 	}
 	ev.IdempotencyKey = key
+	// 乱序防线:本任务尚有未上报事件时不可即发——即发会越过补报
+	// 循环里的旧事件,Runtime 按 (task_id,seq) 去重但无单调守卫,
+	// 后到的小 seq 会把任务状态回退(典型场景:崩溃恢复时 FAILED
+	// 即发先于积压事件到达,状态从 FAILED 退回 RUNNING)。
+	// 有积压则留给 Run 的 (task_id,seq) 有序抽干。
+	pending, err := r.Store.UnreportedEvents(ctx)
+	if err == nil {
+		for _, e := range pending {
+			if e.TaskID == taskID && e.Seq < seq {
+				r.logf("event: %s seq=%d 存在更早未上报事件(seq=%d),留待有序补报", taskID, seq, e.Seq)
+				return
+			}
+		}
+	}
 	if err := r.Client.ReportEvent(ctx, ev); err != nil {
 		r.logf("event: %s seq=%d 即发失败,待后台补报: %v", taskID, seq, err)
 		return

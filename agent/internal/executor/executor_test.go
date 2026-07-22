@@ -483,3 +483,27 @@ func TestPrecheckSOCAlias(t *testing.T) {
 		t.Errorf("environment soc = %q, want QCM6125", sum.Environment["soc"])
 	}
 }
+
+// COLLECTING 期间到达的取消同样生效:终态 CANCELED、判据不满足、仍完成收集。
+func TestCancelDuringCollectingEndsCanceled(t *testing.T) {
+	f := &fakeADB{props: defaultProps(), dfAvailKB: 1 << 20}
+	e, _ := newExecutor(f)
+	e.OnTransition = func(to Status) {
+		if to == StatusCollecting {
+			e.Cancel()
+		}
+	}
+	sum, err := e.Execute(context.Background(), Options{PackagePath: buildPackage(t, 900), Serial: serial, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cancel 是客观结局,不应返回 error: %v", err)
+	}
+	if sum.Status != StatusCanceled {
+		t.Errorf("status = %v, want CANCELED", sum.Status)
+	}
+	if sum.SuccessCriteriaMet {
+		t.Error("取消后判据必须不满足")
+	}
+	if len(sum.Collected) == 0 {
+		t.Error("取消不应跳过收集")
+	}
+}

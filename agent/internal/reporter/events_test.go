@@ -183,3 +183,29 @@ func TestEventRetryLoopStopsOnCancel(t *testing.T) {
 		t.Fatal("Run 未在 ctx 取消后及时返回")
 	}
 }
+
+// 本任务存在更早未上报事件时不得即发(乱序会让 Runtime 状态回退);
+// 即发被抑制后,事件仍在 store 中由补报循环按序送达。
+func TestOnTransitionSuppressesImmediateSendWhenBacklogged(t *testing.T) {
+	f, srv := newFakeRuntime(t)
+	s := openTempStore(t)
+	seedTask(t, s, "t1", "wf1:t1:a1", "SERIAL1")
+	ctx := context.Background()
+	// 制造积压:seq1 标记未上报
+	if _, err := s.Transition(ctx, "t1", store.StateQueued, store.StateAccepted, ""); err != nil {
+		t.Fatal(err)
+	}
+	r := &EventReporter{Store: s, Client: &Client{BaseURL: srv.URL}, Logf: func(string, ...any) {}}
+	r.OnTransition("t1", executor.Status("ACCEPTED"), executor.StatusPreparing, "")
+	// 此时不应有任何即发(积压存在)
+	_, events, _ := f.snapshot()
+	if len(events) != 0 {
+		t.Fatalf("存在积压时不应即发, got %d events", len(events))
+	}
+	// 补报循环抽干后应按序到达 seq1,seq2
+	r.drain(ctx)
+	_, events, _ = f.snapshot()
+	if len(events) != 2 || events[0]["seq"].(float64) != 1 || events[1]["seq"].(float64) != 2 {
+		t.Fatalf("补报应按序到达 seq1,seq2, got %+v", events)
+	}
+}

@@ -224,6 +224,13 @@ func (e *Executor) Execute(ctx context.Context, opts Options) (*Summary, error) 
 	// ---- 设备清理(keep_on_failure 语义;取消同其他异常结局) ----
 	e.cleanupDevice(ctx, opts.Serial, m, opts.KeepWorkdirOverride, canceled || timedOut || !sum.SuccessCriteriaMet)
 
+	// 收集/清理期间到达的取消同样生效:设备进程已自然结束(无需 kill),
+	// 终态记 CANCELED,判据置不满足。
+	canceled = canceled || e.isCancelRequested()
+	if canceled {
+		sum.SuccessCriteriaMet = false
+	}
+
 	final := StatusCompleted
 	switch {
 	case canceled:

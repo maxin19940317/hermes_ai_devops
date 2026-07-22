@@ -280,3 +280,29 @@ func TestUploadEmptyFileSendsContentLengthZero(t *testing.T) {
 		t.Errorf("size = %d, want 0", atts[0].Size)
 	}
 }
+
+// 网络错误不得把含签名的预签名 URL 写进错误文本(设计 §6:URL 永不落日志)。
+func TestUploadNetworkErrorDoesNotLeakURL(t *testing.T) {
+	// 不可达地址:*url.Error 默认会内嵌完整 URL(含 X-Amz-Signature)
+	signed := "http://127.0.0.1:1/bucket/k?X-Amz-Signature=deadbeef&X-Amz-Credential=secret"
+	f := filepath.Join(t.TempDir(), "a.log")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{Client: &http.Client{Timeout: time.Second}}
+	atts := u.Upload(context.Background(),
+		[]PresignedUpload{{ObjectKey: "runs/t/a.log", URL: signed}},
+		map[string]string{"runs/t/a.log": f})
+	if len(atts) != 0 {
+		t.Fatalf("预期上传失败, got %+v", atts)
+	}
+	// 失败路径只许出现 object_key,不许出现 URL 任何片段;
+	// 直接调用 put 断言错误文本
+	err := u.put(context.Background(), PresignedUpload{ObjectKey: "k", URL: signed}, f, 1)
+	if err == nil {
+		t.Fatal("预期错误")
+	}
+	if strings.Contains(err.Error(), "X-Amz-Signature") || strings.Contains(err.Error(), "deadbeef") {
+		t.Errorf("错误文本泄露签名 URL: %v", err)
+	}
+}

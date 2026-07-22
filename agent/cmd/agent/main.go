@@ -246,7 +246,15 @@ func (p *program) Start(service.Service) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.done = make(chan error, 1)
-	go func() { p.done <- runAgent(ctx, p.cfg) }()
+	go func() {
+		err := runAgent(ctx, p.cfg)
+		if err != nil {
+			// kardianos 只在 Stop 时读 p.done 且不输出;致命错误
+			// (DB 打不开/端口被占/监听失败)必须此刻可见。
+			logf("fatal: %v", err)
+		}
+		p.done <- err
+	}()
 	return nil
 }
 
