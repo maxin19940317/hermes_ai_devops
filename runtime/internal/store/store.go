@@ -33,13 +33,14 @@ type ArtifactStore interface {
 
 // MemStore 是进程内实现,供单测与无数据库的开发模式使用。
 type MemStore struct {
-	mu      sync.Mutex
-	rows    map[string]Artifact
-	clients map[string]Client
-	devices map[string]*deviceRow
-	tasks   map[string]*taskRecord
-	events  map[string]TaskEvent
-	results map[string]wf.ResultRecord
+	mu        sync.Mutex
+	rows      map[string]Artifact
+	clients   map[string]Client
+	devices   map[string]*deviceRow
+	tasks     map[string]*taskRecord
+	events    map[string]TaskEvent
+	results   map[string]wf.ResultRecord
+	decisions []wf.DecisionRow
 }
 
 func NewMemStore() *MemStore {

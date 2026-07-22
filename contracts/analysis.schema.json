@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-devops/contracts/analysis.schema.json",
+  "title": "analysis.json v1",
+  "description": "Analyzer(hermes-agent 平台 LLM)对 evidence.json 的结构化分析输出(CLAUDE.md §12 Phase 2)。verdict 判定权始终在确定性规则引擎(§9),本输出只补充解释与建议,落 decisions 表(actor=hermes)供回放与通知;校验不过即视为 Analyzer 失败,回退规则引擎。字段闭合(additionalProperties=false):prompt 要求模型严格按本契约输出。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["analysis_version", "summary", "suggested_category", "confidence", "disagrees_with_rule"],
+  "properties": {
+    "analysis_version": { "const": 1 },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "一句话结论,直接进入飞书通知"
+    },
+    "root_cause": {
+      "type": "string",
+      "maxLength": 2000,
+      "default": "",
+      "description": "根因分析(基于证据,禁止臆测;证据不足时明说)"
+    },
+    "suggested_category": {
+      "description": "建议的错误分类(§9 枚举);与规则引擎判定不一致时置 disagrees_with_rule=true,verdict 仍以规则为准",
+      "enum": ["INFRA", "BUILD", "CODE", "MODEL", "DELEGATE", "DEVICE", "PERF", "UNKNOWN"]
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "next_actions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 200 },
+      "maxItems": 5,
+      "default": [],
+      "description": "建议的下一步(人工排查方向);Analyzer 不能自行改变执行策略(§3 规则 6)"
+    },
+    "disagrees_with_rule": {
+      "type": "boolean",
+      "description": "suggested_category 与规则引擎判定是否不一致(由 Runtime 侧核对,模型按自评填写)"
+    }
+  }
+}

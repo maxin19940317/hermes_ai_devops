@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -23,6 +25,8 @@ type fullStore interface {
 	FinishTask(ctx context.Context, req wf.FinishRequest) error
 	AppendTaskEvent(ctx context.Context, ev TaskEvent) (bool, error)
 	SaveResult(ctx context.Context, rec wf.ResultRecord) (bool, error)
+	SaveDecision(ctx context.Context, row wf.DecisionRow) error
+	ListDecisions(ctx context.Context, taskID string) ([]wf.DecisionRow, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -263,6 +267,55 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		ins, err = s.SaveResult(ctx, rec) // 回调重发
 		if err != nil || ins {
 			t.Fatalf("重复结果应去重: ins=%v err=%v", ins, err)
+		}
+	})
+
+	t.Run("DecisionsRoundTripInOrder", func(t *testing.T) {
+		s := newStore(t)
+		_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w:t1:a1", IdempotencyKey: "w:t1:a1"})
+		rule := wf.DecisionRow{TaskID: "w:t1:a1", Actor: "rule",
+			Output: json.RawMessage(`{"verdict":"PASS","rule":"exit_code"}`)}
+		llm := wf.DecisionRow{TaskID: "w:t1:a1", Actor: "hermes",
+			InputDigest: "sha256:abc123", Model: "kimi-for-coding", PromptVersion: "analyzer-v3",
+			Output: json.RawMessage(`{"category":"PRODUCT","confidence":0.9}`)}
+		if err := s.SaveDecision(ctx, rule); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SaveDecision(ctx, llm); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.ListDecisions(ctx, "w:t1:a1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("decisions = %d, want 2", len(got))
+		}
+		if got[0].Actor != "rule" || got[1].Actor != "hermes" {
+			t.Errorf("顺序应为 rule → hermes: %+v", got)
+		}
+		// JSONB 回读会做规范化(key 排序/空白),output 按语义比较而非字节比较
+		assertJSONEqual := func(want json.RawMessage, got json.RawMessage) {
+			t.Helper()
+			var w, g any
+			if err := json.Unmarshal(want, &w); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(got, &g); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(w, g) {
+				t.Errorf("output = %s, want %s(语义)", got, want)
+			}
+		}
+		assertJSONEqual(rule.Output, got[0].Output)
+		if got[1].InputDigest != "sha256:abc123" || got[1].Model != "kimi-for-coding" ||
+			got[1].PromptVersion != "analyzer-v3" {
+			t.Errorf("hermes decision 字段不完整: %+v", got[1])
+		}
+		assertJSONEqual(llm.Output, got[1].Output)
+		if none, err := s.ListDecisions(ctx, "no-such"); err != nil || len(none) != 0 {
+			t.Errorf("未知任务应返回空: %v %v", none, err)
 		}
 	})
 }

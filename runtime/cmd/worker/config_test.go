@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func lookup(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
@@ -41,6 +44,13 @@ func TestLoadConfigAppliesDefaults(t *testing.T) {
 	}
 	if cfg.Activity.FeishuWebhookURL != "" {
 		t.Errorf("FeishuWebhookURL = %q, want empty(未配置飞书时静默,§notify.go)", cfg.Activity.FeishuWebhookURL)
+	}
+	// §12 Phase 2:HERMES_ENDPOINT 缺省为空 → Analyzer 禁用,规则引擎保底
+	if cfg.Activity.HermesEndpoint != "" {
+		t.Errorf("HermesEndpoint = %q, want empty(禁用 Analyzer)", cfg.Activity.HermesEndpoint)
+	}
+	if cfg.Activity.HermesTimeout != 60*time.Second {
+		t.Errorf("HermesTimeout = %v, want 60s", cfg.Activity.HermesTimeout)
 	}
 	if cfg.SpecDefaults.MaxInfraRetries != 2 || cfg.SpecDefaults.LeaseSeconds != 120 ||
 		cfg.SpecDefaults.HardTimeoutMargin != 1200 || cfg.SpecDefaults.DeviceWaitRounds != 20 ||

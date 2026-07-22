@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 
+	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/rules"
 )
 
@@ -30,6 +32,11 @@ type fakeActs struct {
 	finished      []FinishRequest
 	released      []ReleaseRequest
 	notifications []string
+
+	analysis      *hermesclient.Analysis // 非 nil 模拟 Analyzer 已启用
+	evidenceCalls []ExtractEvidenceRequest
+	analyzeCalls  []AnalyzeRequest
+	decisions     []DecisionRow
 }
 
 var defaultLease = &Lease{DeviceID: "dev1", Serial: "513cd3de", ClientID: "c1", ClientBaseURL: "https://client:8443"}
@@ -87,6 +94,27 @@ func (f *fakeActs) Notify(_ context.Context, msg string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.notifications = append(f.notifications, msg)
+	return nil
+}
+func (f *fakeActs) ExtractEvidence(_ context.Context, r ExtractEvidenceRequest) (*ExtractEvidenceResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.evidenceCalls = append(f.evidenceCalls, r)
+	return &ExtractEvidenceResponse{
+		EvidenceJSON: json.RawMessage(`{"evidence_version":1}`),
+		Digest:       "deadbeef",
+	}, nil
+}
+func (f *fakeActs) Analyze(_ context.Context, r AnalyzeRequest) (*hermesclient.Analysis, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.analyzeCalls = append(f.analyzeCalls, r)
+	return f.analysis, nil // nil = Analyzer 未启用(§12 降级)
+}
+func (f *fakeActs) SaveDecision(_ context.Context, d DecisionRow) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.decisions = append(f.decisions, d)
 	return nil
 }
 
@@ -161,6 +189,14 @@ func TestHappyPathPassed(t *testing.T) {
 		!strings.Contains(f.notifications[0], "PASSED") ||
 		!strings.Contains(f.notifications[0], "runs/x/logcat.txt") {
 		t.Errorf("notification = %q(需含 verdict 与日志对象键)", f.notifications)
+	}
+	// §11:PASSED 落规则裁决;不触发证据提取/分析(Phase 2 只对非 PASSED)
+	if len(f.decisions) != 1 || f.decisions[0].Actor != "rule" {
+		t.Errorf("decisions = %+v, want 单条 rule 裁决", f.decisions)
+	}
+	if len(f.evidenceCalls) != 0 || len(f.analyzeCalls) != 0 {
+		t.Errorf("PASSED 不应触发证据提取/分析: evidence=%d analyze=%d",
+			len(f.evidenceCalls), len(f.analyzeCalls))
 	}
 }
 
@@ -237,6 +273,53 @@ func TestSignatureHitNoRetry(t *testing.T) {
 	}
 	if len(f.released) != 1 || f.released[0].InfraFail {
 		t.Errorf("MODEL 失败不计设备 fail_streak: %+v", f.released)
+	}
+	// Phase 2:非 PASSED 触发证据提取;Analyzer 未启用(fake 返回 nil)时只落规则裁决
+	if len(f.evidenceCalls) != 1 || len(f.analyzeCalls) != 1 {
+		t.Errorf("非 PASSED 应提取证据并尝试分析: evidence=%d analyze=%d",
+			len(f.evidenceCalls), len(f.analyzeCalls))
+	}
+	if len(f.decisions) != 1 || f.decisions[0].Actor != "rule" {
+		t.Errorf("Analyzer 未启用应只落规则裁决: %+v", f.decisions)
+	}
+}
+
+// TestAnalysisSavedOnFailure 验证 Phase 2 接线:非 PASSED → 提取证据 →
+// Analyzer 分析 → 规则与 hermes 两条裁决都落 decisions 表(§11 可回放)。
+func TestAnalysisSavedOnFailure(t *testing.T) {
+	f := &fakeActs{
+		specs: []TestSpec{spec1()},
+		analysis: &hermesclient.Analysis{
+			AnalysisVersion: 1, Summary: "delegate fell back to CPU",
+			SuggestedCategory: "MODEL", Confidence: 0.9,
+		},
+	}
+	env := newEnv(t, f)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, TaskResultSignal{
+			TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 0,
+			SignaturesHit: []string{"cpu_fallback"},
+		})
+	}, 10*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow err: %v", env.GetWorkflowError())
+	}
+	if len(f.analyzeCalls) != 1 || f.analyzeCalls[0].RuleCategory != "MODEL" {
+		t.Fatalf("analyzeCalls = %+v, want 1 次且带规则类别 MODEL", f.analyzeCalls)
+	}
+	if len(f.decisions) != 2 {
+		t.Fatalf("decisions = %+v, want rule + hermes 两条", f.decisions)
+	}
+	rule, herm := f.decisions[0], f.decisions[1]
+	if rule.Actor != "rule" || !strings.Contains(string(rule.Output), "TEST_FAILED") {
+		t.Errorf("rule 裁决 = %+v", rule)
+	}
+	if herm.Actor != "hermes" || herm.InputDigest != "deadbeef" ||
+		herm.PromptVersion != hermesclient.PromptVersion ||
+		!strings.Contains(string(herm.Output), "delegate fell back to CPU") {
+		t.Errorf("hermes 裁决 = %+v(需带 evidence 摘要/prompt 版本/分析本体)", herm)
 	}
 }
 

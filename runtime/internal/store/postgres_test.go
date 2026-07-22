@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
+
+	wf "hermes-devops/runtime/internal/workflow"
 )
 
 // 集成测试:需要真实 Postgres,由 TEST_DATABASE_URL 门控
@@ -44,5 +47,17 @@ func TestPGStoreRegisterIdempotent(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("rows = %d, want 2(重复登记不得产生新行)", n)
+	}
+}
+
+// decisions.task_id 有外键(§11):引用不存在的任务时 PG 必须报错。
+// MemStore 与其他写路径一致不做外键校验(放行),该差异与 AppendTaskEvent 相同,
+// 故只在本 PG 集成用例断言,不进 conformance 套件。
+func TestPGStoreDecisionRequiresExistingTask(t *testing.T) {
+	s := openTestPG(t)
+	err := s.SaveDecision(ctx, wf.DecisionRow{TaskID: "no-such-task", Actor: "rule",
+		Output: json.RawMessage(`{"verdict":"PASS"}`)})
+	if err == nil {
+		t.Fatal("引用不存在的 task_id 应报外键错误")
 	}
 }

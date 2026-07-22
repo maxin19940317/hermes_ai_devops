@@ -89,6 +89,10 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	hermesTimeoutSec, err := envInt("HERMES_TIMEOUT_SEC", 60)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		TemporalAddress:    env("TEMPORAL_ADDRESS", "127.0.0.1:7233"),
@@ -110,6 +114,11 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			MinIOSecretKey:      getenv("MINIO_SECRET_KEY"),
 			MinIOBucket:         env("MINIO_BUCKET", "hermes-evidence"),
 			MinIOPresignTTL:     presignTTL,
+			// §12 Phase 2:HERMES_ENDPOINT 空 → Analyzer 禁用,规则引擎保底。
+			HermesEndpoint:  getenv("HERMES_ENDPOINT"),
+			HermesAuthToken: getenv("HERMES_AUTH_TOKEN"),
+			HermesModel:     getenv("HERMES_MODEL"),
+			HermesTimeout:   time.Duration(hermesTimeoutSec) * time.Second,
 		},
 		SpecDefaults: activity.SpecDefaults{
 			MaxInfraRetries:   maxInfraRetries,

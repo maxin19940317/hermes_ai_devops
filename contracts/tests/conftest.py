@@ -32,7 +32,7 @@ def validators():
     from jsonschema import Draft202012Validator
 
     result = {}
-    for name in ("plan", "manifest", "result", "bundle"):
+    for name in ("plan", "manifest", "result", "bundle", "evidence", "analysis"):
         schema = load_schema(name)
         Draft202012Validator.check_schema(schema)  # schema 本身必须合法
         result[name] = Draft202012Validator(schema)

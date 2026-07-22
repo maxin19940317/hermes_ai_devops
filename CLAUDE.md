@@ -252,7 +252,7 @@ audit_log(actor, action, target, payload_digest, ts)
 
 Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, started_at, ...)` + `events(seq, ...)`,每次状态迁移单事务落盘,崩溃重启后据此恢复。
 
-## 12. 实施阶段(当前所处:Phase 1)
+## 12. 实施阶段(当前所处:Phase 2)
 
 ### Phase 0 — 契约(已随本文件给出草案,首个任务是把 §7/§8 物化为 contracts/ 下的正式 Schema/OpenAPI 并写校验测试)
 

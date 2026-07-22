@@ -7,6 +7,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"hermes-devops/runtime/internal/hermesclient"
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -17,6 +18,7 @@ type Store interface {
 	ReleaseDevice(ctx context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error
 	CreateTask(ctx context.Context, row wf.TaskRow) error
 	FinishTask(ctx context.Context, req wf.FinishRequest) error
+	SaveDecision(ctx context.Context, row wf.DecisionRow) error
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).
@@ -34,6 +36,12 @@ type Config struct {
 	MinIOSecretKey      string
 	MinIOBucket         string        // 缺省 hermes-evidence
 	MinIOPresignTTL     time.Duration // 缺省 1h
+	// Phase 2 Analyzer(§12):复用 q-uat hermes-agent 平台(§4)。
+	// HermesEndpoint 为空即禁用 Analyzer(优雅降级,verdict 由规则引擎保底)。
+	HermesEndpoint  string
+	HermesAuthToken string
+	HermesModel     string // 可选透传;模型主体由平台配置
+	HermesTimeout   time.Duration
 }
 
 // Acts carries all activities; method names are the activity name strings referenced in workflow.
@@ -42,7 +50,8 @@ type Acts struct {
 	Cfg     Config
 	HTTP    *http.Client // for Dispatch/CancelTask/Notify (Task 3)
 	SpecCfg *SpecConfig
-	Log     *zerolog.Logger // optional; nil-safe (tests may leave unset)
+	Log     *zerolog.Logger     // optional; nil-safe (tests may leave unset)
+	Hermes  hermesclient.Client // Phase 2 Analyzer;nil = 禁用,规则引擎保底(§12)
 }
 
 func (a *Acts) AcquireDevice(ctx context.Context, req wf.AcquireRequest) (*wf.Lease, error) {
@@ -59,4 +68,9 @@ func (a *Acts) FinishTask(ctx context.Context, req wf.FinishRequest) error {
 
 func (a *Acts) ReleaseDevice(ctx context.Context, req wf.ReleaseRequest) error {
 	return a.Store.ReleaseDevice(ctx, req.DeviceID, req.TaskID, req.InfraFail, a.Cfg.QuarantineAfter)
+}
+
+// SaveDecision 落 decisions 表(§11):规则引擎与 LLM 的每次裁决都落表,可回放。
+func (a *Acts) SaveDecision(ctx context.Context, row wf.DecisionRow) error {
+	return a.Store.SaveDecision(ctx, row)
 }

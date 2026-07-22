@@ -129,6 +129,13 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
       MINIO_BUCKET: ${MINIO_BUCKET:-hermes-evidence}
       MINIO_PRESIGN_TTL: ${MINIO_PRESIGN_TTL:-1h}
+      # Phase 2 Analyzer(§12):复用 q-uat hermes-agent 平台(§4,宿主 8090,不在本
+      # Compose 内);HERMES_ENDPOINT 为空 → Analyzer 禁用,verdict 由规则引擎保底。
+      # 平台在宿主机上,容器内需填宿主 LAN 地址(如 http://<宿主IP>:8090/...)。
+      HERMES_ENDPOINT: ${HERMES_ENDPOINT:-}
+      HERMES_AUTH_TOKEN: ${HERMES_AUTH_TOKEN:-}
+      HERMES_TIMEOUT_SEC: ${HERMES_TIMEOUT_SEC:-60}
+      HERMES_MODEL: ${HERMES_MODEL:-}
     ports:
       - "${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091"
     healthcheck:

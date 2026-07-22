@@ -1,0 +1,7 @@
+{
+  "analysis_version": 1,
+  "summary": "证据不足,无法判定根因,需人工查看完整日志",
+  "suggested_category": "UNKNOWN",
+  "confidence": 0.1,
+  "disagrees_with_rule": false
+}

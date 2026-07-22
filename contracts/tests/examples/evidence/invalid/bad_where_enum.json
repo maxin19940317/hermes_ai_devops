@@ -1,0 +1,19 @@
+{
+  "evidence_version": 1,
+  "task_id": "wf-1:t1:a1",
+  "variant": "aarch64_Android_SNPE_2.21",
+  "status": "COMPLETED",
+  "exit_code": 1,
+  "cases": { "total": 1, "passed": 0, "failed": 1, "skipped": 0 },
+  "signatures": [
+    {
+      "id": "cpu_fallback",
+      "where": "dmesg",
+      "classify": "MODEL",
+      "matched": true,
+      "matches": []
+    }
+  ],
+  "junit_failures": [],
+  "inputs": { "attachments": [], "missing": [] }
+}

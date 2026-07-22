@@ -1,0 +1,10 @@
+{
+  "task_id": "wf-1:t1:a1",
+  "variant": "aarch64_Android_SNPE_2.21",
+  "status": "COMPLETED",
+  "exit_code": 0,
+  "cases": { "total": 1, "passed": 1, "failed": 0, "skipped": 0 },
+  "signatures": [],
+  "junit_failures": [],
+  "inputs": { "attachments": [], "missing": [] }
+}

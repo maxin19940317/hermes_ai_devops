@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
+	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/rules"
 )
 
@@ -118,6 +120,38 @@ type FinishRequest struct {
 	Verdict  string `json:"verdict"`
 	Category string `json:"category"`
 	Reason   string `json:"reason"`
+}
+
+// DecisionRow 是 decisions 表一行(§11):规则引擎与 LLM 的每次裁决都落表,可回放。
+type DecisionRow struct {
+	TaskID        string          `json:"task_id"`
+	Actor         string          `json:"actor"`        // hermes|rule|human
+	InputDigest   string          `json:"input_digest"` // 输入摘要(evidence sha256;rule 可为空)
+	Model         string          `json:"model"`
+	PromptVersion string          `json:"prompt_version"`
+	Output        json.RawMessage `json:"output"` // 已是 JSON(rule Decision 或 analysis)
+}
+
+// ExtractEvidenceRequest 是 ExtractEvidence 活动的入参(§12 Phase 2)。
+type ExtractEvidenceRequest struct {
+	TaskID  string           `json:"task_id"`
+	Variant string           `json:"variant"`
+	Result  TaskResultSignal `json:"result"`
+}
+
+// ExtractEvidenceResponse 携带 evidence.json 序列化形态及其 sha256 摘要;
+// 摘要在 decisions 表充当 hermes 裁决的 input_digest(§11 可回放)。
+type ExtractEvidenceResponse struct {
+	EvidenceJSON json.RawMessage `json:"evidence_json"`
+	Digest       string          `json:"digest"`
+}
+
+// AnalyzeRequest 是 Analyze 活动的入参;RuleCategory 为规则引擎判定类别(§9),
+// 供 Analyzer 参考,verdict 判定权始终在规则引擎。
+type AnalyzeRequest struct {
+	TaskID       string          `json:"task_id"`
+	RuleCategory string          `json:"rule_category"`
+	EvidenceJSON json.RawMessage `json:"evidence_json"`
 }
 
 type ReleaseRequest struct {
@@ -279,9 +313,65 @@ func runAttempt(ctx workflow.Context, spec TestSpec, attempt int, resultCh, hbCh
 	sum.Verdict, sum.Category, sum.Reason = string(d.Verdict), string(d.Category), d.Reason
 	sum.Attachments = res.Attachments
 	sum.retryable = d.Retry
+	// 规则裁决落 decisions 表(§11 可回放);INFRA 早退路径的裁决已随 FinishTask 落 tasks 表
+	saveRuleDecision(dctx, taskID, d)
+	// Phase 2:非 PASSED 提取证据并交 Analyzer 补充分析(降级设计,不影响主链路)
+	if d.Verdict != rules.VerdictPassed {
+		runAnalysis(ctx, dctx, taskID, spec, res, d)
+	}
 	finish(res.Status, sum.Verdict, sum.Category, sum.Reason)
 	release(d.Category == rules.CategoryInfra)
 	return sum
+}
+
+// saveRuleDecision 把规则引擎裁决落 decisions 表;失败只记日志(用 disconnected
+// ctx:workflow 被取消也尽量留痕)。
+func saveRuleDecision(dctx workflow.Context, taskID string, d rules.Decision) {
+	out, err := json.Marshal(d)
+	if err != nil {
+		workflow.GetLogger(dctx).Error("marshal rule decision failed", "task", taskID, "error", err)
+		return
+	}
+	row := DecisionRow{TaskID: taskID, Actor: "rule", Output: out}
+	if err := workflow.ExecuteActivity(dctx, "SaveDecision", row).Get(dctx, nil); err != nil {
+		workflow.GetLogger(dctx).Error("save rule decision failed", "task", taskID, "error", err)
+	}
+}
+
+// runAnalysis 提取证据并交 LLM Analyzer 补充分析,分析结论落 decisions 表。
+// 全程降级:提取/分析失败或 Analyzer 未启用都只记日志跳过,
+// verdict 判定权永远在规则引擎(§9;§12 Hermes 不可用 → 规则引擎保底)。
+func runAnalysis(ctx, dctx workflow.Context, taskID string, spec TestSpec, res *TaskResultSignal, d rules.Decision) {
+	logger := workflow.GetLogger(ctx)
+	var ev ExtractEvidenceResponse
+	if err := workflow.ExecuteActivity(ctx, "ExtractEvidence", ExtractEvidenceRequest{
+		TaskID: taskID, Variant: spec.Variant, Result: *res,
+	}).Get(ctx, &ev); err != nil {
+		logger.Error("extract evidence failed, skip analysis", "task", taskID, "error", err)
+		return
+	}
+	var analysis *hermesclient.Analysis
+	if err := workflow.ExecuteActivity(ctx, "Analyze", AnalyzeRequest{
+		TaskID: taskID, RuleCategory: string(d.Category), EvidenceJSON: ev.EvidenceJSON,
+	}).Get(ctx, &analysis); err != nil {
+		logger.Error("analyze failed, rule decision stands", "task", taskID, "error", err)
+		return
+	}
+	if analysis == nil {
+		return // Analyzer 未启用(HERMES_ENDPOINT 空)
+	}
+	out, err := json.Marshal(analysis)
+	if err != nil {
+		logger.Error("marshal analysis failed", "task", taskID, "error", err)
+		return
+	}
+	row := DecisionRow{
+		TaskID: taskID, Actor: "hermes", InputDigest: ev.Digest,
+		PromptVersion: hermesclient.PromptVersion, Output: out,
+	}
+	if err := workflow.ExecuteActivity(dctx, "SaveDecision", row).Get(dctx, nil); err != nil {
+		logger.Error("save hermes decision failed", "task", taskID, "error", err)
+	}
 }
 
 // awaitResult 阻塞等待本 task 的结果 signal;心跳 signal 续租;

@@ -39,11 +39,12 @@ type Input struct {
 }
 
 // Decision 是裁决输出。Retry 仅表示"属于可机械重试的类别",次数上限由调用方控制。
+// JSON tag 用于 decisions 表 output 列落库(§11 可回放)。
 type Decision struct {
-	Verdict  Verdict
-	Category Category
-	Reason   string
-	Retry    bool
+	Verdict  Verdict  `json:"verdict"`
+	Category Category `json:"category"`
+	Reason   string   `json:"reason"`
+	Retry    bool     `json:"retry"`
 }
 
 // Decide 按 §9 的优先级裁决:

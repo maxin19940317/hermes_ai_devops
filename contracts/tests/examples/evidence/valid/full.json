@@ -1,0 +1,49 @@
+{
+  "evidence_version": 1,
+  "task_id": "device-test-aios/algo_super_sdk-g108e0d72-p46:aarch64_Android_SNPE_2.21:a1",
+  "variant": "aarch64_Android_SNPE_2.21",
+  "status": "COMPLETED",
+  "exit_code": 1,
+  "duration_sec": 412.5,
+  "cases": { "total": 38, "passed": 37, "failed": 1, "skipped": 0 },
+  "signatures_hit_reported": ["cpu_fallback"],
+  "signatures": [
+    {
+      "id": "cpu_fallback",
+      "where": "logcat",
+      "classify": "MODEL",
+      "matched": true,
+      "matches": [
+        {
+          "line_no": 1204,
+          "context": "... line 1154 ...\n12-03 10:00:01.123 W SNPE: Falling back to CPU\n... line 1254 ...",
+          "truncated": false
+        }
+      ]
+    },
+    {
+      "id": "native_crash",
+      "where": "logcat",
+      "classify": "CODE",
+      "matched": false,
+      "matches": []
+    }
+  ],
+  "junit_failures": [
+    {
+      "name": "test_infer_snpe_smoke",
+      "classname": "snpe_smoke",
+      "message": "AssertionError: expected 0.98 got 0.41"
+    }
+  ],
+  "metrics": { "latency_ms_p50": 12.4, "latency_ms_p99": 18.9, "peak_rss_mb": 214 },
+  "inputs": {
+    "attachments": [
+      { "name": "logcat.txt", "object_key": "runs/t1/logcat.txt", "size": 1830004 },
+      { "name": "junit.xml", "object_key": "runs/t1/junit.xml", "size": 9021 }
+    ],
+    "missing": ["stderr.log"],
+    "truncated_files": ["logcat.txt"]
+  },
+  "truncated": false
+}

@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"hermes-devops/runtime/internal/evidence"
 	"hermes-devops/runtime/internal/rules"
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -24,6 +25,8 @@ type SpecDefaults struct {
 
 type signatureDecl struct {
 	ID       string `yaml:"id"`
+	Where    string `yaml:"where"`
+	Pattern  string `yaml:"pattern"`
 	Classify string `yaml:"classify"`
 }
 
@@ -66,6 +69,31 @@ func LoadSpecConfig(path string, d SpecDefaults) (*SpecConfig, error) {
 		return nil, fmt.Errorf("parse variants config: %w", err)
 	}
 	return &SpecConfig{file: f, defaults: d}, nil
+}
+
+// SignaturesForVariant 合并 defaults.signatures_common_android 与
+// variants.<name>.signatures(同 id 变体覆盖,与 SelectTestSpecs 的
+// SignatureCategory 合并逻辑一致),按声明序返回,供证据提取使用。
+func (c *SpecConfig) SignaturesForVariant(variant string) []evidence.Signature {
+	order := []string{}
+	byID := map[string]evidence.Signature{}
+	merge := func(decls []signatureDecl) {
+		for _, d := range decls {
+			if _, ok := byID[d.ID]; !ok {
+				order = append(order, d.ID)
+			}
+			byID[d.ID] = evidence.Signature{
+				ID: d.ID, Where: d.Where, Pattern: d.Pattern, Classify: d.Classify,
+			}
+		}
+	}
+	merge(c.file.Defaults.SignaturesCommonAndroid)
+	merge(c.file.Variants[variant].Signatures)
+	out := make([]evidence.Signature, 0, len(order))
+	for _, id := range order {
+		out = append(out, byID[id])
+	}
+	return out
 }
 
 // SelectTestSpecs 把 bundle 中的 Android 变体映射为 TestSpec;

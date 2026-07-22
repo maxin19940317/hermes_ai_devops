@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-devops/contracts/evidence.schema.json",
+  "title": "evidence.json v1",
+  "description": "Runtime Evidence Extractor 的确定性产出(CLAUDE.md §12 Phase 2):签名匹配(含命中处 ±50 行上下文)+ junit 失败 + 指标快照,几十 KB 级,是 Analyzer(LLM)的唯一输入——严禁把原始日志全量灌入 LLM。本契约对未知字段宽容,已知字段严格校验。指标差值(基线比较)依赖 metrics 表,属后续阶段;v1 只携带原始 metrics 快照。",
+  "type": "object",
+  "required": ["evidence_version", "task_id", "variant", "status", "exit_code", "cases", "signatures", "junit_failures", "inputs"],
+  "properties": {
+    "evidence_version": { "const": 1 },
+    "task_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "variant": { "type": "string", "minLength": 1 },
+    "status": {
+      "description": "Client 侧终态(§9)",
+      "enum": ["COMPLETED", "FAILED", "TIMEOUT", "CANCELED"]
+    },
+    "exit_code": { "type": "integer" },
+    "duration_sec": { "type": "number", "minimum": 0 },
+    "cases": {
+      "type": "object",
+      "required": ["total", "passed", "failed", "skipped"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "signatures_hit_reported": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "设备脚本自报的 signatures_hit(result.json),与 Runtime 侧确定性匹配结果并列,供 Analyzer 交叉核对"
+    },
+    "signatures": {
+      "type": "array",
+      "description": "Manifest failure_signatures 的 Runtime 侧确定性匹配结果(按声明序)",
+      "items": {
+        "type": "object",
+        "required": ["id", "where", "classify", "matched", "matches"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "where": { "enum": ["logcat", "stdout", "stderr"] },
+          "classify": { "enum": ["INFRA", "BUILD", "CODE", "MODEL", "DELEGATE", "DEVICE", "PERF", "UNKNOWN"] },
+          "matched": { "type": "boolean" },
+          "matches": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["line_no", "context"],
+              "properties": {
+                "line_no": { "type": "integer", "minimum": 1 },
+                "context": {
+                  "type": "string",
+                  "description": "命中行 ±50 行上下文;文件读取超限截断时只含尾部窗口"
+                },
+                "truncated": { "type": "boolean", "default": false }
+              }
+            },
+            "default": []
+          },
+          "error": {
+            "type": "string",
+            "description": "降级记录:正则编译失败、对应日志缺失等;不为空时 matched 语义不可用"
+          }
+        }
+      },
+      "default": []
+    },
+    "junit_failures": {
+      "type": "array",
+      "description": "junit.xml 的 failure/error 用例(最多 20 条,message 截断)",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "classname": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      },
+      "default": []
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "type": "number" },
+      "description": "原始指标快照(来自 result.json);基线差值属后续阶段"
+    },
+    "inputs": {
+      "type": "object",
+      "required": ["attachments", "missing"],
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "description": "实际参与提取的附件",
+          "items": {
+            "type": "object",
+            "required": ["name", "object_key"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "object_key": { "type": "string", "minLength": 1 },
+              "size": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "default": []
+        },
+        "missing": {
+          "type": "array",
+          "description": "期望但未上传的证据文件名(junit 缺失、崩溃恢复空附件等,降级而非错误)",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "truncated_files": {
+          "type": "array",
+          "description": "因超过单文件读取上限只取尾部的文件",
+          "items": { "type": "string" },
+          "default": []
+        }
+      }
+    },
+    "truncated": {
+      "type": "boolean",
+      "default": false,
+      "description": "整体输出接近体积上限,部分内容被截断"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "analysis_version": 1,
+  "summary": "SNPE 算子不支持触发 CPU 回退,精度随之下降致 1 个用例失败",
+  "root_cause": "logcat 出现 'Falling back to CPU'(签名 cpu_fallback),junit 中 test_infer_snpe_smoke 精度断言失败,两者时间相邻,指向 DSP 委托失败后的精度回退。",
+  "suggested_category": "MODEL",
+  "confidence": 0.82,
+  "next_actions": ["核对 SNPE 2.21 对该算子的支持矩阵", "用 --use_dsp 单跑该用例复现"],
+  "disagrees_with_rule": false
+}

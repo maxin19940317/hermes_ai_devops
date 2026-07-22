@@ -1,0 +1,8 @@
+{
+  "analysis_version": 1,
+  "summary": "test",
+  "suggested_category": "CODE",
+  "confidence": 0.5,
+  "disagrees_with_rule": false,
+  "hallucinated_field": "schema 为闭合字段,多余字段必须被拒"
+}

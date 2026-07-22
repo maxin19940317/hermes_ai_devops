@@ -25,6 +25,10 @@
 //	MINIO_SECRET_KEY        空 → 禁用预签名
 //	MINIO_BUCKET            缺省 hermes-evidence
 //	MINIO_PRESIGN_TTL       缺省 1h(Go duration)
+//	HERMES_ENDPOINT         hermes-agent 平台调用 URL(§12 Phase 2);空 → Analyzer 禁用,规则引擎保底
+//	HERMES_AUTH_TOKEN       可选,Bearer
+//	HERMES_TIMEOUT_SEC      Analyzer 调用超时,缺省 60
+//	HERMES_MODEL            可选透传;模型主体由平台配置(§4)
 package main
 
 import (
@@ -44,6 +48,7 @@ import (
 
 	"hermes-devops/runtime/internal/activity"
 	"hermes-devops/runtime/internal/callbacks"
+	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -91,12 +96,27 @@ func main() {
 	}
 	defer tc.Close()
 
+	// ---- Phase 2 Analyzer(§12):HERMES_ENDPOINT 空 → NewHTTPClient 返回 nil,
+	// Analyzer 禁用,verdict 由规则引擎保底 ----
+	var hermes hermesclient.Client
+	if h := hermesclient.NewHTTPClient(hermesclient.Config{
+		Endpoint:  cfg.Activity.HermesEndpoint,
+		AuthToken: cfg.Activity.HermesAuthToken,
+		Timeout:   cfg.Activity.HermesTimeout,
+	}); h != nil {
+		hermes = h
+		log.Info().Msg("hermes analyzer enabled")
+	} else {
+		log.Info().Msg("HERMES_ENDPOINT 未设置,Analyzer 禁用,规则引擎保底")
+	}
+
 	acts := &activity.Acts{
 		Store:   st,
 		Cfg:     cfg.Activity,
 		HTTP:    &http.Client{Timeout: 30 * time.Second},
 		SpecCfg: specCfg,
 		Log:     &log,
+		Hermes:  hermes,
 	}
 
 	w := worker.New(tc, cfg.TemporalTaskQueue, worker.Options{})

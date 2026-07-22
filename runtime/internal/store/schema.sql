@@ -82,3 +82,16 @@ CREATE TABLE IF NOT EXISTS results (
     result_json JSONB       NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 一切裁决(规则引擎/LLM/人工)都落 decisions 表,可回放(§11)。
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id    BIGSERIAL PRIMARY KEY,
+    task_id        TEXT        NOT NULL REFERENCES tasks(task_id),
+    actor          TEXT        NOT NULL,            -- hermes|rule|human
+    input_digest   TEXT        NOT NULL DEFAULT '', -- 输入摘要(evidence sha256;rule 可为空)
+    model          TEXT        NOT NULL DEFAULT '',
+    prompt_version TEXT        NOT NULL DEFAULT '',
+    output         JSONB       NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS decisions_task_id_idx ON decisions(task_id);

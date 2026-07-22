@@ -1,0 +1,14 @@
+{
+  "evidence_version": 1,
+  "task_id": "wf-1:t1:a2",
+  "variant": "aarch64_Android_TFLite_2.21.0",
+  "status": "TIMEOUT",
+  "exit_code": -1,
+  "cases": { "total": 0, "passed": 0, "failed": 0, "skipped": 0 },
+  "signatures": [],
+  "junit_failures": [],
+  "inputs": {
+    "attachments": [],
+    "missing": ["result.json", "junit.xml", "logcat.txt", "stdout.log", "stderr.log"]
+  }
+}
