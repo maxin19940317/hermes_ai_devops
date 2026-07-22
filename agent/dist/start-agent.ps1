@@ -46,4 +46,5 @@ try {
 } catch { Write-Host "minio 9000 -> FAIL: $($_.Exception.Message)" -ForegroundColor Red }
 
 Write-Host "`n==> 4/4 Start agent (foreground, Ctrl+C to stop; output tee'd to agent-console.log)" -ForegroundColor Cyan
-.\agent.exe run 2>&1 | Tee-Object -FilePath agent-console.log
+# PS 5.1 quirks: native stderr lines become ErrorRecords; ToString() flattens them.
+.\agent.exe run 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath agent-console.log
