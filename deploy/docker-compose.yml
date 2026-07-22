@@ -181,6 +181,11 @@ services:
 networks:
   runtime:
     name: hermes-runtime
+    driver: bridge
+    ipam:
+      config:
+        # 显式固定网段:Docker 自动分配可能撞上内网真实设备(曾撞 172.22)。
+        - subnet: ${RUNTIME_SUBNET:-172.31.240.0/24}
 
 volumes:
   postgres-data:
