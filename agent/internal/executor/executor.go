@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"hermes-devops/agent/internal/adb"
@@ -34,6 +35,7 @@ const (
 	StatusCompleted   Status = "COMPLETED"
 	StatusFailed      Status = "FAILED"
 	StatusTimeout     Status = "TIMEOUT"
+	StatusCanceled    Status = "CANCELED"
 )
 
 // Options 描述一次运行的输入。PackagePath 与 PackageURL 二选一。
@@ -61,11 +63,55 @@ type Summary struct {
 }
 
 // Executor 驱动流水线;设备交互全部经 Runner(可注入 fake 测试)。
+// 一个 Executor 对应一次运行;Cancel 可从其他 goroutine 并发调用。
 type Executor struct {
 	Runner       adb.Runner
 	HTTP         *http.Client
 	Logf         func(format string, args ...any)
 	OnTransition func(to Status)
+
+	// SOCAliases 把设备固件上报的平台代号(如 trinket)映射为
+	// manifest 调度约束使用的 SoC 型号(如 QCM6125),precheck 的
+	// soc 匹配在映射后进行;nil 表示不映射。
+	SOCAliases map[string]string
+
+	mu              sync.Mutex
+	status          Status             // 当前状态(供 Cancel 判断终态)
+	cancelRequested bool               // 取消标志(置位后不可复位)
+	runCancel       context.CancelFunc // RUNNING 期间非 nil,Cancel 用它解除执行阻塞
+}
+
+// Cancel 请求取消当前运行:幂等,可与 Execute 并发调用。
+// RUNNING 中取消会解除 Runner.Run 阻塞,由 run() 按超时同一路径 kill
+// 设备端进程,流水线继续走 COLLECTING → cleanup → 终态 CANCELED;
+// 更早阶段取消则在下一个阶段边界中止;已终态后调用无副作用。
+func (e *Executor) Cancel() {
+	e.mu.Lock()
+	if e.cancelRequested || isTerminal(e.status) {
+		e.mu.Unlock()
+		return
+	}
+	e.cancelRequested = true
+	runCancel := e.runCancel
+	e.mu.Unlock()
+	if runCancel != nil {
+		runCancel()
+	}
+}
+
+func (e *Executor) isCancelRequested() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cancelRequested
+}
+
+// isTerminal 报告 status 是否为终态(CLAUDE.md §9)。
+func isTerminal(s Status) bool {
+	switch s {
+	case StatusCompleted, StatusFailed, StatusTimeout, StatusCanceled:
+		return true
+	}
+	return false
 }
 
 func (e *Executor) logf(format string, args ...any) {
@@ -76,6 +122,9 @@ func (e *Executor) logf(format string, args ...any) {
 
 func (e *Executor) transition(sum *Summary, to Status) {
 	sum.Status = to
+	e.mu.Lock()
+	e.status = to
+	e.mu.Unlock()
 	e.logf("→ %s", to)
 	if e.OnTransition != nil {
 		e.OnTransition(to)
@@ -140,14 +189,23 @@ func (e *Executor) Execute(ctx context.Context, opts Options) (*Summary, error) 
 	}
 
 	// ---- DEPLOYING: 清理旧现场 → push → chmod ----
+	// 阶段边界:取消在设备改动前到达,直接终态 CANCELED(无设备现场可清)
+	if e.isCancelRequested() {
+		return e.finishCanceled(sum)
+	}
 	e.transition(sum, StatusDeploying)
 	if err := e.deploy(ctx, opts.Serial, m, extractDir); err != nil {
 		return fail(fmt.Errorf("deploy: %w", err))
 	}
 
 	// ---- RUNNING: 超时控制,超时 kill 但仍收集 ----
+	// 阶段边界:设备现场已建,取消仍须按 keep_on_failure 语义清理
+	if e.isCancelRequested() {
+		e.cleanupDevice(ctx, opts.Serial, m, opts.KeepWorkdirOverride, true)
+		return e.finishCanceled(sum)
+	}
 	e.transition(sum, StatusRunning)
-	timedOut, res, duration, err := e.run(ctx, opts.Serial, m, opts.OutDir)
+	canceled, timedOut, res, duration, err := e.run(ctx, opts.Serial, m, opts.OutDir)
 	sum.DurationSec = duration.Seconds()
 	if err != nil {
 		return fail(fmt.Errorf("run entry: %w", err))
@@ -159,18 +217,35 @@ func (e *Executor) Execute(ctx context.Context, opts Options) (*Summary, error) 
 	deviceDir := filepath.Join(opts.OutDir, "device")
 	sum.Collected = e.collect(ctx, opts.Serial, m, deviceDir)
 	e.dumpLogcat(ctx, opts.Serial, opts.OutDir)
-	sum.SuccessCriteriaMet = !timedOut &&
+	sum.SuccessCriteriaMet = !canceled && !timedOut &&
 		res.ExitCode == m.Test.Success.ExitCode &&
 		requireFilesPresent(deviceDir, m.Test.Success.RequireFiles)
 
-	// ---- 设备清理(keep_on_failure 语义) ----
-	e.cleanupDevice(ctx, opts.Serial, m, opts.KeepWorkdirOverride, timedOut || !sum.SuccessCriteriaMet)
+	// ---- 设备清理(keep_on_failure 语义;取消同其他异常结局) ----
+	e.cleanupDevice(ctx, opts.Serial, m, opts.KeepWorkdirOverride, canceled || timedOut || !sum.SuccessCriteriaMet)
+
+	// 收集/清理期间到达的取消同样生效:设备进程已自然结束(无需 kill),
+	// 终态记 CANCELED,判据置不满足。
+	canceled = canceled || e.isCancelRequested()
+	if canceled {
+		sum.SuccessCriteriaMet = false
+	}
 
 	final := StatusCompleted
-	if timedOut {
+	switch {
+	case canceled:
+		final = StatusCanceled
+	case timedOut:
 		final = StatusTimeout
 	}
 	e.transition(sum, final)
+	e.writeSummary(sum)
+	return sum, nil
+}
+
+// finishCanceled 以终态 CANCELED 收尾;取消是客观结局(同 TIMEOUT),不作为 error。
+func (e *Executor) finishCanceled(sum *Summary) (*Summary, error) {
+	e.transition(sum, StatusCanceled)
 	e.writeSummary(sum)
 	return sum, nil
 }
@@ -210,8 +285,17 @@ func (e *Executor) precheck(ctx context.Context, serial string, m *manifest.Mani
 		matched := ""
 		for _, want := range m.Requirements.SOC {
 			for _, got := range []string{platform, board} {
-				if got != "" && strings.EqualFold(got, want) {
+				if got == "" {
+					continue
+				}
+				if strings.EqualFold(got, want) {
 					matched = got
+					continue
+				}
+				// 平台代号 → SoC 型号别名(trinket → QCM6125):
+				// 固件只暴露代号,manifest 约束用型号
+				if alias, ok := e.SOCAliases[got]; ok && strings.EqualFold(alias, want) {
+					matched = alias
 				}
 			}
 		}
@@ -285,12 +369,28 @@ func (e *Executor) deploy(ctx context.Context, serial string, m *manifest.Manife
 	return nil
 }
 
-// run 执行 entry。返回 timedOut 标志与实际时长;超时不算 error(仍需收集)。
-func (e *Executor) run(ctx context.Context, serial string, m *manifest.Manifest, outDir string) (bool, adb.Result, time.Duration, error) {
+// run 执行 entry。返回 canceled/timedOut 标志与实际时长;
+// 超时与取消都是客观结局不算 error(仍需收集),取消复用超时 kill 路径。
+func (e *Executor) run(ctx context.Context, serial string, m *manifest.Manifest, outDir string) (bool, bool, adb.Result, time.Duration, error) {
 	_, _ = e.Runner.Run(ctx, adb.LogcatClear(serial)) // best effort
 
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(m.Test.TimeoutSec)*time.Second)
 	defer cancel()
+	// 注册 runCancel 供 Cancel() 解除 Runner.Run 阻塞;
+	// 取消若恰好先于注册到达,立即 cancel 让执行快速退出
+	e.mu.Lock()
+	if e.cancelRequested {
+		cancel()
+	} else {
+		e.runCancel = cancel
+	}
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.runCancel = nil
+		e.mu.Unlock()
+	}()
+
 	start := time.Now()
 	res, err := e.Runner.Run(runCtx, adb.ShellRunEntry(
 		serial, m.Deploy.Workdir, m.ResolvedEnv(), m.Test.Entry, m.Test.Args))
@@ -300,14 +400,19 @@ func (e *Executor) run(ctx context.Context, serial string, m *manifest.Manifest,
 	_ = os.WriteFile(filepath.Join(outDir, "stderr.log"), []byte(res.Stderr), 0o644)
 
 	timedOut := errors.Is(err, context.DeadlineExceeded)
-	if timedOut {
-		e.logf("entry timed out after %s, killing device process", duration)
+	canceled := e.isCancelRequested()
+	if timedOut || canceled {
+		if timedOut {
+			e.logf("entry timed out after %s, killing device process", duration)
+		} else {
+			e.logf("cancel requested after %s, killing device process", duration)
+		}
 		killCtx, killCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer killCancel()
 		_, _ = e.Runner.Run(killCtx, adb.ShellPkill(serial, path.Base(m.Test.Entry)))
 		err = nil
 	}
-	return timedOut, res, duration, err
+	return canceled, timedOut, res, duration, err
 }
 
 // collect 按 Manifest collect 列表拉取产物,单项失败只记日志不中断;

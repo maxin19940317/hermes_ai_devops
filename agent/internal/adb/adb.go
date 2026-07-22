@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -73,6 +74,37 @@ func ShellPkill(serial, pattern string) []string {
 
 func LogcatClear(serial string) []string { return withSerial(serial, "logcat", "-c") }
 func LogcatDump(serial string) []string  { return withSerial(serial, "logcat", "-d") }
+
+// LogcatTail 拉取最近 lines 行 logcat(-d 立即返回不阻塞,-t 限定行数)。
+// lines 按契约(client-agent-api openapi)钳制到 1..1000。
+func LogcatTail(serial string, lines int) []string {
+	if lines < 1 {
+		lines = 1
+	}
+	if lines > 1000 {
+		lines = 1000
+	}
+	return withSerial(serial, "logcat", "-d", "-t", strconv.Itoa(lines))
+}
+
+// Devices 是白名单中唯一不带 -s <serial> 的命令:设备发现本身就是为了
+// 拿到 serial,-s 无从填起。输出必须经 ParseDevices 过滤后才可使用。
+func Devices() []string { return []string{"devices", "-l"} }
+
+// ParseDevices 解析 `adb devices -l` 输出,返回 state 为 "device" 的 serial。
+// 跳过表头、空行与 unauthorized/offline 等不可用状态;serial 为 "?" 的
+// 条目无法被 -s 寻址(USB 缺 iSerial,见 agent/README.md 踩坑记录),一并跳过。
+func ParseDevices(out string) []string {
+	serials := []string{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[1] != "device" || fields[0] == "?" {
+			continue
+		}
+		serials = append(serials, fields[0])
+	}
+	return serials
+}
 
 // ShellListGlob 在 workdir 内展开 glob。pattern 来自 Manifest collect 字段,
 // 已由 Schema 限定字符集([A-Za-z0-9._*/-],无 ..),不加引号以保留 glob 展开。

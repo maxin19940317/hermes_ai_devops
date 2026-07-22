@@ -3,6 +3,9 @@ package activity
 import (
 	"context"
 	"net/http"
+	"time"
+
+	"github.com/rs/zerolog"
 
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -24,6 +27,13 @@ type Config struct {
 	ArtifactAuthType  string // bearer | job_token
 	ArtifactAuthToken string
 	FeishuWebhookURL  string // empty → Notify logs only (dev mode)
+	// MinIO 预签名直传(§3.7);Endpoint 或凭据为空即禁用,优雅降级为空 presigned_uploads。
+	MinIOEndpoint       string        // 集群内 endpoint(如 minio:9000);兼作启用开关
+	MinIOPublicEndpoint string        // 预签名 URL 的 host,须 Client 可达(签名覆盖 Host)
+	MinIOAccessKey      string
+	MinIOSecretKey      string
+	MinIOBucket         string        // 缺省 hermes-evidence
+	MinIOPresignTTL     time.Duration // 缺省 1h
 }
 
 // Acts carries all activities; method names are the activity name strings referenced in workflow.
@@ -32,6 +42,7 @@ type Acts struct {
 	Cfg     Config
 	HTTP    *http.Client // for Dispatch/CancelTask/Notify (Task 3)
 	SpecCfg *SpecConfig
+	Log     *zerolog.Logger // optional; nil-safe (tests may leave unset)
 }
 
 func (a *Acts) AcquireDevice(ctx context.Context, req wf.AcquireRequest) (*wf.Lease, error) {

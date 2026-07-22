@@ -14,7 +14,7 @@ read_value() {
 }
 
 : >"$lock_file"
-for key in POSTGRES_IMAGE TEMPORAL_IMAGE TEMPORAL_UI_IMAGE GO_IMAGE RUNTIME_BASE_IMAGE; do
+for key in POSTGRES_IMAGE TEMPORAL_IMAGE TEMPORAL_UI_IMAGE GO_IMAGE RUNTIME_BASE_IMAGE MINIO_IMAGE MINIO_MC_IMAGE; do
   ref=$(read_value "$key")
   test -n "$ref" || {
     echo "ERROR: $key is empty" >&2

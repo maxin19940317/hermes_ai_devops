@@ -155,6 +155,18 @@ func (f *fakeADB) find(substr string) int {
 	return -1
 }
 
+func (f *fakeADB) count(substr string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.Contains(strings.Join(c, " "), substr) {
+			n++
+		}
+	}
+	return n
+}
+
 func newExecutor(f *fakeADB) (*Executor, *[]Status) {
 	var transitions []Status
 	e := &Executor{
@@ -332,5 +344,166 @@ func TestLocalPackageSHAMismatchFailsBeforeAnyADB(t *testing.T) {
 	}
 	if len(f.calls) != 0 {
 		t.Errorf("校验失败前不得触碰设备: %v", f.calls)
+	}
+}
+
+// CANCELED 状态机:取消是客观结局(非 error),终态 CANCELED,
+// 仍走 COLLECTING 与 cleanup(keep_on_failure 语义同其他异常结局)。
+func TestCancelStateMachine(t *testing.T) {
+	tests := []struct {
+		name       string
+		runBlocks  bool   // entry 阻塞直到 ctx 取消(模拟长任务)
+		cancelOn   Status // 在该迁移时触发 Cancel;空 = 不中途取消
+		cancelLate bool   // 终态后再 Cancel(幂等 no-op)
+		wantFinal  Status
+		wantPkill  bool
+		wantPull   bool
+		wantRm     int // rm -rf 次数:deploy 清旧现场 1 次;keep_on_failure 时 cleanup 不再删
+	}{
+		{"RUNNING 中取消:kill 设备进程后仍收集", true, StatusRunning, false,
+			StatusCanceled, true, true, 1},
+		{"RUNNING 前取消:下个边界中止并清理现场", false, StatusDeploying, false,
+			StatusCanceled, false, false, 1},
+		{"终态后取消:幂等 no-op", false, "", true,
+			StatusCompleted, false, true, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeADB{props: defaultProps(), dfAvailKB: 1 << 20, runBlocks: tt.runBlocks}
+			out := t.TempDir()
+			e, tr := newExecutor(f)
+			if tt.cancelOn != "" {
+				base := e.OnTransition
+				e.OnTransition = func(to Status) {
+					base(to)
+					if to == tt.cancelOn {
+						e.Cancel()
+						e.Cancel() // 幂等:重复调用无副作用
+					}
+				}
+			}
+			sum, err := e.Execute(context.Background(), Options{
+				PackagePath: buildPackage(t, 900), Serial: serial, OutDir: out,
+			})
+			if err != nil {
+				t.Fatalf("取消是客观结局,不应返回 error: %v", err)
+			}
+			if sum.Status != tt.wantFinal {
+				t.Errorf("status = %v, want %v", sum.Status, tt.wantFinal)
+			}
+			if tt.cancelLate {
+				callsBefore := f.count("")
+				e.Cancel()
+				e.Cancel()
+				if got := f.count(""); got != callsBefore {
+					t.Errorf("终态后 Cancel 不得触碰设备: %d → %d 次调用", callsBefore, got)
+				}
+				if sum.Status != StatusCompleted {
+					t.Errorf("终态后 Cancel 不得改变结局: %v", sum.Status)
+				}
+				return
+			}
+			if sum.SuccessCriteriaMet {
+				t.Error("取消的运行 success_criteria_met 必须为 false")
+			}
+			if got := f.find("pkill") != -1; got != tt.wantPkill {
+				t.Errorf("pkill 调用 = %v, want %v", got, tt.wantPkill)
+			}
+			if got := f.find("pull") != -1; got != tt.wantPull {
+				t.Errorf("collect(pull) = %v, want %v", got, tt.wantPull)
+			}
+			if got := f.count("rm -rf"); got != tt.wantRm {
+				t.Errorf("rm -rf 次数 = %d, want %d(keep_on_failure 应保留现场)", got, tt.wantRm)
+			}
+			// 终态必须是最后一个迁移,且 run-summary.json 落盘
+			if (*tr)[len(*tr)-1] != tt.wantFinal {
+				t.Errorf("last transition = %v, want %v", (*tr)[len(*tr)-1], tt.wantFinal)
+			}
+			data, rerr := os.ReadFile(filepath.Join(out, "run-summary.json"))
+			if rerr != nil || !strings.Contains(string(data), `"status": "`+string(tt.wantFinal)+`"`) {
+				t.Errorf("run-summary.json 未记录 %v: %v, %s", tt.wantFinal, rerr, data)
+			}
+		})
+	}
+}
+
+// RUNNING 中取消的专项:kill 发生在 run 之后、收集之前,且 logcat 仍落盘。
+func TestCancelDuringRunningKillsThenCollects(t *testing.T) {
+	f := &fakeADB{props: defaultProps(), dfAvailKB: 1 << 20, runBlocks: true}
+	out := t.TempDir()
+	e, _ := newExecutor(f)
+	base := e.OnTransition
+	e.OnTransition = func(to Status) {
+		base(to)
+		if to == StatusRunning {
+			e.Cancel()
+		}
+	}
+	sum, err := e.Execute(context.Background(), Options{
+		PackagePath: buildPackage(t, 900), Serial: serial, OutDir: out,
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if sum.Status != StatusCanceled {
+		t.Fatalf("status = %v, want CANCELED", sum.Status)
+	}
+	runIdx, pkill, pull := f.find("'./run.sh'"), f.find("pkill"), f.find("pull")
+	if !(runIdx != -1 && pkill > runIdx && pull > pkill) {
+		t.Errorf("顺序应为 run → pkill → pull: run=%d pkill=%d pull=%d", runIdx, pkill, pull)
+	}
+	if _, err := os.Stat(filepath.Join(out, "logcat.txt")); err != nil {
+		t.Errorf("取消后仍须落盘 logcat: %v", err)
+	}
+}
+
+// 固件只报平台代号(trinket)时,SOCAliases 使命名约束(QCM6125)匹配成功;
+// 无别名则应按 soc mismatch 失败(回归)。
+func TestPrecheckSOCAlias(t *testing.T) {
+	props := defaultProps()
+	props["ro.board.platform"] = "trinket"
+	props["ro.product.board"] = "trinket"
+
+	// 无别名:soc mismatch
+	f1 := &fakeADB{props: props, dfAvailKB: 1 << 20}
+	_, err1, _ := run(t, f1, Options{PackagePath: buildPackage(t, 900), Serial: serial, OutDir: t.TempDir()})
+	if err1 == nil || !strings.Contains(err1.Error(), "soc mismatch") {
+		t.Fatalf("无别名应 soc mismatch, got %v", err1)
+	}
+
+	// 有别名:trinket→QCM6125 匹配通过
+	f2 := &fakeADB{props: props, dfAvailKB: 1 << 20}
+	e, _ := newExecutor(f2)
+	e.SOCAliases = map[string]string{"trinket": "QCM6125"}
+	sum, err := e.Execute(context.Background(), Options{PackagePath: buildPackage(t, 900), Serial: serial, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("有别名不应失败: %v", err)
+	}
+	if sum.Environment["soc"] != "QCM6125" {
+		t.Errorf("environment soc = %q, want QCM6125", sum.Environment["soc"])
+	}
+}
+
+// COLLECTING 期间到达的取消同样生效:终态 CANCELED、判据不满足、仍完成收集。
+func TestCancelDuringCollectingEndsCanceled(t *testing.T) {
+	f := &fakeADB{props: defaultProps(), dfAvailKB: 1 << 20}
+	e, _ := newExecutor(f)
+	e.OnTransition = func(to Status) {
+		if to == StatusCollecting {
+			e.Cancel()
+		}
+	}
+	sum, err := e.Execute(context.Background(), Options{PackagePath: buildPackage(t, 900), Serial: serial, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cancel 是客观结局,不应返回 error: %v", err)
+	}
+	if sum.Status != StatusCanceled {
+		t.Errorf("status = %v, want CANCELED", sum.Status)
+	}
+	if sum.SuccessCriteriaMet {
+		t.Error("取消后判据必须不满足")
+	}
+	if len(sum.Collected) == 0 {
+		t.Error("取消不应跳过收集")
 	}
 }

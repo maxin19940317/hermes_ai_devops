@@ -6,14 +6,56 @@ or reconfigure the existing Hermes Agent containers or the process using host po
 ## Security boundary
 
 This is a q-uat integration deployment. Trigger is plain HTTP protected by the GitLab
-Webhook Secret Token. Worker callbacks bind to localhost because the callback handler does
-not yet enforce the mTLS declared by the OpenAPI contract. Do not expose port 18091 until
-HTTPS/mTLS or a test-subnet firewall rule is in place.
+Webhook Secret Token. Per design decision 2 (UAT LAN exposure), the worker callbacks
+port (18091) and the MinIO API port (9000) bind to the test subnet
+(`${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}` / `${MINIO_BIND_IP:-0.0.0.0}`) so the Windows
+Client on the same subnet can reach them. Both are plain HTTP without mTLS — this
+exposure is test-subnet-only and must not extend beyond it until Phase 3 lands mTLS.
+The MinIO console (9001) and Temporal UI (18080) stay localhost-pinned.
 
-`CALLBACK_BASE_URL` defaults to `http://127.0.0.1:18091`, which is only valid while no
-Client Agent exists: the Runtime hands this URL to Clients as `callback_base_url`, and a
-real Client would POST callbacks to itself. When a Windows Client joins, set it to the
-server LAN address in `deploy/.env` — only after the exposure conditions above are met.
+`CALLBACK_BASE_URL` now points at the server LAN address (`http://10.88.118.251:18091`
+in `.env.example`): the Runtime hands this URL to Clients as `callback_base_url`, and
+Clients POST callbacks to it. Keep it aligned with the actual bind address in
+`deploy/.env`.
+
+## Networking
+
+The `hermes-runtime` bridge network uses an explicit subnet
+(`RUNTIME_SUBNET`, default `172.31.240.0/24`). Do not leave it to Docker's
+auto-assignment: an auto-assigned range once hijacked the host route for real
+`172.22.0.0/16` devices on the corporate network. If the pinned range ever
+conflicts, change `RUNTIME_SUBNET` in `deploy/.env` and recreate the stack
+(`down` then `up -d`; named volumes persist).
+
+Artifact downloads use `ARTIFACT_AUTH_TYPE=bearer` by default (a GitLab PAT in
+`ARTIFACT_AUTH_TOKEN`). `job_token` is only for CI job tokens; sending a PAT in a
+`JOB-TOKEN` header fails with 401.
+
+## MinIO evidence uploads
+
+The `minio` service stores run evidence (result.json, junit.xml, logcat.txt,
+stdout.log, stderr.log) uploaded directly by Clients against presigned PUT URLs the
+worker signs at dispatch time (design §3.7). `minio-init` is a one-shot container that
+creates the bucket (`MINIO_BUCKET`, default `hermes-evidence`) once `minio` is healthy.
+
+Key environment variables (see `.env.example`):
+
+- `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` — root credentials; the password is a
+  required secret in `deploy/.env` (validated by `validate-env.sh`). The worker reuses
+  them as `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`.
+- `MINIO_ENDPOINT=minio:9000` (compose-internal) and `MINIO_PUBLIC_ENDPOINT` — the host
+  embedded in presigned URLs; it must be Client-reachable (LAN address) because the
+  signature covers the Host header and cannot be rewritten afterwards. If the endpoint
+  or credentials are empty the worker degrades gracefully: `presigned_uploads` is empty
+  and dispatch still succeeds.
+- `MINIO_PRESIGN_TTL` (default `1h`) — presigned URL lifetime. It must exceed the
+  longest task duration (download + deploy + `test.timeout_sec` + collect):
+  URLs are signed at dispatch, and a task finishing after expiry silently keeps
+  its attachments local.
+- `MINIO_BIND_IP` / `MINIO_HOST_PORT` (default `0.0.0.0:9000`) — API exposure;
+  `MINIO_CONSOLE_PORT` (default `9001`) is published on `127.0.0.1` only.
+
+Presigned URLs carry signatures — the worker logs object keys only, never URLs.
 
 ## Configure
 
