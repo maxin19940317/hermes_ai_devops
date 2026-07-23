@@ -98,12 +98,22 @@ func (c *SpecConfig) SignaturesForVariant(variant string) []evidence.Signature {
 
 // SelectTestSpecs 把 bundle 中的 Android 变体映射为 TestSpec;
 // Linux 变体第一阶段不进设备测试链路(§6.4),未配置变体跳过。
+// fleet 感知(§12 变体级触发):整个 fleet(含 OFFLINE/BUSY/QUARANTINED)
+// 无任何设备满足变体 selector 时,该变体秒级跳过(Skipped),不进
+// acquire 等待;"设备在但暂不可用"仍由 acquire 的有限等待处理。
 // 输出顺序跟随 in.Packages(workflow 依赖确定性)。
-func (a *Acts) SelectTestSpecs(_ context.Context, in wf.DeviceTestInput) ([]wf.TestSpec, error) {
-	var specs []wf.TestSpec
+func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.SpecSelection, error) {
+	sel := &wf.SpecSelection{}
 	for _, p := range in.Packages {
 		v, ok := a.SpecCfg.file.Variants[p.Variant]
-		if !ok || v.Requirements.OS != "android" {
+		if !ok {
+			continue
+		}
+		if v.Requirements.OS != "android" {
+			sel.Skipped = append(sel.Skipped, wf.SkippedSpec{
+				Variant: p.Variant,
+				Reason:  "os " + v.Requirements.OS + " 尚未接入设备测试链路(Phase 4)",
+			})
 			continue
 		}
 		timeout := v.Test.TimeoutSec
@@ -118,7 +128,7 @@ func (a *Acts) SelectTestSpecs(_ context.Context, in wf.DeviceTestInput) ([]wf.T
 			sigs[s.ID] = rules.Category(s.Classify)
 		}
 		d := a.SpecCfg.defaults
-		specs = append(specs, wf.TestSpec{
+		spec := wf.TestSpec{
 			TestID:  p.Variant,
 			Variant: p.Variant,
 			Package: p,
@@ -132,7 +142,22 @@ func (a *Acts) SelectTestSpecs(_ context.Context, in wf.DeviceTestInput) ([]wf.T
 			HardTimeoutSec:    timeout + d.HardTimeoutMargin,
 			DeviceWaitRounds:  d.DeviceWaitRounds,
 			DeviceWaitSeconds: d.DeviceWaitSeconds,
-		})
+		}
+		if a.Store != nil {
+			capable, err := a.Store.HasCapableDevice(ctx, spec.Selector)
+			if err != nil {
+				// fleet 查询失败不阻塞派发:退回 acquire 等待的旧行为
+				a.warnf("has capable device check failed for %s: %v; keep spec", p.Variant, err)
+			} else if !capable {
+				sel.Skipped = append(sel.Skipped, wf.SkippedSpec{
+					Variant: p.Variant,
+					Reason: fmt.Sprintf("no capable device registered (soc=%v capabilities=%v)",
+						spec.Selector.SOC, spec.Selector.Capabilities),
+				})
+				continue
+			}
+		}
+		sel.Specs = append(sel.Specs, spec)
 	}
-	return specs, nil
+	return sel, nil
 }

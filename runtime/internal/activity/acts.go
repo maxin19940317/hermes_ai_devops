@@ -19,6 +19,7 @@ type Store interface {
 	CreateTask(ctx context.Context, row wf.TaskRow) error
 	FinishTask(ctx context.Context, req wf.FinishRequest) error
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
+	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).

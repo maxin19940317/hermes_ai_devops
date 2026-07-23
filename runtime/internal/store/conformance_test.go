@@ -19,6 +19,7 @@ type fullStore interface {
 	UpsertClientDevices(ctx context.Context, c Client, devs []Device) error
 	AcquireDevice(ctx context.Context, sel wf.DeviceSelector, taskID string, leaseSeconds int) (*wf.Lease, error)
 	ReleaseDevice(ctx context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error
+	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
 	CreateTask(ctx context.Context, row wf.TaskRow) error
 	GetTask(ctx context.Context, taskID string) (*wf.TaskRow, error)
 	SetTaskStatus(ctx context.Context, taskID, status string) error
@@ -52,6 +53,33 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatal(err)
 		}
 	}
+
+	t.Run("HasCapableDeviceIgnoresStatus", func(t *testing.T) {
+		s := newStore(t)
+		// 空 fleet:任何 selector 都无匹配
+		if ok, err := s.HasCapableDevice(ctx, wf.DeviceSelector{}); err != nil || ok {
+			t.Fatalf("empty fleet: ok=%v err=%v, want false", ok, err)
+		}
+		seed(t, s)
+		// 大小写不敏感 + capabilities 子集,与 AcquireDevice 同一匹配语义
+		if ok, _ := s.HasCapableDevice(ctx, wf.DeviceSelector{SOC: []string{"TRINKET"}, Capabilities: []string{"hexagon"}}); !ok {
+			t.Error("trinket+hexagon 应匹配")
+		}
+		if ok, _ := s.HasCapableDevice(ctx, wf.DeviceSelector{SOC: []string{"RK3588"}}); ok {
+			t.Error("RK3588 不应匹配")
+		}
+		if ok, _ := s.HasCapableDevice(ctx, wf.DeviceSelector{Capabilities: []string{"npu"}}); ok {
+			t.Error("npu 不应匹配(capabilities 非子集)")
+		}
+		// BUSY/QUARANTINED 也算 fleet 有能力("设备在但暂不可用"由 acquire 等待处理)
+		l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t1", 120)
+		if err != nil || l == nil {
+			t.Fatal(err)
+		}
+		if ok, _ := s.HasCapableDevice(ctx, wf.DeviceSelector{SOC: []string{"trinket"}}); !ok {
+			t.Error("BUSY 设备仍应报告 fleet 有能力")
+		}
+	})
 
 	t.Run("AcquireMatchesSelectorAndLocks", func(t *testing.T) {
 		s := newStore(t)

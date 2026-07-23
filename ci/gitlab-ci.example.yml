@@ -12,6 +12,8 @@
 #      URL 仍确定性可寻址,重跑同一 job 产生同名文件,400 skip 变回安全幂等。
 #   B. 打包后注入 manifest.yaml + files.sha256,Schema 不过则 fail(§6.2)。
 #   C. 每 job 产出 dist/meta/{variant}.json;publish:bundle 聚合,8 个不齐不发(§6.3)。
+#   D. 变体级触发:上传成功后直发 Trigger /kick,一个包编好即测,
+#      不等全部 8 个包与 pipeline success(§6.3;TRIGGER_KICK_URL/TOKEN 走 CI/CD 变量)。
 
 variables:
   RELEASE_PACKAGE_NAME: algo-super-sdk
@@ -62,6 +64,12 @@ build:aarch64_Android_SNPE_2.21:
       --upload-file "dist/final/$PKG_FILE"
       "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$RELEASE_PACKAGE_NAME/$RELEASE_VERSION/$PKG_FILE"
       || echo "upload skipped (already exists)"
+    # D: 变体级触发(仅上传成功的分支)。kick 失败即 fail job(可见、可重试,
+    #    Temporal 按确定性 workflow ID 去重,重试不会重复测试)。
+    - python3 hermes-devops/ci/kick.py
+        --meta "dist/meta/aarch64_Android_SNPE_2.21.json"
+        --trigger-url "${TRIGGER_KICK_URL}"
+        --token-env TRIGGER_KICK_TOKEN
   artifacts:
     paths: [dist/meta/]
     expire_in: 1 week

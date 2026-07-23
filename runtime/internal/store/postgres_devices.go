@@ -132,6 +132,30 @@ func (s *PGStore) lockOneCandidate(ctx context.Context, tx *sql.Tx, sel wf.Devic
 	return &d, nil
 }
 
+// HasCapableDevice 报告 fleet 中是否存在满足 sel 的设备(任意状态,含
+// OFFLINE/BUSY/QUARANTINED)。语义与 MemStore 一致;设备表小,全量读出后在
+// Go 侧复用 matchSelector,保证两种 store 的匹配语义不漂移。
+func (s *PGStore) HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT soc, capabilities FROM devices`)
+	if err != nil {
+		return false, fmt.Errorf("has capable device: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d Device
+		if err := rows.Scan(&d.SOC, pq.Array(&d.Capabilities)); err != nil {
+			return false, fmt.Errorf("has capable device: scan: %w", err)
+		}
+		if matchSelector(d, sel) {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("has capable device: %w", err)
+	}
+	return false, nil
+}
+
 // ReleaseDevice 归还租约。infraFail=true 时 fail_streak+1,
 // 达到 quarantineAfter(§10 缺省 3)则 QUARANTINED;成功归还清零 fail_streak。
 // 非租约持有者释放/租约已易主:幂等,无副作用(WHERE 匹配不到行,语句空转)。

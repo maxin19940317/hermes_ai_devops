@@ -105,7 +105,14 @@ hermes-devops/
    解决"版本号不变导致新构建被 skip 静默丢弃"的阻塞问题。URL 保持确定性可寻址:
    `{CI_API_V4_URL}/projects/{id}/packages/generic/{name}/{X.Y.Z}/{上述文件名}`。
 2. **包内注入契约文件**:`gen_manifest.py` 在打包后解包 → 写入 `manifest.yaml`(按 `ci/variants.yaml` 渲染)+ `files.sha256` → 重打包重命名。生成后立即用 `manifest.schema.json` 校验,不合法 fail pipeline。
-3. **bundle 聚合**:每个 build job 输出 `dist/meta/{variant}.json`(job artifact);新增 `publish:bundle` job 聚合为 `bundle-g{sha}.json` 上传 Registry。**8 个 meta 不齐全则不发 bundle**(挡住被 interruptible 打断的残缺构建)。Trigger 服务只认 bundle。
+3. **bundle 聚合**:每个 build job 输出 `dist/meta/{variant}.json`(job artifact);新增 `publish:bundle` job 聚合为 `bundle-g{sha}.json` 上传 Registry。**8 个 meta 不齐全则不发 bundle**(挡住被 interruptible 打断的残缺构建)。
+   **2026-07-22 演进:变体级触发(kick)**。build job 上传成功后直发
+   `POST /kick`(meta 原样透传,复用 webhook 密钥),Trigger 校验(形态 +
+   URL 归属 + Registry 探活)后起**单变体 workflow**(ID 含 variant,重复 kick
+   由 Temporal 去重)——一个包编好即测,不等全部 8 个包与 pipeline success。
+   bundle 保留为发布完整性断言;`TRIGGER_PIPELINE_WEBHOOK=false` 后 pipeline
+   success webhook 仅记录不再起完整 workflow(防双跑)。触发与设备解耦:
+   fleet 无匹配设备的变体由 SelectTestSpecs 秒级跳过(任意 OS/板型,CI 不改)。
 4. Linux 变体第一阶段不进设备测试链路(SSH Adapter 属 Phase 4),但 Manifest 照常生成。
 
 ## 7. 核心契约(v1,放入 contracts/,以 JSON Schema 为准)

@@ -20,6 +20,11 @@ const (
 	SignalTaskHeartbeat = "task-heartbeat"
 )
 
+// VerdictSkipped 标记在 SelectTestSpecs 阶段被跳过的变体(fleet 无匹配设备/
+// OS 未接入)。只出现在 TaskSummary 与通知文案中,不经过规则引擎,
+// §9 的 verdict 集合不变。
+const VerdictSkipped = "SKIPPED"
+
 // TaskResultSignal 是 /callbacks/v1/results 经 API 转投的终态(§8.2)。
 type TaskResultSignal struct {
 	TaskID        string             `json:"task_id"`
@@ -194,16 +199,23 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 		},
 	})
 
-	var specs []TestSpec
-	if err := workflow.ExecuteActivity(ctx, "SelectTestSpecs", in).Get(ctx, &specs); err != nil {
+	var sel SpecSelection
+	if err := workflow.ExecuteActivity(ctx, "SelectTestSpecs", in).Get(ctx, &sel); err != nil {
 		return nil, fmt.Errorf("select test specs: %w", err)
 	}
 
 	out := &DeviceTestOutput{}
+	// fleet 无匹配设备/OS 未接入的变体:秒级标记 SKIPPED,不占设备不等待
+	for _, sk := range sel.Skipped {
+		out.Tasks = append(out.Tasks, TaskSummary{
+			TestID: sk.Variant, Variant: sk.Variant,
+			Verdict: VerdictSkipped, Reason: sk.Reason,
+		})
+	}
 	resultCh := workflow.GetSignalChannel(ctx, SignalTaskResult)
 	hbCh := workflow.GetSignalChannel(ctx, SignalTaskHeartbeat)
 
-	for _, spec := range specs {
+	for _, spec := range sel.Specs {
 		out.Tasks = append(out.Tasks, runTest(ctx, spec, resultCh, hbCh))
 	}
 

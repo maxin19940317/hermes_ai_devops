@@ -22,8 +22,9 @@ var errBoom = errors.New("client unreachable")
 type fakeActs struct {
 	mu           sync.Mutex
 	specs        []TestSpec
-	acquires     []*Lease // 每次 AcquireDevice 依次弹出;耗尽后返回 defaultLease
-	dispatchErrs []error  // 依次弹出;耗尽后 nil
+	skipped      []SkippedSpec // SelectTestSpecs 透传:fleet 无匹配设备/OS 未接入
+	acquires     []*Lease      // 每次 AcquireDevice 依次弹出;耗尽后返回 defaultLease
+	dispatchErrs []error       // 依次弹出;耗尽后 nil
 
 	acquireCalls  int
 	created       []TaskRow
@@ -41,8 +42,8 @@ type fakeActs struct {
 
 var defaultLease = &Lease{DeviceID: "dev1", Serial: "513cd3de", ClientID: "c1", ClientBaseURL: "https://client:8443"}
 
-func (f *fakeActs) SelectTestSpecs(_ context.Context, _ DeviceTestInput) ([]TestSpec, error) {
-	return f.specs, nil
+func (f *fakeActs) SelectTestSpecs(_ context.Context, _ DeviceTestInput) (*SpecSelection, error) {
+	return &SpecSelection{Specs: f.specs, Skipped: f.skipped}, nil
 }
 func (f *fakeActs) AcquireDevice(_ context.Context, _ AcquireRequest) (*Lease, error) {
 	f.mu.Lock()
@@ -281,6 +282,48 @@ func TestSignatureHitNoRetry(t *testing.T) {
 	}
 	if len(f.decisions) != 1 || f.decisions[0].Actor != "rule" {
 		t.Errorf("Analyzer 未启用应只落规则裁决: %+v", f.decisions)
+	}
+}
+
+// TestSkippedVariantInOutputAndNotification:fleet 无匹配设备的变体不进
+// acquire/dispatch,直接以 SKIPPED 出现在输出与通知中(§12 变体级触发)。
+func TestSkippedVariantInOutputAndNotification(t *testing.T) {
+	f := &fakeActs{
+		specs:   []TestSpec{spec1()},
+		skipped: []SkippedSpec{{Variant: "aarch64_Android_RKNN_2.3.2", Reason: "no capable device registered (soc=[RK3588 RK3566] capabilities=[rknpu])"}},
+	}
+	env := newEnv(t, f)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
+	}, 30*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow err: %v", env.GetWorkflowError())
+	}
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Tasks) != 2 {
+		t.Fatalf("tasks = %+v, want skipped + passed 各 1", out.Tasks)
+	}
+	sk, passed := out.Tasks[0], out.Tasks[1]
+	if sk.Variant != "aarch64_Android_RKNN_2.3.2" || sk.Verdict != VerdictSkipped ||
+		!strings.Contains(sk.Reason, "no capable device") {
+		t.Errorf("skipped task = %+v", sk)
+	}
+	if passed.Verdict != "PASSED" {
+		t.Errorf("passed task = %+v", passed)
+	}
+	// 被跳过的变体不得占用设备/派单
+	if len(f.dispatched) != 1 {
+		t.Errorf("dispatched = %d, want 1(跳过变体不派单)", len(f.dispatched))
+	}
+	if len(f.notifications) != 1 ||
+		!strings.Contains(f.notifications[0], "SKIPPED") ||
+		!strings.Contains(f.notifications[0], "no capable device") {
+		t.Errorf("notification = %q(需含 SKIPPED 及原因)", f.notifications)
 	}
 }
 

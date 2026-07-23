@@ -2,9 +2,11 @@ package activity
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"hermes-devops/runtime/internal/rules"
+	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -30,14 +32,14 @@ func TestSelectTestSpecsAndroidOnly(t *testing.T) {
 			{Variant: "aarch64_Linux_SNPE_2.21", URL: "https://gitlab/pkg2"}, // Linux:不进链路(§6.4)
 			{Variant: "unknown_variant", URL: "https://gitlab/pkg3"},         // 未配置:跳过
 		}}
-	specs, err := a.SelectTestSpecs(ctx, in)
+	sel, err := a.SelectTestSpecs(ctx, in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(specs) != 1 {
-		t.Fatalf("specs = %d, want 1(仅 Android 变体)", len(specs))
+	if len(sel.Specs) != 1 {
+		t.Fatalf("specs = %d, want 1(仅 Android 变体)", len(sel.Specs))
 	}
-	s := specs[0]
+	s := sel.Specs[0]
 	if s.TestID != "aarch64_Android_SNPE_2.21" || s.Variant != s.TestID || s.Package.URL != "https://gitlab/pkg1" {
 		t.Errorf("spec = %+v", s)
 	}
@@ -51,6 +53,40 @@ func TestSelectTestSpecsAndroidOnly(t *testing.T) {
 	// §10 缺省 + 硬超时 = timeout_sec + margin
 	if s.MaxInfraRetries != 2 || s.LeaseSeconds != 120 || s.HardTimeoutSec != 2100 {
 		t.Errorf("knobs = %+v", s)
+	}
+	// Linux 变体进入 Skipped(通知可见),未配置变体静默跳过
+	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Linux_SNPE_2.21" {
+		t.Errorf("skipped = %+v, want Linux 变体 1 条", sel.Skipped)
+	}
+}
+
+// TestSelectTestSpecsFleetSkip:fleet 无匹配设备的变体秒级跳过;
+// 有匹配设备(任意状态)的变体保留(§12 变体级触发)。
+func TestSelectTestSpecsFleetSkip(t *testing.T) {
+	a := testActs(t)
+	st := store.NewMemStore()
+	// fleet 只有一台 QCM6125:RKNN 变体(要 RK3588)应被跳过,SNPE 保留
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1", BaseURL: "https://c1"},
+		[]store.Device{{DeviceID: "d1", Serial: "513cd3de", ClientID: "c1",
+			SOC: "QCM6125", Capabilities: []string{"hexagon"}}}); err != nil {
+		t.Fatal(err)
+	}
+	a.Store = st
+	in := wf.DeviceTestInput{Project: "p", Commit: "abc1234", PipelineID: 1,
+		Packages: []wf.PackageRef{
+			{Variant: "aarch64_Android_SNPE_2.21", URL: "https://gitlab/pkg1"},
+			{Variant: "aarch64_Android_RKNN_2.3.2", URL: "https://gitlab/pkg2"},
+		}}
+	sel, err := a.SelectTestSpecs(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sel.Specs) != 1 || sel.Specs[0].Variant != "aarch64_Android_SNPE_2.21" {
+		t.Errorf("specs = %+v, want 仅 SNPE", sel.Specs)
+	}
+	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Android_RKNN_2.3.2" ||
+		!strings.Contains(sel.Skipped[0].Reason, "no capable device") {
+		t.Errorf("skipped = %+v, want RKNN 无匹配设备", sel.Skipped)
 	}
 }
 

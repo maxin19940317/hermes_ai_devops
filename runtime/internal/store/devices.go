@@ -133,3 +133,18 @@ func matchSelector(d Device, sel wf.DeviceSelector) bool {
 	}
 	return true
 }
+
+// HasCapableDevice 报告 fleet 中是否存在满足 sel 的设备(任意状态,含
+// OFFLINE/BUSY/QUARANTINED)。语义边界:"设备在但暂不可用"由 acquire 的
+// 有限等待处理;"fleet 从无匹配设备"才值得跳过,避免每变体白等
+// DeviceWaitRounds×DeviceWaitSeconds(§12 变体级触发后此等待会被放大)。
+func (s *MemStore) HasCapableDevice(_ context.Context, sel wf.DeviceSelector) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, row := range s.devices {
+		if matchSelector(row.Device, sel) {
+			return true, nil
+		}
+	}
+	return false, nil
+}

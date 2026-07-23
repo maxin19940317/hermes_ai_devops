@@ -13,3 +13,9 @@ variants:
       - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
   aarch64_Linux_SNPE_2.21:
     requirements: { os: linux, abi: aarch64 }
+  aarch64_Android_RKNN_2.3.2:
+    requirements: { os: android, abi: arm64-v8a, soc: [RK3588, RK3566], capabilities: [rknpu], min_free_storage_mb: 512 }
+    test:
+      args: []
+    signatures:
+      - { id: rknn_init_fail, where: stdout, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }

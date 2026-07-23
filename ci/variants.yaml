@@ -38,7 +38,9 @@ variants:
     test:
       args: []
     signatures:
-      - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
+      # where=stdout:实测(2026-07-22 p48)SDK 测试二进制输出走 stdout.log,不进 logcat;
+      # 扫 logcat 永远命中不到,native_crash 除外(系统 tombstone 确实在 logcat)。
+      - { id: cpu_fallback, where: stdout, pattern: "Falling back to CPU", classify: MODEL }
 
   aarch64_Android_SNPE_2.21:
     requirements: { os: android, abi: arm64-v8a, soc: [QCM6125], capabilities: [hexagon], min_free_storage_mb: 512 }
@@ -48,7 +50,7 @@ variants:
     test:
       args: []
     signatures:
-      - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
+      - { id: cpu_fallback, where: stdout, pattern: "Falling back to CPU", classify: MODEL }
 
   aarch64_Android_RKNN_2.3.2:
     requirements: { os: android, abi: arm64-v8a, soc: [RK3588, RK3566], capabilities: [rknpu], min_free_storage_mb: 512 }
@@ -57,7 +59,7 @@ variants:
     test:
       args: []
     signatures:
-      - { id: rknn_init_fail, where: logcat, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }
+      - { id: rknn_init_fail, where: stdout, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }
 
   aarch64_Android_TFLite_2.21.0:
     requirements: { os: android, abi: arm64-v8a, min_free_storage_mb: 512 }
@@ -66,7 +68,7 @@ variants:
     test:
       args: []
     signatures:
-      - { id: delegate_fallback, where: logcat, pattern: "falling back to CPU|Delegate creation failed", classify: DELEGATE }
+      - { id: delegate_fallback, where: stdout, pattern: "falling back to CPU|Delegate creation failed", classify: DELEGATE }
 
   aarch64_Linux_SNPE_1.68:
     requirements: { os: linux, abi: arm64-v8a, min_free_storage_mb: 512 }

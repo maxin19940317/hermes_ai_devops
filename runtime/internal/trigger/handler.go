@@ -36,15 +36,24 @@ type Config struct {
 	WebhookSecret string
 	Refs          []string        // 触发的分支白名单;空 = 不过滤
 	Logger        *zerolog.Logger // 缺省 Nop
+	// GitLabBaseURL 用于校验 /kick 载荷中的产物 URL 必须指向本 GitLab
+	// (形如 https://gitlab.example,空 = 不校验,仅开发)。
+	GitLabBaseURL string
+	// PipelineWebhookDisabled 关闭 pipeline success webhook 的触发语义
+	// (变体级 /kick 上线后,避免同一变体被 bundle workflow 与 kick
+	// workflow 双跑;webhook 仍接收并 204,仅作记录)。缺省 false = 启用。
+	PipelineWebhookDisabled bool
 }
 
-// Handler 处理 GitLab webhook。
+// Handler 处理 GitLab webhook 与 CI 直发 /kick。
 type Handler struct {
 	cfg     Config
 	fetcher BundleFetcher
 	store   store.ArtifactStore
 	starter WorkflowStarter
 	log     zerolog.Logger
+	// Prober 复核 /kick 产物存在性;nil = 跳过复核(仅开发)。
+	Prober PackageProber
 }
 
 func New(cfg Config, fetcher BundleFetcher, st store.ArtifactStore, starter WorkflowStarter) (*Handler, error) {
@@ -78,13 +87,19 @@ const shortSHALen = 8 // CI_COMMIT_SHORT_SHA 固定 8 位,bundle 文件名以此
 
 var fullSHARegexp = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
+// checkToken 恒定时间比对共享密钥(GitLab 13.8 webhook secret;
+// /kick 复用同一密钥与请求头,CI 变量下发)。
+func (h *Handler) checkToken(r *http.Request) bool {
+	return subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Gitlab-Token")), []byte(h.cfg.WebhookSecret)) == 1
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	// GitLab webhook secret token 是共享密钥比对(13.8 无 HMAC 签名),恒定时间比较
-	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Gitlab-Token")), []byte(h.cfg.WebhookSecret)) != 1 {
+	if !h.checkToken(r) {
 		http.Error(w, "bad token", http.StatusUnauthorized)
 		return
 	}
@@ -92,6 +107,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var ev pipelineEvent
 	if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
 		http.Error(w, "bad payload", http.StatusBadRequest)
+		return
+	}
+	if ev.ObjectKind == "pipeline" && h.cfg.PipelineWebhookDisabled {
+		// 变体级 /kick 已接管触发;webhook 仅记录,不再起完整 bundle workflow(防双跑)
+		h.log.Info().Str("project", ev.Project.PathWithNamespace).
+			Int64("pipeline", ev.ObjectAttributes.ID).
+			Str("status", ev.ObjectAttributes.Status).
+			Msg("pipeline webhook received but disabled (kick mode)")
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if ev.ObjectKind != "pipeline" || ev.ObjectAttributes.Status != "success" ||

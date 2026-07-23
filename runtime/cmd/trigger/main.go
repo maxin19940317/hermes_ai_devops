@@ -4,8 +4,9 @@
 // 配置(环境变量):
 //
 //	TRIGGER_ADDR          监听地址,缺省 :8090
-//	TRIGGER_WEBHOOK_SECRET  GitLab webhook Secret Token(必填)
+//	TRIGGER_WEBHOOK_SECRET  GitLab webhook Secret Token(必填;/kick 复用)
 //	TRIGGER_REFS          逗号分隔分支白名单,缺省 master(tag 事件总是放行)
+//	TRIGGER_PIPELINE_WEBHOOK  缺省 true;false = webhook 仅记录不起 workflow( kick 模式)
 //	GITLAB_BASE_URL       如 https://gitlab.example(必填)
 //	GITLAB_TOKEN          read_api 访问令牌(必填)
 //	GITLAB_TOKEN_HEADER   缺省 PRIVATE-TOKEN(Deploy Token 用 Deploy-Token)
@@ -76,26 +77,33 @@ func main() {
 	}
 	defer tc.Close()
 
-	h, err := trigger.New(trigger.Config{
-		WebhookSecret: secret,
-		Refs:          strings.Split(env("TRIGGER_REFS", "master"), ","),
-		Logger:        &log,
-	}, &trigger.GitLabClient{
+	gl := &trigger.GitLabClient{
 		BaseURL:     strings.TrimRight(gitlabBase, "/"),
 		Token:       gitlabToken,
 		TokenHeader: env("GITLAB_TOKEN_HEADER", "PRIVATE-TOKEN"),
 		PackageName: env("PACKAGE_NAME", "algo-super-sdk"),
 		HTTP:        &http.Client{Timeout: 60 * time.Second},
-	}, artifacts, &trigger.TemporalStarter{
+	}
+	h, err := trigger.New(trigger.Config{
+		WebhookSecret: secret,
+		Refs:          strings.Split(env("TRIGGER_REFS", "master"), ","),
+		Logger:        &log,
+		GitLabBaseURL: gitlabBase,
+		// 变体级 /kick 上线后置 false:pipeline webhook 仅记录,不再起完整
+		// bundle workflow,避免同一变体双跑(§6.3)。
+		PipelineWebhookDisabled: env("TRIGGER_PIPELINE_WEBHOOK", "true") != "true",
+	}, gl, artifacts, &trigger.TemporalStarter{
 		Client:    tc,
 		TaskQueue: env("TEMPORAL_TASK_QUEUE", "device-test"),
 	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("configure trigger")
 	}
+	h.Prober = gl
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/gitlab", h)
+	mux.HandleFunc("/kick", h.HandleKick)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
