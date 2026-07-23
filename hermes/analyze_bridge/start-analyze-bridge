@@ -3,6 +3,9 @@
 # 形态与 /opt/data/bin/start-queinfer-gitlab-bridge 一致:env 文件 + pidfile +
 # nohup uvicorn,重复执行幂等(健康则直接返回)。
 set -euo pipefail
+# hermes CLI 依 HOME 定位配置(config.yaml);docker exec --user 不带 HOME 时
+# 必须显式 export,否则 -z 找不到 /opt/data/config.yaml(实测报参数解析错误)。
+export HOME=/opt/data
 ENV_FILE=/opt/data/analyze_bridge.env
 PID_FILE=/opt/data/logs/analyze-bridge-8643.pid
 LOG_FILE=/opt/data/logs/analyze-bridge-8643.log

@@ -80,8 +80,7 @@ HERMES_TIMEOUT_SEC=180   # 覆盖 -z 冷启动(实测 76s)
 
 ## 运维
 
-- 日志:`docker exec hermes-devops-analyzer tail -f /opt/data/logs/analyze-bridge-8643.log`
-  (含每次分析的 token/成本 usage 报告)。
+- 日志:`docker exec hermes-devops-analyzer tail -f /opt/data/logs/analyze-bridge-8643.log`。
 - 重启 bridge:重复执行 `start-analyze-bridge` 即可(幂等)。
 - Analyzer 未配置/宕机时 Runtime 行为不变:verdict 由规则引擎保底,decisions
   表只有 rule 行。

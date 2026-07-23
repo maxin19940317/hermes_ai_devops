@@ -53,7 +53,8 @@ def fake_hermes(tmp_path, monkeypatch):
     script = tmp_path / "fake-hermes"
     script.write_text(
         "#!/bin/sh\n"
-        f'echo "$@" >> "{calls_log}"\n'
+        f'for a in "$@"; do echo "ARG:$a"; done >> "{calls_log}"\n'
+        f'echo "END-CALL" >> "{calls_log}"\n'
         f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{counter}"\n'
         f'resp="{resp_dir}/resp$n.json"\n'
         f'[ -f "$resp" ] || resp="{resp_dir}/resp_default.json"\n'
@@ -128,7 +129,7 @@ def test_retry_on_schema_invalid_then_success(client, fake_hermes):
     # 第二次调用的 prompt 应携带上次的校验错误(打回重试);
     # 首次 prompt 不含该提示,出现即证明重试生效
     calls = fake_hermes.parent.joinpath("calls.log").read_text(encoding="utf-8")
-    assert calls.count("-z") == 2
+    assert calls.count("ARG:-z\n") == 2
     assert "未通过 analysis.schema.json 校验" in calls
 
 
@@ -153,7 +154,7 @@ def test_model_passthrough(client, fake_hermes):
     r = client.post("/analyze", json=payload, headers=auth())
     assert r.status_code == 200
     calls = fake_hermes.parent.joinpath("calls.log").read_text(encoding="utf-8")
-    assert "-m deepseek/deepseek-v4-pro" in calls
+    assert "ARG:-m\nARG:deepseek/deepseek-v4-pro\n" in calls
 
 
 def test_toolsets_disabled(client, fake_hermes):
@@ -162,8 +163,8 @@ def test_toolsets_disabled(client, fake_hermes):
     r = client.post("/analyze", json=PAYLOAD, headers=auth())
     assert r.status_code == 200
     calls = fake_hermes.parent.joinpath("calls.log").read_text(encoding="utf-8")
-    # echo "$@" 时空参数塌缩:-t "" 呈现为 -t 后两个空格接 --usage-file
-    assert "-t  --usage-file" in calls
+    # 空工具集参数呈现为 ARG:-t 紧跟一个空 ARG
+    assert "ARG:-t\nARG:\n" in calls
 
 
 def test_timeout_returns_502(client, tmp_path, monkeypatch):

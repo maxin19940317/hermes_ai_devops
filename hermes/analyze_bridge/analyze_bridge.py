@@ -20,7 +20,6 @@ import json
 import logging
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 
 import jsonschema
@@ -105,22 +104,10 @@ def run_hermes(prompt: str, model: str | None) -> str:
     cmd = [HERMES_BIN, "-z", prompt, "-t", ""]
     if model:
         cmd += ["-m", model]
-    with tempfile.NamedTemporaryFile(suffix=".usage.json", delete=False) as f:
-        usage_path = f.name
-    cmd += ["--usage-file", usage_path]
     try:
         cp = subprocess.run(cmd, capture_output=True, text=True, timeout=HERMES_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise BridgeError(502, f"hermes -z 超时({HERMES_TIMEOUT}s)")
-    finally:
-        # usage 报告(成本/token)只落日志,不进响应(契约固定)
-        try:
-            usage = Path(usage_path).read_text(encoding="utf-8")
-            if usage.strip():
-                log.info("hermes usage: %s", usage.strip()[:ERR_SNIPPET])
-        except OSError:
-            pass
-        Path(usage_path).unlink(missing_ok=True)
     if cp.returncode != 0:
         raise BridgeError(502, f"hermes -z 退出码 {cp.returncode}: {cp.stderr[-ERR_SNIPPET:]}")
     return cp.stdout
