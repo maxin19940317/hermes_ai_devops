@@ -41,6 +41,8 @@ variants:
       # where=stdout:实测(2026-07-22 p48)SDK 测试二进制输出走 stdout.log,不进 logcat;
       # 扫 logcat 永远命中不到,native_crash 除外(系统 tombstone 确实在 logcat)。
       - { id: cpu_fallback, where: stdout, pattern: "Falling back to CPU", classify: MODEL }
+      # 2026-07-24 p53:DSP 委派不可用(unsigned PD 不支持),gesture 等强依赖 DSP 的用例 init 失败
+      - { id: dsp_unavailable, where: stdout, pattern: "RUNTIME_NOT_AVAILABLE|DspTransport.*not supported|DSP does not support", classify: DELEGATE }
 
   aarch64_Android_SNPE_2.21:
     requirements: { os: android, abi: arm64-v8a, soc: [QCM6125], capabilities: [hexagon], min_free_storage_mb: 512 }
@@ -51,6 +53,8 @@ variants:
       args: []
     signatures:
       - { id: cpu_fallback, where: stdout, pattern: "Falling back to CPU", classify: MODEL }
+      # 2026-07-24 p53:DSP 委派不可用(unsigned PD 不支持),gesture 等强依赖 DSP 的用例 init 失败
+      - { id: dsp_unavailable, where: stdout, pattern: "RUNTIME_NOT_AVAILABLE|DspTransport.*not supported|DSP does not support", classify: DELEGATE }
 
   aarch64_Android_RKNN_2.3.2:
     requirements: { os: android, abi: arm64-v8a, soc: [RK3588, RK3566], capabilities: [rknpu], min_free_storage_mb: 512 }
@@ -79,6 +83,7 @@ variants:
       args: []
     signatures:
       - { id: cpu_fallback, where: stderr, pattern: "Falling back to CPU", classify: MODEL }
+      - { id: dsp_unavailable, where: stderr, pattern: "RUNTIME_NOT_AVAILABLE|DspTransport.*not supported|DSP does not support", classify: DELEGATE }
 
   aarch64_Linux_SNPE_2.21:
     requirements: { os: linux, abi: arm64-v8a, min_free_storage_mb: 512 }
@@ -89,6 +94,7 @@ variants:
       args: []
     signatures:
       - { id: cpu_fallback, where: stderr, pattern: "Falling back to CPU", classify: MODEL }
+      - { id: dsp_unavailable, where: stderr, pattern: "RUNTIME_NOT_AVAILABLE|DspTransport.*not supported|DSP does not support", classify: DELEGATE }
 
   aarch64_Linux_RKNN_2.3.2:
     requirements: { os: linux, abi: arm64-v8a, min_free_storage_mb: 512 }
