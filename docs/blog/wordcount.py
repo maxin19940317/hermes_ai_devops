@@ -6,12 +6,12 @@ import re, sys
 
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
+text = re.sub(r"```.*?```", "", text, flags=re.S)   # 去代码块
+text = re.sub(r"`[^`]*`", "", text)                  # 去行内代码
 if len(sys.argv) > 2:
     start = text.find(sys.argv[2])
     text = text[start:] if start >= 0 else ""
 if len(sys.argv) > 3:
     end = text.find(sys.argv[3])
     text = text[:end] if end >= 0 else text
-text = re.sub(r"```.*?```", "", text, flags=re.S)   # 去代码块
-text = re.sub(r"`[^`]*`", "", text)                  # 去行内代码
 print(len(re.findall(r"[一-鿿]", text)))
