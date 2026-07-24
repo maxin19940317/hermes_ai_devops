@@ -176,7 +176,10 @@ type TaskSummary struct {
 	Category    string       `json:"category"`
 	Reason      string       `json:"reason"`
 	Attachments []Attachment `json:"attachments,omitempty"`
-	retryable   bool
+	// Analysis 是 Phase 2 LLM Analyzer 的补充结论(仅非 PASSED 且 Analyzer 启用时
+	// 非空);随输出与通知透出,判定权仍在规则引擎(§9)。
+	Analysis  *hermesclient.Analysis `json:"analysis,omitempty"`
+	retryable bool
 }
 
 type DeviceTestOutput struct {
@@ -329,7 +332,7 @@ func runAttempt(ctx workflow.Context, spec TestSpec, attempt int, resultCh, hbCh
 	saveRuleDecision(dctx, taskID, d)
 	// Phase 2:非 PASSED 提取证据并交 Analyzer 补充分析(降级设计,不影响主链路)
 	if d.Verdict != rules.VerdictPassed {
-		runAnalysis(ctx, dctx, taskID, spec, res, d)
+		sum.Analysis = runAnalysis(ctx, dctx, taskID, spec, res, d)
 	}
 	finish(res.Status, sum.Verdict, sum.Category, sum.Reason)
 	release(d.Category == rules.CategoryInfra)
@@ -351,31 +354,31 @@ func saveRuleDecision(dctx workflow.Context, taskID string, d rules.Decision) {
 }
 
 // runAnalysis 提取证据并交 LLM Analyzer 补充分析,分析结论落 decisions 表。
-// 全程降级:提取/分析失败或 Analyzer 未启用都只记日志跳过,
-// verdict 判定权永远在规则引擎(§9;§12 Hermes 不可用 → 规则引擎保底)。
-func runAnalysis(ctx, dctx workflow.Context, taskID string, spec TestSpec, res *TaskResultSignal, d rules.Decision) {
+// 返回分析本体供输出/通知透出;提取/分析失败或 Analyzer 未启用返回 nil
+// (全程降级,verdict 判定权永远在规则引擎,§9;§12 Hermes 不可用 → 规则引擎保底)。
+func runAnalysis(ctx, dctx workflow.Context, taskID string, spec TestSpec, res *TaskResultSignal, d rules.Decision) *hermesclient.Analysis {
 	logger := workflow.GetLogger(ctx)
 	var ev ExtractEvidenceResponse
 	if err := workflow.ExecuteActivity(ctx, "ExtractEvidence", ExtractEvidenceRequest{
 		TaskID: taskID, Variant: spec.Variant, Result: *res,
 	}).Get(ctx, &ev); err != nil {
 		logger.Error("extract evidence failed, skip analysis", "task", taskID, "error", err)
-		return
+		return nil
 	}
 	var analysis *hermesclient.Analysis
 	if err := workflow.ExecuteActivity(ctx, "Analyze", AnalyzeRequest{
 		TaskID: taskID, RuleCategory: string(d.Category), EvidenceJSON: ev.EvidenceJSON,
 	}).Get(ctx, &analysis); err != nil {
 		logger.Error("analyze failed, rule decision stands", "task", taskID, "error", err)
-		return
+		return nil
 	}
 	if analysis == nil {
-		return // Analyzer 未启用(HERMES_ENDPOINT 空)
+		return nil // Analyzer 未启用(HERMES_ENDPOINT 空)
 	}
 	out, err := json.Marshal(analysis)
 	if err != nil {
 		logger.Error("marshal analysis failed", "task", taskID, "error", err)
-		return
+		return nil
 	}
 	row := DecisionRow{
 		TaskID: taskID, Actor: "hermes", InputDigest: ev.Digest,
@@ -384,6 +387,7 @@ func runAnalysis(ctx, dctx workflow.Context, taskID string, spec TestSpec, res *
 	if err := workflow.ExecuteActivity(dctx, "SaveDecision", row).Get(dctx, nil); err != nil {
 		logger.Error("save hermes decision failed", "task", taskID, "error", err)
 	}
+	return analysis
 }
 
 // awaitResult 阻塞等待本 task 的结果 signal;心跳 signal 续租;
@@ -451,6 +455,10 @@ func buildNotification(in DeviceTestInput, out *DeviceTestOutput) string {
 			fmt.Fprintf(&b, "(%s)", tk.Category)
 		}
 		fmt.Fprintf(&b, " attempt=%d %s\n", tk.Attempt, tk.Reason)
+		// Phase 2:LLM Analyzer 的总结性结论随通知透出(仅非 PASSED 且分析成功时存在)
+		if tk.Analysis != nil && tk.Analysis.Summary != "" {
+			fmt.Fprintf(&b, "  · hermes: %s\n", tk.Analysis.Summary)
+		}
 		for _, att := range tk.Attachments {
 			fmt.Fprintf(&b, "  · %s → %s\n", att.Name, att.ObjectKey)
 		}

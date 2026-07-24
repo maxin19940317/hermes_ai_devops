@@ -364,6 +364,19 @@ func TestAnalysisSavedOnFailure(t *testing.T) {
 		!strings.Contains(string(herm.Output), "delegate fell back to CPU") {
 		t.Errorf("hermes 裁决 = %+v(需带 evidence 摘要/prompt 版本/分析本体)", herm)
 	}
+	// 分析结论随 workflow 输出与飞书通知透出(§12.6 通知带 hermes 总结)
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Tasks) != 1 || out.Tasks[0].Analysis == nil ||
+		out.Tasks[0].Analysis.Summary != "delegate fell back to CPU" {
+		t.Errorf("task summary 应携带 analysis: %+v", out.Tasks)
+	}
+	if len(f.notifications) != 1 ||
+		!strings.Contains(f.notifications[0], "hermes: delegate fell back to CPU") {
+		t.Errorf("notification = %q(需含 hermes summary 行)", f.notifications)
+	}
 }
 
 func TestStaleResultSignalIgnored(t *testing.T) {
