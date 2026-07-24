@@ -98,3 +98,22 @@ func (s *PGStore) SaveResult(ctx context.Context, rec wf.ResultRecord) (bool, er
 	}
 	return n > 0, nil
 }
+
+// GetResult 按 task_id 读权威结果(LoadResult 活动,差距清单 #2);
+// 不存在返回 (nil, nil)。
+func (s *PGStore) GetResult(ctx context.Context, taskID string) (*wf.ResultRecord, error) {
+	var body []byte
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT result_json FROM results WHERE task_id = $1`, taskID).Scan(&body)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get result %s: %w", taskID, err)
+	}
+	var sig wf.TaskResultSignal
+	if err := json.Unmarshal(body, &sig); err != nil {
+		return nil, fmt.Errorf("get result %s: unmarshal: %w", taskID, err)
+	}
+	return &wf.ResultRecord{TaskID: taskID, Result: sig}, nil
+}

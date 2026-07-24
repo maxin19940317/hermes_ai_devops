@@ -27,6 +27,9 @@ func (a *Acts) Dispatch(ctx context.Context, req wf.DispatchRequest) error {
 		"manifest_digest":   req.ManifestDigest,
 		"device_serial":     req.DeviceSerial,
 		"callback_base_url": a.Cfg.CallbackBaseURL,
+		// 租约所有权凭据(§10/差距 #15):Client 心跳续租时原样回传
+		"lease_id":          req.LeaseID,
+		"lease_generation":  req.LeaseGeneration,
 		"presigned_uploads": a.presignedUploads(ctx, req.TaskID), // §3.7;禁用时为空集降级
 	}
 	return a.post(ctx, req.ClientBaseURL+"/api/v1/tasks", payload, http.StatusAccepted)

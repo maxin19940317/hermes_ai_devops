@@ -16,8 +16,7 @@ import (
 // ---- signal 契约(callbacks API → workflow) ----
 
 const (
-	SignalTaskResult    = "task-result"
-	SignalTaskHeartbeat = "task-heartbeat"
+	SignalTaskResult = "task-result"
 )
 
 // VerdictSkipped 标记在 SelectTestSpecs 阶段被跳过的变体(fleet 无匹配设备/
@@ -26,6 +25,9 @@ const (
 const VerdictSkipped = "SKIPPED"
 
 // TaskResultSignal 是 /callbacks/v1/results 经 API 转投的终态(§8.2)。
+// 事务性 Outbox 链路(差距清单 #1/#2)落地后,workflow 只消费其中的 task_id
+// 做匹配去重,结果本体经 LoadResult 活动回读 results 表(权威读);
+// 全量字段在过渡期保留以兼容直发双通道,Relay 全量部署后可收缩为轻量载荷。
 type TaskResultSignal struct {
 	TaskID        string             `json:"task_id"`
 	Status        string             `json:"status"` // COMPLETED|FAILED|TIMEOUT|CANCELED
@@ -43,11 +45,6 @@ type Attachment struct {
 	ObjectKey string `json:"object_key"`
 	SHA256    string `json:"sha256"`
 	Size      int64  `json:"size"`
-}
-
-// TaskHeartbeat 续租(§8.2 heartbeat 即租约续期)。
-type TaskHeartbeat struct {
-	TaskID string `json:"task_id"`
 }
 
 // ---- 活动契约(实现在 internal/activity) ----
@@ -77,11 +74,15 @@ type AcquireRequest struct {
 }
 
 // Lease 是 AcquireDevice 的结果;nil 表示当前无可用设备。
+// LeaseID/Generation 是租约所有权凭据(§10/差距 #15):随派单透传 Client,
+// 心跳续租时必须原样携带,失配即 LEASE_NOT_OWNED。
 type Lease struct {
 	DeviceID      string `json:"device_id"`
 	Serial        string `json:"serial"`
 	ClientID      string `json:"client_id"`
 	ClientBaseURL string `json:"client_base_url"`
+	LeaseID       string `json:"lease_id"`
+	Generation    int    `json:"lease_generation"`
 }
 
 type TaskRow struct {
@@ -97,14 +98,22 @@ type TaskRow struct {
 
 // DispatchRequest 对应 §8.1 POST /api/v1/tasks 的派单载荷(凭据由活动实现补充)。
 type DispatchRequest struct {
-	TaskID         string `json:"task_id"`
-	IdempotencyKey string `json:"idempotency_key"`
-	Attempt        int    `json:"attempt"`
-	PackageURL     string `json:"package_url"`
-	PackageSHA256  string `json:"package_sha256"`
-	ManifestDigest string `json:"manifest_digest"`
-	DeviceSerial   string `json:"device_serial"`
-	ClientBaseURL  string `json:"client_base_url"`
+	TaskID          string `json:"task_id"`
+	IdempotencyKey  string `json:"idempotency_key"`
+	Attempt         int    `json:"attempt"`
+	PackageURL      string `json:"package_url"`
+	PackageSHA256   string `json:"package_sha256"`
+	ManifestDigest  string `json:"manifest_digest"`
+	DeviceSerial    string `json:"device_serial"`
+	ClientBaseURL   string `json:"client_base_url"`
+	LeaseID         string `json:"lease_id"`         // 租约所有权凭据,Client 心跳续租时原样回传(§10)
+	LeaseGeneration int    `json:"lease_generation"` // 同上
+}
+
+// CheckLeaseRequest 是 CheckLease 活动的入参(原则 6:租约到期 Timer 触发的
+// 低频检查,非轮询)。
+type CheckLeaseRequest struct {
+	TaskID string `json:"task_id"`
 }
 
 type CancelRequest struct {
@@ -112,11 +121,18 @@ type CancelRequest struct {
 	ClientBaseURL string `json:"client_base_url"`
 }
 
-// ResultRecord 是 results 表一行;由回调服务在投 signal 前落库(SaveResult 去重),
-// workflow 不再经手结果持久化。
+// ResultRecord 是 results 表一行;由回调服务随 outbox 事件单事务落库
+// (SaveResultWithOutbox 去重,原则 3),workflow 收到结果 signal 后经
+// LoadResult 活动按 task_id 回读(权威读,差距清单 #2),不再消费 signal 载荷。
 type ResultRecord struct {
 	TaskID string           `json:"task_id"`
 	Result TaskResultSignal `json:"result"`
+}
+
+// LoadResultRequest 是 LoadResult 活动的入参:signal 只作唤醒提示,
+// 结果本体以 results 表为准(docs/device-test-sequence.md 时序图 §7)。
+type LoadResultRequest struct {
+	TaskID string `json:"task_id"`
 }
 
 type FinishRequest struct {
@@ -192,8 +208,9 @@ type DeviceTestOutput struct {
 // ---- workflow 本体 ----
 
 // DeviceTestWorkflow 主干(§12.6):
-// SelectTestSpecs → 逐测试 [acquire_device → dispatch → await_result(signal,
-// 心跳续租,过期按 on_infra_error 机械重试 ≤2)→ 规则引擎判 verdict → release_device]
+// SelectTestSpecs → 逐测试 [acquire_device → dispatch → await_result(signal 唤醒,
+// 租约到期 Durable Timer + CheckLease 低频检查,过期按 on_infra_error 机械重试 ≤2)
+// → LoadResult 权威读 → 规则引擎按 rule_version 判 verdict → release_device]
 // → 飞书纯文本通知。规则引擎为纯函数,直接在 workflow 内调用(确定性)。
 func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOutput, error) {
 	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
@@ -204,6 +221,16 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 			MaximumAttempts:    3,
 		},
 	})
+
+	// 规则版本路由(原则 2/差距 #7):未知 rule_version 拒绝启动并明确报错,
+	// 绝不静默用最新版判定——同一版本在重放与未来执行中必须得到同一裁决。
+	ruleVersion := in.RuleVersion
+	if ruleVersion == "" {
+		ruleVersion = rules.DefaultVersion
+	}
+	if err := rules.ValidateVersion(ruleVersion); err != nil {
+		return nil, fmt.Errorf("device test %s: %w", in.WorkflowID(), err)
+	}
 
 	var sel SpecSelection
 	if err := workflow.ExecuteActivity(ctx, "SelectTestSpecs", in).Get(ctx, &sel); err != nil {
@@ -219,10 +246,9 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 		})
 	}
 	resultCh := workflow.GetSignalChannel(ctx, SignalTaskResult)
-	hbCh := workflow.GetSignalChannel(ctx, SignalTaskHeartbeat)
 
 	for _, spec := range sel.Specs {
-		out.Tasks = append(out.Tasks, runTest(ctx, spec, resultCh, hbCh))
+		out.Tasks = append(out.Tasks, runTest(ctx, spec, ruleVersion, resultCh))
 	}
 
 	text := buildNotification(in, out)
@@ -233,11 +259,11 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 }
 
 // runTest 执行一个测试(含 INFRA 机械重试,§10 缺省 ≤2 次)。
-func runTest(ctx workflow.Context, spec TestSpec, resultCh, hbCh workflow.ReceiveChannel) TaskSummary {
+func runTest(ctx workflow.Context, spec TestSpec, ruleVersion string, resultCh workflow.ReceiveChannel) TaskSummary {
 	maxAttempts := spec.MaxInfraRetries + 1
 	var sum TaskSummary
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		sum = runAttempt(ctx, spec, attempt, resultCh, hbCh)
+		sum = runAttempt(ctx, spec, ruleVersion, attempt, resultCh)
 		if !sum.retryable || attempt == maxAttempts {
 			break
 		}
@@ -247,13 +273,14 @@ func runTest(ctx workflow.Context, spec TestSpec, resultCh, hbCh workflow.Receiv
 	return sum
 }
 
-func runAttempt(ctx workflow.Context, spec TestSpec, attempt int, resultCh, hbCh workflow.ReceiveChannel) TaskSummary {
+func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt int, resultCh workflow.ReceiveChannel) TaskSummary {
 	wfID := workflow.GetInfo(ctx).WorkflowExecution.ID
 	// 幂等键 = {workflow_id}:{test_id}:{attempt}(§12.6),task_id 同值
 	taskID := fmt.Sprintf("%s:%s:a%d", wfID, spec.TestID, attempt)
 	sum := TaskSummary{TestID: spec.TestID, Variant: spec.Variant, TaskID: taskID, Attempt: attempt}
 	infra := func(reason string, retryable bool) TaskSummary {
-		d := rules.Decide(rules.Input{Status: "FAILED", InfraReason: reason})
+		// ruleVersion 已在 workflow 启动时 ValidateVersion,此处不会出错
+		d, _ := rules.Decide(ruleVersion, rules.Input{Status: "FAILED", InfraReason: reason})
 		sum.Verdict, sum.Category, sum.Reason = string(d.Verdict), string(d.Category), d.Reason
 		sum.retryable = retryable && d.Retry
 		return sum
@@ -307,15 +334,16 @@ func runAttempt(ctx workflow.Context, spec TestSpec, attempt int, resultCh, hbCh
 		PackageURL: spec.Package.URL, PackageSHA256: spec.Package.SHA256,
 		ManifestDigest: spec.Package.ManifestDigest,
 		DeviceSerial:   lease.Serial, ClientBaseURL: lease.ClientBaseURL,
+		// 租约所有权凭据透传 Client:心跳续租时原样回传,失配即 LEASE_NOT_OWNED(§10)
+		LeaseID: lease.LeaseID, LeaseGeneration: lease.Generation,
 	}).Get(ctx, nil); err != nil {
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), "dispatch failed")
 		release(true)
 		return infra("dispatch: "+err.Error(), true)
 	}
 
-	// ---- await_result:signal 驱动,心跳续租,禁止轮询(§14) ----
-	res, infraReason := awaitResult(ctx, taskID, spec, resultCh, hbCh)
-	if infraReason != "" {
+	// ---- await_result:signal 驱动 + 租约到期 Durable Timer/CheckLease(原则 6,§14) ----
+	if infraReason := awaitResult(ctx, taskID, spec, resultCh); infraReason != "" {
 		_ = workflow.ExecuteActivity(dctx, "CancelTask",
 			CancelRequest{TaskID: taskID, ClientBaseURL: lease.ClientBaseURL}).Get(dctx, nil)
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), infraReason)
@@ -323,8 +351,27 @@ func runAttempt(ctx workflow.Context, spec TestSpec, attempt int, resultCh, hbCh
 		return infra(infraReason, true)
 	}
 
-	// ---- 规则引擎判 verdict(结果本体已由回调服务 SaveResult 落库,§8.2) ----
-	d := rules.Decide(rules.Input{
+	// ---- LoadResult 权威读(原则 3 + 差距清单 #2):signal 只是唤醒提示,
+	// 结果本体以 results 表为准。读不到说明 outbox 链路异常(结果未随 signal
+	// 落库),按 INFRA 处理走机械重试,绝不消费 signal 载荷兜底 ----
+	var rec *ResultRecord
+	loadErr := workflow.ExecuteActivity(ctx, "LoadResult", LoadResultRequest{TaskID: taskID}).Get(ctx, &rec)
+	if loadErr != nil || rec == nil {
+		reason := "load result: no row in results table"
+		if loadErr != nil {
+			reason = "load result: " + loadErr.Error()
+		}
+		_ = workflow.ExecuteActivity(dctx, "CancelTask",
+			CancelRequest{TaskID: taskID, ClientBaseURL: lease.ClientBaseURL}).Get(dctx, nil)
+		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), reason)
+		release(true)
+		return infra(reason, true)
+	}
+	res := &rec.Result
+
+	// ---- 规则引擎判 verdict(结果本体已由回调服务单事务落库,§8.2/原则 3;
+	// 按 rule_version 路由,启动时已校验,此处不会出错) ----
+	d, _ := rules.Decide(ruleVersion, rules.Input{
 		Status: res.Status, ExitCode: res.ExitCode, CasesFailed: res.CasesFailed,
 		SignaturesHit: res.SignaturesHit, SignatureCategory: spec.SignatureCategory,
 	})
@@ -394,21 +441,36 @@ func runAnalysis(ctx, dctx workflow.Context, taskID string, spec TestSpec, res *
 	return analysis
 }
 
-// awaitResult 阻塞等待本 task 的结果 signal;心跳 signal 续租;
-// 租约过期或硬超时返回 infraReason。
-func awaitResult(ctx workflow.Context, taskID string, spec TestSpec, resultCh, hbCh workflow.ReceiveChannel) (*TaskResultSignal, string) {
+// awaitResult 阻塞等待本 task 的结果 signal;租约以 Durable Timer 到期驱动
+// CheckLease 活动做低频检查(原则 6:心跳只续数据库租约,不向 workflow 发
+// 高频 signal;Timer 到期才查库,非轮询):已续期 → 按新 expires_at 重设 Timer
+// 继续等;已过期/租约易主 → 返回 infraReason 进入 INFRA 处理。
+// 同 task_id 的重复 signal(Relay 至少一次重投)幂等:首个匹配即返回,
+// 其余留在 channel 缓冲中随 workflow 结束丢弃;陌生/历史 attempt 的迟到
+// 结果按 task_id 不匹配直接忽略。
+func awaitResult(ctx workflow.Context, taskID string, spec TestSpec, resultCh workflow.ReceiveChannel) string {
 	lease := time.Duration(spec.LeaseSeconds) * time.Second
 	hardDeadline := workflow.Now(ctx).Add(time.Duration(spec.HardTimeoutSec) * time.Second)
 	leaseExpiry := workflow.Now(ctx).Add(lease)
 
-	var res *TaskResultSignal
+	matched := false
 	for {
 		now := workflow.Now(ctx)
 		if now.After(hardDeadline) || now.Equal(hardDeadline) {
-			return nil, "hard deadline exceeded"
+			return "hard deadline exceeded"
 		}
 		if now.After(leaseExpiry) || now.Equal(leaseExpiry) {
-			return nil, "lease expired (no heartbeat)"
+			// 租约到期:CheckLease 读库确认(心跳只续 DB 租约,§10)
+			var expiry *time.Time
+			if err := workflow.ExecuteActivity(ctx, "CheckLease",
+				CheckLeaseRequest{TaskID: taskID}).Get(ctx, &expiry); err != nil {
+				return "check lease: " + err.Error()
+			}
+			if expiry == nil || !expiry.After(now) {
+				return "lease expired (no heartbeat)"
+			}
+			leaseExpiry = *expiry // 已续期:按库内新 expires_at 重设 Timer
+			continue
 		}
 		next := leaseExpiry
 		if hardDeadline.Before(next) {
@@ -422,25 +484,18 @@ func awaitResult(ctx workflow.Context, taskID string, spec TestSpec, resultCh, h
 			var cand TaskResultSignal
 			c.Receive(ctx, &cand)
 			if cand.TaskID == taskID {
-				res = &cand
+				matched = true
 			} // 其他 task(含历史 attempt)的迟到结果:忽略
-		})
-		sel.AddReceive(hbCh, func(c workflow.ReceiveChannel, _ bool) {
-			var hb TaskHeartbeat
-			c.Receive(ctx, &hb)
-			if hb.TaskID == taskID {
-				leaseExpiry = workflow.Now(ctx).Add(lease) // 续租(§8.2)
-			}
 		})
 		sel.AddFuture(timer, func(workflow.Future) {}) // 唤醒后由循环头重新判定
 		sel.Select(ctx)
 		cancelTimer()
 
-		if res != nil {
-			return res, ""
+		if matched {
+			return ""
 		}
 		if ctx.Err() != nil {
-			return nil, "workflow canceled"
+			return "workflow canceled"
 		}
 	}
 }

@@ -18,6 +18,11 @@
       "description": "Registry 路径版本号,GitLab 13.8 不接受 + 与预发布后缀"
     },
     "created_at": { "type": "string", "format": "date-time", "description": "UTC" },
+    "rule_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "规则引擎版本(目标设计基线 v1.0 原则 2,缺省 verdict-rules-v1);workflow 按它路由 rules 实现,未知版本拒绝启动"
+    },
     "packages": {
       "type": "array",
       "minItems": 1,

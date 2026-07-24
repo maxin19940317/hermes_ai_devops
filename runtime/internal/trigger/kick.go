@@ -28,6 +28,12 @@ type kickPayload struct {
 	Commit           string `json:"commit"` // short sha
 	PipelineID       int    `json:"pipeline_id"`
 	PipelineGlobalID int64  `json:"pipeline_global_id"`
+	// RuleVersion 规则引擎版本(契约只加不删,缺省 verdict-rules-v1,差距 #7)。
+	RuleVersion string `json:"rule_version"`
+	// Retry 显式重试语义(差距 #11):true 时 workflow ID 加 -r{N} 后缀起新 run
+	// (N 取自 artifacts.workflow_attempt 原子递增);缺省 false = 普通触发,
+	// 同 ID 已存在一律幂等不再启动(无论上次成败)。
+	Retry bool `json:"retry"`
 }
 
 var (
@@ -141,10 +147,22 @@ func (h *Handler) HandleKick(w http.ResponseWriter, r *http.Request) {
 	in := wf.DeviceTestInput{
 		Project: p.Project, Commit: p.Commit, PipelineID: p.PipelineID,
 		Version: p.Version, Scope: p.Variant,
+		RuleVersion: ruleVersionOr(p.RuleVersion),
 		Packages: []wf.PackageRef{{
 			Variant: p.Variant, PackageFile: p.PackageFile, URL: p.URL,
 			SHA256: p.SHA256, Size: p.Size, ManifestDigest: p.ManifestDigest,
 		}},
+	}
+	if p.Retry {
+		// 显式 retry(差距 #11):同一逻辑键(commit,pipeline,variant)原子递增
+		// workflow_attempt 得 N,workflow ID 加 -r{N} 起新 run;普通重放永不走这里。
+		n, err := h.store.NextWorkflowAttempt(r.Context(), p.Commit, p.PipelineID, p.Variant)
+		if err != nil {
+			log.Error().Err(err).Msg("next workflow attempt")
+			http.Error(w, "retry attempt failed", http.StatusInternalServerError)
+			return
+		}
+		in.Attempt = n
 	}
 	wfID, started, err := h.starter.StartDeviceTest(r.Context(), in)
 	if err != nil {

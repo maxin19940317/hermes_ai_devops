@@ -70,13 +70,41 @@ func TestDecide(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := Decide(tc.in)
+			// v1 行为锁定:该版本实现已冻结(历史 workflow 重放依赖),
+			// 任何行为漂移都会在此暴露;演进只能新增版本分支。
+			got, err := Decide(VersionV1, tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if got.Verdict != tc.want.Verdict || got.Category != tc.want.Category || got.Retry != tc.want.Retry {
-				t.Errorf("Decide(%+v) = %+v, want %+v", tc.in, got, tc.want)
+				t.Errorf("Decide(v1, %+v) = %+v, want %+v", tc.in, got, tc.want)
 			}
 			if got.Reason == "" {
 				t.Error("Reason 不得为空(进通知与 decisions 审计)")
 			}
 		})
+	}
+}
+
+// 版本路由(差距 #7):空版本按缺省 v1(兼容旧输入);未知版本必须报错,
+// 绝不静默用最新版——重放安全(同一 rule_version 在重放与未来执行中同裁决)。
+func TestVersionRouting(t *testing.T) {
+	in := Input{Status: "COMPLETED", ExitCode: 0}
+	for _, v := range []string{"", VersionV1} {
+		d, err := Decide(v, in)
+		if err != nil || d.Verdict != VerdictPassed {
+			t.Errorf("Decide(%q) = %+v err=%v, want v1 PASSED", v, d, err)
+		}
+		if err := ValidateVersion(v); err != nil {
+			t.Errorf("ValidateVersion(%q): %v", v, err)
+		}
+	}
+	for _, v := range []string{"verdict-rules-v2", "bogus", "v1"} {
+		if _, err := Decide(v, in); err == nil {
+			t.Errorf("Decide(%q) 应报未知版本错误", v)
+		}
+		if err := ValidateVersion(v); err == nil {
+			t.Errorf("ValidateVersion(%q) 应报未知版本错误", v)
+		}
 	}
 }

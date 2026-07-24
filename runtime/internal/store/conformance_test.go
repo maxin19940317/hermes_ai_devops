@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -16,10 +17,12 @@ var ctx = context.Background()
 // (internal/callbacks.Store)所需持久层方法的并集;
 // MemStore 与 PGStore 必须行为一致,由本套件保证。
 type fullStore interface {
+	RegisterArtifacts(ctx context.Context, arts []Artifact) error
 	UpsertClientDevices(ctx context.Context, c Client, devs []Device) error
 	AcquireDevice(ctx context.Context, sel wf.DeviceSelector, taskID string, leaseSeconds int) (*wf.Lease, error)
 	ReleaseDevice(ctx context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error
-	RenewLease(ctx context.Context, deviceID, taskID string, leaseSeconds int) error
+	RenewLease(ctx context.Context, cred LeaseCredential, leaseSeconds int) (bool, error)
+	GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error)
 	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
 	CreateTask(ctx context.Context, row wf.TaskRow) error
 	GetTask(ctx context.Context, taskID string) (*wf.TaskRow, error)
@@ -27,8 +30,14 @@ type fullStore interface {
 	FinishTask(ctx context.Context, req wf.FinishRequest) error
 	AppendTaskEvent(ctx context.Context, ev TaskEvent) (bool, error)
 	SaveResult(ctx context.Context, rec wf.ResultRecord) (bool, error)
+	SaveResultWithOutbox(ctx context.Context, rec wf.ResultRecord, ev OutboxEvent) (bool, error)
+	GetResult(ctx context.Context, taskID string) (*wf.ResultRecord, error)
+	ClaimUnpublished(ctx context.Context, limit int) ([]OutboxEvent, error)
+	MarkPublished(ctx context.Context, id int64) error
+	MarkFailed(ctx context.Context, id int64, cause string) error
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
 	ListDecisions(ctx context.Context, taskID string) ([]wf.DecisionRow, error)
+	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -243,30 +252,33 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 	t.Run("LeaseLifecycleRenewAndReclaim", func(t *testing.T) {
 		cases := []struct {
 			name          string
-			leaseSeconds  int    // t1 初始租约时长;0 = 立即过期(模拟持有者失联)
-			renewTask     string // 租约过期后续租者;"" 表示不续租
+			leaseSeconds  int  // t1 初始租约时长;0 = 立即过期(模拟持有者失联)
+			renew         bool // 租约过期后持有者是否凭所有权凭据续租
 			renewSeconds  int
 			wantReclaimed bool // t2 随后能否取得设备
 		}{
-			{"有效租约不得回收", 120, "", 0, false},
-			{"过期租约懒回收", 0, "", 0, true},
-			{"持有者续期阻止回收", 0, "t1", 120, false},
-			{"非持有者续租无效", 0, "intruder", 120, true},
+			{"有效租约不得回收", 120, false, 0, false},
+			{"过期租约懒回收", 0, false, 0, true},
+			{"持有者续期阻止回收", 0, true, 120, false},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				s := newStore(t)
 				seed(t, s)
-				l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t1", tc.leaseSeconds)
+				l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", tc.leaseSeconds)
 				if err != nil || l == nil {
 					t.Fatalf("t1 acquire: lease=%v err=%v", l, err)
 				}
-				if tc.renewTask != "" {
-					if err := s.RenewLease(ctx, l.DeviceID, tc.renewTask, tc.renewSeconds); err != nil {
-						t.Fatalf("renew: %v", err)
+				if tc.renew {
+					ok, err := s.RenewLease(ctx, LeaseCredential{
+						DeviceID: l.DeviceID, ClientID: l.ClientID, TaskID: "w:t1:a1",
+						Attempt: 1, LeaseID: l.LeaseID, Generation: l.Generation,
+					}, tc.renewSeconds)
+					if err != nil || !ok {
+						t.Fatalf("持有者续租应成功: ok=%v err=%v", ok, err)
 					}
 				}
-				l2, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t2", 120)
+				l2, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t2:a1", 120)
 				if err != nil {
 					t.Fatalf("t2 acquire: %v", err)
 				}
@@ -274,6 +286,125 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 					t.Errorf("reclaimed = %v, want %v", l2 != nil, tc.wantReclaimed)
 				}
 			})
+		}
+	})
+
+	// 租约所有权凭据(§10/差距 #15):续租是条件更新,任何一项失配都返回
+	// false(LEASE_NOT_OWNED),旧持有者不得再续已易主/已释放的租约。
+	t.Run("LeaseOwnershipCredentials", func(t *testing.T) {
+		cases := []struct {
+			name         string
+			mutate       func(c *LeaseCredential)
+			releaseFirst bool
+			want         bool
+		}{
+			{"正确凭据续租成功", func(*LeaseCredential) {}, false, true},
+			{"错client不得续租", func(c *LeaseCredential) { c.ClientID = "other" }, false, false},
+			{"错task不得续租", func(c *LeaseCredential) { c.TaskID = "w:t9:a1" }, false, false},
+			{"错lease_id不得续租", func(c *LeaseCredential) { c.LeaseID = "forged" }, false, false},
+			{"错generation不得续租", func(c *LeaseCredential) { c.Generation++ }, false, false},
+			{"attempt与task_id不一致不得续租", func(c *LeaseCredential) { c.Attempt = 2 }, false, false},
+			{"已释放租约不得续租", func(*LeaseCredential) {}, true, false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newStore(t)
+				seed(t, s)
+				l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
+				if err != nil || l == nil {
+					t.Fatalf("acquire: lease=%v err=%v", l, err)
+				}
+				cred := LeaseCredential{
+					DeviceID: l.DeviceID, ClientID: l.ClientID, TaskID: "w:t1:a1",
+					Attempt: 1, LeaseID: l.LeaseID, Generation: l.Generation,
+				}
+				tc.mutate(&cred)
+				if tc.releaseFirst {
+					if err := s.ReleaseDevice(ctx, l.DeviceID, "w:t1:a1", false, 3); err != nil {
+						t.Fatal(err)
+					}
+				}
+				ok, err := s.RenewLease(ctx, cred, 120)
+				if err != nil {
+					t.Fatalf("renew: %v", err)
+				}
+				if ok != tc.want {
+					t.Errorf("renewed = %v, want %v", ok, tc.want)
+				}
+			})
+		}
+		// 懒回收易主:generation 递增,旧持有者凭据全部失效,新持有者可续
+		s := newStore(t)
+		seed(t, s)
+		old, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 0) // 立即过期
+		if err != nil || old == nil {
+			t.Fatalf("acquire: %v %v", old, err)
+		}
+		newL, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t2:a1", 120)
+		if err != nil || newL == nil {
+			t.Fatalf("reclaim: %v %v", newL, err)
+		}
+		if newL.Generation != old.Generation+1 {
+			t.Errorf("generation = %d → %d, want +1", old.Generation, newL.Generation)
+		}
+		if ok, _ := s.RenewLease(ctx, LeaseCredential{
+			DeviceID: old.DeviceID, ClientID: old.ClientID, TaskID: "w:t1:a1",
+			Attempt: 1, LeaseID: old.LeaseID, Generation: old.Generation,
+		}, 120); ok {
+			t.Error("旧持有者凭据在易主后不得续租")
+		}
+		if ok, _ := s.RenewLease(ctx, LeaseCredential{
+			DeviceID: newL.DeviceID, ClientID: newL.ClientID, TaskID: "w:t2:a1",
+			Attempt: 1, LeaseID: newL.LeaseID, Generation: newL.Generation,
+		}, 120); !ok {
+			t.Error("新持有者凭据应可续租")
+		}
+	})
+
+	// GetLeaseExpiry:CheckLease 活动的数据源(原则 6)——持有中返回到期时刻,
+	// 释放后/未知任务返回 nil(未续期)。
+	t.Run("GetLeaseExpiryLifecycle", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		if exp, err := s.GetLeaseExpiry(ctx, "w:t1:a1"); err != nil || exp != nil {
+			t.Errorf("未知任务: exp=%v err=%v, want (nil, nil)", exp, err)
+		}
+		l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
+		if err != nil || l == nil {
+			t.Fatalf("acquire: %v %v", l, err)
+		}
+		exp, err := s.GetLeaseExpiry(ctx, "w:t1:a1")
+		if err != nil || exp == nil {
+			t.Fatalf("持有中: exp=%v err=%v", exp, err)
+		}
+		if time.Until(*exp) < 100*time.Second {
+			t.Errorf("expiry = %v, want ~120s 后", exp)
+		}
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "w:t1:a1", false, 3); err != nil {
+			t.Fatal(err)
+		}
+		if exp, err := s.GetLeaseExpiry(ctx, "w:t1:a1"); err != nil || exp != nil {
+			t.Errorf("释放后: exp=%v err=%v, want (nil, nil)", exp, err)
+		}
+	})
+
+	// NextWorkflowAttempt(差距 #11):显式 retry 计数按逻辑键原子单调递增;
+	// 未登记的键报错。
+	t.Run("NextWorkflowAttemptMonotonic", func(t *testing.T) {
+		s := newStore(t)
+		art := Artifact{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42,
+			Variant: "v1", BuildType: "Release", URL: "u", SHA256: "s", Size: 1, ManifestDigest: "m"}
+		if err := s.RegisterArtifacts(ctx, []Artifact{art}); err != nil {
+			t.Fatal(err)
+		}
+		for want := 1; want <= 3; want++ {
+			n, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "v1")
+			if err != nil || n != want {
+				t.Fatalf("attempt = %d err=%v, want %d", n, err, want)
+			}
+		}
+		if _, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "ghost"); err == nil {
+			t.Error("未登记的键应报错")
 		}
 	})
 
@@ -357,6 +488,114 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		ins, err = s.SaveResult(ctx, rec) // 回调重发
 		if err != nil || ins {
 			t.Fatalf("重复结果应去重: ins=%v err=%v", ins, err)
+		}
+	})
+
+	// 事务性 Outbox(原则 3):results + outbox 单事务写入,两侧各自幂等。
+	t.Run("SaveResultWithOutboxIdempotent", func(t *testing.T) {
+		s := newStore(t)
+		_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w:t1:a1", IdempotencyKey: "w:t1:a1"})
+		rec := wf.ResultRecord{TaskID: "w:t1:a1", Result: wf.TaskResultSignal{
+			TaskID: "w:t1:a1", Status: "COMPLETED", ExitCode: 0, CasesTotal: 38,
+		}}
+		payload := json.RawMessage(`{"workflow_id":"w","result":{"task_id":"w:t1:a1"}}`)
+		ev := OutboxEvent{AggregateType: "task", AggregateID: "w:t1:a1",
+			EventType: EventTypeTaskResult, EventKey: "w:t1:a1:result", Payload: payload}
+		ins, err := s.SaveResultWithOutbox(ctx, rec, ev)
+		if err != nil || !ins {
+			t.Fatalf("first save: ins=%v err=%v", ins, err)
+		}
+		// 回调重发:同 task_id 结果去重、同 event_key 不产生第二行、不报错
+		ins, err = s.SaveResultWithOutbox(ctx, rec, ev)
+		if err != nil || ins {
+			t.Fatalf("重复写入应去重: ins=%v err=%v", ins, err)
+		}
+		rows, err := s.ClaimUnpublished(ctx, 10)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("claim = %+v err=%v, want 单行", rows, err)
+		}
+		got := rows[0]
+		if got.AggregateType != "task" || got.AggregateID != "w:t1:a1" ||
+			got.EventType != EventTypeTaskResult || got.EventKey != "w:t1:a1:result" ||
+			got.Attempts != 0 || got.ID == 0 {
+			t.Errorf("outbox row = %+v", got)
+		}
+		// GetResult 权威读(LoadResult 活动,差距 #2)
+		loaded, err := s.GetResult(ctx, "w:t1:a1")
+		if err != nil || loaded == nil {
+			t.Fatalf("get result = %+v err=%v", loaded, err)
+		}
+		if loaded.Result.Status != "COMPLETED" || loaded.Result.CasesTotal != 38 {
+			t.Errorf("loaded result = %+v", loaded.Result)
+		}
+		if missing, err := s.GetResult(ctx, "no-such"); err != nil || missing != nil {
+			t.Errorf("未知任务应返回 (nil, nil): %+v %v", missing, err)
+		}
+	})
+
+	// outbox 投递生命周期状态机:unpublished →(MarkFailed 累计 attempts,行保持
+	// 未投递)→ MarkPublished 终态;两个 Mark* 都只作用于未投递行(表驱动)。
+	t.Run("OutboxLifecycle", func(t *testing.T) {
+		type op struct {
+			fail    string // 非空 → MarkFailed(id, 该错误)
+			publish bool   // → MarkPublished(id)
+		}
+		cases := []struct {
+			name          string
+			ops           []op
+			wantPending   bool // 最终仍待投递
+			wantAttempts  int
+			wantLastError string
+		}{
+			{"直接投递成功", []op{{publish: true}}, false, 0, ""},
+			{"失败后重投成功", []op{{fail: "boom"}, {publish: true}}, false, 1, "boom"},
+			{"连续失败累积attempts", []op{{fail: "e1"}, {fail: "e2"}}, true, 2, "e2"},
+			{"重复MarkPublished幂等", []op{{publish: true}, {publish: true}}, false, 0, ""},
+			{"已投递后MarkFailed无副作用", []op{{publish: true}, {fail: "late"}}, false, 0, ""},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newStore(t)
+				_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w:t1:a1", IdempotencyKey: "w:t1:a1"})
+				_, err := s.SaveResultWithOutbox(ctx,
+					wf.ResultRecord{TaskID: "w:t1:a1", Result: wf.TaskResultSignal{TaskID: "w:t1:a1"}},
+					OutboxEvent{AggregateType: "task", AggregateID: "w:t1:a1",
+						EventType: EventTypeTaskResult, EventKey: "w:t1:a1:result",
+						Payload: json.RawMessage(`{}`)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				rows, err := s.ClaimUnpublished(ctx, 10)
+				if err != nil || len(rows) != 1 {
+					t.Fatalf("claim = %+v err=%v", rows, err)
+				}
+				id := rows[0].ID
+				for _, o := range tc.ops {
+					if o.fail != "" {
+						if err := s.MarkFailed(ctx, id, o.fail); err != nil {
+							t.Fatalf("mark failed: %v", err)
+						}
+					}
+					if o.publish {
+						if err := s.MarkPublished(ctx, id); err != nil {
+							t.Fatalf("mark published: %v", err)
+						}
+					}
+				}
+				rows, err = s.ClaimUnpublished(ctx, 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if (len(rows) == 1) != tc.wantPending {
+					t.Fatalf("pending rows = %d, wantPending=%v", len(rows), tc.wantPending)
+				}
+				if tc.wantPending {
+					if rows[0].Attempts != tc.wantAttempts || rows[0].LastError != tc.wantLastError {
+						t.Errorf("row = %+v, want attempts=%d last_error=%q",
+							rows[0], tc.wantAttempts, tc.wantLastError)
+					}
+				}
+			})
 		}
 	})
 

@@ -53,6 +53,8 @@ def test_full_set_produces_schema_valid_bundle(tmp_path):
     assert bundle["pipeline_global_id"] == 42001
     assert bundle["version"] == "1.2.3"
     assert bundle["created_at"] == "2026-07-17T08:00:00.000Z"
+    # 规则引擎版本(原则 2):缺省写入 verdict-rules-v1,Trigger 据此路由 rules 实现
+    assert bundle["rule_version"] == "verdict-rules-v1"
     assert [p["variant"] for p in bundle["packages"]] == all_variants()
     # 顶层已有 project/commit 等,packages 内不重复携带
     assert "commit" not in bundle["packages"][0]

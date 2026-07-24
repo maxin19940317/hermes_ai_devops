@@ -32,6 +32,27 @@ func OpenPG(ctx context.Context, dsn string) (*PGStore, error) {
 	return &PGStore{DB: db}, nil
 }
 
+// NextWorkflowAttempt 把 (commit,pipeline,variant) 逻辑键的 workflow_attempt
+// 原子 +1 并返回新值(显式 retry 的 -r{N} 后缀来源,差距 #11);
+// 单条 UPDATE 原子递增,并发 retry 得到互不相同的 N;
+// 键未登记(产物尚未 RegisterArtifacts)返回错误。
+func (s *PGStore) NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `
+		UPDATE artifacts SET workflow_attempt = workflow_attempt + 1
+		WHERE commit_sha = $1 AND pipeline_id = $2 AND variant = $3
+		RETURNING workflow_attempt`,
+		commitSHA, pipelineID, variant).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d/%s",
+			commitSHA, pipelineID, variant)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%d/%s: %w", commitSHA, pipelineID, variant, err)
+	}
+	return n, nil
+}
+
 // RegisterArtifacts 幂等登记:同 (commit,pipeline,variant) 冲突时忽略。
 func (s *PGStore) RegisterArtifacts(ctx context.Context, arts []Artifact) error {
 	const q = `INSERT INTO artifacts

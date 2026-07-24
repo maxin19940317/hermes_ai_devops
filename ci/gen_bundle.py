@@ -26,6 +26,10 @@ SHARED_FIELDS = (
     "project", "commit", "pipeline_id", "pipeline_global_id", "version",
 )
 
+# 规则引擎版本(目标设计基线 v1.0 原则 2):bundle 未显式声明时 Trigger 按
+# 此缺省路由 rules 实现;引入新规则版本时由发版流程显式提升。
+DEFAULT_RULE_VERSION = "verdict-rules-v1"
+
 
 def _normalize_created_at(value):
     try:
@@ -62,6 +66,7 @@ def gen_bundle(*, meta_dir, variants_file, schema_file, outdir, created_at) -> P
     bundle = {
         "bundle_version": 1,
         **shared,
+        "rule_version": DEFAULT_RULE_VERSION,
         "created_at": _normalize_created_at(created_at),
         "packages": [
             {k: metas[v][k] for k in PACKAGE_FIELDS} for v in variants

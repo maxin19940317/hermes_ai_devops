@@ -251,10 +251,13 @@ func TestSuccessPipelineStartsWorkflowAndRegistersArtifacts(t *testing.T) {
 			t.Errorf("artifact = %+v", a)
 		}
 	}
-	// workflow 输入来自 bundle,ID 确定性
+	// workflow 输入来自 bundle,ID 确定性;rule_version 缺省补 v1(差距 #7)
 	if starter.gotInput.Commit != "abcd1234" || starter.gotInput.PipelineID != 42 ||
 		len(starter.gotInput.Packages) != 2 {
 		t.Errorf("workflow input = %+v", starter.gotInput)
+	}
+	if starter.gotInput.RuleVersion != "verdict-rules-v1" {
+		t.Errorf("rule_version = %q, want 缺省 verdict-rules-v1", starter.gotInput.RuleVersion)
 	}
 	wantID := "device-test-grp/algo-super-sdk-gabcd1234-p42"
 	var resp struct {
@@ -266,6 +269,24 @@ func TestSuccessPipelineStartsWorkflowAndRegistersArtifacts(t *testing.T) {
 	}
 	if resp.WorkflowID != wantID || !resp.Started {
 		t.Errorf("response = %+v, want id=%s started=true", resp, wantID)
+	}
+}
+
+// TestBundleRuleVersionFlowsToWorkflow:bundle 显式携带 rule_version 时
+// 原样进入 workflow 输入(差距 #7;缺省情形见主路径测试)。
+func TestBundleRuleVersionFlowsToWorkflow(t *testing.T) {
+	bundle := validBundle()
+	bundle["rule_version"] = "verdict-rules-v1"
+	fetcher := &fakeFetcher{bundle: mustJSON(t, bundle)}
+	starter := &fakeStarter{started: true}
+	h, _ := newTestHandler(fetcher, starter)
+
+	rec := post(h, testSecret, pipelinePayload("success", "master", fullSHA))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if starter.gotInput.RuleVersion != "verdict-rules-v1" {
+		t.Errorf("rule_version = %q, want verdict-rules-v1", starter.gotInput.RuleVersion)
 	}
 }
 

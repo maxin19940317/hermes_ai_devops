@@ -29,8 +29,6 @@ func (f *fakeSignaler) SignalWorkflow(_ context.Context, wfID, _ string, name st
 	defer f.mu.Unlock()
 	var tid string
 	switch v := arg.(type) {
-	case wf.TaskHeartbeat:
-		tid = v.TaskID
 	case wf.TaskResultSignal:
 		tid = v.TaskID
 	}
@@ -109,15 +107,15 @@ func TestHeartbeatUpsertsAndRenewsLeases(t *testing.T) {
 	if err != nil || l == nil || l.ClientBaseURL != "https://client:8443" {
 		t.Errorf("lease=%+v err=%v", l, err)
 	}
-	// 已知任务续租 signal;未知任务忽略不报错
-	if len(sig.calls) != 1 || sig.calls[0] != "w1/"+wf.SignalTaskHeartbeat+"/w1:t:a1" {
-		t.Errorf("signals = %v", sig.calls)
+	// 原则 6:心跳不再发任何 workflow signal(续租只写 DB,workflow 用 Timer+CheckLease)
+	if len(sig.calls) != 0 {
+		t.Errorf("心跳不得发 signal: %v", sig.calls)
 	}
 }
 
-// heartbeatLeaseFixture 注册设备、以 0s 租约(立即过期,模拟持有者失联)占用,
-// 并登记带 device_id 的任务行,返回设备的 selector。
-func heartbeatLeaseFixture(t *testing.T, s *store.MemStore, srv *httptest.Server) wf.DeviceSelector {
+// heartbeatLeaseFixture 注册设备、以 0s 租约(立即过期,模拟持有者失联临界点)
+// 租给 "w1:t:a1" 并登记带 device_id 的任务行,返回 selector 与租约所有权凭据。
+func heartbeatLeaseFixture(t *testing.T, s *store.MemStore, srv *httptest.Server) (wf.DeviceSelector, *wf.Lease) {
 	t.Helper()
 	resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
 		"client_id": "c1", "agent_version": "0.1.0", "base_url": "https://client:8443",
@@ -137,44 +135,105 @@ func heartbeatLeaseFixture(t *testing.T, s *store.MemStore, srv *httptest.Server
 		IdempotencyKey: "w1:t:a1", ClientID: "c1", DeviceID: l.DeviceID, Status: "RUNNING"}); err != nil {
 		t.Fatal(err)
 	}
-	return sel
+	return sel, l
 }
 
-// TestHeartbeatRenewsDatabaseLease:心跳中的 active_task_ids 必须续 DB 租约
-// (§10 心跳即租约续期);否则 lease_expires_at 只是 acquire 时写的一次性死值,
-// AcquireDevice 的过期懒回收会偷走健康长任务(900s)正在使用的设备。
-func TestHeartbeatRenewsDatabaseLease(t *testing.T) {
+func activeTaskEntry(l *wf.Lease, taskID string, attempt int) map[string]any {
+	return map[string]any{"task_id": taskID, "attempt": attempt,
+		"lease_id": l.LeaseID, "lease_generation": l.Generation}
+}
+
+// TestHeartbeatRenewsLeaseWithCredentials:新格式心跳携带所有权凭据
+// (task_id/attempt/lease_id/lease_generation,§10/差距 #15)条件续租成功,
+// 设备不得被回收。
+func TestHeartbeatRenewsLeaseWithCredentials(t *testing.T) {
 	s, _, srv := newEnv(t)
-	sel := heartbeatLeaseFixture(t, s, srv)
+	sel, l := heartbeatLeaseFixture(t, s, srv)
 
 	resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
-		"client_id": "c1", "active_task_ids": []string{"w1:t:a1"},
+		"client_id":       "c1",
+		"active_task_ids": []any{activeTaskEntry(l, "w1:t:a1", 1)},
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if l, _ := s.AcquireDevice(ctx, sel, "t2", 120); l != nil {
-		t.Errorf("心跳续期后设备不得被回收: %+v", l)
+	var ack struct {
+		NotOwned []struct{ TaskID string } `json:"not_owned"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&ack)
+	if len(ack.NotOwned) != 0 {
+		t.Errorf("正确凭据不得被判 LEASE_NOT_OWNED: %+v", ack.NotOwned)
+	}
+	if l2, _ := s.AcquireDevice(ctx, sel, "w2:t:a1", 120); l2 != nil {
+		t.Errorf("凭据续租后设备不得被回收: %+v", l2)
 	}
 }
 
-// TestHeartbeatSignalFailureStillRenewsLease:故障注入——workflow 已被 Terminate,
-// 续租 signal 必然失败;但只要 Client 仍在上报该任务(设备被物理占用),
-// DB 租约必须照样续期且心跳仍返回 200,设备不得被其他 workflow 偷走。
-// Client 停止上报后租约自然过期,由 AcquireDevice 回收(恢复路径,见 store 一致性测试)。
-func TestHeartbeatSignalFailureStillRenewsLease(t *testing.T) {
+// TestHeartbeatLeaseNotOwned:故障注入——凭据失配(租约已易主/伪造)必须逐项
+// 返回 LEASE_NOT_OWNED 且不续租(HTTP 仍 200,见 callbacks OpenAPI HeartbeatAck);
+// Client 收到后应停止操作该任务。
+func TestHeartbeatLeaseNotOwned(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(entry map[string]any, clientID *string)
+	}{
+		{"错 generation", func(e map[string]any, _ *string) { e["lease_generation"] = 99 }},
+		{"错 lease_id", func(e map[string]any, _ *string) { e["lease_id"] = "forged" }},
+		{"错 attempt", func(e map[string]any, _ *string) { e["attempt"] = 2 }},
+		{"错 client", func(_ map[string]any, c *string) { *c = "intruder" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, srv := newEnv(t)
+			sel, l := heartbeatLeaseFixture(t, s, srv)
+			clientID := "c1"
+			entry := activeTaskEntry(l, "w1:t:a1", 1)
+			tc.mutate(entry, &clientID)
+
+			resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
+				"client_id":       clientID,
+				"active_task_ids": []any{entry},
+			})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d(失配也回 200,错误码在响应体)", resp.StatusCode)
+			}
+			var ack struct {
+				NotOwned []struct {
+					TaskID string `json:"task_id"`
+					Code   string `json:"code"`
+				} `json:"not_owned"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&ack)
+			if len(ack.NotOwned) != 1 || ack.NotOwned[0].TaskID != "w1:t:a1" ||
+				ack.NotOwned[0].Code != "LEASE_NOT_OWNED" {
+				t.Errorf("ack.NotOwned = %+v, want 单条 LEASE_NOT_OWNED", ack.NotOwned)
+			}
+			if l2, _ := s.AcquireDevice(ctx, sel, "w2:t:a1", 120); l2 == nil {
+				t.Error("失配不得续租,过期租约应可被懒回收")
+			}
+		})
+	}
+}
+
+// TestHeartbeatLegacyStringFormatNoRenew:过渡兼容——旧格式(纯字符串数组)
+// 仅续 client 心跳,不续租、不报错、不判 LEASE_NOT_OWNED;
+// 过期租约照常懒回收(滚动升级窗口,下线时点见契约注释)。
+func TestHeartbeatLegacyStringFormatNoRenew(t *testing.T) {
 	s, sig, srv := newEnv(t)
-	sig.err = errors.New("workflow execution not found")
-	sel := heartbeatLeaseFixture(t, s, srv)
+	sel, _ := heartbeatLeaseFixture(t, s, srv)
 
 	resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
-		"client_id": "c1", "active_task_ids": []string{"w1:t:a1"},
+		"client_id":       "c1",
+		"active_task_ids": []string{"w1:t:a1"},
 	})
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("signal 失败不应影响心跳响应: status = %d", resp.StatusCode)
+		t.Fatalf("旧格式不应报错: status = %d", resp.StatusCode)
 	}
-	if l, _ := s.AcquireDevice(ctx, sel, "t2", 120); l != nil {
-		t.Errorf("signal 失败但 Client 仍在心跳,设备不得被回收: %+v", l)
+	if len(sig.calls) != 0 {
+		t.Errorf("旧格式也不得发 signal: %v", sig.calls)
+	}
+	if l2, _ := s.AcquireDevice(ctx, sel, "w2:t:a1", 120); l2 == nil {
+		t.Error("旧格式不续租,过期租约应可被懒回收")
 	}
 }
 
@@ -209,6 +268,55 @@ func TestResultValidateSaveSignalOnce(t *testing.T) {
 	// signal 只投递一次(§8.2),载荷字段来自 result.json
 	if len(sig.calls) != 1 || sig.calls[0] != "w1/"+wf.SignalTaskResult+"/w1:t:a1" {
 		t.Errorf("signals = %v", sig.calls)
+	}
+}
+
+// TestResultWritesOutboxAtomically:终态结果走事务性 Outbox(原则 3,差距 #1)——
+// 重发去重后 outbox 仍只有一行,event_key 为 {task_id}:result,payload 带 workflow_id
+// 供 Relay 路由 signal。
+func TestResultWritesOutboxAtomically(t *testing.T) {
+	s, _, srv := newEnv(t)
+	_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w1:t:a1", WorkflowID: "w1", IdempotencyKey: "w1:t:a1"})
+
+	body := map[string]any{"task_id": "w1:t:a1", "idempotency_key": "w1:t:a1", "result": validResult("w1:t:a1")}
+	for i := 0; i < 2; i++ { // 首发 + 重发
+		if resp := post(t, srv.URL+"/callbacks/v1/results", body); resp.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次 status = %d", i+1, resp.StatusCode)
+		}
+	}
+	rows, err := s.ClaimUnpublished(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("outbox rows = %+v err=%v, want 单行(重发不产生第二行)", rows, err)
+	}
+	ev := rows[0]
+	if ev.EventType != store.EventTypeTaskResult || ev.EventKey != "w1:t:a1:result" ||
+		ev.AggregateType != "task" || ev.AggregateID != "w1:t:a1" {
+		t.Errorf("outbox row = %+v", ev)
+	}
+	var p store.ResultEventPayload
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		t.Fatalf("payload 不可解析: %v", err)
+	}
+	if p.WorkflowID != "w1" || p.Result.TaskID != "w1:t:a1" || p.Result.Status != "COMPLETED" {
+		t.Errorf("payload = %+v", p)
+	}
+}
+
+// TestResultSignalFailureStillOK:故障注入——Temporal 抖动直发 signal 失败;
+// outbox 已单事务落库(Relay 会补投),回调仍返回 200,Client 无需重发。
+func TestResultSignalFailureStillOK(t *testing.T) {
+	s, sig, srv := newEnv(t)
+	sig.err = errors.New("temporal unavailable")
+	_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w1:t:a1", WorkflowID: "w1", IdempotencyKey: "w1:t:a1"})
+
+	resp := post(t, srv.URL+"/callbacks/v1/results",
+		map[string]any{"task_id": "w1:t:a1", "idempotency_key": "w1:t:a1", "result": validResult("w1:t:a1")})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("signal 失败不应影响回调(outbox 兜底): status = %d", resp.StatusCode)
+	}
+	rows, err := s.ClaimUnpublished(ctx, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("outbox 必须有待 Relay 补投的行: rows=%+v err=%v", rows, err)
 	}
 }
 

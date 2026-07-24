@@ -108,6 +108,58 @@ func TestKickDuplicateDeliveryIdempotent(t *testing.T) {
 	}
 }
 
+// TestKickExplicitRetry:显式 retry(差距 #11)——retry=true 时同一逻辑键
+// (commit,pipeline,variant)原子递增 workflow_attempt,workflow ID 加 -r{N}
+// 起新 run;普通 kick(无 retry)Attempt 恒为 0,ID 不变。
+func TestKickExplicitRetry(t *testing.T) {
+	starter := &fakeStarter{started: true}
+	h, _ := newKickHandler(starter, &fakeProber{})
+
+	// 普通触发:Attempt=0,ID 无 -r 后缀
+	if rec := postKick(h, testSecret, mustJSON(t, validKick())); rec.Code != http.StatusAccepted {
+		t.Fatalf("normal kick: %d", rec.Code)
+	}
+	if starter.gotInput.Attempt != 0 {
+		t.Errorf("普通 kick Attempt = %d, want 0", starter.gotInput.Attempt)
+	}
+	// 两次显式 retry:N 单调递增 1 → 2,ID 分别为 -r1/-r2
+	for want := 1; want <= 2; want++ {
+		m := validKick()
+		m["retry"] = true
+		rec := postKick(h, testSecret, mustJSON(t, m))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("retry #%d: code = %d body = %s", want, rec.Code, rec.Body)
+		}
+		if starter.gotInput.Attempt != want {
+			t.Errorf("retry Attempt = %d, want %d", starter.gotInput.Attempt, want)
+		}
+		wantSuffix := "-aarch64_Android_SNPE_2.21-r" + string(rune('0'+want))
+		if !strings.HasSuffix(starter.gotWFID, wantSuffix) {
+			t.Errorf("retry workflow id = %q, want 后缀 %q", starter.gotWFID, wantSuffix)
+		}
+	}
+}
+
+// TestKickRuleVersion:rule_version 透传(差距 #7);缺省补 verdict-rules-v1。
+func TestKickRuleVersion(t *testing.T) {
+	starter := &fakeStarter{started: true}
+	h, _ := newKickHandler(starter, &fakeProber{})
+	if rec := postKick(h, testSecret, mustJSON(t, validKick())); rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if starter.gotInput.RuleVersion != "verdict-rules-v1" {
+		t.Errorf("缺省 rule_version = %q", starter.gotInput.RuleVersion)
+	}
+	m := validKick()
+	m["rule_version"] = "verdict-rules-v1"
+	if rec := postKick(h, testSecret, mustJSON(t, m)); rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if starter.gotInput.RuleVersion != "verdict-rules-v1" {
+		t.Errorf("显式 rule_version = %q", starter.gotInput.RuleVersion)
+	}
+}
+
 func TestKickAuthRequired(t *testing.T) {
 	starter := &fakeStarter{}
 	h, _ := newKickHandler(starter, &fakeProber{})

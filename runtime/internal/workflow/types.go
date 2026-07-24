@@ -29,14 +29,23 @@ type DeviceTestInput struct {
 	// Scope 区分触发粒度:空 = 完整 bundle(pipeline webhook);
 	// 变体级触发(CI 直发 /kick,§6.3)时为该变体名,参与 workflow ID 去重。
 	Scope string `json:"scope,omitempty"`
+	// RuleVersion 路由规则引擎实现(原则 2/差距 #7);空 = 缺省 verdict-rules-v1。
+	RuleVersion string `json:"rule_version,omitempty"`
+	// Attempt 显式 retry 序号(差距 #11):>0 时 workflow ID 加 -r{N} 后缀,
+	// N 取自 artifacts.workflow_attempt 原子递增;0 = 普通触发。
+	Attempt int `json:"attempt,omitempty"`
 }
 
 // WorkflowID 返回确定性的 workflow ID:同一 bundle(或同一变体 kick)重复
-// 触发得到同一 ID,由 Temporal 的 ID 唯一性完成天然去重(幂等键思想,§3 规则 7)。
+// 触发得到同一 ID,由 Temporal 的 ID 唯一性完成天然去重(幂等键思想,§3 规则 7);
+// 显式 retry(Attempt>0)派生新 ID 起新 run,普通重放永远命中原 ID 被拒绝。
 func (in DeviceTestInput) WorkflowID() string {
 	id := "device-test-" + in.Project + "-g" + in.Commit + "-p" + strconv.Itoa(in.PipelineID)
 	if in.Scope != "" {
 		id += "-" + in.Scope
+	}
+	if in.Attempt > 0 {
+		id += "-r" + strconv.Itoa(in.Attempt)
 	}
 	return id
 }

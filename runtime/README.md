@@ -1,7 +1,13 @@
 # runtime — Temporal Worker + Trigger + REST API(Go)
 
 当前内容：Phase 1.4 Temporal spike、Phase 1.5 Trigger、Phase 1.6
-DeviceTestWorkflow/Worker 主干。q-uat 容器部署见 [`../deploy/README.md`](../deploy/README.md)。
+DeviceTestWorkflow/Worker 主干,可靠事件链路第一批(docs/device-test-sequence.md
+差距清单 #1/#2:outbox 表 + Callback API 单事务写入 + 独立 Outbox Relay
+进程(`cmd/relay`)+ workflow LoadResult 权威读),以及 Temporal History 与
+重放安全第二批(#3/#7/#11/#15:心跳只续 DB 租约(所有权凭据条件续租,
+失配 LEASE_NOT_OWNED)、workflow 改租约到期 Durable Timer + CheckLease、
+plan.rule_version 版本路由、workflow ID RejectDuplicate + 显式 retry -r{N})。
+q-uat 容器部署见 [`../deploy/README.md`](../deploy/README.md)。
 
 ## Trigger 服务(Phase 1.5)
 
@@ -12,10 +18,12 @@ webhook 不携带 Registry 版本号,按 package_name 倒序逐版本探测)
 → Schema 校验(内嵌 bundle.schema.json,防漂移测试)
 → 登记 artifacts 表(幂等 upsert)→ 按名启动 DeviceTestWorkflow。
 
-去重语义:workflow ID = `device-test-{project}-g{commit}-p{iid}`,
-复用策略 AllowDuplicateFailedOnly——webhook 重复投递不重跑,
-上次失败的 bundle 可通过重新投递重触发。无 bundle 的成功 pipeline(如 MR 构建)
-安静跳过(200)。配置见 `cmd/trigger/main.go` 头注释(环境变量)。
+去重语义:workflow ID = `device-test-{project}-g{commit}-p{iid}`(显式 retry
+时加 `-r{N}`,N 为 artifacts.workflow_attempt 原子递增),复用策略
+RejectDuplicate——webhook/kick 重复投递一律幂等不重启(含上次失败),
+只有 `/kick` 载荷显式 `retry: true` 才派生新 ID 起新 run(差距 #11)。
+无 bundle 的成功 pipeline(如 MR 构建)安静跳过(200)。
+配置见 `cmd/trigger/main.go` 头注释(环境变量)。
 
 Postgres 集成测试由 `TEST_DATABASE_URL` 门控(本机跳过,服务器部署后必须跑通);
 其余测试含真实 dev server 上的启动/去重 e2e(`internal/testtemporal` 拉起)。
@@ -57,9 +65,12 @@ cd runtime && go test ./spike/ -v
 spike/                  # go/no-go 三场景(workflow/activity + e2e 测试)
 cmd/spike-worker/       # 独立 worker 进程,供 SIGKILL 场景使用
 cmd/trigger/            # Trigger 服务(webhook → bundle → artifacts → workflow)
+cmd/worker/             # Temporal worker + Client 回调 HTTP 服务
+cmd/relay/              # 独立 Outbox Relay(claim 未投递行 → Signal → 标记已投)
 internal/trigger/       # handler / bundle 校验 / GitLab 客户端 / Temporal starter
-internal/store/         # Postgres 访问层(schema.sql + 内存实现)
-internal/workflow/      # DeviceTestWorkflow 输入契约(本体属 Phase 1.6)
+internal/store/         # Postgres 访问层(schema.sql + 内存实现,含 outbox)
+internal/workflow/      # DeviceTestWorkflow(signal 唤醒 + LoadResult 权威读)
+internal/relay/         # Relay 投递循环(task-result;NotFound 视为已消费)
 internal/testtemporal/  # 测试用 dev server 拉起助手
 ```
 

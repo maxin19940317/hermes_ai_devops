@@ -6,7 +6,8 @@ info:
   version: 1.0.0
   description: |
     Client Agent 上报心跳/状态迁移事件/终态结果的回调接口。
-    - heartbeat 每 10s 一次,同时充当任务租约续期(租约 120s)。
+    - heartbeat 每 10s 一次,携带租约所有权凭据只续数据库租约(原则 6,
+      不向 Workflow 发 signal);凭据失配逐项返回 LEASE_NOT_OWNED。
     - 所有回调均幂等,重发返回 200 且不产生副作用。
 security:
   - mtls: []
@@ -112,8 +113,26 @@ components:
               workdir_free_mb: { type: integer, minimum: 0 }
         active_task_ids:
           type: array
-          items: { type: string }
-          description: 进行中任务列表,即租约续期依据
+          description: |
+            进行中任务列表,即租约续期依据(§10)。
+            过渡期双格式(差距 #15):元素为对象时携带租约所有权凭据
+            (lease_id/lease_generation,派单时下发),执行条件续租,
+            失配在响应 not_owned 中逐项返回 LEASE_NOT_OWNED;
+            元素为纯字符串(旧格式)时仅续 client 心跳、不续租、不报错
+            ——旧 Client 滚动升级窗口,全部升级后应下线字符串格式。
+          items:
+            oneOf:
+              - type: string
+              - $ref: '#/components/schemas/ActiveTask'
+    ActiveTask:
+      type: object
+      additionalProperties: false
+      required: [task_id, attempt, lease_id, lease_generation]
+      properties:
+        task_id: { type: string, minLength: 1 }
+        attempt: { type: integer, minimum: 1 }
+        lease_id: { type: string, minLength: 1 }
+        lease_generation: { type: integer, minimum: 1 }
     HeartbeatAck:
       type: object
       required: [ok]
@@ -126,6 +145,18 @@ components:
           type: array
           items: { type: string }
           description: Runtime 侧已判死(如租约易主)、要求 Client 停止的任务
+        not_owned:
+          type: array
+          description: |
+            租约所有权校验失败的任务(§10):Client 必须立即停止操作
+            (设备可能已租给其他 workflow)。缺省/空 = 全部续租成功。
+          items:
+            type: object
+            additionalProperties: false
+            required: [task_id, code]
+            properties:
+              task_id: { type: string }
+              code: { enum: [LEASE_NOT_OWNED] }
     TaskEvent:
       type: object
       additionalProperties: false

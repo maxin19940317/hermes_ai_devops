@@ -20,6 +20,8 @@ type Store interface {
 	FinishTask(ctx context.Context, req wf.FinishRequest) error
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
 	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
+	GetResult(ctx context.Context, taskID string) (*wf.ResultRecord, error)
+	GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error)
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).
@@ -74,4 +76,18 @@ func (a *Acts) ReleaseDevice(ctx context.Context, req wf.ReleaseRequest) error {
 // SaveDecision 落 decisions 表(§11):规则引擎与 LLM 的每次裁决都落表,可回放。
 func (a *Acts) SaveDecision(ctx context.Context, row wf.DecisionRow) error {
 	return a.Store.SaveDecision(ctx, row)
+}
+
+// LoadResult 按 task_id 回读 results 表的权威结果(原则 3 + 差距清单 #2:
+// signal 只作唤醒提示,结果本体以数据库为准)。无记录返回 (nil, nil),
+// 由 workflow 按 INFRA 处理(结果未随 signal 落库说明 outbox 链路异常)。
+func (a *Acts) LoadResult(ctx context.Context, req wf.LoadResultRequest) (*wf.ResultRecord, error) {
+	return a.Store.GetResult(ctx, req.TaskID)
+}
+
+// CheckLease 读库返回 task 当前租约的到期时刻(原则 6:由 workflow 的租约
+// 到期 Durable Timer 触发,非轮询);租约不存在/已释放返回 (nil, nil),
+// workflow 据此进入 INFRA 处理。
+func (a *Acts) CheckLease(ctx context.Context, req wf.CheckLeaseRequest) (*time.Time, error) {
+	return a.Store.GetLeaseExpiry(ctx, req.TaskID)
 }

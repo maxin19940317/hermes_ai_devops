@@ -93,3 +93,16 @@ func (s *MemStore) SaveResult(_ context.Context, rec wf.ResultRecord) (bool, err
 	s.results[rec.TaskID] = rec
 	return true, nil
 }
+
+// GetResult 按 task_id 读权威结果(LoadResult 活动,差距清单 #2);
+// 不存在返回 (nil, nil)。
+func (s *MemStore) GetResult(_ context.Context, taskID string) (*wf.ResultRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.results[taskID]
+	if !ok {
+		return nil, nil
+	}
+	out := rec
+	return &out, nil
+}

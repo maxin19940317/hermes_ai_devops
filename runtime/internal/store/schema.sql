@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
     sha256          TEXT        NOT NULL,
     size            BIGINT      NOT NULL,
     manifest_digest TEXT        NOT NULL,   -- 派单时透传 Client 核对(§8.1)
+    -- 显式 retry 计数(差距 #11):workflow ID 加 -r{N} 后缀,N 由此列原子递增;
+    -- 普通 webhook/kick 重放绝不递增(RejectDuplicate,失败不自动重启)。
+    workflow_attempt INTEGER    NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (commit_sha, pipeline_id, variant)
 );
@@ -42,10 +45,17 @@ CREATE TABLE IF NOT EXISTS devices (
 -- 只有一个调用者拿到同一设备(§3 规则 3 独占,§11)。
 -- lease_expires_at 由 Client 心跳经 RenewLease 续期(§10 租约 120s);过期 = 持有者失联
 -- (workflow 被 Terminate/进程死亡等绕过 ReleaseDevice),由 AcquireDevice 懒回收。
+-- 所有权凭据(docs/device-test-sequence.md §10/差距 #15):lease_id(每次授予唯一,
+-- 取 task_id)+ lease_generation(每设备单调递增,获取/懒回收时 +1)+ released_at
+-- (ReleaseDevice 置位,行保留作审计);心跳续租必须全部匹配且 released_at IS NULL,
+-- 失配即 LEASE_NOT_OWNED,旧持有者不得再续已易主的租约。
 CREATE TABLE IF NOT EXISTS device_leases (
     device_id        TEXT PRIMARY KEY REFERENCES devices(device_id),
     task_id          TEXT        NOT NULL,
-    lease_expires_at TIMESTAMPTZ NOT NULL
+    lease_id         TEXT        NOT NULL DEFAULT '',
+    lease_generation INTEGER     NOT NULL DEFAULT 0,
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    released_at      TIMESTAMPTZ
 );
 
 -- status(生命周期)与 verdict(终态判定)正交,不合并为一个枚举(§9,§14 红线)。
@@ -97,3 +107,21 @@ CREATE TABLE IF NOT EXISTS decisions (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS decisions_task_id_idx ON decisions(task_id);
+
+-- 事务性 Outbox(docs/device-test-sequence.md 设计原则 3,表结构见文末):
+-- 关键事件(Result/Cancel/Human Decision)与业务数据单事务写入,由独立 Outbox Relay
+-- 至少一次投递 Temporal Signal,接收端幂等兜底。published_at IS NULL = 未投递;
+-- 投递失败 attempts+1 并记 last_error,留待下轮重试,可监控。
+CREATE TABLE IF NOT EXISTS outbox (
+    id             BIGSERIAL PRIMARY KEY,
+    aggregate_type TEXT        NOT NULL,            -- task / device / ...
+    aggregate_id   TEXT        NOT NULL,
+    event_type     TEXT        NOT NULL,            -- task-result / cancel / ...
+    event_key      TEXT        NOT NULL UNIQUE,     -- 幂等键,如 {task_id}:result
+    payload        JSONB       NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at   TIMESTAMPTZ,                     -- NULL = 未投递
+    attempts       INTEGER     NOT NULL DEFAULT 0,
+    last_error     TEXT        NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS outbox_unpublished_idx ON outbox(id) WHERE published_at IS NULL;

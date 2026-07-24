@@ -54,3 +54,47 @@ func TestTemporalStarterStartAndDedup(t *testing.T) {
 		t.Errorf("duplicate: id=%q started=%v, want id=%q started=false", id2, started2, id1)
 	}
 }
+
+// 差距 #11:RejectDuplicate——上次失败/终止的 workflow 也不得被普通重放
+// 自动重启;只有显式 retry(ID 加 -r{N})能起新 run。
+func TestTemporalStarterRejectDuplicateAfterTerminate(t *testing.T) {
+	addr := testtemporal.StartDevServer(t)
+	c, err := client.Dial(client.Options{HostPort: addr})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(c.Close)
+
+	s := &TemporalStarter{Client: c, TaskQueue: "device-test"}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	in := wf.DeviceTestInput{
+		Project: "grp/algo-super-sdk", Commit: "abcd1234", PipelineID: 42, Version: "1.2.3",
+	}
+	id1, started1, err := s.StartDeviceTest(ctx, in)
+	if err != nil || !started1 {
+		t.Fatalf("first start: id=%q started=%v err=%v", id1, started1, err)
+	}
+	// 终止(等价于失败终态)后普通重放:必须拒绝重启,幂等返回 started=false
+	if err := c.TerminateWorkflow(ctx, id1, "", "test terminate"); err != nil {
+		t.Fatalf("terminate: %v", err)
+	}
+	_, started2, err := s.StartDeviceTest(ctx, in)
+	if err != nil {
+		t.Fatalf("terminated 后重放应幂等成功(不重启): %v", err)
+	}
+	if started2 {
+		t.Error("terminated workflow 被普通重放自动重启(违反差距 #11)")
+	}
+	// 显式 retry:Attempt=1 → 新 ID -r1,允许起新 run
+	retry := in
+	retry.Attempt = 1
+	id3, started3, err := s.StartDeviceTest(ctx, retry)
+	if err != nil || !started3 {
+		t.Fatalf("explicit retry: id=%q started=%v err=%v", id3, started3, err)
+	}
+	if id3 != id1+"-r1" {
+		t.Errorf("retry id = %q, want %q", id3, id1+"-r1")
+	}
+}

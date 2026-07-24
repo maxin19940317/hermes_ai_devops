@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 
@@ -24,33 +25,43 @@ type Artifact struct {
 	SHA256         string
 	Size           int64
 	ManifestDigest string // 派单时透传给 Client 核对(§8.1)
+	// WorkflowAttempt 显式 retry 计数(差距 #11):>0 时 workflow ID 加 -r{N}。
+	WorkflowAttempt int
 }
 
 // ArtifactStore 登记产物;实现必须幂等(同一 (commit,pipeline,variant) 重复登记无效果)。
+// NextWorkflowAttempt 供显式 retry 派生 -r{N} 序号(差距 #11)。
 type ArtifactStore interface {
 	RegisterArtifacts(ctx context.Context, arts []Artifact) error
+	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
 }
 
 // MemStore 是进程内实现,供单测与无数据库的开发模式使用。
 type MemStore struct {
-	mu        sync.Mutex
-	rows      map[string]Artifact
-	clients   map[string]Client
-	devices   map[string]*deviceRow
-	tasks     map[string]*taskRecord
-	events    map[string]TaskEvent
-	results   map[string]wf.ResultRecord
-	decisions []wf.DecisionRow
+	mu          sync.Mutex
+	rows        map[string]Artifact
+	clients     map[string]Client
+	devices     map[string]*deviceRow
+	tasks       map[string]*taskRecord
+	events      map[string]TaskEvent
+	results     map[string]wf.ResultRecord
+	decisions   []wf.DecisionRow
+	outbox      []*outboxRow
+	outboxByKey map[string]*outboxRow
+	outboxByID  map[int64]*outboxRow
+	outboxSeq   int64
 }
 
 func NewMemStore() *MemStore {
 	return &MemStore{
-		rows:    map[string]Artifact{},
-		clients: map[string]Client{},
-		devices: map[string]*deviceRow{},
-		tasks:   map[string]*taskRecord{},
-		events:  map[string]TaskEvent{},
-		results: map[string]wf.ResultRecord{},
+		rows:        map[string]Artifact{},
+		clients:     map[string]Client{},
+		devices:     map[string]*deviceRow{},
+		tasks:       map[string]*taskRecord{},
+		events:      map[string]TaskEvent{},
+		results:     map[string]wf.ResultRecord{},
+		outboxByKey: map[string]*outboxRow{},
+		outboxByID:  map[int64]*outboxRow{},
 	}
 }
 
@@ -75,4 +86,20 @@ func (s *MemStore) Artifacts() []Artifact {
 		out = append(out, a)
 	}
 	return out
+}
+
+// NextWorkflowAttempt 把 (commit,pipeline,variant) 逻辑键的 workflow_attempt
+// 原子 +1 并返回新值(显式 retry 的 -r{N} 后缀来源,差距 #11);
+// 键未登记(产物尚未 RegisterArtifacts)返回错误。
+func (s *MemStore) NextWorkflowAttempt(_ context.Context, commitSHA string, pipelineID int, variant string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := commitSHA + "|" + strconv.Itoa(pipelineID) + "|" + variant
+	a, ok := s.rows[key]
+	if !ok {
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s", key)
+	}
+	a.WorkflowAttempt++
+	s.rows[key] = a
+	return a.WorkflowAttempt, nil
 }

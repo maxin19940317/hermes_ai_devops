@@ -1,6 +1,8 @@
 // Package callbacks 实现 Client → Runtime 回调 API(CLAUDE.md §8.2,
-// contracts/callbacks-api.openapi.yaml):心跳(设备注册 + DB/workflow 双侧租约续期)、
-// 任务事件(按 task_id+seq 去重)、终态结果(Schema 校验 → SaveResult 去重 → signal)。
+// contracts/callbacks-api.openapi.yaml):心跳(设备注册 + 租约所有权条件续租,
+// 不发 workflow signal——原则 6,workflow 侧用到期 Timer + CheckLease)、
+// 任务事件(按 task_id+seq 去重)、终态结果(Schema 校验 → 单事务 results+outbox
+// 去重 → 过渡期 best-effort signal,可靠投递由 Outbox Relay 保证)。
 package callbacks
 
 import (
@@ -35,11 +37,11 @@ func mustCompileResultSchema() *jsonschema.Schema {
 // Store 是回调服务依赖的持久层子集。
 type Store interface {
 	UpsertClientDevices(ctx context.Context, c store.Client, devs []store.Device) error
-	RenewLease(ctx context.Context, deviceID, taskID string, leaseSeconds int) error
+	RenewLease(ctx context.Context, cred store.LeaseCredential, leaseSeconds int) (bool, error)
 	AppendTaskEvent(ctx context.Context, ev store.TaskEvent) (bool, error)
 	SetTaskStatus(ctx context.Context, taskID, status string) error
 	GetTask(ctx context.Context, taskID string) (*wf.TaskRow, error)
-	SaveResult(ctx context.Context, rec wf.ResultRecord) (bool, error)
+	SaveResultWithOutbox(ctx context.Context, rec wf.ResultRecord, ev store.OutboxEvent) (bool, error)
 }
 
 // Signaler 是 temporal client.Client 的 signal 子集。
@@ -98,7 +100,25 @@ type heartbeatReq struct {
 			Capabilities []string `json:"capabilities"`
 		} `json:"props"`
 	} `json:"devices"`
-	ActiveTaskIDs []string `json:"active_task_ids"`
+	// ActiveTaskIDs 过渡期双格式(差距 #15):元素为对象 = 携带租约所有权凭据
+	// (新格式,执行条件续租);元素为纯字符串 = 旧格式,仅续 client 心跳、
+	// 不续租、不报错(旧 Client 滚动升级窗口;下线时点见契约注释)。
+	ActiveTaskIDs []json.RawMessage `json:"active_task_ids"`
+}
+
+// activeTask 是新格式心跳的任务项:续租必须携带派单时下发的所有权凭据(§10)。
+type activeTask struct {
+	TaskID     string `json:"task_id"`
+	Attempt    int    `json:"attempt"`
+	LeaseID    string `json:"lease_id"`
+	Generation int    `json:"lease_generation"`
+}
+
+// notOwnedEntry 是心跳响应里 LEASE_NOT_OWNED 的逐项报告:
+// 凭据失配 = 租约已易主/已释放,Client 必须立即停止操作该任务。
+type notOwnedEntry struct {
+	TaskID string `json:"task_id"`
+	Code   string `json:"code"` // 恒为 LEASE_NOT_OWNED
 }
 
 func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
@@ -120,29 +140,49 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	// 进行中任务 → 续租(§8.2/§10):先续 DB 租约(device_leases.lease_expires_at,
-	// AcquireDevice 懒回收的判据),再发 workflow 续租 signal。
-	// DB 续租不以 signal 成功为前提:workflow 可能已被 Terminate(signal 必然失败),
-	// 但只要 Client 仍在心跳上报该任务,设备就被物理占用,不得被其他 workflow 回收;
-	// Client 停止上报(任务结束/进程死亡)后租约自然过期,由 AcquireDevice 回收。
-	// 未知任务(如 Runtime 已重启丢内存)忽略,租约过期由 workflow 的 on_infra_error 兜底。
-	for _, tid := range req.ActiveTaskIDs {
-		row, err := h.store.GetTask(r.Context(), tid)
-		if err != nil || row == nil {
+	// 进行中任务 → 条件续租(§10/差距 #15):凭据(lease_id/task/attempt/client/
+	// generation)全部匹配且租约未释放才续;失配 → LEASE_NOT_OWNED 逐项返回,
+	// Client 必须停止操作该任务(设备可能已租给其他 workflow)。
+	// 旧格式(纯字符串)不续租不报错:租约过期后由 AcquireDevice 懒回收。
+	// 未知任务(如 Runtime 已重启丢内存)忽略,租约过期由 workflow 的
+	// CheckLease → on_infra_error 兜底。不再发任何 workflow signal(原则 6)。
+	var notOwned []notOwnedEntry
+	for _, raw := range req.ActiveTaskIDs {
+		var legacy string
+		if err := json.Unmarshal(raw, &legacy); err == nil {
+			continue // 旧格式:仅续上面的 client 心跳
+		}
+		var at activeTask
+		if err := json.Unmarshal(raw, &at); err != nil || at.TaskID == "" || at.LeaseID == "" {
+			writeErr(w, http.StatusBadRequest, "bad_heartbeat", "invalid active task entry")
+			return
+		}
+		row, err := h.store.GetTask(r.Context(), at.TaskID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+			return
+		}
+		if row == nil || row.DeviceID == "" {
+			continue // 未知/未绑设备的任务:忽略(见上注释)
+		}
+		ok, err := h.store.RenewLease(r.Context(), store.LeaseCredential{
+			DeviceID: row.DeviceID, ClientID: req.ClientID, TaskID: at.TaskID,
+			Attempt: at.Attempt, LeaseID: at.LeaseID, Generation: at.Generation,
+		}, h.leaseSec)
+		if err != nil {
+			h.log.Error().Err(err).Str("task_id", at.TaskID).Msg("renew lease failed")
 			continue
 		}
-		if row.DeviceID != "" {
-			if err := h.store.RenewLease(r.Context(), row.DeviceID, tid, h.leaseSec); err != nil {
-				h.log.Error().Err(err).Str("task_id", tid).Msg("renew lease failed")
-			}
-		}
-		if err := h.signaler.SignalWorkflow(r.Context(), row.WorkflowID, "",
-			wf.SignalTaskHeartbeat, wf.TaskHeartbeat{TaskID: tid}); err != nil {
-			h.log.Error().Err(err).Str("task_id", tid).Msg("heartbeat signal failed")
+		if !ok {
+			notOwned = append(notOwned, notOwnedEntry{TaskID: at.TaskID, Code: "LEASE_NOT_OWNED"})
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	resp := map[string]any{"ok": true}
+	if len(notOwned) > 0 {
+		resp["not_owned"] = notOwned
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // ---- task-events ----
@@ -237,19 +277,32 @@ func (h *Handler) result(w http.ResponseWriter, r *http.Request) {
 		CasesFailed: parsed.Cases.Failed, SignaturesHit: parsed.SignaturesHit,
 		Metrics: parsed.Metrics, Attachments: parsed.Attachments,
 	}
-	// 先落库去重再 signal:重发不重投("signal 只投递一次",§8.2)。
-	// 落库成功但 signal 失败的窗口由租约过期 → on_infra_error 兜底收敛。
-	ins, err := h.store.SaveResult(r.Context(), wf.ResultRecord{TaskID: req.TaskID, Result: sig})
+	// 事务性 Outbox(docs/device-test-sequence.md 原则 3,差距清单 #1):
+	// results + outbox 单事务写入(幂等键 {task_id}:result),消灭"写库成功但
+	// signal 失败"的双写窗口;重发回调两侧各自去重,不产生第二行、不重投。
+	payload, err := json.Marshal(store.ResultEventPayload{WorkflowID: row.WorkflowID, Result: sig})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	ins, err := h.store.SaveResultWithOutbox(r.Context(), wf.ResultRecord{TaskID: req.TaskID, Result: sig},
+		store.OutboxEvent{
+			AggregateType: "task", AggregateID: req.TaskID,
+			EventType: store.EventTypeTaskResult, EventKey: req.TaskID + ":result",
+			Payload: payload,
+		})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
 	if ins {
+		// 过渡期双通道:Outbox Relay 是可靠投递路径(至少一次,接收端幂等);
+		// 这里的直发只为 Relay 部署前保持低延迟,失败不影响收敛(outbox 行
+		// 会由 Relay 补投),只记日志不回 5xx——结果已持久化,回调语义是成功。
+		// TODO(差距清单 #1 收尾):Relay 全量部署后下线直发,本块删除。
 		if err := h.signaler.SignalWorkflow(r.Context(), row.WorkflowID, "",
 			wf.SignalTaskResult, sig); err != nil {
-			h.log.Error().Err(err).Str("task_id", req.TaskID).Msg("result signal failed")
-			writeErr(w, http.StatusInternalServerError, "signal_error", err.Error())
-			return
+			h.log.Error().Err(err).Str("task_id", req.TaskID).Msg("result signal failed (outbox will redeliver)")
 		}
 	}
 	w.WriteHeader(http.StatusOK)

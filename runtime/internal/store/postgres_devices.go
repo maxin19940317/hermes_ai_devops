@@ -74,12 +74,20 @@ func (s *PGStore) AcquireDevice(ctx context.Context, sel wf.DeviceSelector, task
 		return nil, fmt.Errorf("acquire device: mark busy: %w", err)
 	}
 	expiresAt := time.Now().Add(time.Duration(leaseSeconds) * time.Second)
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO device_leases (device_id, task_id, lease_expires_at)
-		VALUES ($1, $2, $3)
+	// 每次授予(含懒回收)生成新 lease_id(取 task_id,本身含 attempt,全链路唯一)
+	// 并递增 generation,旧持有者的续租凭据立即失效(§10/差距 #15);
+	// released_at 复位(行保留作审计)。
+	var generation int
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO device_leases (device_id, task_id, lease_id, lease_generation, lease_expires_at)
+		VALUES ($1, $2, $3, 1, $4)
 		ON CONFLICT (device_id) DO UPDATE SET
-			task_id = EXCLUDED.task_id, lease_expires_at = EXCLUDED.lease_expires_at`,
-		chosen.DeviceID, taskID, expiresAt); err != nil {
+			task_id = EXCLUDED.task_id, lease_id = EXCLUDED.lease_id,
+			lease_generation = device_leases.lease_generation + 1,
+			lease_expires_at = EXCLUDED.lease_expires_at,
+			released_at = NULL
+		RETURNING lease_generation`,
+		chosen.DeviceID, taskID, taskID, expiresAt).Scan(&generation); err != nil {
 		return nil, fmt.Errorf("acquire device: write lease: %w", err)
 	}
 	var baseURL string
@@ -93,6 +101,7 @@ func (s *PGStore) AcquireDevice(ctx context.Context, sel wf.DeviceSelector, task
 	return &wf.Lease{
 		DeviceID: chosen.DeviceID, Serial: chosen.Serial,
 		ClientID: chosen.ClientID, ClientBaseURL: baseURL,
+		LeaseID: taskID, Generation: generation,
 	}, nil
 }
 
@@ -162,26 +171,56 @@ func (s *PGStore) HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (
 	return false, nil
 }
 
-// RenewLease 续期 DB 租约(§10 心跳即租约续期)。仅当前持有者(task_id 精确匹配)
-// 可续;租约已易主/不存在时 WHERE 匹配不到行,幂等空转,无副作用。
-func (s *PGStore) RenewLease(ctx context.Context, deviceID, taskID string, leaseSeconds int) error {
+// RenewLease 条件续期 DB 租约(§10/差距 #15):设备归属 client、lease_id、
+// task_id、attempt(与 task_id 后缀一致)、generation 全部精确匹配且
+// released_at IS NULL 才续期(影响行数=1);失配返回 false(LEASE_NOT_OWNED),
+// 旧持有者不得再续已易主/已释放的租约。
+func (s *PGStore) RenewLease(ctx context.Context, cred LeaseCredential, leaseSeconds int) (bool, error) {
 	expiresAt := time.Now().Add(time.Duration(leaseSeconds) * time.Second)
-	if _, err := s.DB.ExecContext(ctx, `
-		UPDATE device_leases SET lease_expires_at = $3
-		WHERE device_id = $1 AND task_id = $2`,
-		deviceID, taskID, expiresAt); err != nil {
-		return fmt.Errorf("renew lease %s/%s: %w", deviceID, taskID, err)
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE device_leases l SET lease_expires_at = $6
+		FROM devices d
+		WHERE l.device_id = $1 AND d.device_id = l.device_id AND d.client_id = $2
+		  AND l.task_id = $3 AND l.lease_id = $4 AND l.lease_generation = $5
+		  AND l.released_at IS NULL`,
+		cred.DeviceID, cred.ClientID, cred.TaskID, cred.LeaseID, cred.Generation, expiresAt)
+	if err != nil {
+		return false, fmt.Errorf("renew lease %s/%s: %w", cred.DeviceID, cred.TaskID, err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("renew lease %s/%s: rows affected: %w", cred.DeviceID, cred.TaskID, err)
+	}
+	// attempt 与 task_id 后缀的一致性校验在 SQL 之外(task_id 编码 attempt,差距 #14)
+	return n == 1 && attemptMatches(cred.TaskID, cred.Attempt), nil
 }
 
-// ReleaseDevice 归还租约。infraFail=true 时 fail_streak+1,
-// 达到 quarantineAfter(§10 缺省 3)则 QUARANTINED;成功归还清零 fail_streak。
-// 非租约持有者释放/租约已易主:幂等,无副作用(WHERE 匹配不到行,语句空转)。
+// GetLeaseExpiry 返回 taskID 当前持有租约的到期时刻(CheckLease 活动,
+// 原则 6);租约不存在/已释放返回 (nil, nil)——即"未续期"。
+func (s *PGStore) GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error) {
+	var exp time.Time
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT lease_expires_at FROM device_leases
+		WHERE task_id = $1 AND released_at IS NULL`, taskID).Scan(&exp)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get lease expiry %s: %w", taskID, err)
+	}
+	return &exp, nil
+}
+
+// ReleaseDevice 归还租约(置 released_at,行保留作审计;§10/差距 #15)。
+// infraFail=true 时 fail_streak+1,达到 quarantineAfter(§10 缺省 3)则 QUARANTINED;
+// 成功归还清零 fail_streak。非持有者释放/租约已易主/重复释放(已 released):
+// 幂等,无副作用(WHERE 匹配不到行,语句空转,fail_streak 不重复计数)。
 func (s *PGStore) ReleaseDevice(ctx context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error {
 	_, err := s.DB.ExecContext(ctx, `
 		WITH lease AS (
-			DELETE FROM device_leases WHERE device_id = $1 AND task_id = $2 RETURNING device_id
+			UPDATE device_leases SET released_at = now()
+			WHERE device_id = $1 AND task_id = $2 AND released_at IS NULL
+			RETURNING device_id
 		)
 		UPDATE devices SET
 			status = CASE

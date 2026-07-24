@@ -38,6 +38,12 @@ type fakeActs struct {
 	evidenceCalls []ExtractEvidenceRequest
 	analyzeCalls  []AnalyzeRequest
 	decisions     []DecisionRow
+
+	results   map[string]ResultRecord // LoadResult 的权威数据源(模拟 results 表)
+	loadCalls []string
+
+	leaseExpiry     *time.Time // CheckLease 的返回(模拟 device_leases.lease_expires_at);nil = 未续期
+	checkLeaseCalls []string
 }
 
 var defaultLease = &Lease{DeviceID: "dev1", Serial: "513cd3de", ClientID: "c1", ClientBaseURL: "https://client:8443"}
@@ -118,6 +124,32 @@ func (f *fakeActs) SaveDecision(_ context.Context, d DecisionRow) error {
 	f.decisions = append(f.decisions, d)
 	return nil
 }
+func (f *fakeActs) LoadResult(_ context.Context, r LoadResultRequest) (*ResultRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loadCalls = append(f.loadCalls, r.TaskID)
+	rec, ok := f.results[r.TaskID]
+	if !ok {
+		return nil, nil
+	}
+	out := rec
+	return &out, nil
+}
+func (f *fakeActs) CheckLease(_ context.Context, r CheckLeaseRequest) (*time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkLeaseCalls = append(f.checkLeaseCalls, r.TaskID)
+	return f.leaseExpiry, nil
+}
+
+// seedResult 把 sig 登记为 results 表的权威行:事务性 Outbox 链路下
+// workflow 只消费 signal 里的 task_id,结果本体由 LoadResult 回读(差距 #2)。
+func seedResult(f *fakeActs, sig TaskResultSignal) {
+	if f.results == nil {
+		f.results = map[string]ResultRecord{}
+	}
+	f.results[sig.TaskID] = ResultRecord{TaskID: sig.TaskID, Result: sig}
+}
 
 const wfID = "device-test-grp/p-gabcd1234-p42"
 
@@ -161,6 +193,7 @@ func TestHappyPathPassed(t *testing.T) {
 	f := &fakeActs{specs: []TestSpec{spec1()}}
 	env := newEnv(t, f)
 	// 30s 时回传结果(期间无需心跳,未超 120s 租约)
+	seedResult(f, passResult(taskID("a1")))
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
 	}, 30*time.Second)
@@ -205,7 +238,8 @@ func TestHappyPathPassed(t *testing.T) {
 func TestLeaseExpiryRetriesThenInfraError(t *testing.T) {
 	f := &fakeActs{specs: []TestSpec{spec1()}}
 	env := newEnv(t, f)
-	// 不回传任何结果、无心跳 → 每次 attempt 120s 租约过期,机械重试 2 次后终态 INFRA_ERROR
+	// 不回传任何结果、CheckLease 始终返回未续期(nil)→ 每次 attempt 120s
+	// 租约到期确认过期,机械重试 2 次后终态 INFRA_ERROR
 
 	env.ExecuteWorkflow(DeviceTestWorkflow, input())
 	var out DeviceTestOutput
@@ -218,6 +252,9 @@ func TestLeaseExpiryRetriesThenInfraError(t *testing.T) {
 	if len(f.dispatched) != 3 {
 		t.Errorf("dispatched %d 次, want 3", len(f.dispatched))
 	}
+	if len(f.checkLeaseCalls) != 3 {
+		t.Errorf("checkLeaseCalls = %v, want 3(每 attempt 到期确认一次)", f.checkLeaseCalls)
+	}
 	if len(f.canceled) != 3 {
 		t.Errorf("canceled = %+v, 每次租约过期应尽力取消", f.canceled)
 	}
@@ -228,16 +265,23 @@ func TestLeaseExpiryRetriesThenInfraError(t *testing.T) {
 	}
 }
 
-func TestHeartbeatRenewsLease(t *testing.T) {
+// TestCheckLeaseRenewsLease:原则 6——心跳只续 DB 租约(此处由 delayed callback
+// 模拟把库内 expires_at 推后),workflow 不发/不收心跳 signal,以租约到期
+// Durable Timer 触发 CheckLease:读到新 expires_at → 重设 Timer 继续等。
+func TestCheckLeaseRenewsLease(t *testing.T) {
 	f := &fakeActs{specs: []TestSpec{spec1()}}
 	env := newEnv(t, f)
-	// 心跳在 100s/200s(每次都在上次续约后 120s 内),结果在 290s:
-	// 无续租机制的话 120s 就会过期
+	// 心跳在 100s/200s 续库内租约(每次都在上次到期前);
+	// workflow 在 120s/220s Timer 到期时 CheckLease 读到续期结果
 	for _, d := range []time.Duration{100 * time.Second, 200 * time.Second} {
 		env.RegisterDelayedCallback(func() {
-			env.SignalWorkflow(SignalTaskHeartbeat, TaskHeartbeat{TaskID: taskID("a1")})
+			exp := env.Now().Add(120 * time.Second)
+			f.mu.Lock()
+			f.leaseExpiry = &exp
+			f.mu.Unlock()
 		}, d)
 	}
+	seedResult(f, passResult(taskID("a1")))
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
 	}, 290*time.Second)
@@ -248,18 +292,23 @@ func TestHeartbeatRenewsLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out.Tasks[0].Verdict != "PASSED" || out.Tasks[0].Attempt != 1 {
-		t.Errorf("summary = %+v, 心跳续租后应 PASSED 且无重试", out.Tasks[0])
+		t.Errorf("summary = %+v, CheckLease 续租后应 PASSED 且无重试", out.Tasks[0])
+	}
+	if len(f.checkLeaseCalls) != 2 {
+		t.Errorf("checkLeaseCalls = %v, want 2 次(120s/220s Timer 到期)", f.checkLeaseCalls)
 	}
 }
 
 func TestSignatureHitNoRetry(t *testing.T) {
 	f := &fakeActs{specs: []TestSpec{spec1()}}
 	env := newEnv(t, f)
+	sig := TaskResultSignal{
+		TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 0,
+		SignaturesHit: []string{"cpu_fallback"},
+	}
+	seedResult(f, sig)
 	env.RegisterDelayedCallback(func() {
-		env.SignalWorkflow(SignalTaskResult, TaskResultSignal{
-			TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 0,
-			SignaturesHit: []string{"cpu_fallback"},
-		})
+		env.SignalWorkflow(SignalTaskResult, sig)
 	}, 10*time.Second)
 
 	env.ExecuteWorkflow(DeviceTestWorkflow, input())
@@ -286,6 +335,24 @@ func TestSignatureHitNoRetry(t *testing.T) {
 	}
 }
 
+// TestUnknownRuleVersionRejected:未知 rule_version 拒绝启动并明确报错
+// (差距 #7:绝不静默用最新版判定,重放安全)。
+func TestUnknownRuleVersionRejected(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}}
+	env := newEnv(t, f)
+	in := input()
+	in.RuleVersion = "verdict-rules-v99"
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
+	err := env.GetWorkflowError()
+	if err == nil || !strings.Contains(err.Error(), "verdict-rules-v99") {
+		t.Fatalf("err = %v, want 未知 rule_version 报错", err)
+	}
+	if len(f.dispatched) != 0 || len(f.finished) != 0 {
+		t.Errorf("未知版本不得执行任何任务动作: dispatched=%d finished=%d",
+			len(f.dispatched), len(f.finished))
+	}
+}
+
 // TestSkippedVariantInOutputAndNotification:fleet 无匹配设备的变体不进
 // acquire/dispatch,直接以 SKIPPED 出现在输出与通知中(§12 变体级触发)。
 func TestSkippedVariantInOutputAndNotification(t *testing.T) {
@@ -294,6 +361,7 @@ func TestSkippedVariantInOutputAndNotification(t *testing.T) {
 		skipped: []SkippedSpec{{Variant: "aarch64_Android_RKNN_2.3.2", Reason: "no capable device registered (soc=[RK3588 RK3566] capabilities=[rknpu])"}},
 	}
 	env := newEnv(t, f)
+	seedResult(f, passResult(taskID("a1")))
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
 	}, 30*time.Second)
@@ -339,11 +407,13 @@ func TestAnalysisSavedOnFailure(t *testing.T) {
 		},
 	}
 	env := newEnv(t, f)
+	sig := TaskResultSignal{
+		TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 0,
+		SignaturesHit: []string{"cpu_fallback"},
+	}
+	seedResult(f, sig)
 	env.RegisterDelayedCallback(func() {
-		env.SignalWorkflow(SignalTaskResult, TaskResultSignal{
-			TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 0,
-			SignaturesHit: []string{"cpu_fallback"},
-		})
+		env.SignalWorkflow(SignalTaskResult, sig)
 	}, 10*time.Second)
 
 	env.ExecuteWorkflow(DeviceTestWorkflow, input())
@@ -386,10 +456,10 @@ func TestStaleResultSignalIgnored(t *testing.T) {
 	env.RegisterDelayedCallback(func() { // 其他 task 的迟到结果:必须忽略
 		env.SignalWorkflow(SignalTaskResult, passResult("some-other-task"))
 	}, 5*time.Second)
+	sig := TaskResultSignal{TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 7}
+	seedResult(f, sig)
 	env.RegisterDelayedCallback(func() {
-		env.SignalWorkflow(SignalTaskResult, TaskResultSignal{
-			TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 7,
-		})
+		env.SignalWorkflow(SignalTaskResult, sig)
 	}, 10*time.Second)
 
 	env.ExecuteWorkflow(DeviceTestWorkflow, input())
@@ -402,9 +472,76 @@ func TestStaleResultSignalIgnored(t *testing.T) {
 	}
 }
 
+// TestDuplicateResultSignalRedelivered:接收端幂等(原则 3/差距清单 #5)——
+// Outbox Relay 至少一次投递,同 task_id 的结果 signal 可能重投(此处连发两次);
+// 且 Relay 侧载荷可收缩为轻量(仅 task_id)。workflow 必须:首个匹配即采纳,
+// 重投无副作用;verdict 数据全部来自 LoadResult 权威读,与 signal 载荷无关。
+func TestDuplicateResultSignalRedelivered(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}}
+	env := newEnv(t, f)
+	seedResult(f, passResult(taskID("a1")))
+	env.RegisterDelayedCallback(func() {
+		// Relay 重投:轻量载荷(只带 task_id),连发两次
+		env.SignalWorkflow(SignalTaskResult, TaskResultSignal{TaskID: taskID("a1")})
+		env.SignalWorkflow(SignalTaskResult, TaskResultSignal{TaskID: taskID("a1")})
+	}, 5*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow err: %v", env.GetWorkflowError())
+	}
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	// verdict 与统计来自 LoadResult 回读(signal 载荷为空也不得影响判定)
+	if out.Tasks[0].Verdict != "PASSED" || out.Tasks[0].CasesTotal != 10 ||
+		out.Tasks[0].DurationSec != 12 {
+		t.Errorf("summary = %+v(应来自权威 results 行)", out.Tasks[0])
+	}
+	// 幂等:LoadResult/FinishTask 各一次,重复 signal 无二次效果
+	if len(f.loadCalls) != 1 || f.loadCalls[0] != taskID("a1") {
+		t.Errorf("loadCalls = %v, want 单次权威读", f.loadCalls)
+	}
+	if len(f.finished) != 1 || f.finished[0].Verdict != "PASSED" {
+		t.Errorf("finished = %+v", f.finished)
+	}
+}
+
+// TestLoadResultMissingIsInfraError:signal 到了但 results 表无权威行
+// (outbox 链路异常):按 INFRA 处理走机械重试,绝不拿 signal 载荷兜底判 verdict。
+func TestLoadResultMissingIsInfraError(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}}
+	env := newEnv(t, f)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, TaskResultSignal{TaskID: taskID("a1")})
+	}, 5*time.Second)
+	// 每个 attempt 都会收到 signal,但 results 始终为空(不 seed)
+	for _, a := range []string{"a2", "a3"} {
+		aid := taskID(a)
+		env.RegisterDelayedCallback(func() {
+			env.SignalWorkflow(SignalTaskResult, TaskResultSignal{TaskID: aid})
+		}, 5*time.Second)
+	}
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Tasks[0].Verdict != "INFRA_ERROR" || out.Tasks[0].Category != "INFRA" ||
+		out.Tasks[0].Attempt != 3 {
+		t.Errorf("summary = %+v, want INFRA_ERROR attempt=3", out.Tasks[0])
+	}
+	if len(f.loadCalls) != 3 {
+		t.Errorf("loadCalls = %v, want 每 attempt 一次权威读", f.loadCalls)
+	}
+}
+
 func TestDeviceBusyThenAvailable(t *testing.T) {
 	f := &fakeActs{specs: []TestSpec{spec1()}, acquires: []*Lease{nil, nil}} // 前两轮无设备
 	env := newEnv(t, f)
+	seedResult(f, passResult(taskID("a1")))
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
 	}, 90*time.Second) // 2×30s 等待后拿到设备
@@ -427,6 +564,7 @@ func TestDispatchFailureRetriesOnFreshTask(t *testing.T) {
 	// 第一次 dispatch 持续失败(activity 层重试 3 次后仍败,注入 3 个错误),第二 attempt 成功
 	f.dispatchErrs = []error{errBoom, errBoom, errBoom}
 	env := newEnv(t, f)
+	seedResult(f, passResult(taskID("a2")))
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a2")))
 	}, 60*time.Second)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"hermes-devops/runtime/internal/rules"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -187,10 +188,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ---- 启动 workflow(ID 确定性,重复投递由 Temporal 去重) ----
+	// ---- 启动 workflow(ID 确定性;RejectDuplicate,webhook 重放绝不自动重启,差距 #11) ----
 	in := wf.DeviceTestInput{
 		Project: b.Project, Commit: b.Commit, PipelineID: b.PipelineID,
 		Version: b.Version, Packages: b.Packages,
+		RuleVersion: ruleVersionOr(b.RuleVersion),
 	}
 	wfID, started, err := h.starter.StartDeviceTest(r.Context(), in)
 	if err != nil {
@@ -207,6 +209,15 @@ func (h *Handler) refAllowed(ref string, isTag bool) bool {
 		return true
 	}
 	return isTag || slices.Contains(h.cfg.Refs, ref)
+}
+
+// ruleVersionOr 补缺省规则版本(契约只加不删:旧 bundle/kick 无 rule_version
+// 字段,按 v1 路由;差距 #7)。
+func ruleVersionOr(v string) string {
+	if v == "" {
+		return rules.DefaultVersion
+	}
+	return v
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

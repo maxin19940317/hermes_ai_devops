@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,12 +35,40 @@ const (
 )
 
 // deviceRow 是 MemStore 内部的设备运行时状态(props + status + fail_streak + 租约)。
+// 租约所有权凭据(§10/差距 #15):LeaseID 每次授予唯一(取 task_id),
+// LeaseGeneration 每设备单调递增,Released 标记 ReleaseDevice 已置 released_at
+// (行保留作审计,续租必须 Released=false)。
 type deviceRow struct {
 	Device
-	Status         string
-	FailStreak     int
-	LeaseTaskID    string
-	LeaseExpiresAt time.Time
+	Status          string
+	FailStreak      int
+	LeaseTaskID     string
+	LeaseID         string
+	LeaseGeneration int
+	LeaseExpiresAt  time.Time
+	Released        bool
+}
+
+// LeaseCredential 是心跳续租携带的租约所有权凭据(§10/差距 #15):
+// 全部字段精确匹配且租约未释放,才允许续期;任一失配即 LEASE_NOT_OWNED。
+type LeaseCredential struct {
+	DeviceID   string
+	ClientID   string // 心跳信封的 client_id,必须与设备当前归属一致
+	TaskID     string
+	Attempt    int // 与 task_id 后缀 :a{N} 一致性校验(task_id 编码 attempt,差距 #14)
+	LeaseID    string
+	Generation int
+}
+
+// attemptMatches 校验 cred.Attempt 与 task_id 的 :a{N} 后缀一致
+// (task_id = {workflow_id}:{test_id}:a{attempt})。
+func attemptMatches(taskID string, attempt int) bool {
+	i := strings.LastIndex(taskID, ":a")
+	if i < 0 {
+		return false
+	}
+	n, err := strconv.Atoi(taskID[i+2:])
+	return err == nil && n == attempt
 }
 
 // UpsertClientDevices 处理心跳注册(§8.2):新设备以 IDLE 入库,
@@ -71,26 +100,33 @@ func (s *MemStore) AcquireDevice(_ context.Context, sel wf.DeviceSelector, taskI
 		}
 		row.Status = DeviceBusy
 		row.LeaseTaskID = taskID
+		row.LeaseID = taskID // lease_id 每次授予唯一;取 task_id(本身含 attempt,全链路唯一)
+		row.LeaseGeneration++
+		row.Released = false
 		row.LeaseExpiresAt = time.Now().Add(time.Duration(leaseSeconds) * time.Second)
 		return &wf.Lease{
 			DeviceID:      row.DeviceID,
 			Serial:        row.Serial,
 			ClientID:      row.ClientID,
 			ClientBaseURL: s.clients[row.ClientID].BaseURL,
+			LeaseID:       row.LeaseID,
+			Generation:    row.LeaseGeneration,
 		}, nil
 	}
 	return nil, nil
 }
 
-// ReleaseDevice 归还租约。infraFail=true 时 fail_streak+1,
-// 达到 quarantineAfter(§10 缺省 3)则 QUARANTINED;成功归还清零 fail_streak。
+// ReleaseDevice 归还租约(置 released_at,行保留作审计;§10/差距 #15)。
+// infraFail=true 时 fail_streak+1,达到 quarantineAfter(§10 缺省 3)则 QUARANTINED;
+// 成功归还清零 fail_streak。非租约持有者释放/租约已易主/重复释放:幂等,无副作用。
 func (s *MemStore) ReleaseDevice(_ context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.devices[deviceID]
-	if !ok || row.LeaseTaskID != taskID {
+	if !ok || row.LeaseTaskID != taskID || row.Released {
 		return nil // 重复释放/租约已易主:幂等,无副作用
 	}
+	row.Released = true
 	row.LeaseTaskID = ""
 	row.LeaseExpiresAt = time.Time{}
 	if infraFail {
@@ -120,17 +156,38 @@ func leasable(row *deviceRow, now time.Time) bool {
 	}
 }
 
-// RenewLease 续期 DB 租约(§10 心跳即租约续期)。仅当前持有者(taskID 精确匹配)
-// 可续;租约已易主/设备不存在时幂等空转,无副作用。
-func (s *MemStore) RenewLease(_ context.Context, deviceID, taskID string, leaseSeconds int) error {
+// RenewLease 条件续期 DB 租约(§10/差距 #15):设备归属 client、lease_id、
+// task_id、attempt(与 task_id 后缀一致)、generation 全部精确匹配且租约未释放,
+// 才允许续期并返回 true;任一失配(租约已易主/已释放/凭据伪造或过期)返回
+// false——调用方据此向 Client 报告 LEASE_NOT_OWNED,Client 必须停止操作该任务。
+func (s *MemStore) RenewLease(_ context.Context, cred LeaseCredential, leaseSeconds int) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	row, ok := s.devices[deviceID]
-	if !ok || row.Status != DeviceBusy || row.LeaseTaskID != taskID {
-		return nil
+	row, ok := s.devices[cred.DeviceID]
+	if !ok || row.Status != DeviceBusy || row.Released {
+		return false, nil
+	}
+	if row.ClientID != cred.ClientID || row.LeaseTaskID != cred.TaskID ||
+		row.LeaseID != cred.LeaseID || row.LeaseGeneration != cred.Generation ||
+		!attemptMatches(cred.TaskID, cred.Attempt) {
+		return false, nil
 	}
 	row.LeaseExpiresAt = time.Now().Add(time.Duration(leaseSeconds) * time.Second)
-	return nil
+	return true, nil
+}
+
+// GetLeaseExpiry 返回 taskID 当前持有租约的到期时刻(CheckLease 活动,
+// 原则 6);租约不存在/已释放/已易主返回 (nil, nil)——即"未续期"。
+func (s *MemStore) GetLeaseExpiry(_ context.Context, taskID string) (*time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, row := range s.devices {
+		if row.LeaseTaskID == taskID && !row.Released {
+			exp := row.LeaseExpiresAt
+			return &exp, nil
+		}
+	}
+	return nil, nil
 }
 
 // matchSelector:SOC 大小写不敏感命中列表任一项;Capabilities 须为设备能力子集。
