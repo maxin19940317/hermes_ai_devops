@@ -153,7 +153,7 @@ func input() DeviceTestInput {
 func taskID(attempt string) string { return wfID + ":t1:" + attempt }
 
 func passResult(id string) TaskResultSignal {
-	return TaskResultSignal{TaskID: id, Status: "COMPLETED", ExitCode: 0, CasesTotal: 10,
+	return TaskResultSignal{TaskID: id, Status: "COMPLETED", ExitCode: 0, DurationSec: 12, CasesTotal: 10,
 		Attachments: []Attachment{{Name: "logcat.txt", ObjectKey: "runs/x/logcat.txt"}}}
 }
 
@@ -188,8 +188,9 @@ func TestHappyPathPassed(t *testing.T) {
 	}
 	if len(f.notifications) != 1 ||
 		!strings.Contains(f.notifications[0], "PASSED") ||
-		!strings.Contains(f.notifications[0], "runs/x/logcat.txt") {
-		t.Errorf("notification = %q(需含 verdict 与日志对象键)", f.notifications)
+		!strings.Contains(f.notifications[0], "12.0s cases=10/10") ||
+		strings.Contains(f.notifications[0], "runs/x/") {
+		t.Errorf("notification = %q(需含 verdict 与耗时/用例,不含附件对象键)", f.notifications)
 	}
 	// §11:PASSED 落规则裁决;不触发证据提取/分析(Phase 2 只对非 PASSED)
 	if len(f.decisions) != 1 || f.decisions[0].Actor != "rule" {

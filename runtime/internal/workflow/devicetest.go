@@ -175,6 +175,9 @@ type TaskSummary struct {
 	Verdict     string       `json:"verdict"`
 	Category    string       `json:"category"`
 	Reason      string       `json:"reason"`
+	DurationSec float64      `json:"duration_sec,omitempty"`
+	CasesTotal  int          `json:"cases_total,omitempty"`
+	CasesFailed int          `json:"cases_failed,omitempty"`
 	Attachments []Attachment `json:"attachments,omitempty"`
 	// Analysis 是 Phase 2 LLM Analyzer 的补充结论(仅非 PASSED 且 Analyzer 启用时
 	// 非空);随输出与通知透出,判定权仍在规则引擎(§9)。
@@ -326,6 +329,7 @@ func runAttempt(ctx workflow.Context, spec TestSpec, attempt int, resultCh, hbCh
 		SignaturesHit: res.SignaturesHit, SignatureCategory: spec.SignatureCategory,
 	})
 	sum.Verdict, sum.Category, sum.Reason = string(d.Verdict), string(d.Category), d.Reason
+	sum.DurationSec, sum.CasesTotal, sum.CasesFailed = res.DurationSec, res.CasesTotal, res.CasesFailed
 	sum.Attachments = res.Attachments
 	sum.retryable = d.Retry
 	// 规则裁决落 decisions 表(§11 可回放);INFRA 早退路径的裁决已随 FinishTask 落 tasks 表
@@ -454,13 +458,15 @@ func buildNotification(in DeviceTestInput, out *DeviceTestOutput) string {
 		if tk.Category != "" && tk.Verdict != string(rules.VerdictPassed) {
 			fmt.Fprintf(&b, "(%s)", tk.Category)
 		}
+		// 精练格式(§12.6):耗时与用例通过数是性能一瞥;附件 key 不进通知,
+		// 需要时按 task_id 到 MinIO 取。
+		if tk.CasesTotal > 0 {
+			fmt.Fprintf(&b, " %.1fs cases=%d/%d", tk.DurationSec, tk.CasesTotal-tk.CasesFailed, tk.CasesTotal)
+		}
 		fmt.Fprintf(&b, " attempt=%d %s\n", tk.Attempt, tk.Reason)
 		// Phase 2:LLM Analyzer 的总结性结论随通知透出(仅非 PASSED 且分析成功时存在)
 		if tk.Analysis != nil && tk.Analysis.Summary != "" {
 			fmt.Fprintf(&b, "  · hermes: %s\n", tk.Analysis.Summary)
-		}
-		for _, att := range tk.Attachments {
-			fmt.Fprintf(&b, "  · %s → %s\n", att.Name, att.ObjectKey)
 		}
 	}
 	return b.String()
