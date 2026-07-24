@@ -32,17 +32,19 @@
 
 ```text
 contracts/   契约优先:plan/manifest/result/bundle JSON Schema + 两个 OpenAPI,附正反例测试
-ci/          业务仓库(algo-super-sdk)CI 脚本:gen_manifest / write_meta / gen_bundle / variants.yaml
+ci/          业务仓库(algo-super-sdk)CI 脚本:gen_manifest / write_meta / gen_bundle / kick / variants.yaml
 agent/       Windows Client Agent(Go):agent-cli 先行,后套 RPC 壳
 runtime/     Temporal Worker + Trigger 服务 + REST API(Go)
 hermes/      hermes-agent 平台侧组件:analyze_bridge(Analyzer HTTP 适配层,Phase 2)
-docs/        设计 spec、实施 plan、SDK 打包适配评估
+docs/        设计 spec、实施 plan、SDK 打包适配评估、设备测试链路时序图(device-test-sequence.md)
 ```
 
 各组件细节见子目录 README:[ci/](ci/README.md)、[agent/](agent/README.md)、
 [runtime/](runtime/README.md)、[agent/dist/](agent/dist/README.md)(Windows 分发包使用说明)。
 
-## 当前进度(Phase 1 — 无 LLM 最小闭环)
+## 当前进度
+
+### Phase 1 — 无 LLM 最小闭环(已达成)
 
 | 步骤 | 状态 |
 |---|---|
@@ -57,6 +59,15 @@ docs/        设计 spec、实施 plan、SDK 打包适配评估
 **Phase 1 DoD 已达成**(2026-07-22,workflow `device-test-aios/algo_super_sdk-g108e0d72-p46`):
 push → CI → webhook → 派单 → QCM6125 开发板实测 → SNPE 1.68 / SNPE 2.21 / TFLite 全部
 PASSED(exit 0,真实推理耗时)→ MinIO 附件直传 → 飞书通知,全程无人工干预、零重复执行。
+
+### Phase 2 — 证据-分析-通知增强(进行中)
+
+| 步骤 | 状态 |
+|---|---|
+| 变体级 `/kick` 触发 + fleet 感知 spec 跳过 | ✅ Runtime 侧;业务仓库 CI 接线 `kick.py` 待做 |
+| evidence 提取 → analyze_bridge → decisions 回放链 | ✅ q-uat 实战运行(非 PASSED 触发) |
+| 飞书通知精练化 + 附 Hermes 总结 | ✅ 2026-07-24 端到端实测 |
+| 设备租约心跳续期 + 过期懒回收 | ✅ 2026-07-24 修复并实战验证(workflow 被 terminate 后自动恢复) |
 
 完整阶段规划(Phase 0–4)与 DoD 见 CLAUDE.md §12。
 
