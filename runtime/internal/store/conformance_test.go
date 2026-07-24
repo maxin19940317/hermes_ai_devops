@@ -19,6 +19,7 @@ type fullStore interface {
 	UpsertClientDevices(ctx context.Context, c Client, devs []Device) error
 	AcquireDevice(ctx context.Context, sel wf.DeviceSelector, taskID string, leaseSeconds int) (*wf.Lease, error)
 	ReleaseDevice(ctx context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error
+	RenewLease(ctx context.Context, deviceID, taskID string, leaseSeconds int) error
 	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
 	CreateTask(ctx context.Context, row wf.TaskRow) error
 	GetTask(ctx context.Context, taskID string) (*wf.TaskRow, error)
@@ -233,6 +234,67 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if granted != 1 {
 			t.Errorf("granted = %d, want 1(租约独占,§11 行锁)", granted)
+		}
+	})
+
+	// 租约生命周期状态机(§10 租约 120s 心跳续期):BUSY 设备在租约过期后被
+	// AcquireDevice 懒回收——这是 workflow 被 Terminate/进程死亡等绕过
+	// ReleaseDevice 场景的唯一恢复路径,必须有表驱动覆盖。
+	t.Run("LeaseLifecycleRenewAndReclaim", func(t *testing.T) {
+		cases := []struct {
+			name          string
+			leaseSeconds  int    // t1 初始租约时长;0 = 立即过期(模拟持有者失联)
+			renewTask     string // 租约过期后续租者;"" 表示不续租
+			renewSeconds  int
+			wantReclaimed bool // t2 随后能否取得设备
+		}{
+			{"有效租约不得回收", 120, "", 0, false},
+			{"过期租约懒回收", 0, "", 0, true},
+			{"持有者续期阻止回收", 0, "t1", 120, false},
+			{"非持有者续租无效", 0, "intruder", 120, true},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newStore(t)
+				seed(t, s)
+				l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t1", tc.leaseSeconds)
+				if err != nil || l == nil {
+					t.Fatalf("t1 acquire: lease=%v err=%v", l, err)
+				}
+				if tc.renewTask != "" {
+					if err := s.RenewLease(ctx, l.DeviceID, tc.renewTask, tc.renewSeconds); err != nil {
+						t.Fatalf("renew: %v", err)
+					}
+				}
+				l2, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t2", 120)
+				if err != nil {
+					t.Fatalf("t2 acquire: %v", err)
+				}
+				if (l2 != nil) != tc.wantReclaimed {
+					t.Errorf("reclaimed = %v, want %v", l2 != nil, tc.wantReclaimed)
+				}
+			})
+		}
+	})
+
+	// 懒回收后租约易主:旧持有者的 ReleaseDevice 必须幂等空转,
+	// 不得把新持有者的设备释放掉(§3 规则 7 幂等)。
+	t.Run("ReclaimTransfersOwnership", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "dead-task", 0) // 立即过期
+		if err != nil || l == nil {
+			t.Fatalf("acquire: lease=%v err=%v", l, err)
+		}
+		l2, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t2", 120) // 回收
+		if err != nil || l2 == nil {
+			t.Fatalf("reclaim: lease=%v err=%v", l2, err)
+		}
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "dead-task", true, 3); err != nil {
+			t.Fatal(err)
+		}
+		if l3, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t3", 120); l3 != nil {
+			t.Errorf("旧持有者释放不得影响新租约: %+v", l3)
 		}
 	})
 

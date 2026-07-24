@@ -38,8 +38,10 @@ CREATE TABLE IF NOT EXISTS devices (
     fail_streak  INTEGER     NOT NULL DEFAULT 0
 );
 
--- 独占租约:AcquireDevice 用 `SELECT ... FOR UPDATE SKIP LOCKED` 行锁保证并发下
+-- 独占租约:AcquireDevice 用 `SELECT ... FOR UPDATE OF d SKIP LOCKED` 行锁保证并发下
 -- 只有一个调用者拿到同一设备(§3 规则 3 独占,§11)。
+-- lease_expires_at 由 Client 心跳经 RenewLease 续期(§10 租约 120s);过期 = 持有者失联
+-- (workflow 被 Terminate/进程死亡等绕过 ReleaseDevice),由 AcquireDevice 懒回收。
 CREATE TABLE IF NOT EXISTS device_leases (
     device_id        TEXT PRIMARY KEY REFERENCES devices(device_id),
     task_id          TEXT        NOT NULL,

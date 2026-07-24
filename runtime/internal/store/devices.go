@@ -58,13 +58,15 @@ func (s *MemStore) UpsertClientDevices(_ context.Context, c Client, devs []Devic
 	return nil
 }
 
-// AcquireDevice 按 selector 选一台 IDLE 设备并租给 taskID(§11 device_leases 独占)。
-// 无可用设备返回 (nil, nil),由 workflow 决定等待或放弃。
+// AcquireDevice 按 selector 选一台可租设备并租给 taskID(§11 device_leases 独占)。
+// 可租 = IDLE,或 BUSY 但租约已过期(持有者失联:workflow 被 Terminate/进程死亡等
+// 绕过 ReleaseDevice 的场景,§10 租约 120s 由心跳续期,过期即无人认领)——
+// 懒回收,无需后台清扫。无可用设备返回 (nil, nil),由 workflow 决定等待或放弃。
 func (s *MemStore) AcquireDevice(_ context.Context, sel wf.DeviceSelector, taskID string, leaseSeconds int) (*wf.Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, row := range s.devices {
-		if row.Status != DeviceIdle || !matchSelector(row.Device, sel) {
+		if !leasable(row, time.Now()) || !matchSelector(row.Device, sel) {
 			continue
 		}
 		row.Status = DeviceBusy
@@ -101,6 +103,33 @@ func (s *MemStore) ReleaseDevice(_ context.Context, deviceID, taskID string, inf
 		row.FailStreak = 0
 	}
 	row.Status = DeviceIdle
+	return nil
+}
+
+// leasable 判定设备当前是否可出租:IDLE 可租;BUSY 仅当租约已过期
+// (lease_expires_at 由心跳经 RenewLease 续期,过期 = 持有者失联)可懒回收;
+// QUARANTINED 永不可租(只能由人工/后续机制解除)。
+func leasable(row *deviceRow, now time.Time) bool {
+	switch row.Status {
+	case DeviceIdle:
+		return true
+	case DeviceBusy:
+		return now.After(row.LeaseExpiresAt)
+	default:
+		return false
+	}
+}
+
+// RenewLease 续期 DB 租约(§10 心跳即租约续期)。仅当前持有者(taskID 精确匹配)
+// 可续;租约已易主/设备不存在时幂等空转,无副作用。
+func (s *MemStore) RenewLease(_ context.Context, deviceID, taskID string, leaseSeconds int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.devices[deviceID]
+	if !ok || row.Status != DeviceBusy || row.LeaseTaskID != taskID {
+		return nil
+	}
+	row.LeaseExpiresAt = time.Now().Add(time.Duration(leaseSeconds) * time.Second)
 	return nil
 }
 

@@ -1,5 +1,5 @@
 // Package callbacks 实现 Client → Runtime 回调 API(CLAUDE.md §8.2,
-// contracts/callbacks-api.openapi.yaml):心跳(设备注册 + 租约续期 signal)、
+// contracts/callbacks-api.openapi.yaml):心跳(设备注册 + DB/workflow 双侧租约续期)、
 // 任务事件(按 task_id+seq 去重)、终态结果(Schema 校验 → SaveResult 去重 → signal)。
 package callbacks
 
@@ -35,6 +35,7 @@ func mustCompileResultSchema() *jsonschema.Schema {
 // Store 是回调服务依赖的持久层子集。
 type Store interface {
 	UpsertClientDevices(ctx context.Context, c store.Client, devs []store.Device) error
+	RenewLease(ctx context.Context, deviceID, taskID string, leaseSeconds int) error
 	AppendTaskEvent(ctx context.Context, ev store.TaskEvent) (bool, error)
 	SetTaskStatus(ctx context.Context, taskID, status string) error
 	GetTask(ctx context.Context, taskID string) (*wf.TaskRow, error)
@@ -50,14 +51,18 @@ type Handler struct {
 	store    Store
 	signaler Signaler
 	log      zerolog.Logger
+	leaseSec int
 }
 
-func New(s Store, sig Signaler, log *zerolog.Logger) *Handler {
+func New(s Store, sig Signaler, log *zerolog.Logger, leaseSeconds int) *Handler {
 	l := zerolog.Nop()
 	if log != nil {
 		l = *log
 	}
-	return &Handler{store: s, signaler: sig, log: l}
+	if leaseSeconds <= 0 {
+		leaseSeconds = 120 // §10 缺省
+	}
+	return &Handler{store: s, signaler: sig, log: l, leaseSec: leaseSeconds}
 }
 
 func (h *Handler) Mux() *http.ServeMux {
@@ -115,12 +120,21 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 		return
 	}
-	// 进行中任务 → 续租 signal(§8.2);未知任务(如 Runtime 已重启丢内存)忽略,
-	// 租约过期由 workflow 的 on_infra_error 兜底
+	// 进行中任务 → 续租(§8.2/§10):先续 DB 租约(device_leases.lease_expires_at,
+	// AcquireDevice 懒回收的判据),再发 workflow 续租 signal。
+	// DB 续租不以 signal 成功为前提:workflow 可能已被 Terminate(signal 必然失败),
+	// 但只要 Client 仍在心跳上报该任务,设备就被物理占用,不得被其他 workflow 回收;
+	// Client 停止上报(任务结束/进程死亡)后租约自然过期,由 AcquireDevice 回收。
+	// 未知任务(如 Runtime 已重启丢内存)忽略,租约过期由 workflow 的 on_infra_error 兜底。
 	for _, tid := range req.ActiveTaskIDs {
 		row, err := h.store.GetTask(r.Context(), tid)
 		if err != nil || row == nil {
 			continue
+		}
+		if row.DeviceID != "" {
+			if err := h.store.RenewLease(r.Context(), row.DeviceID, tid, h.leaseSec); err != nil {
+				h.log.Error().Err(err).Str("task_id", tid).Msg("renew lease failed")
+			}
 		}
 		if err := h.signaler.SignalWorkflow(r.Context(), row.WorkflowID, "",
 			wf.SignalTaskHeartbeat, wf.TaskHeartbeat{TaskID: tid}); err != nil {

@@ -126,7 +126,7 @@ func main() {
 	w.RegisterActivity(acts)
 
 	// ---- Client 回调 HTTP 服务(§8.2) ----
-	cb := callbacks.New(st, tc, &log)
+	cb := callbacks.New(st, tc, &log, cfg.Activity.LeaseSeconds)
 	callbackSrv := &http.Server{
 		Addr:              cfg.CallbacksAddr,
 		Handler:           cb.Mux(),

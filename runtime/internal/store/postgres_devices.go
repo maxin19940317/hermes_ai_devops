@@ -50,8 +50,10 @@ func (s *PGStore) UpsertClientDevices(ctx context.Context, c Client, devs []Devi
 	return tx.Commit()
 }
 
-// AcquireDevice 按 selector 选一台 IDLE 设备并租给 taskID(§11 device_leases 独占)。
-// 无可用设备返回 (nil, nil)。
+// AcquireDevice 按 selector 选一台可租设备并租给 taskID(§11 device_leases 独占)。
+// 可租 = IDLE,或 BUSY 但租约已过期(持有者失联:workflow 被 Terminate/进程死亡等
+// 绕过 ReleaseDevice 的场景,§10 租约 120s 由心跳经 RenewLease 续期,过期即无人
+// 认领)——懒回收,无需后台清扫。无可用设备返回 (nil, nil)。
 func (s *PGStore) AcquireDevice(ctx context.Context, sel wf.DeviceSelector, taskID string, leaseSeconds int) (*wf.Lease, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -94,8 +96,11 @@ func (s *PGStore) AcquireDevice(ctx context.Context, sel wf.DeviceSelector, task
 	}, nil
 }
 
-// lockOneCandidate 在 tx 内用 `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1` 精确锁住至多一行:
+// lockOneCandidate 在 tx 内用 `SELECT ... FOR UPDATE OF d SKIP LOCKED LIMIT 1` 精确锁住至多一行:
 // selector 过滤下推到 SQL WHERE、且 LIMIT 1,只锁住将被选中的那一台设备。
+// 候选含两类:IDLE 设备,以及 BUSY 但租约已过期的设备(懒回收,见 AcquireDevice);
+// 行锁只落在 devices 行上(FOR UPDATE OF d),过期租约行的覆写由后续的
+// device_leases UPSERT 在同一 tx 内完成,并发回收者被 SKIP LOCKED 挡在锁外。
 // 不这样做的后果:若把过滤留到 Go 侧、或不加 LIMIT,行锁会覆盖所有匹配当前 selector 的
 // IDLE 设备(即便最终只取用其中一台),导致另一个并发 Acquire 明明能匹配到其他空闲设备,
 // 却被这笔尚未提交的事务无谓阻塞——§11 device_leases 独占的本意是"独占被选中的设备",
@@ -112,15 +117,16 @@ func (s *PGStore) lockOneCandidate(ctx context.Context, tx *sql.Tx, sel wf.Devic
 
 	var d Device
 	err := tx.QueryRowContext(ctx, `
-		SELECT device_id, serial, client_id, soc, abi, capabilities
-		FROM devices
-		WHERE status = 'IDLE'
-		  AND (cardinality($1::text[]) = 0 OR lower(soc) = ANY($1))
+		SELECT d.device_id, d.serial, d.client_id, d.soc, d.abi, d.capabilities
+		FROM devices d
+		LEFT JOIN device_leases l ON l.device_id = d.device_id
+		WHERE (d.status = 'IDLE' OR (d.status = 'BUSY' AND l.lease_expires_at < now()))
+		  AND (cardinality($1::text[]) = 0 OR lower(d.soc) = ANY($1))
 		  AND (cardinality($2::text[]) = 0 OR
-		       COALESCE((SELECT array_agg(lower(cap)) FROM unnest(capabilities) AS cap), '{}'::text[]) @> $2::text[])
-		ORDER BY device_id
+		       COALESCE((SELECT array_agg(lower(cap)) FROM unnest(d.capabilities) AS cap), '{}'::text[]) @> $2::text[])
+		ORDER BY d.device_id
 		LIMIT 1
-		FOR UPDATE SKIP LOCKED`,
+		FOR UPDATE OF d SKIP LOCKED`,
 		pq.Array(socs), pq.Array(caps)).Scan(
 		&d.DeviceID, &d.Serial, &d.ClientID, &d.SOC, &d.ABI, pq.Array(&d.Capabilities))
 	if err == sql.ErrNoRows {
@@ -154,6 +160,19 @@ func (s *PGStore) HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (
 		return false, fmt.Errorf("has capable device: %w", err)
 	}
 	return false, nil
+}
+
+// RenewLease 续期 DB 租约(§10 心跳即租约续期)。仅当前持有者(task_id 精确匹配)
+// 可续;租约已易主/不存在时 WHERE 匹配不到行,幂等空转,无副作用。
+func (s *PGStore) RenewLease(ctx context.Context, deviceID, taskID string, leaseSeconds int) error {
+	expiresAt := time.Now().Add(time.Duration(leaseSeconds) * time.Second)
+	if _, err := s.DB.ExecContext(ctx, `
+		UPDATE device_leases SET lease_expires_at = $3
+		WHERE device_id = $1 AND task_id = $2`,
+		deviceID, taskID, expiresAt); err != nil {
+		return fmt.Errorf("renew lease %s/%s: %w", deviceID, taskID, err)
+	}
+	return nil
 }
 
 // ReleaseDevice 归还租约。infraFail=true 时 fail_streak+1,
