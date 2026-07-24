@@ -81,6 +81,18 @@ docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
   -f deploy/docker-compose.yml ps
 ```
 
+## Database migrations
+
+Runtime services apply `runtime/internal/store/schema.sql` at startup (`OpenPG`),
+but only as `CREATE TABLE IF NOT EXISTS` — new columns on existing tables are NOT
+added. When a release adds columns, apply the matching script in
+`deploy/postgres/migrations/` before recreating services:
+
+```bash
+docker exec -i hermes-runtime-postgres-1 psql -U hermes_runtime -d hermes_runtime \
+  -v ON_ERROR_STOP=1 < deploy/postgres/migrations/<file>.sql
+```
+
 ## Verify
 
 ```bash
@@ -100,12 +112,14 @@ ssh -L 18080:127.0.0.1:18080 "$Q_UAT_HOST"
 
 ```bash
 docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
-  -f deploy/docker-compose.yml logs -f --tail 100 trigger worker
+  -f deploy/docker-compose.yml logs -f --tail 100 trigger worker relay
 ```
 
 ## Upgrade
 
-Record the current image ID, update source, rebuild, and recreate only Runtime services:
+Record the current image ID, update source, rebuild, and recreate only Runtime services
+(if the release adds database columns, apply the migration first — see Database
+migrations):
 
 ```bash
 docker image inspect hermes-runtime:${RUNTIME_IMAGE_TAG:-dev} --format '{{.Id}}'
@@ -113,19 +127,19 @@ deploy/scripts/lock-images.sh deploy/.env deploy/images.lock.env
 docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
   -f deploy/docker-compose.yml build trigger
 docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
-  -f deploy/docker-compose.yml up -d --no-deps trigger worker
+  -f deploy/docker-compose.yml up -d --no-deps trigger worker relay
 ```
 
 ## Roll back
 
-Retag the recorded Runtime image ID and recreate Trigger/Worker. Never use `down -v` in
+Retag the recorded Runtime image ID and recreate Trigger/Worker/Relay. Never use `down -v` in
 normal rollback because `hermes-runtime-postgres` contains Temporal and Runtime state.
 
 ```bash
 test -n "${ROLLBACK_IMAGE_ID:-}" || { echo "Set ROLLBACK_IMAGE_ID first" >&2; exit 1; }
 docker tag "$ROLLBACK_IMAGE_ID" hermes-runtime:${RUNTIME_IMAGE_TAG:-dev}
 docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
-  -f deploy/docker-compose.yml up -d --no-deps trigger worker
+  -f deploy/docker-compose.yml up -d --no-deps trigger worker relay
 ```
 
 ## Stop without deleting data

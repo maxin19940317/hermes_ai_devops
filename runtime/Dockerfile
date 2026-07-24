@@ -7,13 +7,15 @@ COPY runtime/go.mod runtime/go.sum ./
 RUN go mod download
 COPY runtime/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/hermes-trigger ./cmd/trigger \
- && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/hermes-worker ./cmd/worker
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/hermes-worker ./cmd/worker \
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/hermes-relay ./cmd/relay
 FROM ${RUNTIME_BASE_IMAGE}
 RUN apk add --no-cache ca-certificates wget \
  && addgroup -S hermes \
  && adduser -S -G hermes -h /nonexistent -s /sbin/nologin hermes
 COPY --from=build /out/hermes-trigger /app/hermes-trigger
 COPY --from=build /out/hermes-worker /app/hermes-worker
+COPY --from=build /out/hermes-relay /app/hermes-relay
 COPY ci/variants.yaml /etc/hermes/variants.yaml
 USER hermes
 WORKDIR /app

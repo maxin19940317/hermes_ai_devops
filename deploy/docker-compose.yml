@@ -145,6 +145,22 @@ services:
       retries: 20
       start_period: 10s
 
+  relay:
+    <<: *runtime-common
+    command: [/app/hermes-relay]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    environment:
+      <<: *runtime-environment
+      # 事务性 Outbox 投递(设计基线 v1.0 原则 3):无监听端口,崩溃由 restart 策略拉起;
+      # 未投递积压与 last_error 查 outbox 表(published_at IS NULL)。
+      RELAY_BATCH_SIZE: ${RELAY_BATCH_SIZE:-100}
+      RELAY_POLL_INTERVAL: ${RELAY_POLL_INTERVAL:-1s}
+      RELAY_MAX_BACKOFF: ${RELAY_MAX_BACKOFF:-30s}
+
   minio:
     image: ${MINIO_IMAGE:?MINIO_IMAGE must come from images.lock.env}
     restart: unless-stopped
