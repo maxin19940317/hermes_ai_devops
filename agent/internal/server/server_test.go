@@ -827,3 +827,44 @@ func TestHealthz(t *testing.T) {
 		t.Errorf("healthz = %v", body)
 	}
 }
+
+// 派单携带租约所有权凭据(差距 #15,契约只加不删):lease_id/lease_generation
+// 必须过 Schema 校验并随任务落库,心跳据此按新格式续租;旧 Runtime 派单
+// (无凭据字段)照常接受,凭据读回零值。
+func TestDispatchPersistsLeaseCredentials(t *testing.T) {
+	env := newTestEnv(t)
+	pkg := newPkgServer(t)
+	t.Cleanup(func() { unblock(env.runner) })
+
+	body := dispatchBody("t-lease", "wf:t-lease:a1", pkg.srv.URL, pkg.sha, map[string]any{
+		"lease_id":         "wf:t-lease:a1",
+		"lease_generation": 2,
+	})
+	rec := doReq(t, env.handler, http.MethodPost, "/api/v1/tasks", body)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d body = %s(带凭据派单必须过 Schema)", rec.Code, rec.Body)
+	}
+	got, err := env.st.GetTask(context.Background(), "t-lease")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.LeaseID != "wf:t-lease:a1" || got.LeaseGeneration != 2 {
+		t.Errorf("落库凭据 = (%q, %d), want (wf:t-lease:a1, 2)", got.LeaseID, got.LeaseGeneration)
+	}
+	unblock(env.runner)
+	waitState(t, env.st, "t-lease", store.StateCompleted)
+
+	// 无凭据派单(旧 Runtime):照常接受,凭据零值
+	body2 := dispatchBody("t-nolease", "wf:t-nolease:a1", pkg.srv.URL, pkg.sha, nil)
+	if rec := doReq(t, env.handler, http.MethodPost, "/api/v1/tasks", body2); rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+	got2, err := env.st.GetTask(context.Background(), "t-nolease")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got2.LeaseID != "" || got2.LeaseGeneration != 0 {
+		t.Errorf("无凭据派单读回 (%q, %d), want 零值", got2.LeaseID, got2.LeaseGeneration)
+	}
+	waitState(t, env.st, "t-nolease", store.StateCompleted)
+}

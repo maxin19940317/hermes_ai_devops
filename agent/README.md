@@ -8,7 +8,8 @@ CLI 细节见 [`dist/README.md`](dist/README.md)。
 
 实现 contracts/client-agent-api.openapi.yaml v1 全部端点
 (派单/取消/查询/设备/诊断/healthz),并按 callbacks-api 上报
-心跳(10s,即租约续期)/任务事件/终态结果;附件经预签名 URL 直传 MinIO,不过 Runtime。
+心跳(10s,携带租约所有权凭据只续数据库租约)/任务事件/终态结果;
+附件经预签名 URL 直传 MinIO,不过 Runtime。
 
 ### 架构要点(对照 CLAUDE.md 红线)
 
@@ -17,7 +18,9 @@ CLI 细节见 [`dist/README.md`](dist/README.md)。
 - `internal/store`:SQLite(modernc.org/sqlite,纯 Go 免 CGO)任务+事件表,
   状态迁移单事务落盘,崩溃重启后 `LoadInflight` 恢复:非终态任务置 FAILED 补报,
   未上报事件/结果自动重发。
-- `internal/reporter`:心跳(设备发现+属性+空间,失败退避不阻塞执行)、
+- `internal/reporter`:心跳(设备发现+属性+空间,失败退避不阻塞执行;
+  active_task_ids 逐任务混合格式——带 lease 凭据的任务发对象、无凭据发字符串,
+  滚动升级任意顺序安全;应答 not_owned 即 LEASE_NOT_OWNED 时立即停止本地执行)、
   事件(seq 单任务单调递增,Runtime 按 (task_id,seq) 去重)、
   结果(组装过 result.schema.json 校验;500 重发,400 不重发)。
 - `internal/uploader`:预签名 PUT 直传;单项失败降级本地保留,不阻断结果回流;

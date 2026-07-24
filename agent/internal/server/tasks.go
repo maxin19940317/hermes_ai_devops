@@ -49,9 +49,14 @@ type Dispatch struct {
 			Token string `json:"token"`
 		} `json:"auth"`
 	} `json:"artifact"`
-	ManifestDigest   string `json:"manifest_digest"`
-	DeviceSerial     string `json:"device_serial"`
-	CallbackBaseURL  string `json:"callback_base_url"`
+	ManifestDigest  string `json:"manifest_digest"`
+	DeviceSerial    string `json:"device_serial"`
+	CallbackBaseURL string `json:"callback_base_url"`
+	// 租约所有权凭据(差距 #15,契约只加不删):新 Runtime 派单携带,
+	// 落库后心跳续租时原样回传;旧 Runtime 不携带(空 = 无凭据,
+	// 心跳按旧字符串格式上报)。
+	LeaseID          string `json:"lease_id"`
+	LeaseGeneration  int    `json:"lease_generation"`
 	PresignedUploads []struct {
 		ObjectKey string `json:"object_key"`
 		URL       string `json:"url"`
@@ -105,6 +110,9 @@ func (s *Server) dispatchTask(w http.ResponseWriter, r *http.Request) {
 		Attempt:        d.Attempt,
 		DispatchJSON:   string(body),
 		OutDir:         outDir,
+		// 租约所有权凭据随任务落库:崩溃重启后心跳仍按新格式续租(§10)
+		LeaseID:         d.LeaseID,
+		LeaseGeneration: d.LeaseGeneration,
 	}
 	if err := s.cfg.Store.CreateTask(ctx, task); err != nil {
 		// 并发窗口:预检与插入之间被另一个相同请求抢先——按其结果应答
@@ -161,14 +169,33 @@ func (s *Server) cancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !store.IsTerminal(t.State) {
-		s.mu.Lock()
-		exec := s.running[t.TaskID]
-		s.mu.Unlock()
-		if exec != nil {
-			exec.Cancel()
-		}
+		s.cancelRunning(t.TaskID)
 	}
 	writeJSON(w, http.StatusAccepted, s.taskStatus(ctx, t))
+}
+
+// cancelRunning 调用运行中 Executor 的 Cancel(尽力而为);未在运行表
+// 中幂等空转。DELETE 取消与 LEASE_NOT_OWNED 停止共用此路径。
+func (s *Server) cancelRunning(taskID string) {
+	s.mu.Lock()
+	exec := s.running[taskID]
+	s.mu.Unlock()
+	if exec != nil {
+		exec.Cancel()
+	}
+}
+
+// StopTask 是 reporter.Heartbeat 的 LEASE_NOT_OWNED 停止钩子(§10/差距 #15):
+// 心跳应答宣告租约已易主/失效,继续操作设备会干扰新持有者——走与 DELETE
+// 取消相同的清理路径;executor 随后把任务迁移到 CANCELED 终态,自动离开
+// 心跳的 inflight 集合。未知/已终态任务幂等空转。
+func (s *Server) StopTask(taskID string) {
+	t, err := s.cfg.Store.GetTask(context.Background(), taskID)
+	if err != nil || store.IsTerminal(t.State) {
+		return
+	}
+	s.logf("task %s: lease not owned by runtime, canceling local execution", taskID)
+	s.cancelRunning(taskID)
 }
 
 // newExecutor 构造一次运行的 Executor(可用 Config.NewExecutor 注入 fake)。

@@ -3,6 +3,8 @@ package reporter
 import (
 	"context"
 	"encoding/json"
+	"strconv"
+	"strings"
 	"time"
 
 	"hermes-devops/agent/internal/adb"
@@ -18,12 +20,16 @@ const (
 )
 
 // Heartbeat 周期上报心跳:adb 设备清单 + getprop/df 组装的设备状态 +
-// store 中的进行中任务(租约续期依据)。只做上报,不触碰任务执行。
+// store 中的进行中任务(租约续期依据)。LEASE_NOT_OWNED 处置见 once。
 type Heartbeat struct {
 	Runner adb.Runner   // 设备发现与探测(可注入 fake)
 	Store  *store.Store // active_task_ids 与 BUSY 判定来源
 	Client *Client
 	Logf   func(format string, args ...any) // nil → 静默
+
+	// StopTask 在心跳应答带 LEASE_NOT_OWNED 时调用(租约易主/失效,
+	// 立即停止本地执行;§10/差距 #15)。nil = 只记日志不停任务(仅测试)。
+	StopTask func(taskID string)
 
 	ClientID     string
 	AgentVersion string
@@ -101,7 +107,8 @@ func (h *Heartbeat) Run(ctx context.Context) error {
 }
 
 // once 组装并发送一次心跳。单次探测整体限时一个周期,避免设备挂死
-// 拖住循环。
+// 拖住循环。应答中的 not_owned(LEASE_NOT_OWNED)逐项停任务:
+// 租约已易主/失效,继续操作设备会干扰新持有者(§10 防线)。
 func (h *Heartbeat) once(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, h.interval())
 	defer cancel()
@@ -116,17 +123,34 @@ func (h *Heartbeat) once(ctx context.Context) error {
 		Devices:       devices,
 		ActiveTaskIDs: activeIDs,
 	}
-	if _, err := h.Client.Heartbeat(ctx, req); err != nil {
+	ack, err := h.Client.Heartbeat(ctx, req)
+	if err != nil {
 		return err
+	}
+	for _, no := range ack.NotOwned {
+		// 停止路径与 DELETE /api/v1/tasks 取消一致(executor.Cancel →
+		// CANCELED 终态 → 自动离开 inflight 集合,下轮心跳不再上报)
+		h.logf("heartbeat: %s not owned (%s), stopping local execution", no.TaskID, no.Code)
+		if h.StopTask != nil {
+			h.StopTask(no.TaskID)
+		}
 	}
 	return nil
 }
 
-// inflight 从 store 取进行中任务:返回任务 ID 列表与占用中的设备 serial
-// 集合(由 dispatch_json 的 device_serial 解析;解析失败只丢 BUSY 判定,
-// 任务 ID 仍上报)。
-func (h *Heartbeat) inflight(ctx context.Context) ([]string, map[string]bool) {
-	ids := []string{}
+// inflight 从 store 取进行中任务:返回逐任务混合格式的任务清单与占用中的
+// 设备 serial 集合(由 dispatch_json 的 device_serial 解析;解析失败只丢
+// BUSY 判定,任务仍上报)。
+//
+// 混合格式的滚动升级兼容推理(差距 #15):
+//   - 旧 Runtime(只认字符串)派发的任务不带凭据 → 全部字符串 → 与旧格式
+//     逐字节等价,Runtime 行为不变(仅续 client 心跳);
+//   - 新 Runtime 派发的任务带 lease 凭据 → 对象格式 → 条件续租生效;
+//   - 升级窗口内两种任务并存时各按各的格式上报,契约 oneOf 两种都合法。
+//
+// 因此 agent 与 runtime 的任何部署顺序都安全。
+func (h *Heartbeat) inflight(ctx context.Context) ([]any, map[string]bool) {
+	ids := []any{}
 	busy := map[string]bool{}
 	inf, err := h.Store.LoadInflight(ctx)
 	if err != nil {
@@ -134,7 +158,16 @@ func (h *Heartbeat) inflight(ctx context.Context) ([]string, map[string]bool) {
 		return ids, busy
 	}
 	for _, t := range inf.Tasks {
-		ids = append(ids, t.TaskID)
+		if t.LeaseID != "" {
+			ids = append(ids, ActiveTask{
+				TaskID:          t.TaskID,
+				Attempt:         attemptFromTaskID(t.TaskID, t.Attempt),
+				LeaseID:         t.LeaseID,
+				LeaseGeneration: t.LeaseGeneration,
+			})
+		} else {
+			ids = append(ids, t.TaskID) // 无凭据:旧字符串格式
+		}
 		var d struct {
 			DeviceSerial string `json:"device_serial"`
 		}
@@ -143,4 +176,19 @@ func (h *Heartbeat) inflight(ctx context.Context) ([]string, map[string]bool) {
 		}
 	}
 	return ids, busy
+}
+
+// attemptFromTaskID 从 task_id 的 :a{N} 后缀解析 attempt
+// (task_id = {workflow_id}:{test_id}:a{attempt},差距 #14);
+// 解析失败回退 dispatch 载荷里的 attempt 字段。
+func attemptFromTaskID(taskID string, fallback int) int {
+	i := strings.LastIndex(taskID, ":a")
+	if i < 0 {
+		return fallback
+	}
+	n, err := strconv.Atoi(taskID[i+2:])
+	if err != nil || n < 1 {
+		return fallback
+	}
+	return n
 }

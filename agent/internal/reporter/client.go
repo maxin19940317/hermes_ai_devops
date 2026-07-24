@@ -73,20 +73,40 @@ type DeviceInfo struct {
 	WorkdirFreeMB *int64       `json:"workdir_free_mb,omitempty"`
 }
 
+// ActiveTask 是新格式心跳的任务项(契约 callbacks ActiveTask,差距 #15):
+// 携带派单时下发的租约所有权凭据,Runtime 据此条件续租。
+type ActiveTask struct {
+	TaskID          string `json:"task_id"`
+	Attempt         int    `json:"attempt"`
+	LeaseID         string `json:"lease_id"`
+	LeaseGeneration int    `json:"lease_generation"`
+}
+
 // HeartbeatRequest 是 /callbacks/v1/heartbeat 的载荷。
+// ActiveTaskIDs 逐任务混合格式(契约 oneOf):元素为 ActiveTask(有凭据)
+// 或 string(无凭据的旧任务)——见 Heartbeat.inflight 的兼容推理。
 type HeartbeatRequest struct {
 	ClientID      string       `json:"client_id"`
 	BaseURL       string       `json:"base_url,omitempty"`
 	AgentVersion  string       `json:"agent_version"`
 	Ts            string       `json:"ts"`
 	Devices       []DeviceInfo `json:"devices"`
-	ActiveTaskIDs []string     `json:"active_task_ids"`
+	ActiveTaskIDs []any        `json:"active_task_ids"`
 }
 
-// HeartbeatAck 是心跳应答。契约保证 ok,其余字段(min_agent_version /
-// cancel_task_ids)属 Phase 3,本轮容忍缺失。
+// NotOwnedEntry 是心跳应答里 LEASE_NOT_OWNED 的逐项报告(§10):
+// 租约已易主/失效,Agent 必须立即停止操作该任务。
+type NotOwnedEntry struct {
+	TaskID string `json:"task_id"`
+	Code   string `json:"code"` // 恒为 LEASE_NOT_OWNED
+}
+
+// HeartbeatAck 是心跳应答。契约保证 ok,not_owned 为租约失配任务清单
+// (差距 #15);其余字段(min_agent_version / cancel_task_ids)属 Phase 3,
+// 本轮容忍缺失。
 type HeartbeatAck struct {
-	OK bool `json:"ok"`
+	OK       bool            `json:"ok"`
+	NotOwned []NotOwnedEntry `json:"not_owned"`
 }
 
 // TaskEvent 是 /callbacks/v1/task-events 的载荷。Seq 单任务内从 1

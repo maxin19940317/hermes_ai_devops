@@ -85,7 +85,7 @@ func TestHeartbeatAckToleratesOkOnly(t *testing.T) {
 		c := &Client{BaseURL: srv.URL}
 		if _, err := c.Heartbeat(context.Background(), HeartbeatRequest{
 			ClientID: "c1", AgentVersion: "0.1.0", Ts: utcNowMs(),
-			Devices: []DeviceInfo{}, ActiveTaskIDs: []string{},
+			Devices: []DeviceInfo{}, ActiveTaskIDs: []any{},
 		}); err != nil {
 			t.Errorf("heartbeat with ack %s: %v", body, err)
 		}

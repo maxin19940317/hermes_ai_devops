@@ -195,3 +195,78 @@ func TestHeartbeatStopsOnContextCancel(t *testing.T) {
 		t.Fatal("Run 未在 ctx 取消后及时返回")
 	}
 }
+
+// 混合格式心跳(差距 #15,滚动升级关键):带租约凭据的任务发对象
+// {task_id, attempt, lease_id, lease_generation}(attempt 从 task_id 的
+// :a{N} 后缀解析),无凭据任务发原字符串——对旧 Runtime(任务本无凭据)
+// 载荷与旧格式等价;对新 Runtime 条件续租生效。任何部署顺序都安全。
+func TestHeartbeatMixedFormats(t *testing.T) {
+	f, srv := newFakeRuntime(t)
+	h := newTestHeartbeat(t, srv.URL)
+	// newTestHeartbeat 已 seed "t1"(无凭据,旧格式);再 seed 两个带凭据任务
+	seedTaskWithLease(t, h.Store, "wf1:t2:a2", "wf1:t2:a2", "SERIAL2", "wf1:t2:a2", 3)
+	seedTaskWithLease(t, h.Store, "wf1:t3:a1", "wf1:t3:a1", "SERIAL2", "wf1:t3:a1", 1)
+
+	if err := h.once(context.Background()); err != nil {
+		t.Fatalf("once: %v", err)
+	}
+	heartbeats, _, _ := f.snapshot()
+	if len(heartbeats) != 1 {
+		t.Fatalf("heartbeats = %d", len(heartbeats))
+	}
+	ids, _ := heartbeats[0]["active_task_ids"].([]any)
+	if len(ids) != 3 {
+		t.Fatalf("active_task_ids = %v, want 3 项", ids)
+	}
+	var legacy, objects []any
+	for _, id := range ids {
+		if _, ok := id.(string); ok {
+			legacy = append(legacy, id)
+		} else {
+			objects = append(objects, id)
+		}
+	}
+	if len(legacy) != 1 || legacy[0] != "t1" {
+		t.Errorf("旧格式项 = %v, want [t1]", legacy)
+	}
+	if len(objects) != 2 {
+		t.Fatalf("对象格式项 = %v, want 2", objects)
+	}
+	got := map[string]map[string]any{}
+	for _, o := range objects {
+		m, _ := o.(map[string]any)
+		got[m["task_id"].(string)] = m
+	}
+	t2 := got["wf1:t2:a2"]
+	if t2 == nil || t2["lease_id"] != "wf1:t2:a2" ||
+		t2["lease_generation"] != float64(3) || t2["attempt"] != float64(2) {
+		t.Errorf("wf1:t2:a2 凭据项 = %v(attempt 应从 :a2 后缀解析)", t2)
+	}
+	t3 := got["wf1:t3:a1"]
+	if t3 == nil || t3["lease_generation"] != float64(1) || t3["attempt"] != float64(1) {
+		t.Errorf("wf1:t3:a1 凭据项 = %v", t3)
+	}
+}
+
+// 故障注入:心跳应答带 not_owned(LEASE_NOT_OWNED)→ 必须逐项调 StopTask
+// 停止本地执行(租约易主防线,§10);无 StopTask 钩子时只记日志不 panic。
+func TestHeartbeatNotOwnedStopsTask(t *testing.T) {
+	f, srv := newFakeRuntime(t)
+	f.heartbeatBody = `{"ok":true,"not_owned":[{"task_id":"t1","code":"LEASE_NOT_OWNED"}]}`
+	h := newTestHeartbeat(t, srv.URL)
+
+	var stopped []string
+	h.StopTask = func(taskID string) { stopped = append(stopped, taskID) }
+	if err := h.once(context.Background()); err != nil {
+		t.Fatalf("once: %v", err)
+	}
+	if len(stopped) != 1 || stopped[0] != "t1" {
+		t.Errorf("stopped = %v, want [t1]", stopped)
+	}
+
+	// nil StopTask:容忍(仅记日志),不得 panic/报错
+	h.StopTask = nil
+	if err := h.once(context.Background()); err != nil {
+		t.Fatalf("once without StopTask: %v", err)
+	}
+}

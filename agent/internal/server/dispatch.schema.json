@@ -48,6 +48,15 @@
     },
     "device_serial": { "type": "string", "minLength": 1 },
     "callback_base_url": { "type": "string", "format": "uri" },
+    "lease_id": {
+      "type": "string",
+      "description": "租约所有权凭据(目标设计基线 v1.0 §10):Client 心跳续租时必须原样回传,失配即 LEASE_NOT_OWNED。只加字段不删字段,旧 Client 可暂不消费(过渡期心跳不续租)。"
+    },
+    "lease_generation": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "租约代数,与 lease_id 配对使用(同上)"
+    },
     "presigned_uploads": {
       "type": "array",
       "default": [],

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -425,5 +426,98 @@ func TestCrashRecovery(t *testing.T) {
 	}
 	if len(inf2.UnreportedEvents) != 0 || len(inf2.PendingResults) != 0 {
 		t.Errorf("after drain: %+v, want no unreported/pending", inf2)
+	}
+}
+
+// 租约所有权凭据(差距 #15):派单下发的 lease_id/lease_generation 随任务
+// 落库,供心跳按新格式回传;无凭据任务(旧 Runtime 派单)读回零值。
+func TestLeaseCredentialsRoundTrip(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+
+	withLease := mkTask("t-lease", "wf1:t-lease:a2")
+	withLease.Attempt = 2
+	withLease.LeaseID = "wf1:t-lease:a2"
+	withLease.LeaseGeneration = 3
+	if err := s.CreateTask(ctx, withLease); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	got, err := s.GetTask(ctx, "t-lease")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.LeaseID != "wf1:t-lease:a2" || got.LeaseGeneration != 3 {
+		t.Errorf("lease creds = (%q, %d), want (wf1:t-lease:a2, 3)", got.LeaseID, got.LeaseGeneration)
+	}
+	// 崩溃恢复路径(LoadInflight)同样要带凭据
+	inf, err := s.LoadInflight(ctx)
+	if err != nil {
+		t.Fatalf("LoadInflight: %v", err)
+	}
+	if len(inf.Tasks) != 1 || inf.Tasks[0].LeaseID != "wf1:t-lease:a2" ||
+		inf.Tasks[0].LeaseGeneration != 3 {
+		t.Errorf("inflight tasks = %+v", inf.Tasks)
+	}
+
+	noLease := mkTask("t-legacy", "wf0:t-legacy:a1")
+	if err := s.CreateTask(ctx, noLease); err != nil {
+		t.Fatalf("CreateTask legacy: %v", err)
+	}
+	got, err = s.GetTask(ctx, "t-legacy")
+	if err != nil {
+		t.Fatalf("GetTask legacy: %v", err)
+	}
+	if got.LeaseID != "" || got.LeaseGeneration != 0 {
+		t.Errorf("无凭据任务读回 (%q, %d), want 零值", got.LeaseID, got.LeaseGeneration)
+	}
+}
+
+// 存量库迁移:旧 schema(无 lease 列)的库打开后必须补列,且旧记录
+// 读回无凭据零值(NULL 合法)。
+func TestMigrateAddsLeaseColumnsToExistingDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	// 手工建旧 schema(迁移前的 tasks 定义)
+	if _, err := db.Exec(`
+CREATE TABLE tasks (
+  task_id TEXT PRIMARY KEY,
+  idempotency_key TEXT UNIQUE NOT NULL,
+  state TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  dispatch_json TEXT NOT NULL,
+  out_dir TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  result_recorded INTEGER NOT NULL DEFAULT 0
+)`); err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO tasks (task_id, idempotency_key, state, attempt, dispatch_json, out_dir, started_at)
+VALUES ('t-old', 'wf0:t-old:a1', 'RUNNING', 1, '{}', '/tmp/out/t-old', '2026-07-24T08:00:00.000Z')`); err != nil {
+		t.Fatalf("insert old row: %v", err)
+	}
+	db.Close()
+
+	s, err := Open(path) // migrate 应补 lease 列
+	if err != nil {
+		t.Fatalf("Open on old db: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	got, err := s.GetTask(context.Background(), "t-old")
+	if err != nil {
+		t.Fatalf("GetTask after migrate: %v", err)
+	}
+	if got.LeaseID != "" || got.LeaseGeneration != 0 {
+		t.Errorf("旧记录凭据 = (%q, %d), want 零值(NULL)", got.LeaseID, got.LeaseGeneration)
+	}
+	// 补列后新任务可写凭据
+	t2 := mkTask("t-new", "wf1:t-new:a1")
+	t2.LeaseID, t2.LeaseGeneration = "wf1:t-new:a1", 1
+	if err := s.CreateTask(context.Background(), t2); err != nil {
+		t.Fatalf("CreateTask after migrate: %v", err)
 	}
 }

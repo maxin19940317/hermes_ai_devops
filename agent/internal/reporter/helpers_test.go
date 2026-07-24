@@ -30,17 +30,30 @@ func openStoreAt(t *testing.T, path string) *store.Store {
 // seedTask 插入一个 QUEUED 任务,dispatch_json 带 device_serial。
 func seedTask(t *testing.T, s *store.Store, taskID, key, serial string) store.Task {
 	t.Helper()
+	return seedTaskFull(t, s, taskID, key, serial, "", 0)
+}
+
+// seedTaskWithLease 插入一个带租约所有权凭据的 QUEUED 任务(差距 #15)。
+func seedTaskWithLease(t *testing.T, s *store.Store, taskID, key, serial, leaseID string, generation int) store.Task {
+	t.Helper()
+	return seedTaskFull(t, s, taskID, key, serial, leaseID, generation)
+}
+
+func seedTaskFull(t *testing.T, s *store.Store, taskID, key, serial, leaseID string, generation int) store.Task {
+	t.Helper()
 	dispatch := map[string]any{"task_id": taskID, "device_serial": serial}
 	raw, err := json.Marshal(dispatch)
 	if err != nil {
 		t.Fatalf("marshal dispatch: %v", err)
 	}
 	task := store.Task{
-		TaskID:         taskID,
-		IdempotencyKey: key,
-		Attempt:        1,
-		DispatchJSON:   string(raw),
-		OutDir:         t.TempDir(),
+		TaskID:          taskID,
+		IdempotencyKey:  key,
+		Attempt:         1,
+		DispatchJSON:    string(raw),
+		OutDir:          t.TempDir(),
+		LeaseID:         leaseID,
+		LeaseGeneration: generation,
 	}
 	if err := s.CreateTask(context.Background(), task); err != nil {
 		t.Fatalf("CreateTask: %v", err)

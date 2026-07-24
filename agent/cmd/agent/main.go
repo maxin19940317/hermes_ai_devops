@@ -321,6 +321,8 @@ func runAgent(ctx context.Context, cfg Config) error {
 		Runner: runner, Store: st, Client: client, Logf: logf,
 		ClientID: cfg.ClientID, AgentVersion: cfg.Version, BaseURL: cfg.BaseURL,
 		Interval: cfg.HeartbeatInterval, SOCAliases: cfg.SOCAliases, Capabilities: cfg.Capabilities,
+		// LEASE_NOT_OWNED 停止钩子(§10/差距 #15):租约易主立即停止本地执行
+		StopTask: srv.StopTask,
 	}
 
 	var wg sync.WaitGroup

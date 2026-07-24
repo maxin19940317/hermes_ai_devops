@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动(database/sql 驱动名 "sqlite")
@@ -72,6 +73,11 @@ type Task struct {
 	StartedAt      time.Time
 	EndedAt        *time.Time // 仅终态迁移时写入
 	ResultRecorded bool
+	// 租约所有权凭据(目标设计基线 v1.0 §10/差距 #15):派单时由 Runtime
+	// 下发,心跳续租时原样回传。LeaseID 为空 = 无凭据(旧 Runtime 派单或
+	// 升级前入库的旧记录,落盘为 NULL),心跳按旧字符串格式上报。
+	LeaseID         string
+	LeaseGeneration int
 }
 
 // Event 是 events 表的一行。Seq 每任务从 1 单调递增,与
@@ -137,7 +143,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   out_dir TEXT NOT NULL,
   started_at TEXT NOT NULL,
   ended_at TEXT,
-  result_recorded INTEGER NOT NULL DEFAULT 0
+  result_recorded INTEGER NOT NULL DEFAULT 0,
+  lease_id TEXT,
+  lease_generation INTEGER
 );
 CREATE TABLE IF NOT EXISTS events (
   task_id TEXT NOT NULL,
@@ -152,21 +160,63 @@ CREATE TABLE IF NOT EXISTS events (
 	if _, err := db.Exec(ddl); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
+	// 增量列迁移(存量库):lease 凭据两列,缺失时 ALTER 补列(旧记录为
+	// NULL = 无凭据,合法,心跳按旧字符串格式上报)。
+	for _, col := range []string{
+		`lease_id TEXT`,
+		`lease_generation INTEGER`,
+	} {
+		if err := ensureTaskColumn(db, col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureTaskColumn 在 tasks 表缺列时 ALTER TABLE 补列(列名取定义首词)。
+// SQLite 不支持 IF NOT EXISTS 的 ADD COLUMN,先查 pragma table_info。
+func ensureTaskColumn(db *sql.DB, def string) error {
+	name, _, _ := strings.Cut(strings.TrimSpace(def), " ")
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('tasks')`)
+	if err != nil {
+		return fmt.Errorf("migrate: inspect tasks columns: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return fmt.Errorf("migrate: scan tasks column: %w", err)
+		}
+		if col == name {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("migrate: inspect tasks columns: %w", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE tasks ADD COLUMN ` + def); err != nil {
+		return fmt.Errorf("migrate: add column %s: %w", name, err)
+	}
 	return nil
 }
 
 // CreateTask 以 QUEUED 状态插入新任务,用于幂等派单检查(§4):
 // 同 idempotency_key 重复插入返回 wrapped 唯一约束错误,调用方应改用
 // LookupByIdempotencyKey 返回既有任务状态。StartedAt 为零值时取当前 UTC。
+// LeaseID 为空(旧 Runtime 派单)时凭据两列落 NULL。
 func (s *Store) CreateTask(ctx context.Context, t Task) error {
 	if t.StartedAt.IsZero() {
 		t.StartedAt = time.Now()
 	}
+	var leaseID, leaseGen any
+	if t.LeaseID != "" {
+		leaseID, leaseGen = t.LeaseID, t.LeaseGeneration
+	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO tasks (task_id, idempotency_key, state, attempt, dispatch_json, out_dir, started_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`,
+INSERT INTO tasks (task_id, idempotency_key, state, attempt, dispatch_json, out_dir, started_at, lease_id, lease_generation)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.TaskID, t.IdempotencyKey, string(StateQueued), t.Attempt,
-		t.DispatchJSON, t.OutDir, formatTime(t.StartedAt))
+		t.DispatchJSON, t.OutDir, formatTime(t.StartedAt), leaseID, leaseGen)
 	if err != nil {
 		return fmt.Errorf("create task %q: %w", t.TaskID, err)
 	}
@@ -177,7 +227,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 func (s *Store) GetTask(ctx context.Context, taskID string) (Task, error) {
 	t, err := s.scanTask(s.db.QueryRowContext(ctx, `
 SELECT task_id, idempotency_key, state, attempt, dispatch_json, out_dir,
-       started_at, ended_at, result_recorded
+       started_at, ended_at, result_recorded,
+       COALESCE(lease_id, ''), COALESCE(lease_generation, 0)
 FROM tasks WHERE task_id = ?`, taskID))
 	if err != nil {
 		return Task{}, fmt.Errorf("get task %q: %w", taskID, err)
@@ -189,7 +240,8 @@ FROM tasks WHERE task_id = ?`, taskID))
 func (s *Store) LookupByIdempotencyKey(ctx context.Context, key string) (Task, error) {
 	t, err := s.scanTask(s.db.QueryRowContext(ctx, `
 SELECT task_id, idempotency_key, state, attempt, dispatch_json, out_dir,
-       started_at, ended_at, result_recorded
+       started_at, ended_at, result_recorded,
+       COALESCE(lease_id, ''), COALESCE(lease_generation, 0)
 FROM tasks WHERE idempotency_key = ?`, key))
 	if err != nil {
 		return Task{}, fmt.Errorf("lookup idempotency key %q: %w", key, err)
@@ -340,7 +392,8 @@ func (s *Store) LoadInflight(ctx context.Context) (Inflight, error) {
 
 	rows, err := s.db.QueryContext(ctx, `
 SELECT task_id, idempotency_key, state, attempt, dispatch_json, out_dir,
-       started_at, ended_at, result_recorded
+       started_at, ended_at, result_recorded,
+       COALESCE(lease_id, ''), COALESCE(lease_generation, 0)
 FROM tasks WHERE state NOT IN ('COMPLETED', 'FAILED', 'TIMEOUT', 'CANCELED')
 ORDER BY started_at`)
 	if err != nil {
@@ -358,7 +411,8 @@ ORDER BY started_at`)
 
 	rows2, err := s.db.QueryContext(ctx, `
 SELECT task_id, idempotency_key, state, attempt, dispatch_json, out_dir,
-       started_at, ended_at, result_recorded
+       started_at, ended_at, result_recorded,
+       COALESCE(lease_id, ''), COALESCE(lease_generation, 0)
 FROM tasks WHERE state IN ('COMPLETED', 'FAILED', 'TIMEOUT', 'CANCELED')
   AND result_recorded = 0
 ORDER BY started_at`)
@@ -382,7 +436,8 @@ func (s *Store) scanTask(row *sql.Row) (Task, error) {
 		recorded  int
 	)
 	err := row.Scan(&t.TaskID, &t.IdempotencyKey, &state, &t.Attempt,
-		&t.DispatchJSON, &t.OutDir, &startedAt, &endedAt, &recorded)
+		&t.DispatchJSON, &t.OutDir, &startedAt, &endedAt, &recorded,
+		&t.LeaseID, &t.LeaseGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Task{}, ErrTaskNotFound
 	}
@@ -417,7 +472,8 @@ func scanTasks(rows *sql.Rows) ([]Task, error) {
 			recorded  int
 		)
 		if err := rows.Scan(&t.TaskID, &t.IdempotencyKey, &state, &t.Attempt,
-			&t.DispatchJSON, &t.OutDir, &startedAt, &endedAt, &recorded); err != nil {
+			&t.DispatchJSON, &t.OutDir, &startedAt, &endedAt, &recorded,
+			&t.LeaseID, &t.LeaseGeneration); err != nil {
 			return nil, err
 		}
 		t.State = State(state)
