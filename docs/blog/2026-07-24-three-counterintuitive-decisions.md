@@ -136,4 +136,47 @@ LLM 真正待的地方，是末端一个独立服务 `analyze_bridge`：调用�
 
 ## 决定三：先写一个"注定被扔掉"的命令行工具
 
+明知道最终要交付的是一个跑在 Windows 上的常驻服务——接受调度、维护心跳、管理设备队列，为什么第一步却是先写一个用完就该扔掉的命令行工具?
+
+答案跟"应该做成什么"没有关系，跟"这条链路上哪一段最不确定"有关系。Temporal 的重试语义、回调的幂等键、心跳续租，这些都是纯逻辑问题，在服务端就能想清楚、写清楚、测清楚。真正会反复踩坑的是另一段：Windows 机器上驱动装没装对、USB 口认不认设备、开发板的序列号会不会重启就丢、adb server 抢没抢占同一个端口、命令行输出经过终端编码转一手会不会乱码。这些坑跟 Temporal、跟回调、跟幂等键毫无关系，纯粹是"接上一块设备"这一层的具体麻烦。
+
+如果先把服务壳搭起来——HTTP handler、任务队列、心跳线程，每调一个 ADB 问题，都得先穿过这五层抽象才能看到设备侧到底发生了什么。命令行工具反过来：一行 `agent-cli run --package-url ... --serial ...`，参数摆在眼前，输出直接打在终端，改一行代码、重跑一次的成本以秒计。决定一里提过一句"Android 扫 stdout 而不是 logcat"的知识，正是在这个阶段用 CLI 一次次实跑试出来的：先怀疑签名规则写错了，再怀疑设备权限不够，最后才发现测试二进制根本没往 logcat 里打日志，日志走的是标准输出。这种知识没有捷径可抄，只能靠跑，而命令行工具让"跑一次"这件事便宜到可以反复试错。
+
+但这不代表命令行工具真的会被扔掉。回头看 `agent/internal/executor` 这个包，从下载、校验、解压、预检、部署、执行到收集，整条流水线原封不动地被服务模式复用——写服务模式的时候没有重新实现一遍这条链路，接缝只是一个 `OnTransition` 钩子：
+
+```go
+// agent-cli：不关心状态迁移要通知谁
+exec := &executor.Executor{Runner: ..., Logf: logf}
+
+// 服务模式：同一个 executor，把迁移接到事件上报链上
+exec := s.newExecutor()
+exec.OnTransition = func(to executor.Status) {
+    s.cfg.Events.OnTransition(d.TaskID, s.currentStatus(d.TaskID), to, "")
+}
+```
+
+命令行工具不关心状态迁移要通知给谁，日志打到 stderr 就算交差；服务模式构造的是同一个 `executor.Executor`，只是多接了一根线——把每一次迁移转发到事件上报链路上。命令行工具留下的几处细节，后来也原样长进了服务里。
+
+最直观的一处是退出码。整个 `main` 函数收尾是一段 switch：
+
+```go
+switch sum.Status {
+case executor.StatusCompleted:
+    if sum.SuccessCriteriaMet { return 0 }
+    return 2                    // 测试没过
+case executor.StatusTimeout:
+    return 3
+default:
+    return 1                    // 流水线自己坏了
+}
+```
+
+2 和 1 是刻意分开的——"测试没过"和"流水线自己坏了"是两回事，不能因为都不是 0 就混为一谈。这其实是决定二里 status/verdict 正交的思路，投影到了命令行的退出码上：任务有没有跑完是一回事，跑完之后算不算通过是另一回事，两者绝不能塌缩成同一个数字。
+
+其余几处落地细节同样朴素。`--serial` 是必填参数，不填就直接报错退出，文案写得很直白："禁止无 -s 的 adb 操作"——机器上一旦接了不止一块板，不带 `-s` 的 adb 命令落到哪块设备上就说不准。执行超时会被 kill，但日志依旧照常收集，超时往往正是最需要看现场的时刻，不能因为进程被杀就连日志一起丢了。ADB server 端口固定用私有的 5137，永远不碰系统默认的 5037，免得和开发者自己开着调试的 adb server 抢同一块设备。
+
+先攻不确定性最高的那一段，用最薄的壳。
+
+> 想细看：`agent/cmd/agent-cli/main.go`、`agent/internal/executor/executor.go`
+
 ## 这些决定值不值
