@@ -30,10 +30,12 @@ type Artifact struct {
 }
 
 // ArtifactStore 登记产物;实现必须幂等(同一 (commit,pipeline,variant) 重复登记无效果)。
-// NextWorkflowAttempt 供显式 retry 派生 -r{N} 序号(差距 #11)。
+// NextWorkflowAttempt 供显式 retry 派生 -r{N} 序号(差距 #11);
+// ConclusiveWorkflowIDs 供 bundle webhook 跳过已测变体。
 type ArtifactStore interface {
 	RegisterArtifacts(ctx context.Context, arts []Artifact) error
 	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
+	ConclusiveWorkflowIDs(ctx context.Context, workflowIDs []string) (map[string]bool, error)
 }
 
 // MemStore 是进程内实现,供单测与无数据库的开发模式使用。

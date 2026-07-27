@@ -22,6 +22,9 @@ webhook 不携带 Registry 版本号,按 package_name 倒序逐版本探测)
 时加 `-r{N}`,N 为 artifacts.workflow_attempt 原子递增),复用策略
 RejectDuplicate——webhook/kick 重复投递一律幂等不重启(含上次失败),
 只有 `/kick` 载荷显式 `retry: true` 才派生新 ID 起新 run(差距 #11)。
+bundle webhook 启动前还会跳过已测变体:kick 变体级 workflow 已出结论
+(status=COMPLETED 且 verdict ∈ {PASSED, TEST_FAILED})的包从 Packages 中过滤,
+全部有结论则不启动(200);INFRA_ERROR/TIMEOUT/无记录照常测,查询失败 fail-open 全量测。
 无 bundle 的成功 pipeline(如 MR 构建)安静跳过(200)。
 配置见 `cmd/trigger/main.go` 头注释(环境变量)。
 

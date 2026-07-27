@@ -106,3 +106,27 @@ func (s *MemStore) GetResult(_ context.Context, taskID string) (*wf.ResultRecord
 	out := rec
 	return &out, nil
 }
+
+// ConclusiveVerdicts 是"结论性"终态集合(§9):测试真实跑完且有确定判定。
+// INFRA_ERROR/TIMEOUT(基础设施问题,测试未必真实执行)与无记录 = 非结论性。
+var ConclusiveVerdicts = map[string]bool{"PASSED": true, "TEST_FAILED": true}
+
+// ConclusiveWorkflowIDs 返回候选 workflow ID 中已存在结论性测试结果的子集:
+// 该 workflow 下有 status='COMPLETED' 且 verdict ∈ ConclusiveVerdicts 的 task。
+// 用于 bundle webhook 跳过已测变体(kick 变体级链路已测过的不再重测)。
+func (s *MemStore) ConclusiveWorkflowIDs(_ context.Context, workflowIDs []string) (map[string]bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := make(map[string]bool, len(workflowIDs))
+	for _, id := range workflowIDs {
+		want[id] = false
+	}
+	out := map[string]bool{}
+	for _, rec := range s.tasks {
+		id := rec.row.WorkflowID
+		if _, ok := want[id]; ok && rec.row.Status == "COMPLETED" && ConclusiveVerdicts[rec.verdict] {
+			out[id] = true
+		}
+	}
+	return out, nil
+}

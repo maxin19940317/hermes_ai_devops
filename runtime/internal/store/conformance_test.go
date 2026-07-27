@@ -28,6 +28,7 @@ type fullStore interface {
 	GetTask(ctx context.Context, taskID string) (*wf.TaskRow, error)
 	SetTaskStatus(ctx context.Context, taskID, status string) error
 	FinishTask(ctx context.Context, req wf.FinishRequest) error
+	ConclusiveWorkflowIDs(ctx context.Context, workflowIDs []string) (map[string]bool, error)
 	AppendTaskEvent(ctx context.Context, ev TaskEvent) (bool, error)
 	SaveResult(ctx context.Context, rec wf.ResultRecord) (bool, error)
 	SaveResultWithOutbox(ctx context.Context, rec wf.ResultRecord, ev OutboxEvent) (bool, error)
@@ -594,6 +595,49 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 						t.Errorf("row = %+v, want attempts=%d last_error=%q",
 							rows[0], tc.wantAttempts, tc.wantLastError)
 					}
+				}
+			})
+		}
+	})
+
+	// 结论性判定边界(bundle webhook 跳过已测变体):
+	// status='COMPLETED' 且 verdict ∈ {PASSED, TEST_FAILED} 才算结论;
+	// INFRA_ERROR/TIMEOUT(测试未必真实执行)、非终态、无记录均需重测。
+	t.Run("ConclusiveWorkflowIDsBoundary", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			status     string // FinishTask 落库的 status
+			verdict    string
+			conclusive bool
+		}{
+			{"PASSED 结论", "COMPLETED", "PASSED", true},
+			{"TEST_FAILED 结论(测试真实跑完)", "COMPLETED", "TEST_FAILED", true},
+			{"INFRA_ERROR 非结论", "FAILED", "INFRA_ERROR", false},
+			{"TIMEOUT 非结论", "TIMEOUT", "INFRA_ERROR", false},
+			{"status 非 COMPLETED 即使 verdict 通过也不算", "FAILED", "PASSED", false},
+			{"COMPLETED 但 verdict 未判定", "COMPLETED", "", false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newStore(t)
+				const wfID = "device-test-grp/p-gabcd1234-p42-v1"
+				if err := s.CreateTask(ctx, wf.TaskRow{TaskID: wfID + ":t1:a1",
+					WorkflowID: wfID, IdempotencyKey: wfID + ":t1:a1"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.FinishTask(ctx, wf.FinishRequest{TaskID: wfID + ":t1:a1",
+					Status: tc.status, Verdict: tc.verdict}); err != nil {
+					t.Fatal(err)
+				}
+				got, err := s.ConclusiveWorkflowIDs(ctx, []string{wfID, "device-test-grp/p-gabcd1234-p42-v2"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got[wfID] != tc.conclusive {
+					t.Errorf("conclusive = %v, want %v", got[wfID], tc.conclusive)
+				}
+				if got["device-test-grp/p-gabcd1234-p42-v2"] {
+					t.Error("无记录的 workflow 不得判结论")
 				}
 			})
 		}

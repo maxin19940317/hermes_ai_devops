@@ -405,3 +405,97 @@ func TestStarterErrorIs502(t *testing.T) {
 		t.Errorf("code=%d, want 502", rec.Code)
 	}
 }
+
+// ---- bundle webhook 跳过已测变体(kick 变体级链路已出结论的不重测) ----
+
+const testBaseWfID = "device-test-grp/algo-super-sdk-gabcd1234-p42"
+
+// seedTaskVerdict 预置某变体 workflow 的终态 task(status/verdict 组合)。
+func seedTaskVerdict(t *testing.T, st *store.MemStore, workflowID, status, verdict string) {
+	t.Helper()
+	taskID := workflowID + ":t1:a1"
+	if err := st.CreateTask(context.Background(), wf.TaskRow{
+		TaskID: taskID, WorkflowID: workflowID, IdempotencyKey: taskID, Status: "RUNNING",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishTask(context.Background(), wf.FinishRequest{
+		TaskID: taskID, Status: status, Verdict: verdict,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func variantNames(pkgs []wf.PackageRef) []string {
+	out := []string{}
+	for _, p := range pkgs {
+		out = append(out, p.Variant)
+	}
+	return out
+}
+
+func TestWebhookSkipsConclusiveVariants(t *testing.T) {
+	cases := []struct {
+		name string
+		// 预置:变体 → (status, verdict);空串 verdict = 只登记不终态
+		seed map[string][2]string
+		// 期望:starter 收到的变体集合;nil = 不启动 workflow
+		wantVariants []string
+	}{
+		{"无记录全量启动", nil, []string{"aarch64_Android_SNPE_2.21", "aarch64_Linux_SNPE_2.21"}},
+		{"全部结论不启动", map[string][2]string{
+			"aarch64_Android_SNPE_2.21": {"COMPLETED", "PASSED"},
+			"aarch64_Linux_SNPE_2.21":   {"COMPLETED", "TEST_FAILED"},
+		}, nil},
+		{"部分结论只带剩余包", map[string][2]string{
+			"aarch64_Android_SNPE_2.21": {"COMPLETED", "PASSED"},
+		}, []string{"aarch64_Linux_SNPE_2.21"}},
+		{"INFRA_ERROR 非结论需重测", map[string][2]string{
+			"aarch64_Android_SNPE_2.21": {"FAILED", "INFRA_ERROR"},
+		}, []string{"aarch64_Android_SNPE_2.21", "aarch64_Linux_SNPE_2.21"}},
+		{"TIMEOUT 非结论需重测", map[string][2]string{
+			"aarch64_Android_SNPE_2.21": {"TIMEOUT", "INFRA_ERROR"},
+		}, []string{"aarch64_Android_SNPE_2.21", "aarch64_Linux_SNPE_2.21"}},
+		{"进行中任务不算结论", map[string][2]string{
+			"aarch64_Android_SNPE_2.21": {"RUNNING", ""},
+		}, []string{"aarch64_Android_SNPE_2.21", "aarch64_Linux_SNPE_2.21"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &fakeFetcher{bundle: mustJSON(t, validBundle())}
+			starter := &fakeStarter{started: true}
+			h, st := newTestHandler(fetcher, starter)
+			for variant, sv := range tc.seed {
+				seedTaskVerdict(t, st, testBaseWfID+"-"+variant, sv[0], sv[1])
+			}
+
+			rec := post(h, testSecret, pipelinePayload("success", "master", fullSHA))
+			if tc.wantVariants == nil {
+				if rec.Code != http.StatusOK {
+					t.Fatalf("code = %d body = %s, want 200(全部有结论,不启动)", rec.Code, rec.Body)
+				}
+				if starter.calls != 0 {
+					t.Errorf("全部变体已有结论,不得启动 workflow(calls=%d)", starter.calls)
+				}
+				// artifacts 登记语义不变
+				if len(st.Artifacts()) != 2 {
+					t.Errorf("artifacts = %d, want 2(登记不受跳过影响)", len(st.Artifacts()))
+				}
+				return
+			}
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("code = %d body = %s, want 202", rec.Code, rec.Body)
+			}
+			got := variantNames(starter.gotInput.Packages)
+			if len(got) != len(tc.wantVariants) {
+				t.Fatalf("packages = %v, want %v", got, tc.wantVariants)
+			}
+			for i, v := range tc.wantVariants {
+				if got[i] != v {
+					t.Errorf("packages = %v, want %v", got, tc.wantVariants)
+					break
+				}
+			}
+		})
+	}
+}

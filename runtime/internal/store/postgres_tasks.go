@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/lib/pq"
+
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -116,4 +118,31 @@ func (s *PGStore) GetResult(ctx context.Context, taskID string) (*wf.ResultRecor
 		return nil, fmt.Errorf("get result %s: unmarshal: %w", taskID, err)
 	}
 	return &wf.ResultRecord{TaskID: taskID, Result: sig}, nil
+}
+
+// ConclusiveWorkflowIDs 返回候选 workflow ID 中已存在结论性测试结果的子集:
+// 该 workflow 下有 status='COMPLETED' 且 verdict ∈ ConclusiveVerdicts 的 task。
+// 用于 bundle webhook 跳过已测变体(kick 变体级链路已测过的不再重测)。
+func (s *PGStore) ConclusiveWorkflowIDs(ctx context.Context, workflowIDs []string) (map[string]bool, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT DISTINCT workflow_id FROM tasks
+		WHERE workflow_id = ANY($1) AND status = 'COMPLETED'
+		  AND verdict IN ('PASSED', 'TEST_FAILED')`,
+		pq.Array(workflowIDs))
+	if err != nil {
+		return nil, fmt.Errorf("conclusive workflow ids: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("conclusive workflow ids: scan: %w", err)
+		}
+		out[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("conclusive workflow ids: %w", err)
+	}
+	return out, nil
 }

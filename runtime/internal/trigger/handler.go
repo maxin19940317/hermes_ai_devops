@@ -194,6 +194,43 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Version: b.Version, Packages: b.Packages,
 		RuleVersion: ruleVersionOr(b.RuleVersion),
 	}
+
+	// 跳过已测变体:kick 变体级链路(ID = {baseID}-{variant})已跑出结论
+	// (status=COMPLETED 且 verdict ∈ {PASSED, TEST_FAILED},§9)的变体,
+	// bundle webhook 不再重测;INFRA_ERROR/TIMEOUT/无记录 = 非结论,照常测。
+	// 查询失败时 fail-open 全量测(绝不因 store 抖动漏测)。
+	if len(in.Packages) > 0 {
+		baseID := in.WorkflowID()
+		candidates := make([]string, 0, len(in.Packages))
+		for _, p := range in.Packages {
+			candidates = append(candidates, baseID+"-"+p.Variant)
+		}
+		done, err := h.store.ConclusiveWorkflowIDs(r.Context(), candidates)
+		if err != nil {
+			log.Error().Err(err).Msg("lookup conclusive variants failed, run all")
+		} else {
+			remaining := make([]wf.PackageRef, 0, len(in.Packages))
+			for _, p := range in.Packages {
+				if !done[baseID+"-"+p.Variant] {
+					remaining = append(remaining, p)
+				}
+			}
+			if len(remaining) == 0 {
+				log.Info().Int("variants", len(in.Packages)).
+					Msg("all variants already have conclusive results, skip bundle workflow")
+				writeJSON(w, http.StatusOK, map[string]any{
+					"skipped": "all variants conclusive",
+					"count":   len(in.Packages),
+				})
+				return
+			}
+			if len(remaining) < len(in.Packages) {
+				log.Info().Int("skipped", len(in.Packages)-len(remaining)).
+					Int("remaining", len(remaining)).Msg("skip conclusive variants")
+			}
+			in.Packages = remaining
+		}
+	}
 	wfID, started, err := h.starter.StartDeviceTest(r.Context(), in)
 	if err != nil {
 		log.Error().Err(err).Msg("start workflow")
