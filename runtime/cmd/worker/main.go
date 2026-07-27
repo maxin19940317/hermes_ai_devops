@@ -19,7 +19,11 @@
 //	ARTIFACT_AUTH_TYPE      缺省 job_token(bearer | job_token | basic;basic 用于只读 Deploy Token,原则 5)
 //	ARTIFACT_AUTH_TOKEN     可选
 //	ARTIFACT_AUTH_USERNAME  可选;仅 basic(Deploy Token 用户名)
-//	FEISHU_WEBHOOK_URL      可选;缺省 Notify 静默成功(开发模式)
+//	FEISHU_WEBHOOK_URL      可选;群自定义机器人 webhook(双模兜底)
+//	FEISHU_APP_ID           可选;企业自建应用(三件套齐全时优先于 webhook)
+//	FEISHU_APP_SECRET       可选;同上
+//	FEISHU_RECEIVE_ID       可选;接收方 open_id(个人单聊)或 chat_id(群)
+//	FEISHU_RECEIVE_ID_TYPE  可选;chat_id|open_id,缺省 chat_id
 //	MINIO_ENDPOINT          集群内 endpoint(如 minio:9000);空 → 禁用预签名(§3.7 降级)
 //	MINIO_PUBLIC_ENDPOINT   预签名 URL 的 host,须 Client 可达;空 → 用 MINIO_ENDPOINT
 //	MINIO_ACCESS_KEY        空 → 禁用预签名
@@ -49,6 +53,7 @@ import (
 
 	"hermes-devops/runtime/internal/activity"
 	"hermes-devops/runtime/internal/callbacks"
+	"hermes-devops/runtime/internal/feishu"
 	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
@@ -119,6 +124,18 @@ func main() {
 		Log:     &log,
 		Hermes:  hermes,
 	}
+
+	// ---- 飞书双模:app 凭据齐全 → 企业自建应用;否则 webhook 兜底;
+	// 全空 → disabled(Notify 静默成功,开发模式) ----
+	feishuSender, feishuMode := feishu.NewSender(feishu.Config{
+		AppID:         cfg.Activity.FeishuAppID,
+		AppSecret:     cfg.Activity.FeishuAppSecret,
+		ReceiveID:     cfg.Activity.FeishuReceiveID,
+		ReceiveIDType: cfg.Activity.FeishuReceiveIDType,
+		WebhookURL:    cfg.Activity.FeishuWebhookURL,
+	})
+	acts.Feishu = feishuSender
+	log.Info().Str("mode", feishuMode).Msg("feishu notify mode")
 
 	w := worker.New(tc, cfg.TemporalTaskQueue, worker.Options{})
 	w.RegisterWorkflowWithOptions(wf.DeviceTestWorkflow, workflow.RegisterOptions{

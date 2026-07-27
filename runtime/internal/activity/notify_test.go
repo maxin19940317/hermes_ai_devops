@@ -1,45 +1,51 @@
 package activity
 
 import (
-	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
+	"context"
+	"errors"
 	"strings"
 	"testing"
+
+	"hermes-devops/runtime/internal/feishu"
 )
 
-func TestNotifyPostsFeishuText(t *testing.T) {
-	var got map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(body, &got)
-		_, _ = w.Write([]byte(`{"code":0,"msg":"success"}`))
-	}))
-	defer srv.Close()
-	a := &Acts{HTTP: srv.Client(), Cfg: Config{FeishuWebhookURL: srv.URL}}
+// fakeSender 记录 SendText 调用并按预设失败。
+type fakeSender struct {
+	texts []string
+	err   error
+}
+
+func (f *fakeSender) SendText(_ context.Context, text string) error {
+	f.texts = append(f.texts, text)
+	return f.err
+}
+
+// Notify 委托给注入的 feishu.Sender(双模判定在 feishu.NewSender,
+// 见该包测试);错误包装后上抛(触发 workflow 降级:只记日志)。
+func TestNotifyDelegatesToSender(t *testing.T) {
+	fs := &fakeSender{}
+	a := &Acts{Feishu: fs}
 	if err := a.Notify(ctx, "hello"); err != nil {
 		t.Fatal(err)
 	}
-	if got["msg_type"] != "text" || got["content"].(map[string]any)["text"] != "hello" {
-		t.Errorf("payload = %v", got)
+	if len(fs.texts) != 1 || fs.texts[0] != "hello" {
+		t.Errorf("texts = %v", fs.texts)
+	}
+
+	fs.err = errors.New("feishu api: code 230001: bot not in chat")
+	err := a.Notify(ctx, "hi")
+	if err == nil || !strings.Contains(err.Error(), "230001") {
+		t.Errorf("发送失败应包装错误码上抛, got %v", err)
 	}
 }
 
-func TestNotifyFeishuBusinessError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"code":19001,"msg":"param invalid"}`))
-	}))
-	defer srv.Close()
-	a := &Acts{HTTP: srv.Client(), Cfg: Config{FeishuWebhookURL: srv.URL}}
-	if err := a.Notify(ctx, "hello"); err == nil || !strings.Contains(err.Error(), "19001") {
-		t.Errorf("飞书业务错误码应报错, got %v", err)
-	}
-}
-
-func TestNotifyNoWebhookConfigured(t *testing.T) {
+// Sender 为 nil(双模均未配置)时静默成功(开发模式)。
+func TestNotifyNilSenderIsSilent(t *testing.T) {
 	a := &Acts{}
 	if err := a.Notify(ctx, "hello"); err != nil {
-		t.Errorf("未配置 webhook 应静默成功(开发模式): %v", err)
+		t.Errorf("nil sender 应静默成功: %v", err)
 	}
 }
+
+// 确保 feishu.Sender 接口满足(编译期断言)。
+var _ feishu.Sender = (*fakeSender)(nil)

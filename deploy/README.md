@@ -34,6 +34,16 @@ Artifact downloads support three auth modes via `ARTIFACT_AUTH_TYPE`: `basic`
 only; sending a PAT in a `JOB-TOKEN` header fails with 401). GitLab Deploy Tokens
 support HTTP Basic auth only — they cannot be used with `bearer`.
 
+Feishu notifications are dual-mode: when `FEISHU_APP_ID` / `FEISHU_APP_SECRET` /
+`FEISHU_RECEIVE_ID` are all set, the worker sends via the enterprise custom app bot
+(`im/v1/messages`, tenant token cached with a 5-minute refresh margin and one
+forced refresh on expiry errors); otherwise it falls back to the group custom
+bot webhook (`FEISHU_WEBHOOK_URL`). `FEISHU_RECEIVE_ID` accepts an `open_id`
+(personal DM, set `FEISHU_RECEIVE_ID_TYPE=open_id`) or a `chat_id` (group chat,
+the default when the type is unset). All empty means notifications are silently
+skipped (dev mode). Messages are plain text in this version; interactive cards
+are a later milestone.
+
 ## MinIO evidence uploads
 
 The `minio` service stores run evidence (result.json, junit.xml, logcat.txt,

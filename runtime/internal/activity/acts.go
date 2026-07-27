@@ -7,6 +7,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"hermes-devops/runtime/internal/feishu"
 	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
@@ -35,7 +36,12 @@ type Config struct {
 	ArtifactAuthToken string
 	// ArtifactAuthUsername 仅 basic 使用(Deploy Token 用户名);空 = 非 basic。
 	ArtifactAuthUsername string
-	FeishuWebhookURL  string // empty → Notify logs only (dev mode)
+	FeishuWebhookURL     string // empty → 无 webhook 兜底(dev mode 可全空)
+	// 飞书企业自建应用(三件套齐全时优先于 webhook;缺任一项回退 webhook)。
+	FeishuAppID         string
+	FeishuAppSecret     string
+	FeishuReceiveID     string // 接收方:open_id(个人单聊)或 chat_id(群)
+	FeishuReceiveIDType string // chat_id|open_id;空 → chat_id
 	// MinIO 预签名直传(§3.7);Endpoint 或凭据为空即禁用,优雅降级为空 presigned_uploads。
 	MinIOEndpoint       string        // 集群内 endpoint(如 minio:9000);兼作启用开关
 	MinIOPublicEndpoint string        // 预签名 URL 的 host,须 Client 可达(签名覆盖 Host)
@@ -55,10 +61,13 @@ type Config struct {
 type Acts struct {
 	Store   Store
 	Cfg     Config
-	HTTP    *http.Client // for Dispatch/CancelTask/Notify (Task 3)
+	HTTP    *http.Client // for Dispatch/CancelTask (Task 3)
 	SpecCfg *SpecConfig
 	Log     *zerolog.Logger     // optional; nil-safe (tests may leave unset)
 	Hermes  hermesclient.Client // Phase 2 Analyzer;nil = 禁用,规则引擎保底(§12)
+	// Feishu 通知发送方(feishu.NewSender 构造:app 优先,webhook 兜底);
+	// nil = 未配置,Notify 静默成功(开发模式)。
+	Feishu feishu.Sender
 }
 
 func (a *Acts) AcquireDevice(ctx context.Context, req wf.AcquireRequest) (*wf.Lease, error) {

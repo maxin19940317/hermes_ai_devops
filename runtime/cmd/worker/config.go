@@ -108,6 +108,11 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			ArtifactAuthToken:    getenv("ARTIFACT_AUTH_TOKEN"),
 			ArtifactAuthUsername: getenv("ARTIFACT_AUTH_USERNAME"), // 仅 basic(Deploy Token)使用
 			FeishuWebhookURL:     getenv("FEISHU_WEBHOOK_URL"),
+			// 飞书双模:三件套齐全走企业自建应用,否则回退 webhook(见 feishu.NewSender)
+			FeishuAppID:         getenv("FEISHU_APP_ID"),
+			FeishuAppSecret:     getenv("FEISHU_APP_SECRET"),
+			FeishuReceiveID:     getenv("FEISHU_RECEIVE_ID"),      // open_id 单聊 / chat_id 群
+			FeishuReceiveIDType: getenv("FEISHU_RECEIVE_ID_TYPE"), // 空 → chat_id
 			// §3.7:MINIO_ENDPOINT 或凭据为空即禁用预签名(优雅降级)。
 			MinIOEndpoint:       getenv("MINIO_ENDPOINT"),
 			MinIOPublicEndpoint: getenv("MINIO_PUBLIC_ENDPOINT"),

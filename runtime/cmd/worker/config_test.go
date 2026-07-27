@@ -45,6 +45,10 @@ func TestLoadConfigAppliesDefaults(t *testing.T) {
 	if cfg.Activity.FeishuWebhookURL != "" {
 		t.Errorf("FeishuWebhookURL = %q, want empty(未配置飞书时静默,§notify.go)", cfg.Activity.FeishuWebhookURL)
 	}
+	if cfg.Activity.FeishuAppID != "" || cfg.Activity.FeishuAppSecret != "" ||
+		cfg.Activity.FeishuReceiveID != "" || cfg.Activity.FeishuReceiveIDType != "" {
+		t.Errorf("飞书应用凭据缺省应为空: %+v", cfg.Activity)
+	}
 	// §12 Phase 2:HERMES_ENDPOINT 缺省为空 → Analyzer 禁用,规则引擎保底
 	if cfg.Activity.HermesEndpoint != "" {
 		t.Errorf("HermesEndpoint = %q, want empty(禁用 Analyzer)", cfg.Activity.HermesEndpoint)
@@ -77,6 +81,10 @@ func TestLoadConfigOverridesFromEnv(t *testing.T) {
 		"ARTIFACT_AUTH_TOKEN":    "secret-tok",
 		"ARTIFACT_AUTH_USERNAME": "deploy-user",
 		"FEISHU_WEBHOOK_URL":     "https://open.feishu.cn/hook/x",
+		"FEISHU_APP_ID":          "cli_a1",
+		"FEISHU_APP_SECRET":      "app-sec",
+		"FEISHU_RECEIVE_ID":      "ou_user1",
+		"FEISHU_RECEIVE_ID_TYPE": "open_id",
 	}))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
@@ -110,6 +118,12 @@ func TestLoadConfigOverridesFromEnv(t *testing.T) {
 	}
 	if cfg.Activity.FeishuWebhookURL != "https://open.feishu.cn/hook/x" {
 		t.Errorf("FeishuWebhookURL = %q", cfg.Activity.FeishuWebhookURL)
+	}
+	if cfg.Activity.FeishuAppID != "cli_a1" || cfg.Activity.FeishuAppSecret != "app-sec" ||
+		cfg.Activity.FeishuReceiveID != "ou_user1" || cfg.Activity.FeishuReceiveIDType != "open_id" {
+		t.Errorf("feishu app creds = %q/%q/%q/%q",
+			cfg.Activity.FeishuAppID, cfg.Activity.FeishuAppSecret,
+			cfg.Activity.FeishuReceiveID, cfg.Activity.FeishuReceiveIDType)
 	}
 }
 
