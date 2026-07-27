@@ -162,9 +162,12 @@ type ExtractEvidenceRequest struct {
 
 // ExtractEvidenceResponse 携带 evidence.json 序列化形态及其 sha256 摘要;
 // 摘要在 decisions 表充当 hermes 裁决的 input_digest(§11 可回放)。
+// MatchedSignatures 是 runtime 侧确定性提取的签名命中 id 列表(按声明序),
+// 作为规则引擎判定的额外输入(判定权仍在规则引擎,§9)。
 type ExtractEvidenceResponse struct {
-	EvidenceJSON json.RawMessage `json:"evidence_json"`
-	Digest       string          `json:"digest"`
+	EvidenceJSON      json.RawMessage `json:"evidence_json"`
+	Digest            string          `json:"digest"`
+	MatchedSignatures []string        `json:"matched_signatures,omitempty"`
 }
 
 // AnalyzeRequest 是 Analyze 活动的入参;RuleCategory 为规则引擎判定类别(§9),
@@ -375,19 +378,73 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 		Status: res.Status, ExitCode: res.ExitCode, CasesFailed: res.CasesFailed,
 		SignaturesHit: res.SignaturesHit, SignatureCategory: spec.SignatureCategory,
 	})
+
+	// 非 PASSED:提取一次证据,复用给规则归类(签名命中)与 Hermes 分析。
+	// 顺序语义:先规则后分析,分析永不影响判定(§9 红线)。
+	var ev *ExtractEvidenceResponse
+	if d.Verdict != rules.VerdictPassed {
+		ev = extractEvidenceOnce(ctx, taskID, spec, res)
+		if ev != nil {
+			// 规则归类修复:runtime 侧确定性提取的签名命中(SDK 测试程序不自报)
+			// 作为规则引擎的额外输入。设备自报优先(同名冲突类别以自报为准,
+			// 首个命中定类别);verdict 不因签名变"好"(refined 只会是
+			// TEST_FAILED 或更具体的 INFRA 类,典型修复:CODE → DELEGATE)。
+			if merged, added := mergeSignatureHits(res.SignaturesHit, ev.MatchedSignatures); added {
+				d2, _ := rules.Decide(ruleVersion, rules.Input{
+					Status: res.Status, ExitCode: res.ExitCode, CasesFailed: res.CasesFailed,
+					SignaturesHit: merged, SignatureCategory: spec.SignatureCategory,
+				})
+				d = d2
+			}
+		}
+	}
 	sum.Verdict, sum.Category, sum.Reason = string(d.Verdict), string(d.Category), d.Reason
 	sum.DurationSec, sum.CasesTotal, sum.CasesFailed = res.DurationSec, res.CasesTotal, res.CasesFailed
 	sum.Attachments = res.Attachments
 	sum.retryable = d.Retry
-	// 规则裁决落 decisions 表(§11 可回放);INFRA 早退路径的裁决已随 FinishTask 落 tasks 表
+	// 规则裁决落 decisions 表(§11 可回放):落的是归类修复后的最终裁决
+	// (reason 含签名 id 可与初判区分);INFRA 早退路径的裁决已随 FinishTask 落 tasks 表
 	saveRuleDecision(dctx, taskID, d)
-	// Phase 2:非 PASSED 提取证据并交 Analyzer 补充分析(降级设计,不影响主链路)
+	// Phase 2:非 PASSED 交 Analyzer 补充分析(降级设计,不影响主链路)
 	if d.Verdict != rules.VerdictPassed {
-		sum.Analysis = runAnalysis(ctx, dctx, taskID, spec, res, d)
+		sum.Analysis = runAnalysis(ctx, dctx, taskID, d, ev)
 	}
 	finish(res.Status, sum.Verdict, sum.Category, sum.Reason)
 	release(d.Category == rules.CategoryInfra)
 	return sum
+}
+
+// extractEvidenceOnce 执行一次证据提取(非 PASSED 路径),供规则归类与
+// Hermes 分析复用;失败返回 nil(降级:归类与分析都按现状进行,
+// 证据缺失不构成重试理由,§3.7)。
+func extractEvidenceOnce(ctx workflow.Context, taskID string, spec TestSpec, res *TaskResultSignal) *ExtractEvidenceResponse {
+	var ev ExtractEvidenceResponse
+	if err := workflow.ExecuteActivity(ctx, "ExtractEvidence", ExtractEvidenceRequest{
+		TaskID: taskID, Variant: spec.Variant, Result: *res,
+	}).Get(ctx, &ev); err != nil {
+		workflow.GetLogger(ctx).Error("extract evidence failed, rule decision stands", "task", taskID, "error", err)
+		return nil
+	}
+	return &ev
+}
+
+// mergeSignatureHits 合并设备自报与 runtime 提取的签名命中:设备自报在前
+// (优先),runtime 命中按声明序去重追加;返回合并列表与是否有新增。
+func mergeSignatureHits(reported, extracted []string) ([]string, bool) {
+	merged := append([]string{}, reported...)
+	seen := make(map[string]bool, len(reported)+len(extracted))
+	for _, s := range reported {
+		seen[s] = true
+	}
+	added := false
+	for _, s := range extracted {
+		if !seen[s] {
+			seen[s] = true
+			merged = append(merged, s)
+			added = true
+		}
+	}
+	return merged, added
 }
 
 // saveRuleDecision 把规则引擎裁决落 decisions 表;失败只记日志(用 disconnected
@@ -404,17 +461,14 @@ func saveRuleDecision(dctx workflow.Context, taskID string, d rules.Decision) {
 	}
 }
 
-// runAnalysis 提取证据并交 LLM Analyzer 补充分析,分析结论落 decisions 表。
-// 返回分析本体供输出/通知透出;提取/分析失败或 Analyzer 未启用返回 nil
+// runAnalysis 交 LLM Analyzer 补充分析(复用 runAttempt 已提取的证据,
+// 不重复调用 ExtractEvidence),分析结论落 decisions 表。
+// 返回分析本体供输出/通知透出;分析失败或 Analyzer 未启用返回 nil
 // (全程降级,verdict 判定权永远在规则引擎,§9;§12 Hermes 不可用 → 规则引擎保底)。
-func runAnalysis(ctx, dctx workflow.Context, taskID string, spec TestSpec, res *TaskResultSignal, d rules.Decision) *hermesclient.Analysis {
+func runAnalysis(ctx, dctx workflow.Context, taskID string, d rules.Decision, ev *ExtractEvidenceResponse) *hermesclient.Analysis {
 	logger := workflow.GetLogger(ctx)
-	var ev ExtractEvidenceResponse
-	if err := workflow.ExecuteActivity(ctx, "ExtractEvidence", ExtractEvidenceRequest{
-		TaskID: taskID, Variant: spec.Variant, Result: *res,
-	}).Get(ctx, &ev); err != nil {
-		logger.Error("extract evidence failed, skip analysis", "task", taskID, "error", err)
-		return nil
+	if ev == nil {
+		return nil // 证据提取失败(降级),无分析输入
 	}
 	var analysis *hermesclient.Analysis
 	if err := workflow.ExecuteActivity(ctx, "Analyze", AnalyzeRequest{

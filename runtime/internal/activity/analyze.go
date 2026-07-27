@@ -54,10 +54,18 @@ func (a *Acts) ExtractEvidence(ctx context.Context, req wf.ExtractEvidenceReques
 	if err != nil {
 		return nil, fmt.Errorf("marshal evidence: %w", err)
 	}
+	// runtime 侧确定性提取的签名命中,供规则归类复用(判定权仍在规则引擎,§9)
+	matched := []string{}
+	for _, sig := range ev.Signatures {
+		if sig.Matched {
+			matched = append(matched, sig.ID)
+		}
+	}
 	sum := sha256.Sum256(raw)
 	return &wf.ExtractEvidenceResponse{
-		EvidenceJSON: raw,
-		Digest:       hex.EncodeToString(sum[:]),
+		EvidenceJSON:      raw,
+		Digest:            hex.EncodeToString(sum[:]),
+		MatchedSignatures: matched,
 	}, nil
 }
 

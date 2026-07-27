@@ -38,6 +38,8 @@ type fakeActs struct {
 	evidenceCalls []ExtractEvidenceRequest
 	analyzeCalls  []AnalyzeRequest
 	decisions     []DecisionRow
+	matchedSigs   []string // ExtractEvidence 返回的 runtime 提取签名命中
+	evidenceErr   error    // 非 nil 模拟提取失败(降级路径)
 
 	results   map[string]ResultRecord // LoadResult 的权威数据源(模拟 results 表)
 	loadCalls []string
@@ -107,9 +109,13 @@ func (f *fakeActs) ExtractEvidence(_ context.Context, r ExtractEvidenceRequest) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.evidenceCalls = append(f.evidenceCalls, r)
+	if f.evidenceErr != nil {
+		return nil, f.evidenceErr
+	}
 	return &ExtractEvidenceResponse{
-		EvidenceJSON: json.RawMessage(`{"evidence_version":1}`),
-		Digest:       "deadbeef",
+		EvidenceJSON:      json.RawMessage(`{"evidence_version":1}`),
+		Digest:            "deadbeef",
+		MatchedSignatures: f.matchedSigs,
 	}, nil
 }
 func (f *fakeActs) Analyze(_ context.Context, r AnalyzeRequest) (*hermesclient.Analysis, error) {
@@ -159,7 +165,7 @@ func spec1() TestSpec {
 		Variant:           "aarch64_Android_SNPE_2.21",
 		Package:           PackageRef{URL: "https://reg/pkg.tar.gz", SHA256: "aa", ManifestDigest: "bb"},
 		Selector:          DeviceSelector{SOC: []string{"QCM6125"}},
-		SignatureCategory: map[string]rules.Category{"cpu_fallback": "MODEL"},
+		SignatureCategory: map[string]rules.Category{"cpu_fallback": "MODEL", "dsp_unavailable": "DELEGATE"},
 		MaxInfraRetries:   2,
 		LeaseSeconds:      120,
 		HardTimeoutSec:    2700,
@@ -350,6 +356,74 @@ func TestUnknownRuleVersionRejected(t *testing.T) {
 	if len(f.dispatched) != 0 || len(f.finished) != 0 {
 		t.Errorf("未知版本不得执行任何任务动作: dispatched=%d finished=%d",
 			len(f.dispatched), len(f.finished))
+	}
+}
+
+// TestRuntimeSignatureRefinesCategory:规则归类修复——SDK 测试程序不在
+// result.json 自报签名,runtime 证据提取(variants.yaml 签名正则扫日志)
+// 的命中作为规则引擎的额外输入(判定权仍在规则引擎,§9)。
+// verdict 不因签名变"好";只有类别/reason 更精确(典型:CODE → DELEGATE)。
+func TestRuntimeSignatureRefinesCategory(t *testing.T) {
+	cases := []struct {
+		name          string
+		reported      []string // 设备自报(result.json signatures_hit)
+		matched       []string // runtime 提取命中
+		evidenceErr   error    // 非 nil 模拟提取失败
+		wantVerdict   string
+		wantCategory  string
+		wantReasonSig string // 非空则 reason 必须含该签名 id
+		wantAnalyze   int
+		wantEvidence  int // 提取调用次数(失败时 activity 按 RetryPolicy 重试 3 次)
+	}{
+		{"提取命中dsp_unavailable→类别DELEGATE", nil, []string{"dsp_unavailable"}, nil,
+			"TEST_FAILED", "DELEGATE", "dsp_unavailable", 1, 1},
+		{"两者都空→现状CODE", nil, nil, nil,
+			"TEST_FAILED", "CODE", "", 1, 1},
+		{"自报与提取同名→去重不重复归类", []string{"dsp_unavailable"}, []string{"dsp_unavailable"}, nil,
+			"TEST_FAILED", "DELEGATE", "dsp_unavailable", 1, 1},
+		{"提取失败→降级现状CODE", nil, nil, errBoom,
+			"TEST_FAILED", "CODE", "", 0, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeActs{specs: []TestSpec{spec1()}, matchedSigs: tc.matched, evidenceErr: tc.evidenceErr}
+			env := newEnv(t, f)
+			sig := TaskResultSignal{
+				TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 0, CasesTotal: 10,
+				CasesFailed: 2, SignaturesHit: tc.reported,
+			}
+			seedResult(f, sig)
+			env.RegisterDelayedCallback(func() {
+				env.SignalWorkflow(SignalTaskResult, sig)
+			}, 10*time.Second)
+
+			env.ExecuteWorkflow(DeviceTestWorkflow, input())
+			var out DeviceTestOutput
+			if err := env.GetWorkflowResult(&out); err != nil {
+				t.Fatal(err)
+			}
+			sum := out.Tasks[0]
+			if sum.Verdict != tc.wantVerdict || sum.Category != tc.wantCategory {
+				t.Errorf("summary = %+v, want %s/%s", sum, tc.wantVerdict, tc.wantCategory)
+			}
+			if tc.wantReasonSig != "" && !strings.Contains(sum.Reason, tc.wantReasonSig) {
+				t.Errorf("reason = %q, want 含签名 %q", sum.Reason, tc.wantReasonSig)
+			}
+			// 证据提取一次即复用(归类与分析共享);失败时按 RetryPolicy 重试 3 次后降级
+			if len(f.evidenceCalls) != tc.wantEvidence {
+				t.Errorf("evidenceCalls = %d, want %d", len(f.evidenceCalls), tc.wantEvidence)
+			}
+			if len(f.analyzeCalls) != tc.wantAnalyze {
+				t.Errorf("analyzeCalls = %d, want %d", len(f.analyzeCalls), tc.wantAnalyze)
+			}
+			// decisions 落最终裁决(单条 rule)
+			if len(f.decisions) != 1 || f.decisions[0].Actor != "rule" {
+				t.Fatalf("decisions = %+v, want 单条 rule 最终裁决", f.decisions)
+			}
+			if !strings.Contains(string(f.decisions[0].Output), tc.wantCategory) {
+				t.Errorf("最终裁决 output = %s, want 类别 %s", f.decisions[0].Output, tc.wantCategory)
+			}
+		})
 	}
 }
 
