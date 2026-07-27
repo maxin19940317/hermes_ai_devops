@@ -52,18 +52,21 @@ type MemStore struct {
 	outboxByKey map[string]*outboxRow
 	outboxByID  map[int64]*outboxRow
 	outboxSeq   int64
+	// evidenceSnaps 是 evidence_snapshots 表(差距 #6)的内存视图。
+	evidenceSnaps map[string]EvidenceSnapshot
 }
 
 func NewMemStore() *MemStore {
 	return &MemStore{
-		rows:        map[string]Artifact{},
-		clients:     map[string]Client{},
-		devices:     map[string]*deviceRow{},
-		tasks:       map[string]*taskRecord{},
-		events:      map[string]TaskEvent{},
-		results:     map[string]wf.ResultRecord{},
-		outboxByKey: map[string]*outboxRow{},
-		outboxByID:  map[int64]*outboxRow{},
+		rows:          map[string]Artifact{},
+		clients:       map[string]Client{},
+		devices:       map[string]*deviceRow{},
+		tasks:         map[string]*taskRecord{},
+		events:        map[string]TaskEvent{},
+		results:       map[string]wf.ResultRecord{},
+		outboxByKey:   map[string]*outboxRow{},
+		outboxByID:    map[int64]*outboxRow{},
+		evidenceSnaps: map[string]EvidenceSnapshot{},
 	}
 }
 

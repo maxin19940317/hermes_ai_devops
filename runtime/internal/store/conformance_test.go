@@ -39,6 +39,8 @@ type fullStore interface {
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
 	ListDecisions(ctx context.Context, taskID string) ([]wf.DecisionRow, error)
 	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
+	SaveEvidenceSnapshot(ctx context.Context, snap EvidenceSnapshot) error
+	GetEvidenceSnapshot(ctx context.Context, evidenceID string) (*EvidenceSnapshot, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -643,6 +645,35 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 	})
 
+	// evidence_snapshots(差距 #6,决策可回放):幂等登记 + 读回;未知 id (nil,nil)。
+	t.Run("EvidenceSnapshotIdempotentRoundTrip", func(t *testing.T) {
+		s := newStore(t)
+		snap := EvidenceSnapshot{
+			EvidenceID: "w:t1:a1", TaskID: "w:t1:a1", Attempt: 1,
+			ObjectKey: "evidence/w:t1:a1/evidence.json",
+			SHA256:    "deadbeef", ExtractorVersion: "1",
+		}
+		if err := s.SaveEvidenceSnapshot(ctx, snap); err != nil {
+			t.Fatal(err)
+		}
+		// 重复登记(activity 重试/重复提取):无副作用,保留首次内容
+		dup := snap
+		dup.SHA256 = "changed"
+		if err := s.SaveEvidenceSnapshot(ctx, dup); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.GetEvidenceSnapshot(ctx, "w:t1:a1")
+		if err != nil || got == nil {
+			t.Fatalf("get = %+v err=%v", got, err)
+		}
+		if *got != snap {
+			t.Errorf("snapshot = %+v, want %+v(首次内容,幂等)", *got, snap)
+		}
+		if missing, err := s.GetEvidenceSnapshot(ctx, "no-such"); err != nil || missing != nil {
+			t.Errorf("未知 id 应返回 (nil, nil): %+v %v", missing, err)
+		}
+	})
+
 	t.Run("DecisionsRoundTripInOrder", func(t *testing.T) {
 		s := newStore(t)
 		_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w:t1:a1", IdempotencyKey: "w:t1:a1"})
@@ -650,7 +681,8 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			Output: json.RawMessage(`{"verdict":"PASS","rule":"exit_code"}`)}
 		llm := wf.DecisionRow{TaskID: "w:t1:a1", Actor: "hermes",
 			InputDigest: "sha256:abc123", Model: "kimi-for-coding", PromptVersion: "analyzer-v3",
-			Output: json.RawMessage(`{"category":"PRODUCT","confidence":0.9}`)}
+			Output:             json.RawMessage(`{"category":"PRODUCT","confidence":0.9}`),
+			EvidenceSnapshotID: "w:t1:a1"}
 		if err := s.SaveDecision(ctx, rule); err != nil {
 			t.Fatal(err)
 		}
@@ -683,8 +715,12 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		assertJSONEqual(rule.Output, got[0].Output)
 		if got[1].InputDigest != "sha256:abc123" || got[1].Model != "kimi-for-coding" ||
-			got[1].PromptVersion != "analyzer-v3" {
+			got[1].PromptVersion != "analyzer-v3" || got[1].EvidenceSnapshotID != "w:t1:a1" {
 			t.Errorf("hermes decision 字段不完整: %+v", got[1])
+		}
+		// rule 裁决不带快照引用(基于 result,不基于 evidence)
+		if got[0].EvidenceSnapshotID != "" {
+			t.Errorf("rule decision 不应带 evidence_snapshot_id: %+v", got[0])
 		}
 		assertJSONEqual(llm.Output, got[1].Output)
 		if none, err := s.ListDecisions(ctx, "no-such"); err != nil || len(none) != 0 {

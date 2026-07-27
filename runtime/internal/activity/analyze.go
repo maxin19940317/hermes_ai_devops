@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,12 +9,15 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"hermes-devops/runtime/internal/evidence"
 	"hermes-devops/runtime/internal/hermesclient"
+	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -62,11 +66,59 @@ func (a *Acts) ExtractEvidence(ctx context.Context, req wf.ExtractEvidenceReques
 		}
 	}
 	sum := sha256.Sum256(raw)
+	digest := hex.EncodeToString(sum[:])
 	return &wf.ExtractEvidenceResponse{
 		EvidenceJSON:      raw,
-		Digest:            hex.EncodeToString(sum[:]),
+		Digest:            digest,
 		MatchedSignatures: matched,
+		SnapshotID:        a.persistEvidenceSnapshot(ctx, req.TaskID, ev.EvidenceVersion, raw, digest),
 	}, nil
+}
+
+// persistEvidenceSnapshot 把 evidence.json 上传 MinIO 并登记 evidence_snapshots
+// (差距 #6,决策可回放);返回 evidence_id(= task_id,含 attempt 全链路唯一,
+// 重复提取幂等)。MinIO 未配置/上传失败/落库失败一律降级:记日志返回空串,
+// 不阻断分析——evidence 本体仍随响应内存传递(§3.7)。
+func (a *Acts) persistEvidenceSnapshot(ctx context.Context, taskID string, extractorVersion int, raw []byte, digest string) string {
+	if a.Store == nil || !a.Cfg.presignEnabled() {
+		return "" // MinIO 未配置:快照不可用是既定降级形态,无需每任务刷日志
+	}
+	cli, err := evidenceClient(a.Cfg)
+	if err != nil {
+		a.warnf("minio evidence client init failed: %v; snapshot skipped", err)
+		return ""
+	}
+	// object_key 与 runs/{task_id}/ 附件并排:evidence/{task_id}/evidence.json。
+	// 同一任务重复提取(activity 重试)覆写同一 key、同 evidence_id 幂等。
+	objectKey := "evidence/" + taskID + "/evidence.json"
+	if _, err := cli.PutObject(ctx, a.Cfg.MinIOBucket, objectKey,
+		bytes.NewReader(raw), int64(len(raw)),
+		minio.PutObjectOptions{ContentType: "application/json"}); err != nil {
+		a.warnf("evidence snapshot upload %s failed: %v", objectKey, err)
+		return ""
+	}
+	if err := a.Store.SaveEvidenceSnapshot(ctx, store.EvidenceSnapshot{
+		EvidenceID: taskID, TaskID: taskID, Attempt: attemptFromTaskID(taskID),
+		ObjectKey: objectKey, SHA256: digest,
+		ExtractorVersion: strconv.Itoa(extractorVersion),
+	}); err != nil {
+		a.warnf("save evidence snapshot %s failed: %v", taskID, err)
+		return ""
+	}
+	return taskID
+}
+
+// attemptFromTaskID 解析 task_id 的 :a{N} 后缀(差距 #14);失败返回 0。
+func attemptFromTaskID(taskID string) int {
+	i := strings.LastIndex(taskID, ":a")
+	if i < 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(taskID[i+2:])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // fetchEvidenceFiles 按附件清单从 MinIO 拉取 4 类证据文件。返回的 reader 由

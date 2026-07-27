@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"hermes-devops/runtime/internal/hermesclient"
+	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -22,6 +23,7 @@ type Store interface {
 	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
 	GetResult(ctx context.Context, taskID string) (*wf.ResultRecord, error)
 	GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error)
+	SaveEvidenceSnapshot(ctx context.Context, snap store.EvidenceSnapshot) error
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).

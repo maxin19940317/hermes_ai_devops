@@ -151,6 +151,10 @@ type DecisionRow struct {
 	Model         string          `json:"model"`
 	PromptVersion string          `json:"prompt_version"`
 	Output        json.RawMessage `json:"output"` // 已是 JSON(rule Decision 或 analysis)
+	// EvidenceSnapshotID 引用 evidence_snapshots(差距 #6 决策可回放);
+	// 仅 hermes 裁决携带(基于 evidence),rule 裁决基于 result,为空。
+	// 快照未持久化(MinIO 未配置/上传失败,降级)时亦为空。
+	EvidenceSnapshotID string `json:"evidence_snapshot_id,omitempty"`
 }
 
 // ExtractEvidenceRequest 是 ExtractEvidence 活动的入参(§12 Phase 2)。
@@ -164,10 +168,13 @@ type ExtractEvidenceRequest struct {
 // 摘要在 decisions 表充当 hermes 裁决的 input_digest(§11 可回放)。
 // MatchedSignatures 是 runtime 侧确定性提取的签名命中 id 列表(按声明序),
 // 作为规则引擎判定的额外输入(判定权仍在规则引擎,§9)。
+// SnapshotID 是 evidence_snapshots.evidence_id(差距 #6);空 = 快照未持久化
+// (MinIO 未配置/上传失败,降级,evidence 本体仍随 EvidenceJSON 内存传递)。
 type ExtractEvidenceResponse struct {
 	EvidenceJSON      json.RawMessage `json:"evidence_json"`
 	Digest            string          `json:"digest"`
 	MatchedSignatures []string        `json:"matched_signatures,omitempty"`
+	SnapshotID        string          `json:"snapshot_id,omitempty"`
 }
 
 // AnalyzeRequest 是 Analyze 活动的入参;RuleCategory 为规则引擎判定类别(§9),
@@ -488,6 +495,8 @@ func runAnalysis(ctx, dctx workflow.Context, taskID string, d rules.Decision, ev
 	row := DecisionRow{
 		TaskID: taskID, Actor: "hermes", InputDigest: ev.Digest,
 		PromptVersion: hermesclient.PromptVersion, Output: out,
+		// 快照引用(差距 #6 决策可回放);降级(未持久化)时为空
+		EvidenceSnapshotID: ev.SnapshotID,
 	}
 	if err := workflow.ExecuteActivity(dctx, "SaveDecision", row).Get(dctx, nil); err != nil {
 		logger.Error("save hermes decision failed", "task", taskID, "error", err)

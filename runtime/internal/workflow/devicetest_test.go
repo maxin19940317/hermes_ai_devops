@@ -40,6 +40,7 @@ type fakeActs struct {
 	decisions     []DecisionRow
 	matchedSigs   []string // ExtractEvidence 返回的 runtime 提取签名命中
 	evidenceErr   error    // 非 nil 模拟提取失败(降级路径)
+	snapshotID    string   // ExtractEvidence 返回的快照 id(空 = 降级未持久化)
 
 	results   map[string]ResultRecord // LoadResult 的权威数据源(模拟 results 表)
 	loadCalls []string
@@ -116,6 +117,7 @@ func (f *fakeActs) ExtractEvidence(_ context.Context, r ExtractEvidenceRequest) 
 		EvidenceJSON:      json.RawMessage(`{"evidence_version":1}`),
 		Digest:            "deadbeef",
 		MatchedSignatures: f.matchedSigs,
+		SnapshotID:        f.snapshotID,
 	}, nil
 }
 func (f *fakeActs) Analyze(_ context.Context, r AnalyzeRequest) (*hermesclient.Analysis, error) {
@@ -479,6 +481,7 @@ func TestAnalysisSavedOnFailure(t *testing.T) {
 			AnalysisVersion: 1, Summary: "delegate fell back to CPU",
 			SuggestedCategory: "MODEL", Confidence: 0.9,
 		},
+		snapshotID: "snap-1", // evidence 已持久化(差距 #6)
 	}
 	env := newEnv(t, f)
 	sig := TaskResultSignal{
@@ -508,6 +511,13 @@ func TestAnalysisSavedOnFailure(t *testing.T) {
 		herm.PromptVersion != hermesclient.PromptVersion ||
 		!strings.Contains(string(herm.Output), "delegate fell back to CPU") {
 		t.Errorf("hermes 裁决 = %+v(需带 evidence 摘要/prompt 版本/分析本体)", herm)
+	}
+	// 差距 #6 决策可回放:hermes 裁决携带 evidence 快照引用;rule 裁决不带(基于 result)
+	if herm.EvidenceSnapshotID != "snap-1" {
+		t.Errorf("hermes 裁决 evidence_snapshot_id = %q, want snap-1", herm.EvidenceSnapshotID)
+	}
+	if rule.EvidenceSnapshotID != "" {
+		t.Errorf("rule 裁决不应带快照引用: %+v", rule)
 	}
 	// 分析结论随 workflow 输出与飞书通知透出(§12.6 通知带 hermes 总结)
 	var out DeviceTestOutput

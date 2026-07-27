@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS results (
 );
 
 -- 一切裁决(规则引擎/LLM/人工)都落 decisions 表,可回放(§11)。
+-- evidence_snapshot_id 引用 evidence_snapshots(差距 #6 决策可回放):
+-- 仅 hermes 裁决携带(基于 evidence);rule 裁决基于 result,为空。
 CREATE TABLE IF NOT EXISTS decisions (
     decision_id    BIGSERIAL PRIMARY KEY,
     task_id        TEXT        NOT NULL REFERENCES tasks(task_id),
@@ -104,9 +106,25 @@ CREATE TABLE IF NOT EXISTS decisions (
     model          TEXT        NOT NULL DEFAULT '',
     prompt_version TEXT        NOT NULL DEFAULT '',
     output         JSONB       NOT NULL,
+    evidence_snapshot_id TEXT  NOT NULL DEFAULT '',
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS decisions_task_id_idx ON decisions(task_id);
+
+-- evidence.json 快照登记(差距 #6):原始日志可按生命周期清理,
+-- 快照(≤96KB)随 Decision 保留,hermes 裁决可回放"当时看到了什么"。
+-- evidence_id = task_id(含 attempt,全链路唯一,差距 #14);
+-- 同一任务重复提取(activity 重试)按 evidence_id 幂等。
+CREATE TABLE IF NOT EXISTS evidence_snapshots (
+    evidence_id       TEXT PRIMARY KEY,
+    task_id           TEXT        NOT NULL,
+    attempt           INTEGER     NOT NULL DEFAULT 0,
+    object_key        TEXT        NOT NULL,
+    sha256            TEXT        NOT NULL,
+    extractor_version TEXT        NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS evidence_snapshots_task_id_idx ON evidence_snapshots(task_id);
 
 -- 事务性 Outbox(docs/device-test-sequence.md 设计原则 3,表结构见文末):
 -- 关键事件(Result/Cancel/Human Decision)与业务数据单事务写入,由独立 Outbox Relay

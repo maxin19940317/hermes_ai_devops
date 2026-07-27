@@ -11,9 +11,10 @@ import (
 // output 已是 JSON,原样存入 JSONB;task_id 不存在时外键报错。
 func (s *PGStore) SaveDecision(ctx context.Context, row wf.DecisionRow) error {
 	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO decisions (task_id, actor, input_digest, model, prompt_version, output)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		row.TaskID, row.Actor, row.InputDigest, row.Model, row.PromptVersion, row.Output)
+		INSERT INTO decisions (task_id, actor, input_digest, model, prompt_version, output, evidence_snapshot_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		row.TaskID, row.Actor, row.InputDigest, row.Model, row.PromptVersion, row.Output,
+		row.EvidenceSnapshotID)
 	if err != nil {
 		return fmt.Errorf("save decision %s/%s: %w", row.TaskID, row.Actor, err)
 	}
@@ -24,7 +25,7 @@ func (s *PGStore) SaveDecision(ctx context.Context, row wf.DecisionRow) error {
 // 无记录返回空切片。
 func (s *PGStore) ListDecisions(ctx context.Context, taskID string) ([]wf.DecisionRow, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT task_id, actor, input_digest, model, prompt_version, output
+		SELECT task_id, actor, input_digest, model, prompt_version, output, evidence_snapshot_id
 		FROM decisions WHERE task_id = $1
 		ORDER BY created_at, decision_id`, taskID)
 	if err != nil {
@@ -35,7 +36,7 @@ func (s *PGStore) ListDecisions(ctx context.Context, taskID string) ([]wf.Decisi
 	for rows.Next() {
 		var d wf.DecisionRow
 		if err := rows.Scan(&d.TaskID, &d.Actor, &d.InputDigest, &d.Model,
-			&d.PromptVersion, &d.Output); err != nil {
+			&d.PromptVersion, &d.Output, &d.EvidenceSnapshotID); err != nil {
 			return nil, fmt.Errorf("list decisions %s: scan: %w", taskID, err)
 		}
 		out = append(out, d)
