@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -44,10 +45,11 @@ func writeTarGz(t *testing.T, path string, entries map[string]struct {
 
 func TestDownloadSetsAuthHeaderAndWritesFile(t *testing.T) {
 	content := []byte("package-bytes")
-	var gotBearer, gotJobToken string
+	var gotBearer, gotJobToken, gotBasicUser, gotBasicPass string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBearer = r.Header.Get("Authorization")
 		gotJobToken = r.Header.Get("JOB-TOKEN")
+		gotBasicUser, gotBasicPass, _ = r.BasicAuth()
 		w.Write(content)
 	}))
 	defer srv.Close()
@@ -73,6 +75,41 @@ func TestDownloadSetsAuthHeaderAndWritesFile(t *testing.T) {
 	if gotJobToken != "jt" {
 		t.Errorf("JOB-TOKEN = %q", gotJobToken)
 	}
+
+	// basic(Deploy Token,原则 5):HTTP Basic 认证头
+	if err := Download(context.Background(), srv.Client(), srv.URL,
+		&Auth{Type: "basic", Username: "deploy-user", Token: "dt-secret"}, dest); err != nil {
+		t.Fatalf("download basic: %v", err)
+	}
+	if gotBasicUser != "deploy-user" || gotBasicPass != "dt-secret" {
+		t.Errorf("BasicAuth = (%q, %q), want (deploy-user, dt-secret)", gotBasicUser, gotBasicPass)
+	}
+}
+
+// basic 缺 username 必须报清晰错误(不得静默发空用户名请求)。
+func TestDownloadBasicRequiresUsername(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("缺 username 的请求不得发出")
+	}))
+	defer srv.Close()
+	dest := filepath.Join(t.TempDir(), "pkg.tar.gz")
+	err := Download(context.Background(), srv.Client(), srv.URL,
+		&Auth{Type: "basic", Token: "dt-secret"}, dest)
+	if err == nil {
+		t.Fatal("want username required error")
+	}
+	if got := err.Error(); got == "" || !containsAll(got, "basic", "username") {
+		t.Errorf("error = %q, want 指明 basic 缺 username", got)
+	}
+}
+
+func containsAll(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if !strings.Contains(s, sub) {
+			return false
+		}
+	}
+	return true
 }
 
 func TestDownloadFailsOnHTTPError(t *testing.T) {

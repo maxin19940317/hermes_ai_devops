@@ -17,9 +17,11 @@ import (
 )
 
 // Auth 描述 Registry 下载凭据(契约 client-agent-api §TaskDispatchRequest.artifact.auth)。
+// basic 用于 GitLab Deploy Token(只读,原则 5):仅支持 HTTP Basic 认证。
 type Auth struct {
-	Type  string // bearer | job_token
-	Token string
+	Type     string // bearer | job_token | basic
+	Token    string
+	Username string // 仅 basic 使用(Deploy Token 用户名);其余类型忽略
 }
 
 func (a *Auth) apply(req *http.Request) error {
@@ -31,6 +33,11 @@ func (a *Auth) apply(req *http.Request) error {
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 	case "job_token":
 		req.Header.Set("JOB-TOKEN", a.Token)
+	case "basic":
+		if a.Username == "" {
+			return fmt.Errorf("basic auth requires username (deploy token 用户名,经 --auth-username / auth.username 下发)")
+		}
+		req.SetBasicAuth(a.Username, a.Token)
 	default:
 		return fmt.Errorf("unknown auth type %q", a.Type)
 	}

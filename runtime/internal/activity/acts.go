@@ -29,8 +29,10 @@ type Config struct {
 	LeaseSeconds      int    // task lease; default 120
 	QuarantineAfter   int    // consecutive INFRA quarantine threshold; default 3
 	CallbackBaseURL   string // base URL given to Client for callbacks (§8.1)
-	ArtifactAuthType  string // bearer | job_token
+	ArtifactAuthType  string // bearer | job_token | basic(Deploy Token,原则 5)
 	ArtifactAuthToken string
+	// ArtifactAuthUsername 仅 basic 使用(Deploy Token 用户名);空 = 非 basic。
+	ArtifactAuthUsername string
 	FeishuWebhookURL  string // empty → Notify logs only (dev mode)
 	// MinIO 预签名直传(§3.7);Endpoint 或凭据为空即禁用,优雅降级为空 presigned_uploads。
 	MinIOEndpoint       string        // 集群内 endpoint(如 minio:9000);兼作启用开关

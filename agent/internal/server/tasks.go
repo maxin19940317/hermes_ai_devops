@@ -45,8 +45,9 @@ type Dispatch struct {
 		URL    string `json:"url"`
 		SHA256 string `json:"sha256"`
 		Auth   struct {
-			Type  string `json:"type"`
-			Token string `json:"token"`
+			Type     string `json:"type"`
+			Token    string `json:"token"`
+			Username string `json:"username"` // basic(Deploy Token)用户名;契约只加不删
 		} `json:"auth"`
 	} `json:"artifact"`
 	ManifestDigest  string `json:"manifest_digest"`
@@ -242,7 +243,7 @@ func (s *Server) runTask(d Dispatch, outDir string, exec *executor.Executor) {
 	if _, err := exec.Execute(ctx, executor.Options{
 		PackageURL: d.Artifact.URL,
 		SHA256:     d.Artifact.SHA256,
-		Auth:       &artifact.Auth{Type: d.Artifact.Auth.Type, Token: d.Artifact.Auth.Token},
+		Auth:       &artifact.Auth{Type: d.Artifact.Auth.Type, Token: d.Artifact.Auth.Token, Username: d.Artifact.Auth.Username},
 		Serial:     d.DeviceSerial,
 		OutDir:     outDir,
 	}); err != nil {

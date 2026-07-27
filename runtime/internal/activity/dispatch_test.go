@@ -23,7 +23,8 @@ func TestDispatchPostsContractPayload(t *testing.T) {
 	defer srv.Close()
 
 	a := &Acts{HTTP: srv.Client(), Cfg: Config{
-		CallbackBaseURL: "https://runtime:8091", ArtifactAuthType: "bearer", ArtifactAuthToken: "tok"}}
+		CallbackBaseURL: "https://runtime:8091", ArtifactAuthType: "basic",
+		ArtifactAuthToken: "tok", ArtifactAuthUsername: "deploy-user"}}
 	err := a.Dispatch(ctx, wf.DispatchRequest{
 		TaskID: "w:t:a1", IdempotencyKey: "w:t:a1", Attempt: 1,
 		PackageURL: "https://gitlab/pkg", PackageSHA256: "ab12", ManifestDigest: "cd34",
@@ -41,7 +42,7 @@ func TestDispatchPostsContractPayload(t *testing.T) {
 	art := got["artifact"].(map[string]any)
 	auth := art["auth"].(map[string]any)
 	if art["url"] != "https://gitlab/pkg" || art["sha256"] != "ab12" ||
-		auth["type"] != "bearer" || auth["token"] != "tok" {
+		auth["type"] != "basic" || auth["token"] != "tok" || auth["username"] != "deploy-user" {
 		t.Errorf("artifact = %v", art)
 	}
 }

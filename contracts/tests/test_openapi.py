@@ -122,3 +122,16 @@ def test_heartbeat_ack_not_owned_shape():
             pass
         else:
             raise AssertionError(f"非法 ack 被接受: {bad}")
+
+
+def test_dispatch_auth_supports_basic_deploy_token():
+    """派单 artifact.auth:type 枚举含 basic(Deploy Token,原则 5),
+    username 为可选字段(只加不删)。"""
+    with (CONTRACTS_DIR / "client-agent-api.openapi.yaml").open(encoding="utf-8") as f:
+        spec = yaml.safe_load(f)
+    auth = spec["components"]["schemas"]["TaskDispatchRequest"]["properties"]["artifact"]["properties"]["auth"]
+    types = auth["properties"]["type"]["enum"]
+    assert "basic" in types, f"auth.type 缺 basic: {types}"
+    assert "bearer" in types and "job_token" in types  # 只加不删
+    assert "username" in auth["properties"], "auth 缺可选 username"
+    assert "username" not in auth.get("required", []), "username 必须可选(旧载荷兼容)"

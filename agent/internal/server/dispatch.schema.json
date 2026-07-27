@@ -35,8 +35,12 @@
           "additionalProperties": false,
           "required": ["type", "token"],
           "properties": {
-            "type": { "enum": ["bearer", "job_token"] },
-            "token": { "type": "string", "minLength": 1 }
+            "type": { "enum": ["bearer", "job_token", "basic"] },
+            "token": { "type": "string", "minLength": 1 },
+            "username": {
+              "type": "string",
+              "description": "basic(GitLab Deploy Token,原则 5 只读凭据)的 HTTP Basic 用户名;type=basic 时必填(运行时校验),其余类型忽略。"
+            }
           }
         }
       }

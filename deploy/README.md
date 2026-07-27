@@ -27,9 +27,12 @@ auto-assignment: an auto-assigned range once hijacked the host route for real
 conflicts, change `RUNTIME_SUBNET` in `deploy/.env` and recreate the stack
 (`down` then `up -d`; named volumes persist).
 
-Artifact downloads use `ARTIFACT_AUTH_TYPE=bearer` by default (a GitLab PAT in
-`ARTIFACT_AUTH_TOKEN`). `job_token` is only for CI job tokens; sending a PAT in a
-`JOB-TOKEN` header fails with 401.
+Artifact downloads support three auth modes via `ARTIFACT_AUTH_TYPE`: `basic`
+(recommended, design principle 5 — a read-only GitLab Deploy Token in
+`ARTIFACT_AUTH_USERNAME` / `ARTIFACT_AUTH_TOKEN`, sent as HTTP Basic auth),
+`bearer` (a GitLab PAT in `ARTIFACT_AUTH_TOKEN`), and `job_token` (CI job tokens
+only; sending a PAT in a `JOB-TOKEN` header fails with 401). GitLab Deploy Tokens
+support HTTP Basic auth only — they cannot be used with `bearer`.
 
 ## MinIO evidence uploads
 

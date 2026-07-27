@@ -16,8 +16,9 @@
 //	HARD_TIMEOUT_MARGIN_SEC 硬超时叠加在 manifest timeout 上的余量,缺省 1200
 //	DEVICE_WAIT_ROUNDS      设备忙时等待轮数,缺省 20
 //	DEVICE_WAIT_SECONDS     每轮等待秒数,缺省 30
-//	ARTIFACT_AUTH_TYPE      缺省 job_token
+//	ARTIFACT_AUTH_TYPE      缺省 job_token(bearer | job_token | basic;basic 用于只读 Deploy Token,原则 5)
 //	ARTIFACT_AUTH_TOKEN     可选
+//	ARTIFACT_AUTH_USERNAME  可选;仅 basic(Deploy Token 用户名)
 //	FEISHU_WEBHOOK_URL      可选;缺省 Notify 静默成功(开发模式)
 //	MINIO_ENDPOINT          集群内 endpoint(如 minio:9000);空 → 禁用预签名(§3.7 降级)
 //	MINIO_PUBLIC_ENDPOINT   预签名 URL 的 host,须 Client 可达;空 → 用 MINIO_ENDPOINT

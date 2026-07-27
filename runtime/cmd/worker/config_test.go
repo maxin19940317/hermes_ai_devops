@@ -64,18 +64,19 @@ func TestLoadConfigAppliesDefaults(t *testing.T) {
 
 func TestLoadConfigOverridesFromEnv(t *testing.T) {
 	cfg, err := loadConfig(lookup(map[string]string{
-		"VARIANTS_CONFIG":       "v.yaml",
-		"CALLBACK_BASE_URL":     "https://runtime.example",
-		"TEMPORAL_ADDRESS":      "temporal.internal:7233",
-		"TEMPORAL_TASK_QUEUE":   "custom-queue",
-		"DATABASE_URL":          "postgres://x/y",
-		"WORKER_CALLBACKS_ADDR": ":9999",
-		"LEASE_SECONDS":         "60",
-		"QUARANTINE_AFTER":      "5",
-		"MAX_INFRA_RETRIES":     "1",
-		"ARTIFACT_AUTH_TYPE":    "bearer",
-		"ARTIFACT_AUTH_TOKEN":   "secret-tok",
-		"FEISHU_WEBHOOK_URL":    "https://open.feishu.cn/hook/x",
+		"VARIANTS_CONFIG":        "v.yaml",
+		"CALLBACK_BASE_URL":      "https://runtime.example",
+		"TEMPORAL_ADDRESS":       "temporal.internal:7233",
+		"TEMPORAL_TASK_QUEUE":    "custom-queue",
+		"DATABASE_URL":           "postgres://x/y",
+		"WORKER_CALLBACKS_ADDR":  ":9999",
+		"LEASE_SECONDS":          "60",
+		"QUARANTINE_AFTER":       "5",
+		"MAX_INFRA_RETRIES":      "1",
+		"ARTIFACT_AUTH_TYPE":     "basic",
+		"ARTIFACT_AUTH_TOKEN":    "secret-tok",
+		"ARTIFACT_AUTH_USERNAME": "deploy-user",
+		"FEISHU_WEBHOOK_URL":     "https://open.feishu.cn/hook/x",
 	}))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
@@ -102,8 +103,10 @@ func TestLoadConfigOverridesFromEnv(t *testing.T) {
 	if cfg.SpecDefaults.MaxInfraRetries != 1 {
 		t.Errorf("MaxInfraRetries = %d", cfg.SpecDefaults.MaxInfraRetries)
 	}
-	if cfg.Activity.ArtifactAuthType != "bearer" || cfg.Activity.ArtifactAuthToken != "secret-tok" {
-		t.Errorf("artifact auth = %q/%q", cfg.Activity.ArtifactAuthType, cfg.Activity.ArtifactAuthToken)
+	if cfg.Activity.ArtifactAuthType != "basic" || cfg.Activity.ArtifactAuthToken != "secret-tok" ||
+		cfg.Activity.ArtifactAuthUsername != "deploy-user" {
+		t.Errorf("artifact auth = %q/%q/%q", cfg.Activity.ArtifactAuthType,
+			cfg.Activity.ArtifactAuthToken, cfg.Activity.ArtifactAuthUsername)
 	}
 	if cfg.Activity.FeishuWebhookURL != "https://open.feishu.cn/hook/x" {
 		t.Errorf("FeishuWebhookURL = %q", cfg.Activity.FeishuWebhookURL)

@@ -30,8 +30,9 @@ func run(argv []string) int {
 		packageURL  = fs.String("package-url", "", "产物 Registry URL(与 --package-file 二选一)")
 		packageFile = fs.String("package-file", "", "本地包路径(与 --package-url 二选一)")
 		sha256Hex   = fs.String("sha256", "", "整包 sha256(package-url 时必填)")
-		authType    = fs.String("auth-type", "", "bearer | job_token")
-		authToken   = fs.String("auth-token", "", "下载凭据(建议用环境变量 AGENT_AUTH_TOKEN)")
+		authType     = fs.String("auth-type", "", "bearer | job_token | basic(Deploy Token)")
+		authToken    = fs.String("auth-token", "", "下载凭据(建议用环境变量 AGENT_AUTH_TOKEN)")
+		authUsername = fs.String("auth-username", "", "basic 认证用户名(Deploy Token 用户名;建议用环境变量 AGENT_AUTH_USERNAME)")
 		serial      = fs.String("serial", "", "目标设备序列号(必填)")
 		adbPath     = fs.String("adb", "adb", "adb 可执行文件路径")
 		outDir      = fs.String("out", "", "本地结果目录(默认 ./agent-runs/<UTC时间戳>)")
@@ -64,9 +65,13 @@ func run(argv []string) int {
 	if token == "" {
 		token = os.Getenv("AGENT_AUTH_TOKEN")
 	}
+	username := *authUsername
+	if username == "" {
+		username = os.Getenv("AGENT_AUTH_USERNAME")
+	}
 	var auth *artifact.Auth
 	if *authType != "" {
-		auth = &artifact.Auth{Type: *authType, Token: token}
+		auth = &artifact.Auth{Type: *authType, Token: token, Username: username}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

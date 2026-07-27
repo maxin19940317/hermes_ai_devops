@@ -22,7 +22,8 @@ func (a *Acts) Dispatch(ctx context.Context, req wf.DispatchRequest) error {
 		"artifact": map[string]any{
 			"url":    req.PackageURL,
 			"sha256": req.PackageSHA256,
-			"auth":   map[string]any{"type": a.Cfg.ArtifactAuthType, "token": a.Cfg.ArtifactAuthToken},
+			// username 空串也带上,保持载荷形态稳定(契约只加不删;basic 时才被消费)
+			"auth": map[string]any{"type": a.Cfg.ArtifactAuthType, "token": a.Cfg.ArtifactAuthToken, "username": a.Cfg.ArtifactAuthUsername},
 		},
 		"manifest_digest":   req.ManifestDigest,
 		"device_serial":     req.DeviceSerial,

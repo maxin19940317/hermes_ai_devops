@@ -171,6 +171,10 @@ $env:AGENT_AUTH_TOKEN = "<临时下载令牌>"
   --adb $adb
 ```
 
+只读 Deploy Token(推荐,原则 5)走 HTTP Basic:再加用户名即可
+(`--auth-type basic --auth-username <deploy-token-用户名>`,用户名也可走
+`AGENT_AUTH_USERNAME` 环境变量)。
+
 执行完成后清除当前 PowerShell 会话中的 Token：
 
 ```powershell

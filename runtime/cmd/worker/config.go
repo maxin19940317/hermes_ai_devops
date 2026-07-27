@@ -101,12 +101,13 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		CallbacksAddr:      env("WORKER_CALLBACKS_ADDR", ":8091"),
 		VariantsConfigPath: variantsPath,
 		Activity: activity.Config{
-			LeaseSeconds:      leaseSeconds,
-			QuarantineAfter:   quarantineAfter,
-			CallbackBaseURL:   callbackBaseURL,
-			ArtifactAuthType:  env("ARTIFACT_AUTH_TYPE", "job_token"),
-			ArtifactAuthToken: getenv("ARTIFACT_AUTH_TOKEN"),
-			FeishuWebhookURL:  getenv("FEISHU_WEBHOOK_URL"),
+			LeaseSeconds:         leaseSeconds,
+			QuarantineAfter:      quarantineAfter,
+			CallbackBaseURL:      callbackBaseURL,
+			ArtifactAuthType:     env("ARTIFACT_AUTH_TYPE", "job_token"),
+			ArtifactAuthToken:    getenv("ARTIFACT_AUTH_TOKEN"),
+			ArtifactAuthUsername: getenv("ARTIFACT_AUTH_USERNAME"), // 仅 basic(Deploy Token)使用
+			FeishuWebhookURL:     getenv("FEISHU_WEBHOOK_URL"),
 			// §3.7:MINIO_ENDPOINT 或凭据为空即禁用预签名(优雅降级)。
 			MinIOEndpoint:       getenv("MINIO_ENDPOINT"),
 			MinIOPublicEndpoint: getenv("MINIO_PUBLIC_ENDPOINT"),
