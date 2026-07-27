@@ -6,7 +6,7 @@
   "type": "object",
   "required": ["evidence_version", "task_id", "variant", "status", "exit_code", "cases", "signatures", "junit_failures", "inputs"],
   "properties": {
-    "evidence_version": { "const": 1 },
+    "evidence_version": { "const": 2 },
     "task_id": { "type": "string", "minLength": 1, "maxLength": 256 },
     "variant": { "type": "string", "minLength": 1 },
     "status": {
@@ -121,6 +121,21 @@
       "type": "boolean",
       "default": false,
       "description": "整体输出接近体积上限,部分内容被截断"
+    },
+    "excerpts": {
+      "type": "array",
+      "description": "兜底摘录(v2 新增):全部签名未命中时给出有界原文——stdout/stderr 尾部 + logcat 错误行,总量受签名上下文同一 96KB 预算约束,不是全量灌入;否则 Analyzer 只见文件元数据,无法分析",
+      "items": {
+        "type": "object",
+        "required": ["file", "kind", "content"],
+        "properties": {
+          "file": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["tail", "error_lines"] },
+          "content": { "type": "string" },
+          "truncated": { "type": "boolean", "default": false }
+        }
+      },
+      "default": []
     }
   }
 }

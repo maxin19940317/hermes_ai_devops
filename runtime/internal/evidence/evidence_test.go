@@ -188,6 +188,86 @@ func TestExtractSignatures(t *testing.T) {
 	}
 }
 
+func TestExtractFallbackExcerpts(t *testing.T) {
+	tests := []struct {
+		name string
+		in   func() Input
+		want func(t *testing.T, ev Evidence)
+	}{
+		{
+			name: "全部签名未命中时给出尾部与错误行摘录",
+			in: func() Input {
+				in := baseInput()
+				in.Signatures = []Signature{{ID: "cpu_fallback", Where: "stdout", Pattern: "Falling back to CPU", Classify: "MODEL"}}
+				in.Files["stdout"] = strings.NewReader("init ok\nE2022 Engine init failed, ret: -1\nDeepSeg_Infer init error\n")
+				in.Files["logcat"] = strings.NewReader("07-01 01:25:46.1 1 1 I tag: fine\n07-01 01:25:47.2 1 1 E tag: seg init failed\n07-01 01:25:48.3 1 1 D tag: noise\n")
+				return in
+			},
+			want: func(t *testing.T, ev Evidence) {
+				if len(ev.Excerpts) != 2 {
+					t.Fatalf("excerpts = %+v, want stdout tail + logcat error_lines", ev.Excerpts)
+				}
+				if ev.Excerpts[0].File != "stdout.log" || ev.Excerpts[0].Kind != "tail" ||
+					!strings.Contains(ev.Excerpts[0].Content, "DeepSeg_Infer init error") {
+					t.Errorf("stdout 摘录缺失关键错误: %+v", ev.Excerpts[0])
+				}
+				lc := ev.Excerpts[1]
+				if lc.File != "logcat.txt" || lc.Kind != "error_lines" ||
+					!strings.Contains(lc.Content, "seg init failed") || strings.Contains(lc.Content, "noise") {
+					t.Errorf("logcat 摘录应只含错误行: %+v", lc)
+				}
+			},
+		},
+		{
+			name: "有签名命中时不产生摘录",
+			in: func() Input {
+				in := baseInput()
+				in.Signatures = []Signature{{ID: "cpu_fallback", Where: "stdout", Pattern: "Falling back to CPU", Classify: "MODEL"}}
+				in.Files["stdout"] = strings.NewReader("ok\nFalling back to CPU\n")
+				return in
+			},
+			want: func(t *testing.T, ev Evidence) {
+				if len(ev.Excerpts) != 0 {
+					t.Errorf("命中后不应有兜底摘录: %+v", ev.Excerpts)
+				}
+			},
+		},
+		{
+			name: "stderr 为空时跳过该文件",
+			in: func() Input {
+				in := baseInput()
+				in.Signatures = []Signature{{ID: "cpu_fallback", Where: "stdout", Pattern: "Falling back to CPU", Classify: "MODEL"}}
+				in.Files["stdout"] = strings.NewReader("boom\n")
+				in.Files["stderr"] = strings.NewReader("")
+				return in
+			},
+			want: func(t *testing.T, ev Evidence) {
+				if len(ev.Excerpts) != 1 || ev.Excerpts[0].File != "stdout.log" {
+					t.Errorf("空 stderr 不应产生摘录: %+v", ev.Excerpts)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := Extract(tt.in())
+			tt.want(t, ev)
+			// 兜底摘录也必须过契约校验(含 v2 excerpts 字段)
+			raw, err := json.Marshal(ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc any
+			if err := json.Unmarshal(raw, &doc); err != nil {
+				t.Fatal(err)
+			}
+			if err := compiledSchema.Validate(doc); err != nil {
+				t.Errorf("schema 校验失败: %v", err)
+			}
+		})
+	}
+}
+
 func TestExtractJunit(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -332,7 +412,7 @@ func TestExtractContextBudget(t *testing.T) {
 // TestEvidenceSchemaValidation 构造完整 Evidence,序列化后必须过契约校验。
 func TestEvidenceSchemaValidation(t *testing.T) {
 	full := Evidence{
-		EvidenceVersion: 1, TaskID: "task-1", Variant: "v", Status: "FAILED",
+		EvidenceVersion: 2, TaskID: "task-1", Variant: "v", Status: "FAILED",
 		ExitCode: 1, DurationSec: 12.5,
 		Cases:                 Cases{Total: 10, Passed: 8, Failed: 1, Skipped: 1},
 		SignaturesHitReported: []string{"native_crash"},

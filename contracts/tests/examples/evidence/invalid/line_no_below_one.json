@@ -1,5 +1,5 @@
 {
-  "evidence_version": 1,
+  "evidence_version": 2,
   "task_id": "wf-1:t1:a1",
   "variant": "aarch64_Android_SNPE_2.21",
   "status": "COMPLETED",

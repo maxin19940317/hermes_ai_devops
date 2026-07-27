@@ -167,7 +167,7 @@ func TestExtractEvidencePersistsSnapshot(t *testing.T) {
 		t.Fatalf("snapshot = %+v err=%v", snap, err)
 	}
 	if snap.ObjectKey != "evidence/w:t:a2/evidence.json" || snap.SHA256 != resp.Digest ||
-		snap.ExtractorVersion != "1" || snap.Attempt != 2 || snap.TaskID != "w:t:a2" {
+		snap.ExtractorVersion != "2" || snap.Attempt != 2 || snap.TaskID != "w:t:a2" {
 		t.Errorf("snapshot = %+v", snap)
 	}
 }

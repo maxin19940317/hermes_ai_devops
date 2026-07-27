@@ -25,6 +25,10 @@ const (
 	maxJunitFailures      = 20          // junit 失败最多 20 条
 	maxJunitMessageBytes  = 2 << 10     // junit message 截断 2KB
 	contextBudgetBytes    = 96 << 10    // 签名上下文总量预算,逼近 100KB 整体目标即截断
+	// 兜底摘录(全部签名未命中时):单文件上限与 logcat 错误行上限,
+	// 总量同样受 contextBudgetBytes 约束——有界,不是全量灌入。
+	excerptFileBytes      = 16 << 10
+	excerptLogcatMaxLines = 50
 )
 
 // Signature 是一条失败签名声明(来自 variants.yaml 合并结果)。
@@ -53,6 +57,13 @@ type Input struct {
 
 // ---- 输出结构(与 contracts/evidence.schema.json 一一对应)----
 
+type Excerpt struct {
+	File      string `json:"file"` // stdout.log / stderr.log / logcat.txt
+	Kind      string `json:"kind"` // tail | error_lines
+	Content   string `json:"content"`
+	Truncated bool   `json:"truncated,omitempty"`
+}
+
 type Evidence struct {
 	EvidenceVersion       int                `json:"evidence_version"`
 	TaskID                string             `json:"task_id"`
@@ -66,7 +77,10 @@ type Evidence struct {
 	JunitFailures         []JunitFailure     `json:"junit_failures"`
 	Metrics               map[string]float64 `json:"metrics,omitempty"`
 	Inputs                Inputs             `json:"inputs"`
-	Truncated             bool               `json:"truncated,omitempty"`
+	// Excerpts 兜底摘录:全部签名未命中时给出有界原文(stdout/stderr 尾部 +
+	// logcat 错误行);否则 Analyzer 只见文件元数据,只能回答"证据不足"(v2 新增)。
+	Excerpts  []Excerpt `json:"excerpts,omitempty"`
+	Truncated bool      `json:"truncated,omitempty"`
 }
 
 type Cases struct {
@@ -172,7 +186,7 @@ func readWindow(r io.Reader) (*fileWindow, error) {
 // Extract 执行确定性证据提取。任何缺失/异常都降级进输出,不返回 error。
 func Extract(in Input) Evidence {
 	ev := Evidence{
-		EvidenceVersion:       1,
+		EvidenceVersion:       2,
 		TaskID:                in.TaskID,
 		Variant:               in.Variant,
 		Status:                in.Status,
@@ -209,6 +223,7 @@ func Extract(in Input) Evidence {
 
 	// ---- 签名匹配(按声明序)----
 	used := 0 // 已用上下文预算
+	totalMatched := 0
 	budgetOut := false
 	for _, sig := range in.Signatures {
 		res := SignatureResult{
@@ -276,12 +291,22 @@ func Extract(in Input) Evidence {
 			res.Matches[len(res.Matches)-1].Truncated = true
 		}
 		res.Matched = len(res.Matches) > 0
+		if res.Matched {
+			totalMatched++
+		}
 		ev.Signatures = append(ev.Signatures, res)
 	}
 
 	// ---- junit 失败解析(非 XML 等解析失败降级为空,不报错)----
 	if r, ok := in.Files["junit"]; ok && r != nil {
 		ev.JunitFailures = parseJunit(r)
+	}
+
+	// ---- 兜底摘录(契约 v2):全部签名未命中时提供有界原文——
+	// 否则 evidence 只有文件元数据,Analyzer 只能回答"证据不足"
+	// (实证:2026-07-27 p56 SNPE_1.68 seg 模型错误全漏签名,Hermes 无法分析)。
+	if totalMatched == 0 {
+		ev.Excerpts = buildExcerpts(load)
 	}
 
 	// ---- inputs.attachments / truncated_files(固定顺序,确定性输出)----
@@ -306,6 +331,98 @@ func Extract(in Input) Evidence {
 		}
 	}
 	return ev
+}
+
+// logcatErrLine 匹配 logcat 的错误/致命行(级别列 E/F)。
+var logcatErrLine = regexp.MustCompile(` [EF] `)
+
+// buildExcerpts 构造兜底摘录:stdout/stderr 尾部 + logcat 错误行,
+// 共享 contextBudgetBytes 总预算(此时签名上下文为零,预算全部可用)。
+// load 与签名扫描同一读取缓存,已读文件不重复读。
+func buildExcerpts(load func(string) (*fileWindow, error)) []Excerpt {
+	out := make([]Excerpt, 0, 3)
+	budget := contextBudgetBytes
+	tail := func(key, name string) {
+		if budget <= 0 {
+			return
+		}
+		w, err := load(key)
+		if err != nil || w == nil || len(w.lines) == 0 {
+			return
+		}
+		limit := excerptFileBytes
+		if budget < limit {
+			limit = budget
+		}
+		content, truncated := tailLines(w.lines, limit)
+		if content == "" {
+			return
+		}
+		out = append(out, Excerpt{File: name, Kind: "tail", Content: content, Truncated: truncated})
+		budget -= len(content)
+	}
+	tail("stdout", "stdout.log")
+	tail("stderr", "stderr.log")
+
+	if budget > 0 {
+		if w, err := load("logcat"); err == nil && w != nil {
+			var lines []string
+			for _, ln := range w.lines {
+				if logcatErrLine.MatchString(ln) {
+					lines = append(lines, ln)
+					if len(lines) >= excerptLogcatMaxLines {
+						break
+					}
+				}
+			}
+			if len(lines) > 0 {
+				limit := excerptFileBytes
+				if budget < limit {
+					limit = budget
+				}
+				content, truncated := headLines(lines, limit)
+				out = append(out, Excerpt{File: "logcat.txt", Kind: "error_lines",
+					Content: content, Truncated: truncated || len(lines) >= excerptLogcatMaxLines})
+			}
+		}
+	}
+	return out
+}
+
+// tailLines 取行切片尾部,不超过 budget 字节;截断时丢弃开头半行。
+func tailLines(lines []string, budget int) (string, bool) {
+	total := 0
+	lo := len(lines)
+	for i := len(lines) - 1; i >= 0; i-- {
+		n := len(lines[i]) + 1
+		if total+n > budget {
+			break
+		}
+		total += n
+		lo = i
+	}
+	if lo == len(lines) {
+		return "", false
+	}
+	return strings.Join(lines[lo:], "\n"), lo > 0
+}
+
+// headLines 取行切片头部,不超过 budget 字节。
+func headLines(lines []string, budget int) (string, bool) {
+	total := 0
+	hi := 0
+	for i, ln := range lines {
+		n := len(ln) + 1
+		if total+n > budget {
+			break
+		}
+		total += n
+		hi = i + 1
+	}
+	if hi == 0 {
+		return "", false
+	}
+	return strings.Join(lines[:hi], "\n"), hi < len(lines)
 }
 
 // parseJunit 流式解析 junit.xml:收集 testcase 下的 failure 与 error,
