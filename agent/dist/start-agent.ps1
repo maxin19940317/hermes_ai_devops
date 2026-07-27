@@ -3,6 +3,12 @@
 #   powershell -ExecutionPolicy Bypass -File .\start-agent.ps1
 # First time: edit the two variables below (LAN IP of THIS machine, adb path).
 
+# 控制台切 UTF-8:agent 输出为 UTF-8,中文版 Windows 默认 GBK 解码会显示乱码。
+# [Console]::OutputEncoding 同时决定 PowerShell 解码原生 stdout 与 Tee 落盘的编码。
+chcp 65001 > $null
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 # ===== edit these two =====
 $AGENT_BASE_IP = "10.88.118.51"   # LAN IP of this Windows machine (ipconfig)
 $ADB           = "D:\platform-tools_r33.0.2-windows\platform-tools\adb.exe"
