@@ -120,6 +120,7 @@ services:
       CALLBACK_BASE_URL: ${CALLBACK_BASE_URL:-http://127.0.0.1:18091}
       ARTIFACT_AUTH_TYPE: ${ARTIFACT_AUTH_TYPE:-bearer}
       ARTIFACT_AUTH_TOKEN: ${ARTIFACT_AUTH_TOKEN:-}
+      ARTIFACT_AUTH_USERNAME: ${ARTIFACT_AUTH_USERNAME:-}
       FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
       # §3.7 预签名直传;worker 不 depends_on minio——MinIO 缺失时优雅降级为空
       # presigned_uploads。签名覆盖 Host,故预签名 client 用 PUBLIC endpoint 构造。
