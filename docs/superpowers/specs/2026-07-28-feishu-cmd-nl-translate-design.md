@@ -1,0 +1,375 @@
+# 飞书指令层自然语言翻译设计（路线 A）
+
+日期：2026-07-28
+
+状态：待批准
+
+## 1. 背景与决策
+
+`runtime/internal/feishucmd` 已实现封闭枚举指令层：长连接 listener 收单聊消息 →
+白名单 open_id 鉴权 → `Parse` 解析 `status | devices | rerun | unquarantine` →
+`Executor.execute` 执行 → 文本回复。不在这四个指令里的输入一律回 usage。
+
+本设计在 `Parse` 与 `execute` 之间插入一层**意图翻译器**：自然语言经 Hermes 翻译成
+一行合法指令文本，重走既有解析与校验，执行路径一个字节不变。目标是覆盖"懒得背指令
+格式"这个场景（"帮我重跑一下昨天 SNPE 1.68 那个失败的"），**不是**让 Hermes 回答开放
+问题（"为什么挂""这块板最近成功率"）——那属于语义层，需要只读工具白名单与多轮对话，
+单独设计。
+
+关键决策（已与负责人确认，2026-07-28）：
+
+1. **翻译只在 `help` 分支触发**。能被现有语法解析的输入原样走老路，解析不了才问
+   Hermes。省 token，且对既有指令零回归风险——LLM 不在任何一条已能工作的指令的路径上。
+2. **翻译输出是一行指令文本，重走 `Parse`**。LLM 返回 `{command, args}`，Runtime 渲染成
+   `rerun 9da3b9d9 56 aarch64_Android_SNPE_1.68`，原样喂回 `Parse()`。翻译层的值域因此
+   等于用户手打的值域，封闭性是结构上的保证，不依赖 prompt 措辞。
+3. **副作用指令二次确认，只读指令直接执行**。`rerun` / `unquarantine` 翻译成功后先回执
+   待确认，用户回 `y` 才执行；`status` / `devices` 直接执行。LLM 把 `pipeline_iid` 猜错的
+   代价是白跑一轮设备测试。
+4. **待确认态存内存**（`Executor` 内 `map[open_id]pending` + TTL 120s，单槽覆盖）。worker
+   重启丢失待确认项，代价只是用户重说一遍，绝不会误执行一个跨重启的陈旧 `rerun`。
+5. **翻译请求附带 Runtime 组装的只读上下文快照**。"昨天那个失败的"必须有数据才能解析。
+   快照由 Runtime 查库定形后随请求下发，Hermes 不直连数据库（§14 红线不放宽）。
+6. **翻译不走 Temporal activity**，在 `HandleMessage` 内同步调用（带 context 超时）。
+   §3 规则 5"Hermes 不在执行关键路径"约束的是派单/执行/回收；翻译挂了只是用户收到
+   "没理解"，在跑的任务不受影响。
+7. **审计单开 `command_translations` 表**。`decisions.task_id` 是
+   `NOT NULL REFERENCES tasks(task_id)`（`schema.sql:103`），而翻译发生在任何 task 存在
+   之前，没有 task_id 可填。
+
+不采用的方案：
+
+- 所有消息都过翻译层：一致，但把 LLM 放进每一条指令的路径上，既费 token 又给已工作的
+  指令引入新的失败模式。
+- 翻译输出直接构造 `Command` 结构体交给 `execute`：省一次解析，但 `Command.Args` 是
+  `[]string`，翻译层能造出 `Parse` 永远造不出的组合，封闭性退化为"Schema 约束得够不够严"。
+- 待确认态落库：重启不丢，但引入跨重启的待确认——用户半小时后回 `y`，执行的是一个
+  早已忘记上下文的 `rerun`。
+- 只回建议指令让用户自己复制重发：零状态零风险，但每次都要用户多操作一步，便利性
+  被吃掉大半。
+
+## 2. 范围
+
+交付：
+
+- `contracts/command.schema.json`（v1）+ 正反例测试
+- `hermesclient.Translate` + `prompts/cmd_translate_v1.md` + 内嵌 Schema 校验
+- `feishucmd/translate.go`：快照组装、渲染、回灌 `Parse`、参数复校、置信度门限
+- `feishucmd/executor.go`：`help` 分支旁路 + 待确认态
+- `store`：`RecentRuns` / `SaveCommandTranslation` 双实现 + `command_translations` 表
+  + 迁移文件
+- 配置项 `FEISHU_CMD_NL`（缺省 false）与 `deploy/.env.example`、`deploy/README.md` 更新
+
+不交付（明确排除）：
+
+- 开放问答、多轮对话、Hermes 只读工具白名单（属语义层，另行设计）
+- 新增任何指令（指令面严格保持四个 + help）
+- 飞书交互卡片按钮确认（本轮确认用纯文本 `y`；卡片属 Phase 2 通知改造）
+- 翻译结果的自动纠错重试（Schema 不过即失败回退，不做二次追问循环）
+
+## 3. 架构
+
+翻译层是 `feishucmd` 包内的一条旁路，不是新服务。
+
+```text
+飞书单聊消息
+  │
+  ▼
+Listener（不变）──► Executor.HandleMessage
+                      │
+                      ├─ 白名单判定（不变，永远在最前）
+                      │
+                      ├─ 待确认态命中？（y/n）──► 执行或放弃 ──► 回复
+                      │
+                      ├─ Parse(text)
+                      │    ├─ 命中四指令 ──────────────────► execute（完全不变）
+                      │    └─ help ──► Translator.Translate
+                      │                   │
+                      │                   ├─ 组装上下文快照（store.RecentRuns + specCfg + FleetOverview）
+                      │                   ├─ hermesclient.Translate（HTTP + command.schema.json 校验）
+                      │                   ├─ 渲染 "cmd arg1 arg2 ..." 
+                      │                   ├─ 回灌 Parse → 必须命中四指令，否则拒绝
+                      │                   ├─ 参数复校（validateSHA / iid / 变体存在性 / 设备存在性）
+                      │                   └─ 置信度门限
+                      │                        ├─ 只读指令 ──► execute ──► 回复（附"已按 X 执行"）
+                      │                        ├─ 副作用指令 ──► 存待确认 ──► 回执确认提示
+                      │                        └─ 任一环节失败 ──► usage + 翻译结果供人工判断
+                      │
+                      └─ 每条翻译落 command_translations
+```
+
+### 3.1 组件与职责
+
+| 组件 | 文件 | 职责 |
+|---|---|---|
+| `Translator` | `feishucmd/translate.go`（新） | 快照组装、调用、渲染、回灌解析、复校、门限。不碰 `execute`，不碰飞书 SDK |
+| `hermesclient.Translate` | `hermesclient/http.go`（扩展） | HTTP 调用 + `command.schema.json` 校验。与 `Analyze` 对称 |
+| `Executor` 旁路 | `feishucmd/executor.go`（改） | `help` 分支接入、待确认态存取 |
+| `store.RecentRuns` | `store/fleet.go` + `postgres_fleet.go`（扩展） | 快照的历史运行来源 |
+| `store.SaveCommandTranslation` | `store/translations.go`（新） | 审计落库 |
+
+`PromptVersion` 常量拆为 `PromptVersionAnalyze` / `PromptVersionTranslate`；现有
+`PromptVersion` 只在 `http.go:87` 用了一处，改动面极小。
+
+### 3.2 `RecentRuns` 的已知耦合
+
+仓库里**没有 `workflows` 表**（CLAUDE.md §11 列了，`schema.sql` 里不存在）。verdict 只在
+`tasks` 上，而 tasks 与 `(commit, pipeline_iid, variant)` 的关联只经由 `workflow_id`
+字符串（`workflow/types.go:42`：`device-test-{project}-g{sha}-p{iid}[-{scope}][-r{N}]`）。
+
+因此 `RecentRuns(ctx, limit)` 的实现是：取最近 `limit` 条 `artifacts`，按上述前缀
+`LIKE` 回查 `tasks` 取最新一条的 verdict/ended_at。这是对 `WorkflowID()` 格式的隐式
+依赖，必须有一个单测把前缀构造函数与 `WorkflowID()` 钉在一起——格式一改测试就红。
+
+本设计不新建 `workflows` 表：那是 §11 的独立欠账，牵动 trigger/workflow 多处写入，
+不应搭车进这一轮。
+
+## 4. 契约
+
+### 4.1 `contracts/command.schema.json`（LLM 输出，v1）
+
+```json
+{
+  "translation_version": 1,
+  "command": "rerun",
+  "args": ["9da3b9d9", "56", "aarch64_Android_SNPE_1.68"],
+  "confidence": 0.92,
+  "reason": "指代最近一次 SNPE 1.68 的失败运行"
+}
+```
+
+约束：
+
+- `additionalProperties: false`；`translation_version`、`command`、`confidence` 必填
+- `command`：闭枚举 `status | devices | rerun | unquarantine | none`
+  （`none` = 信息不足或根本不是指令）
+- `args`：`maxItems: 3`，item pattern **`^[A-Za-z0-9._-]{1,64}$`**
+- `confidence`：`number`，`0 ≤ x ≤ 1`
+- `reason`：`string`，`maxLength: 200`，回执时展示给用户
+
+`args` 的 pattern 是全设计最吃重的一条：**禁掉全部空白字符**，使"渲染成文本再
+`strings.Fields` 切回来"成为可逆操作。LLM 无法用含空格的 arg 把一行伪造成两个 token，
+也无法用换行伪造多条指令。方案 1 的封闭性由这条 pattern 承担。
+
+### 4.2 上下文快照（Runtime → 平台）
+
+```json
+{
+  "now": "2026-07-28T09:12:00Z",
+  "variants": ["aarch64_Android_SNPE_1.68", "aarch64_Android_SNPE_2.21"],
+  "recent_runs": [
+    { "commit": "9da3b9d9", "pipeline_iid": 56,
+      "variant": "aarch64_Android_SNPE_1.68",
+      "verdict": "TEST_FAILED", "ended_at": "2026-07-27T14:03:00Z" }
+  ],
+  "devices": [
+    { "device_id": "dev-1", "serial": "513cd3de", "status": "QUARANTINED" }
+  ]
+}
+```
+
+- `now` 必须显式给：LLM 不知道今天几号，"昨天""最近一次"全靠它锚定
+- `recent_runs` 上限 10 条（`RecentRuns(ctx, 10)`）
+- `variants` 取 `specCfg`（与 `ExpectedVariants` 同源）
+- `devices` 取 `FleetOverview`，只含 `device_id`/`serial`/`status`
+- 快照只含调度元数据，**不含日志、不含 evidence、不含 result.json**
+- 整体量级几 KB；`context_digest` = 快照 JSON 的 sha256，落审计
+
+### 4.3 `command_translations` 表
+
+```sql
+CREATE TABLE IF NOT EXISTS command_translations (
+    translation_id BIGSERIAL PRIMARY KEY,
+    open_id        TEXT        NOT NULL,
+    raw_text       TEXT        NOT NULL,              -- 用户原话
+    prompt_version TEXT        NOT NULL DEFAULT '',
+    model          TEXT        NOT NULL DEFAULT '',
+    context_digest TEXT        NOT NULL DEFAULT '',   -- 快照 sha256,可回放"当时看到了什么"
+    output         JSONB       NOT NULL DEFAULT '{}', -- LLM 原始输出(校验失败也存)
+    rendered       TEXT        NOT NULL DEFAULT '',   -- 渲染出的那行指令
+    outcome        TEXT        NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS command_translations_open_id_idx
+    ON command_translations(open_id, created_at DESC);
+```
+
+`outcome` 取值：
+
+| 值 | 含义 |
+|---|---|
+| `executed` | 只读指令，翻译后直接执行 |
+| `pending_confirm` | 副作用指令，已回执待确认 |
+| `confirmed` | 用户回 `y`，已执行 |
+| `declined` | 用户回 `n`/其他，放弃 |
+| `expired` | TTL 到期或被新翻译覆盖 |
+| `rejected_schema` | 平台返回不符合 `command.schema.json` |
+| `rejected_none` | 平台明确返回 `command = none`（信息不足或不是指令） |
+| `rejected_args` | 渲染后回灌 `Parse` 或参数复校未通过 |
+| `rejected_low_confidence` | `confidence < 0.75` |
+| `translator_error` | 平台不可达/超时/非 2xx |
+
+确认流程**只追加不更新**：待确认时写一行 `pending_confirm`，用户回 `y` 时再写一行
+`confirmed`（`raw_text='y'`，`rendered` 为同一行指令）。只需一个 insert 方法，同 open_id
+按时序读即完整证据链。`context_digest` 存摘要而非快照全文，与 `persistEvidenceSnapshot`
+的思路一致，表不会被撑爆。
+
+DDL 同时进 `runtime/internal/store/schema.sql` 与
+`deploy/postgres/migrations/2026-07-28-command-translations.sql`（仓库现有惯例）。
+
+## 5. 数据流
+
+### 5.1 只读指令（无确认）
+
+```text
+用户: "看下设备都什么状态"
+  → Parse → help → Translator
+  → 快照 {now, variants, recent_runs, devices}
+  → LLM: {"command":"devices","args":[],"confidence":0.95,"reason":"询问设备状态"}
+  → 渲染 "devices" → Parse → Command{devices} ✓
+  → 落审计 outcome=executed
+  → execute(devices)
+  → 回复: "(已理解为: devices)\n513cd3de  soc=QCM6125 status=IDLE fail_streak=0"
+```
+
+回复带上"已理解为 X"这行，用户下次可以直接打 X，翻译层因此是自我消解的——用得越久，
+用户越不需要它。
+
+### 5.2 副作用指令（两段式）
+
+```text
+用户: "帮我重跑一下昨天 SNPE 1.68 那个失败的"
+  → Parse → help → Translator
+  → LLM: {"command":"rerun","args":["9da3b9d9","56","aarch64_Android_SNPE_1.68"],
+          "confidence":0.9,"reason":"指代最近一次 SNPE 1.68 的失败运行"}
+  → 渲染 → Parse ✓ → validateSHA ✓ → iid 正整数 ✓ → 变体在 variants 内 ✓
+  → 落审计 outcome=pending_confirm；pending[open_id] = {cmd, 到期时间 now+120s}
+  → 回复: "将执行: rerun 9da3b9d9 56 aarch64_Android_SNPE_1.68
+           (依据: 指代最近一次 SNPE 1.68 的失败运行)
+           回复 y 确认,n 取消,120 秒后自动失效"
+
+用户: "y"
+  → 待确认命中且未过期 → 落审计 outcome=confirmed → execute(rerun ...) → 回复执行结果
+```
+
+待确认态语义：
+
+- 单槽：同一 open_id 的新翻译覆盖旧待确认，被覆盖的落一行 `expired`
+- TTL 120s：过期后回 `y` 视同未理解，回 usage，并落 `expired`
+- `y` 判定：`strings.TrimSpace` 后小写等于 `y` 或 `yes`；其余任何输入都不是确认
+  （包括 `n`——落 `declined` 并清槽），确认词绝不做模糊匹配
+- 待确认态检查在 `Parse` **之前**：这样用户打 `y` 不会被当成未知指令
+
+### 5.3 参数复校（渲染之后、执行之前）
+
+回灌 `Parse` 只保证了"形状是合法指令"，参数正确性仍要复校，全部复用既有函数：
+
+| 检查 | 依据 | 失败回复 |
+|---|---|---|
+| 回灌 `Parse` 命中四指令 | `Parse` | 拒绝，落 `rejected_args` |
+| `rerun` sha 形态 | `validateSHA`（`command.go:55`） | 拒绝，落 `rejected_args` |
+| `rerun` iid 正整数 | `strconv.Atoi` + `> 0` | 同上 |
+| `rerun` 变体存在 | 快照 `variants` 成员判定 | 同上 |
+| `unquarantine` device_id 存在 | 快照 `devices` 成员判定 | 同上 |
+| `confidence ≥ 0.75` | 门限常量 | 落 `rejected_low_confidence` |
+
+注意"变体存在性"在翻译层是**对快照的成员判定**（快照即真相来源），而 `execute` 内部
+仍会独立做 artifacts 表查询——两层校验都保留，不因翻译层查过就跳过。
+
+## 6. 错误处理
+
+原则：**翻译层的任何失败都退化为今天的行为**（回 usage），绝不放大能力、绝不阻塞。
+
+| 情形 | 行为 |
+|---|---|
+| `HERMES_ENDPOINT` 为空 / `FEISHU_CMD_NL=false` | 翻译层不启用，`help` 分支直接回 usage（今天的行为） |
+| 平台超时/不可达/非 2xx | 落 `translator_error`，回 "翻译服务暂时不可用" + usage |
+| 响应不符合 Schema | 落 `rejected_schema`，回 "没理解" + usage |
+| `command = none` | 落 `rejected_none`，回 "没理解" + usage，附 `reason` |
+| 渲染后回灌 `Parse` 未命中 | 落 `rejected_args`，回 "没理解" + usage |
+| 参数复校失败 | 落 `rejected_args`，回 "你是想说 `<渲染的指令行>` 吗?该指令参数不合法: <原因>" |
+| `confidence < 0.75` | 落 `rejected_low_confidence`，回 "不太确定,你是想说 `<指令行>` 吗?确认请直接发这行" |
+| 审计落库失败 | 记 error 日志，**不阻断**执行（与 `persistEvidenceSnapshot` 的降级一致） |
+| 快照组装失败（查库出错） | 记日志，用降级快照继续（仅含 `now`，其余为空数组；LLM 大概率返回 `none`，安全降级） |
+
+非白名单 open_id 的处理**完全不变**：在翻译之前静默忽略，翻译层永远看不到非白名单
+消息，token 消耗不受外部消息影响。
+
+超时：翻译请求 `context.WithTimeout` 15s（比 `Analyze` 的 60s 短——人在等回复）。
+`HERMES_TIMEOUT_SEC` 是分析用的，翻译单独用常量 `translateTimeout = 15 * time.Second`。
+
+## 7. 配置
+
+| 变量 | 缺省 | 说明 |
+|---|---|---|
+| `FEISHU_CMD_NL` | `false` | 翻译层总开关。灰度用：先让四指令跑稳，再打开 |
+| `HERMES_ENDPOINT` | 空 | 复用分析用的同一平台端点；为空则翻译层不启用 |
+| `HERMES_AUTH_TOKEN` | 空 | 复用 |
+| `HERMES_MODEL` | 空 | 复用 |
+
+启用条件是三者的合取：`FEISHU_CMD_NL=true` 且 `HERMES_ENDPOINT` 非空 且指令 listener
+本身已启用（`FEISHU_CMD_WHITELIST` 非空）。任一不满足，`help` 分支回今天的 usage，
+并在启动日志打印 `feishu cmd nl=disabled (原因)`——与现有
+`feishu cmd listener=disabled (FEISHU_CMD_WHITELIST empty)` 的日志风格一致。
+
+## 8. 测试
+
+### 8.1 契约测试（`contracts/tests/`）
+
+按仓库现有 `examples/{valid,invalid}` 惯例，为 `command.schema.json` 建正反例：
+
+- valid：四个指令各一例、`none` 一例、`args` 为空数组、`confidence` 边界 0 与 1
+- invalid：未知 `command`、`args` 含空格（**关键用例**）、`args` 含换行、`args` 超 3 项、
+  `args` item 超 64 字符、`confidence` 越界、多余字段、缺 `translation_version`
+
+### 8.2 `feishucmd` 单测（fake Translator，不打网络）
+
+- **渲染-解析往返**：对 schema 允许的全部 args 形态，断言
+  `Parse(render(cmd)) == cmd`（这是方案 1 封闭性的核心断言）
+- 只读指令直接执行；副作用指令进待确认不执行（断言 fake Starter 未被调用）
+- `y` / `yes` 确认执行；`n` 放弃；其他输入不算确认
+- TTL 过期后 `y` 不执行
+- 新翻译覆盖旧待确认（旧的落 `expired`）
+- 待确认态检查先于 `Parse`：用户打 `y` 时不落到 usage
+- 逐条错误路径：schema 不过 / `none` / 回灌失败 / sha 非法 / iid 非法 / 变体不存在 /
+  设备不存在 / 低置信度 —— 各断言回复文本与 `outcome` 落库值
+- 非白名单发自然语言：Translator **零调用**（断言 fake 计数为 0）
+- 翻译层禁用时 `help` 分支行为与今天逐字节一致
+
+### 8.3 `hermesclient.Translate` 单测
+
+沿用 `hermesclient_test.go` 的 httptest 模式：2xx + 合法 JSON、2xx + 不合法 JSON、
+非 2xx、超时、响应非 JSON —— 断言错误分类与 `Analyze` 对称。
+
+### 8.4 store 一致性测试
+
+`RecentRuns` / `SaveCommandTranslation` 进 `conformance_test.go`，MemStore 与 PGStore
+双实现跑同一组断言（仓库既有约束）。另加 `RecentRuns` 的前缀构造与
+`WorkflowID()` 的同步断言测试（§3.2）。
+
+### 8.5 手工验收
+
+`FEISHU_CMD_NL=true` 打开后，白名单账号在飞书单聊依次验证：
+
+1. "看下设备状态" → 直接返回 devices 列表，回复含"已理解为: devices"
+2. "帮我重跑昨天 SNPE 1.68 那个失败的" → 回执待确认 → 回 `y` → workflow 启动，
+   ID 含 `-r{N}` 后缀
+3. 同上但回 `n` → 不执行，`command_translations` 有 `pending_confirm` + `declined` 两行
+4. "今天天气怎么样" → 回 usage，落 `rejected_none`
+5. 停掉 Hermes 端点 → 自然语言回"翻译服务暂时不可用" + usage，四个手打指令照常工作
+
+## 9. 验收标准
+
+- 指令面仍是四个 + help，`execute` 无任何行为变更
+- `Parse(render(x)) == x` 对 schema 允许的全部输入成立（有测试）
+- 翻译层禁用或失败时，行为与本轮改动前逐字节一致
+- 每次翻译在 `command_translations` 留痕，含原文、`context_digest`、渲染结果、outcome
+- 副作用指令未经用户确认不会执行（有测试）
+- 非白名单消息不触发任何 LLM 调用（有测试）
+
+## 10. 后续（不在本轮）
+
+- Hermes 语义层：只读工具白名单、多轮对话、开放问答（"为什么挂""这块板成功率"）。
+  本轮沉淀的 prompt 管理、输出 Schema 校验、翻译审计三件积木可直接复用。
+- 飞书交互卡片确认按钮替代文本 `y`（与 Phase 2 卡片改造合并）。
+- `workflows` 表补齐，`RecentRuns` 摆脱对 `WorkflowID()` 字符串格式的依赖。
