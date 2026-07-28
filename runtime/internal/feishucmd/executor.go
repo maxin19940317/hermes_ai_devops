@@ -20,6 +20,10 @@ type Store interface {
 	ListArtifacts(ctx context.Context, commitSHA string, pipelineID int) ([]store.Artifact, error)
 	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
 	NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error)
+	// 以下三个供意图翻译层使用(设计文档 §3.1)
+	RecentRuns(ctx context.Context, limit int) ([]store.RecentRun, error)
+	SaveCommandTranslation(ctx context.Context, row store.CommandTranslation) error
+	ListCommandTranslations(ctx context.Context, openID string, limit int) ([]store.CommandTranslation, error)
 }
 
 // WorkflowStarter 启动 DeviceTestWorkflow(trigger.TemporalStarter 满足)。
