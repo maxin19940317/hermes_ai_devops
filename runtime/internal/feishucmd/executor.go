@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -42,6 +44,33 @@ type Executor struct {
 	// ExpectedVariants 是 bundle 全量变体数(variants.yaml 声明数),
 	// rerun 无 variant 时的包齐整性判据;0 = 不校验齐整性。
 	ExpectedVariants int
+
+	// Translator 非 nil 时启用自然语言翻译旁路(设计文档 §3.1);
+	// nil = 未启用,未知输入回 usage(改动前的行为)。
+	Translator *Translator
+	// Now 可注入,便于测试待确认 TTL;nil 用 time.Now().UTC()。
+	Now func() time.Time
+
+	pendingMu sync.Mutex
+	pending   map[string]pendingCmd
+}
+
+// confirmTTL 是待确认态存活时长(设计文档 §5.2)。过期后回 y 视同未理解。
+const confirmTTL = 120 * time.Second
+
+// pendingCmd 是一条等待用户确认的副作用指令。存内存而非落库:worker 重启丢失
+// 待确认项,代价只是用户重说一遍,绝不会误执行一个跨重启的陈旧 rerun。
+type pendingCmd struct {
+	cmd      Command
+	rendered string
+	expires  time.Time
+}
+
+func (e *Executor) nowFn() time.Time {
+	if e.Now != nil {
+		return e.Now()
+	}
+	return time.Now().UTC()
 }
 
 func (e *Executor) log() zerolog.Logger {
@@ -52,24 +81,167 @@ func (e *Executor) log() zerolog.Logger {
 }
 
 // HandleMessage 处理一条单聊文本消息。安全红线:非白名单 open_id 静默忽略
-// (不回复,防探测),记 info 日志。
+// (不回复,防探测;翻译层永远看不到非白名单消息),记 info 日志。
 func (e *Executor) HandleMessage(ctx context.Context, openID, text string) {
 	log := e.log()
 	if !e.Whitelist[openID] {
 		log.Info().Str("open_id", openID).Msg("feishu cmd from non-whitelist sender, ignored")
 		return
 	}
-	cmd := Parse(text)
+	trimmed := strings.TrimSpace(text)
+	prefix := "" // 待确认被取消时,前置到最终回复里
+
+	// CONTRACT-ISSUE: brief 原文对"default"分支给的字面代码是无条件
+	// `e.audit(..., store.OutcomeDeclined)`。但 takePending 在函数最开始就已经把
+	// 槽位取空(delete),所以当 fallthrough 继续处理的新消息本身又翻译出一个需确认
+	// 指令时(TestNewTranslationSupersedesPending 这种"再放一次"场景),
+	// putPending 里"覆盖旧项落 expired"的分支永远看不到旧项(已经被删了)——
+	// 单槽覆盖(§5.2 规则 4)在时序上必然落空,只会落 declined,与该测试断言的
+	// "被覆盖应为 expired"矛盾。
+	// 解决:把 default 分支的旧项处理推迟到知道下一步结果之后 ——
+	// 如果新消息立刻翻译出另一个需确认指令,旧项算被"取代"(expired,规则 4);
+	// 否则旧项算被"放弃"(declined,规则 3)。用 superseded 承载这个延迟决策,
+	// putPending 里的"覆盖落 expired"逻辑保留作为并发场景的兜底
+	// (两个 goroutine 同时处理同一 openID 消息时的防御,非本次改动重点)。
+	var superseded *pendingCmd
+
+	// 待确认态检查必须在 Parse 之前:否则用户打的 y 会被当成未知指令(设计文档 §5.2)
+	if pend, ok := e.takePending(openID); ok {
+		switch strings.ToLower(trimmed) {
+		case "y", "yes":
+			e.audit(ctx, openID, trimmed, pend.rendered, store.OutcomeConfirmed)
+			reply, err := e.execute(ctx, pend.cmd)
+			if err != nil {
+				log.Error().Err(err).Str("cmd", pend.cmd.Name).Msg("feishu cmd failed")
+				reply = fmt.Sprintf("指令执行失败: %v", err)
+			}
+			e.reply(ctx, reply)
+			return
+		case "n", "no":
+			// 与 y/yes 对称:确认问句给两个答案,不是一个答案加一堆非答案。
+			// 顺带省掉一次必然落 rejected_none 的 LLM 调用。
+			e.audit(ctx, openID, trimmed, pend.rendered, store.OutcomeDeclined)
+			e.reply(ctx, "已取消: "+pend.rendered)
+			return
+		default:
+			superseded = &pend
+			prefix = "已取消上一条待确认(" + pend.rendered + ")\n"
+		}
+	}
+
+	cmd := Parse(trimmed)
+	if cmd.Name == "help" && e.Translator != nil {
+		e.reply(ctx, prefix+e.handleTranslated(ctx, openID, trimmed, superseded))
+		return
+	}
+	// 新消息本身就是已知指令,不会再产生新的待确认:旧项(若有)算放弃。
+	e.disposeSuperseded(ctx, openID, trimmed, superseded)
 	reply, err := e.execute(ctx, cmd)
 	if err != nil {
 		log.Error().Err(err).Str("cmd", cmd.Name).Msg("feishu cmd failed")
 		reply = fmt.Sprintf("指令执行失败: %v", err)
 	}
 	log.Info().Str("open_id", openID).Str("cmd", cmd.Name).Msg("feishu cmd executed")
-	if e.Sender != nil {
-		if err := e.Sender.SendText(ctx, reply); err != nil {
-			log.Error().Err(err).Msg("feishu cmd reply failed")
+	e.reply(ctx, prefix+reply)
+}
+
+// disposeSuperseded 落 superseded(fallthrough 取代的旧待确认,可能为 nil)的
+// declined 审计——用于确认新消息最终没有产生替代它的新待确认的各条路径。
+func (e *Executor) disposeSuperseded(ctx context.Context, openID, rawText string, superseded *pendingCmd) {
+	if superseded == nil {
+		return
+	}
+	e.audit(ctx, openID, rawText, superseded.rendered, store.OutcomeDeclined)
+}
+
+// handleTranslated 走翻译旁路并返回回复文本(不含 prefix)。superseded 非 nil
+// 时表示本次消息取代了一个尚未确认的旧指令(见 HandleMessage 的 CONTRACT-ISSUE
+// 注释):若本次翻译又产生一个需确认指令,旧项按"被取代"落 expired;否则按
+// "被放弃"落 declined。
+func (e *Executor) handleTranslated(ctx context.Context, openID, text string, superseded *pendingCmd) string {
+	log := e.log()
+	res := e.Translator.Translate(ctx, openID, text)
+	log.Info().Str("open_id", openID).Str("outcome", res.Outcome).
+		Str("rendered", res.Rendered).Msg("feishu cmd translated")
+	if res.OK && res.NeedsConfirm {
+		e.putPending(ctx, openID, pendingCmd{
+			cmd: res.Cmd, rendered: res.Rendered,
+			expires: e.nowFn().Add(confirmTTL),
+		})
+		if superseded != nil {
+			e.audit(ctx, openID, text, superseded.rendered, store.OutcomeExpired)
 		}
+		msg := fmt.Sprintf("将执行: %s", res.Rendered)
+		if res.Reason != "" {
+			msg += "\n(依据: " + res.Reason + ")"
+		}
+		return msg + fmt.Sprintf("\n回复 y 确认,n 取消,%d 秒后自动失效", int(confirmTTL.Seconds()))
+	}
+	e.disposeSuperseded(ctx, openID, text, superseded)
+	if !res.OK {
+		return res.Reply
+	}
+	reply, err := e.execute(ctx, res.Cmd)
+	if err != nil {
+		log.Error().Err(err).Str("cmd", res.Cmd.Name).Msg("feishu cmd failed")
+		return fmt.Sprintf("指令执行失败: %v", err)
+	}
+	// 带上"已理解为 X":用户下次可以直接打 X,翻译层因此是自我消解的
+	return fmt.Sprintf("(已理解为: %s)\n%s", res.Rendered, reply)
+}
+
+// takePending 取出并清空某用户的待确认项;不存在或已过期返回 (_, false)。
+// 过期项不单独落审计行:它已经在 putPending 时落过 pending_confirm,
+// TTL 到期本身不是一次新的用户动作,没有额外事实需要记录。
+func (e *Executor) takePending(openID string) (pendingCmd, bool) {
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	pend, ok := e.pending[openID]
+	if !ok {
+		return pendingCmd{}, false
+	}
+	delete(e.pending, openID)
+	if e.nowFn().After(pend.expires) {
+		return pendingCmd{}, false
+	}
+	return pend, true
+}
+
+// putPending 放入待确认项(单槽:覆盖旧项)。这里的"had"覆盖审计是并发场景的
+// 兜底(两个 goroutine 同时处理同一 openID 的消息、都在 takePending 时读到空槽);
+// 顺序场景下的"取代"审计已经由 HandleMessage/handleTranslated 的 superseded
+// 机制在语义上更准确地处理(见 HandleMessage 里的 CONTRACT-ISSUE 注释)。
+func (e *Executor) putPending(ctx context.Context, openID string, pend pendingCmd) {
+	e.pendingMu.Lock()
+	if e.pending == nil {
+		e.pending = map[string]pendingCmd{}
+	}
+	old, had := e.pending[openID]
+	e.pending[openID] = pend
+	e.pendingMu.Unlock()
+	if had {
+		e.audit(ctx, openID, "", old.rendered, store.OutcomeExpired)
+	}
+}
+
+// audit 追加一行翻译审计(确认/取消/过期这些非翻译事件也留痕,设计文档 §4.3)。
+func (e *Executor) audit(ctx context.Context, openID, rawText, rendered, outcome string) {
+	if e.Store == nil {
+		return
+	}
+	_ = e.Store.SaveCommandTranslation(ctx, store.CommandTranslation{
+		OpenID: openID, RawText: rawText, Rendered: rendered, Outcome: outcome,
+	})
+}
+
+// reply 发送回复;Sender 为 nil 时只执行不回复(测试)。
+func (e *Executor) reply(ctx context.Context, text string) {
+	if e.Sender == nil {
+		return
+	}
+	if err := e.Sender.SendText(ctx, text); err != nil {
+		log := e.log()
+		log.Error().Err(err).Msg("feishu cmd reply failed")
 	}
 }
 
