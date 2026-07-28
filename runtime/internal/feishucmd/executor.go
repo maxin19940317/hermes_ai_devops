@@ -91,22 +91,12 @@ func (e *Executor) HandleMessage(ctx context.Context, openID, text string) {
 	trimmed := strings.TrimSpace(text)
 	prefix := "" // 待确认被取消时,前置到最终回复里
 
-	// CONTRACT-ISSUE: brief 原文对"default"分支给的字面代码是无条件
-	// `e.audit(..., store.OutcomeDeclined)`。但 takePending 在函数最开始就已经把
-	// 槽位取空(delete),所以当 fallthrough 继续处理的新消息本身又翻译出一个需确认
-	// 指令时(TestNewTranslationSupersedesPending 这种"再放一次"场景),
-	// putPending 里"覆盖旧项落 expired"的分支永远看不到旧项(已经被删了)——
-	// 单槽覆盖(§5.2 规则 4)在时序上必然落空,只会落 declined,与该测试断言的
-	// "被覆盖应为 expired"矛盾。
-	// 解决:把 default 分支的旧项处理推迟到知道下一步结果之后 ——
-	// 如果新消息立刻翻译出另一个需确认指令,旧项算被"取代"(expired,规则 4);
-	// 否则旧项算被"放弃"(declined,规则 3)。用 superseded 承载这个延迟决策,
-	// putPending 里的"覆盖落 expired"逻辑保留作为并发场景的兜底
-	// (两个 goroutine 同时处理同一 openID 消息时的防御,非本次改动重点)。
+	// superseded 承载"default 分支旧项该判 declined 还是 expired"的延迟决策,
+	// 详见 disposeSuperseded 的 doc comment(CONTRACT-ISSUE)。
 	var superseded *pendingCmd
 
 	// 待确认态检查必须在 Parse 之前:否则用户打的 y 会被当成未知指令(设计文档 §5.2)
-	if pend, ok := e.takePending(openID); ok {
+	if pend, ok, expired := e.takePending(openID); ok {
 		switch strings.ToLower(trimmed) {
 		case "y", "yes":
 			e.audit(ctx, openID, trimmed, pend.rendered, store.OutcomeConfirmed)
@@ -127,6 +117,11 @@ func (e *Executor) HandleMessage(ctx context.Context, openID, text string) {
 			superseded = &pend
 			prefix = "已取消上一条待确认(" + pend.rendered + ")\n"
 		}
+	} else if expired {
+		// 设计文档 §4.3:expired 由 TTL 到期或被新翻译覆盖两个独立触发共同定义,
+		// 覆盖侧走 superseded/putPending 的 expired 审计,这里补上 TTL 到期侧——
+		// 二者都必须留痕,否则 120s 后一个 y 会静默清掉一条待确认而零审计。
+		e.audit(ctx, openID, trimmed, pend.rendered, store.OutcomeExpired)
 	}
 
 	cmd := Parse(trimmed)
@@ -147,6 +142,20 @@ func (e *Executor) HandleMessage(ctx context.Context, openID, text string) {
 
 // disposeSuperseded 落 superseded(fallthrough 取代的旧待确认,可能为 nil)的
 // declined 审计——用于确认新消息最终没有产生替代它的新待确认的各条路径。
+//
+// CONTRACT-ISSUE: brief 原文对 HandleMessage "default" 分支给的字面代码是无条件
+// `e.audit(..., store.OutcomeDeclined)`。但 takePending 在函数最开始就已经把
+// 槽位取空(delete),所以当 fallthrough 继续处理的新消息本身又翻译出一个需确认
+// 指令时(TestNewTranslationSupersedesPending 这种"再放一次"场景),
+// putPending 里"覆盖旧项落 expired"的分支永远看不到旧项(已经被删了)——
+// 单槽覆盖(§5.2 规则 4)在时序上必然落空,只会落 declined,与该测试断言的
+// "被覆盖应为 expired"矛盾。
+// 解决:把 default 分支的旧项处理推迟到知道下一步结果之后 ——
+// 如果新消息立刻翻译出另一个需确认指令,旧项算被"取代"(expired,规则 4,见
+// handleTranslated);否则旧项算被"放弃"(declined,规则 3,此函数)。用
+// superseded 承载这个延迟决策,putPending 里的"覆盖落 expired"逻辑保留作为
+// 并发场景的兜底(两个 goroutine 同时处理同一 openID 消息时的防御,非本次改动
+// 重点)。
 func (e *Executor) disposeSuperseded(ctx context.Context, openID, rawText string, superseded *pendingCmd) {
 	if superseded == nil {
 		return
@@ -155,9 +164,9 @@ func (e *Executor) disposeSuperseded(ctx context.Context, openID, rawText string
 }
 
 // handleTranslated 走翻译旁路并返回回复文本(不含 prefix)。superseded 非 nil
-// 时表示本次消息取代了一个尚未确认的旧指令(见 HandleMessage 的 CONTRACT-ISSUE
-// 注释):若本次翻译又产生一个需确认指令,旧项按"被取代"落 expired;否则按
-// "被放弃"落 declined。
+// 时表示本次消息取代了一个尚未确认的旧指令(见 disposeSuperseded 的
+// CONTRACT-ISSUE 注释):若本次翻译又产生一个需确认指令,旧项按"被取代"落
+// expired;否则按"被放弃"落 declined。
 func (e *Executor) handleTranslated(ctx context.Context, openID, text string, superseded *pendingCmd) string {
 	log := e.log()
 	res := e.Translator.Translate(ctx, openID, text)
@@ -190,21 +199,27 @@ func (e *Executor) handleTranslated(ctx context.Context, openID, text string, su
 	return fmt.Sprintf("(已理解为: %s)\n%s", res.Rendered, reply)
 }
 
-// takePending 取出并清空某用户的待确认项;不存在或已过期返回 (_, false)。
-// 过期项不单独落审计行:它已经在 putPending 时落过 pending_confirm,
-// TTL 到期本身不是一次新的用户动作,没有额外事实需要记录。
-func (e *Executor) takePending(openID string) (pendingCmd, bool) {
+// takePending 取出并清空某用户的待确认项。三种结果:
+//   - ok=true:存在且未过期,pend 可用于 y/n/fallthrough 分支。
+//   - ok=false, expired=true:存在但已过 TTL——调用方需为其落一行 expired 审计
+//     (设计文档 §4.3 的 TTL 触发侧;pend.rendered 仍有效,供审计用)。
+//   - ok=false, expired=false:本来就没有待确认项,无事可做。
+//
+// 注:该待确认项对应的 pending_confirm 行不是这里写的,而是 Translator.Translate
+// 产生需确认指令时写的(Task 6,translate.go);takePending/putPending 只负责
+// 这条项之后的确认/取消/过期/覆盖这几种终态审计。
+func (e *Executor) takePending(openID string) (pend pendingCmd, ok bool, expired bool) {
 	e.pendingMu.Lock()
 	defer e.pendingMu.Unlock()
-	pend, ok := e.pending[openID]
-	if !ok {
-		return pendingCmd{}, false
+	pend, had := e.pending[openID]
+	if !had {
+		return pendingCmd{}, false, false
 	}
 	delete(e.pending, openID)
 	if e.nowFn().After(pend.expires) {
-		return pendingCmd{}, false
+		return pend, false, true
 	}
-	return pend, true
+	return pend, true, false
 }
 
 // putPending 放入待确认项(单槽:覆盖旧项)。这里的"had"覆盖审计是并发场景的

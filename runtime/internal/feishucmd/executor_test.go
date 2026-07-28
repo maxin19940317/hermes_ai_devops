@@ -274,6 +274,18 @@ func lastText(s *fakeSender) string {
 	return s.texts[len(s.texts)-1]
 }
 
+// countOutcome 统计审计行里某 outcome 的条数——只看回复文本会漏掉审计层的
+// bug(比如 outcome 常量被写反,回复文案照样正确),Finding 2 就是这么漏过去的。
+func countOutcome(rows []store.CommandTranslation, outcome string) int {
+	n := 0
+	for _, r := range rows {
+		if r.Outcome == outcome {
+			n++
+		}
+	}
+	return n
+}
+
 func TestHandleMessageTranslatesUnknownInput(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
 		TranslationVersion: 1, Command: "devices", Confidence: 0.95,
@@ -330,6 +342,20 @@ func TestConfirmFlowExecutesOnYes(t *testing.T) {
 	if !strings.Contains(lastText(sender), "已解隔离") {
 		t.Errorf("确认后应执行: %q", lastText(sender))
 	}
+
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2 (pending_confirm + confirmed)", rows)
+	}
+	if n := countOutcome(rows, store.OutcomePendingConfirm); n != 1 {
+		t.Errorf("pending_confirm 行数 = %d, want 1", n)
+	}
+	if n := countOutcome(rows, store.OutcomeConfirmed); n != 1 {
+		t.Errorf("confirmed 行数 = %d, want 1", n)
+	}
 }
 
 func TestConfirmFlowCancelsOnNoWithoutTranslating(t *testing.T) {
@@ -350,6 +376,20 @@ func TestConfirmFlowCancelsOnNoWithoutTranslating(t *testing.T) {
 	if !strings.Contains(lastText(sender), "已取消") {
 		t.Errorf("reply = %q", lastText(sender))
 	}
+
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2 (pending_confirm + declined)", rows)
+	}
+	if n := countOutcome(rows, store.OutcomePendingConfirm); n != 1 {
+		t.Errorf("pending_confirm 行数 = %d, want 1", n)
+	}
+	if n := countOutcome(rows, store.OutcomeDeclined); n != 1 {
+		t.Errorf("declined 行数 = %d, want 1", n)
+	}
 }
 
 func TestConfirmFlowFallsThroughOnOtherInput(t *testing.T) {
@@ -369,6 +409,20 @@ func TestConfirmFlowFallsThroughOnOtherInput(t *testing.T) {
 	if !strings.Contains(lastText(sender), "dev-1") && !strings.Contains(lastText(sender), "serial") {
 		t.Errorf("devices 应被执行: %q", lastText(sender))
 	}
+
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2 (pending_confirm + declined)", rows)
+	}
+	if n := countOutcome(rows, store.OutcomePendingConfirm); n != 1 {
+		t.Errorf("pending_confirm 行数 = %d, want 1", n)
+	}
+	if n := countOutcome(rows, store.OutcomeDeclined); n != 1 {
+		t.Errorf("declined 行数 = %d, want 1", n)
+	}
 }
 
 func TestConfirmExpires(t *testing.T) {
@@ -386,6 +440,18 @@ func TestConfirmExpires(t *testing.T) {
 	e.HandleMessage(context.Background(), "ou_1", "y")
 	if strings.Contains(lastText(sender), "已解隔离") {
 		t.Error("TTL 过期后 y 不得执行")
+	}
+
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if n := countOutcome(rows, store.OutcomeExpired); n != 1 {
+		t.Errorf("TTL 到期应落一行 expired(设计文档 §4.3 的两个独立触发之一,"+
+			"另一个是 TestNewTranslationSupersedesPending 覆盖的被覆盖场景), got %d, rows=%+v", n, rows)
+	}
+	if n := countOutcome(rows, store.OutcomeConfirmed); n != 0 {
+		t.Errorf("TTL 过期后不得落 confirmed, got %d", n)
 	}
 }
 
