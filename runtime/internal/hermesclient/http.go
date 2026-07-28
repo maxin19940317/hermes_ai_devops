@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,10 @@ import (
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
 )
+
+// ErrSchemaInvalid 标记"平台响应不符合契约 Schema"这一类失败,与网络/超时/非 2xx
+// 区分开:前者是 prompt 需要迭代的信号,后者是基础设施问题(审计要能分辨)。
+var ErrSchemaInvalid = errors.New("hermesclient: 响应不符合契约 Schema")
 
 // 缺省请求超时(Config.Timeout <= 0 时生效)。
 const defaultTimeout = 60 * time.Second
@@ -213,7 +218,7 @@ func (c *HTTPClient) Translate(ctx context.Context, req TranslateRequest) (*Tran
 		return nil, fmt.Errorf("hermesclient: 翻译响应不是合法 JSON: %w", err)
 	}
 	if err := commandSchema.Validate(doc); err != nil {
-		return nil, fmt.Errorf("hermesclient: 响应不符合 command.schema.json(视为翻译失败): %w", err)
+		return nil, fmt.Errorf("hermesclient: 响应不符合 command.schema.json(视为翻译失败): %w: %w", ErrSchemaInvalid, err)
 	}
 	var tr Translation
 	if err := json.Unmarshal(raw, &tr); err != nil {

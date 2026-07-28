@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +57,10 @@ func TestRenderParseRoundTrip(t *testing.T) {
 		if got.Name != c.cmd {
 			t.Errorf("render+Parse(%q,%v) name = %q, want %q", c.cmd, c.args, got.Name, c.cmd)
 		}
-		if strings.Join(got.Args, ",") != strings.Join(c.args, ",") {
+		// 逐项比较(而非拼接后比较字符串):否则若 render 误用 "," 拼接参数,
+		// Parse 会把多个参数折叠回一个 token,拼接后的字符串仍可能相等,
+		// 从而掩盖参数身份被破坏的事实。
+		if !slices.Equal(got.Args, c.args) {
 			t.Errorf("render+Parse(%q,%v) args = %v, want %v", c.cmd, c.args, got.Args, c.args)
 		}
 	}
@@ -151,6 +156,37 @@ func TestTranslateClientError(t *testing.T) {
 	}
 	if !strings.Contains(res.Reply, "翻译服务暂时不可用") {
 		t.Errorf("reply = %q", res.Reply)
+	}
+}
+
+// TestTranslateSchemaInvalidError 验证"平台答复不符合 command.schema.json"这一类
+// 失败与普通的网络/超时/非 2xx 错误在审计上是可区分的(rejected_schema vs
+// translator_error):前者是 prompt 需要迭代的信号,不应被 client 错误的处理逻辑吞掉。
+func TestTranslateSchemaInvalidError(t *testing.T) {
+	f := &fakeTranslator{err: fmt.Errorf("hermesclient: 响应不符合 command.schema.json: %w", hermesclient.ErrSchemaInvalid)}
+	res := newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "随便说点什么")
+	if res.OK || res.Outcome != store.OutcomeRejectedSchema {
+		t.Fatalf("res = %+v, want rejected_schema", res)
+	}
+	if !strings.Contains(res.Reply, "没理解这句话") {
+		t.Errorf("schema 失败应回复“没理解”而非“翻译服务暂时不可用”: %q", res.Reply)
+	}
+}
+
+// TestTranslateRejectsUnknownDevice 验证 unquarantine 的 device_id 存在性
+// 按快照 devices 成员判定(设计文档 §5.3),而不只是校验参数个数。
+func TestTranslateRejectsUnknownDevice(t *testing.T) {
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 1, Command: "unquarantine", Args: []string{"dev-ghost"}, Confidence: 0.95,
+	}}
+	st := store.NewMemStore()
+	if err := st.UpsertClientDevices(context.Background(), store.Client{ClientID: "c1"},
+		[]store.Device{{DeviceID: "dev-1", Serial: "s1", ClientID: "c1"}}); err != nil {
+		t.Fatalf("UpsertClientDevices: %v", err)
+	}
+	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "解除隔离 dev-ghost")
+	if res.OK || res.Outcome != store.OutcomeRejectedArgs {
+		t.Fatalf("res = %+v, want 拒绝且 rejected_args", res)
 	}
 }
 

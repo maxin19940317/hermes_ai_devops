@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -133,8 +134,15 @@ func (t *Translator) Translate(ctx context.Context, openID, rawText string) Tran
 		RawText: rawText, Context: snapJSON, Model: t.Model,
 	})
 	if err != nil {
-		audit.Outcome = store.OutcomeTranslatorError
 		audit.Output = []byte(fmt.Sprintf(`{"error":%q}`, err.Error()))
+		if errors.Is(err, hermesclient.ErrSchemaInvalid) {
+			// 平台答复不符合 command.schema.json:prompt 需要迭代的信号,
+			// 与网络/超时/非 2xx 等基础设施问题在审计里必须能分辨(见 CONTRACT 评审)。
+			audit.Outcome = store.OutcomeRejectedSchema
+			t.save(ctx, audit)
+			return TranslateResult{Outcome: audit.Outcome, Reply: "没理解这句话。\n" + usage}
+		}
+		audit.Outcome = store.OutcomeTranslatorError
 		t.save(ctx, audit)
 		return TranslateResult{Outcome: audit.Outcome,
 			Reply: "翻译服务暂时不可用。\n" + usage}
@@ -162,7 +170,7 @@ func (t *Translator) Translate(ctx context.Context, openID, rawText string) Tran
 		t.save(ctx, audit)
 		return TranslateResult{Outcome: audit.Outcome, Rendered: rendered, Reply: "没理解这句话。\n" + usage}
 	}
-	if why := t.checkArgs(cmd); why != "" {
+	if why := t.checkArgs(cmd, snap.Devices); why != "" {
 		audit.Outcome = store.OutcomeRejectedArgs
 		t.save(ctx, audit)
 		return TranslateResult{Outcome: audit.Outcome, Rendered: rendered,
@@ -191,7 +199,8 @@ func (t *Translator) Translate(ctx context.Context, openID, rawText string) Tran
 
 // checkArgs 复用既有参数校验(设计文档 §5.3);返回空串表示通过。
 // 变体/设备存在性按快照成员判定;execute 内部仍会独立查库,两层都保留。
-func (t *Translator) checkArgs(cmd Command) string {
+// devices 是本次快照里的设备列表,用于 unquarantine 的 device_id 存在性判定。
+func (t *Translator) checkArgs(cmd Command, devices []snapshotDev) string {
 	switch cmd.Name {
 	case "rerun":
 		if len(cmd.Args) < 2 || len(cmd.Args) > 3 {
@@ -210,6 +219,9 @@ func (t *Translator) checkArgs(cmd Command) string {
 		if len(cmd.Args) > 1 {
 			return "unquarantine 最多一个 device_id"
 		}
+		if len(cmd.Args) == 1 && !containsDevice(devices, cmd.Args[0]) {
+			return fmt.Sprintf("设备 %s 不在快照设备名单内", cmd.Args[0])
+		}
 	case "status", "devices":
 		if len(cmd.Args) != 0 {
 			return cmd.Name + " 不接受参数"
@@ -227,10 +239,18 @@ func contains(list []string, s string) bool {
 	return false
 }
 
-// save 落审计;失败只记日志不阻断(与 persistEvidenceSnapshot 的降级一致)。
-func (t *Translator) save(ctx context.Context, row store.CommandTranslation) {
-	if t.Store == nil {
-		return
+// containsDevice 判定 device_id 是否在快照设备列表内(unquarantine 的存在性校验)。
+func containsDevice(devices []snapshotDev, deviceID string) bool {
+	for _, d := range devices {
+		if d.DeviceID == deviceID {
+			return true
+		}
 	}
+	return false
+}
+
+// save 落审计;失败只记日志不阻断(与 persistEvidenceSnapshot 的降级一致)。
+// Store 是必填依赖(buildSnapshot 已无条件解引用它),这里不再重复判空。
+func (t *Translator) save(ctx context.Context, row store.CommandTranslation) {
 	_ = t.Store.SaveCommandTranslation(ctx, row)
 }

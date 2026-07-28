@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -270,8 +271,14 @@ func TestTranslateRejectsInvalidSchema(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
-	if _, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"}); err == nil {
+	_, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"})
+	if err == nil {
 		t.Fatal("want error for schema-invalid response, got nil")
+	}
+	// Schema 失败必须能与网络/超时/非 2xx 等基础设施错误区分开(审计要能分辨
+	// "prompt 需要迭代" vs "桥不可达"),因此必须满足 errors.Is(err, ErrSchemaInvalid)。
+	if !errors.Is(err, ErrSchemaInvalid) {
+		t.Fatalf("want errors.Is(err, ErrSchemaInvalid), got %v", err)
 	}
 }
 
@@ -281,8 +288,13 @@ func TestTranslateNon2xx(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
-	if _, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"}); err == nil {
+	_, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"})
+	if err == nil {
 		t.Fatal("want error for 502, got nil")
+	}
+	// 非 2xx 是基础设施问题,不应被误判成"prompt 需要迭代"的 schema 失败。
+	if errors.Is(err, ErrSchemaInvalid) {
+		t.Fatalf("502 不应满足 errors.Is(err, ErrSchemaInvalid): %v", err)
 	}
 }
 
