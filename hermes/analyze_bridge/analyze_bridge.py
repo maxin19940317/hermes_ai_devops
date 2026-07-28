@@ -139,7 +139,7 @@ def run_hermes(prompt: str, model: str | None) -> str:
     return cp.stdout
 
 
-def run_with_schema(payload: dict, schema: dict, prompt_builder, label: str) -> dict:
+def run_with_schema(payload: dict, schema: dict, prompt_builder, label: str, fallback_msg: str) -> dict:
     """调 hermes 并做 Schema 校验打回重试;全部失败抛 BridgeError(502)。
     校验用哪份 schema 由路由写死,不接受请求方指定(契约选择权不外放)。"""
     errors: list[str] = []
@@ -153,15 +153,16 @@ def run_with_schema(payload: dict, schema: dict, prompt_builder, label: str) -> 
         except (ValueError, jsonschema.ValidationError) as e:
             log.warning("%s attempt %d 校验失败: %s", label, attempt, str(e)[:ERR_SNIPPET])
             errors.append(str(e)[:ERR_SNIPPET])
-    raise BridgeError(502, f"输出连续 {MAX_ATTEMPTS} 次未通过 Schema 校验,降级调用方保底")
+    raise BridgeError(502, f"输出连续 {MAX_ATTEMPTS} 次未通过 Schema 校验,{fallback_msg}")
 
 
 def run_analysis(payload: dict) -> dict:
-    return run_with_schema(payload, ANALYSIS_SCHEMA, build_prompt, "analyze")
+    label = f"analyze task={payload.get('task_id')}"
+    return run_with_schema(payload, ANALYSIS_SCHEMA, build_prompt, label, "降级规则引擎")
 
 
 def run_translation(payload: dict) -> dict:
-    return run_with_schema(payload, COMMAND_SCHEMA, build_translate_prompt, "translate")
+    return run_with_schema(payload, COMMAND_SCHEMA, build_translate_prompt, "translate", "降级调用方保底")
 
 
 @app.get("/health")
