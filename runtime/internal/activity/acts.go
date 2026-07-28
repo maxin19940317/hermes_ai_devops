@@ -42,6 +42,9 @@ type Config struct {
 	FeishuAppSecret     string
 	FeishuReceiveID     string // 接收方:open_id(个人单聊)或 chat_id(群)
 	FeishuReceiveIDType string // chat_id|open_id;空 → chat_id
+	// FeishuCmdWhitelist 指令 listener 白名单(逗号分隔 open_id);
+	// 空 = listener 不启动。
+	FeishuCmdWhitelist string
 	// MinIO 预签名直传(§3.7);Endpoint 或凭据为空即禁用,优雅降级为空 presigned_uploads。
 	MinIOEndpoint       string        // 集群内 endpoint(如 minio:9000);兼作启用开关
 	MinIOPublicEndpoint string        // 预签名 URL 的 host,须 Client 可达(签名覆盖 Host)

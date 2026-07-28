@@ -85,6 +85,7 @@ func TestLoadConfigOverridesFromEnv(t *testing.T) {
 		"FEISHU_APP_SECRET":      "app-sec",
 		"FEISHU_RECEIVE_ID":      "ou_user1",
 		"FEISHU_RECEIVE_ID_TYPE": "open_id",
+		"FEISHU_CMD_WHITELIST":   "ou_a,ou_b",
 	}))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
@@ -120,10 +121,9 @@ func TestLoadConfigOverridesFromEnv(t *testing.T) {
 		t.Errorf("FeishuWebhookURL = %q", cfg.Activity.FeishuWebhookURL)
 	}
 	if cfg.Activity.FeishuAppID != "cli_a1" || cfg.Activity.FeishuAppSecret != "app-sec" ||
-		cfg.Activity.FeishuReceiveID != "ou_user1" || cfg.Activity.FeishuReceiveIDType != "open_id" {
-		t.Errorf("feishu app creds = %q/%q/%q/%q",
-			cfg.Activity.FeishuAppID, cfg.Activity.FeishuAppSecret,
-			cfg.Activity.FeishuReceiveID, cfg.Activity.FeishuReceiveIDType)
+		cfg.Activity.FeishuReceiveID != "ou_user1" || cfg.Activity.FeishuReceiveIDType != "open_id" ||
+		cfg.Activity.FeishuCmdWhitelist != "ou_a,ou_b" {
+		t.Errorf("feishu app creds = %+v", cfg.Activity)
 	}
 }
 

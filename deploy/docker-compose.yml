@@ -126,6 +126,7 @@ services:
       FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
       FEISHU_RECEIVE_ID: ${FEISHU_RECEIVE_ID:-}
       FEISHU_RECEIVE_ID_TYPE: ${FEISHU_RECEIVE_ID_TYPE:-}
+      FEISHU_CMD_WHITELIST: ${FEISHU_CMD_WHITELIST:-}
       # §3.7 预签名直传;worker 不 depends_on minio——MinIO 缺失时优雅降级为空
       # presigned_uploads。签名覆盖 Host,故预签名 client 用 PUBLIC endpoint 构造。
       MINIO_ENDPOINT: minio:9000

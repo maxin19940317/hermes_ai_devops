@@ -24,6 +24,7 @@
 //	FEISHU_APP_SECRET       可选;同上
 //	FEISHU_RECEIVE_ID       可选;接收方 open_id(个人单聊)或 chat_id(群)
 //	FEISHU_RECEIVE_ID_TYPE  可选;chat_id|open_id,缺省 chat_id
+//	FEISHU_CMD_WHITELIST    可选;指令 listener 白名单(逗号分隔 open_id),空 = 不启动
 //	MINIO_ENDPOINT          集群内 endpoint(如 minio:9000);空 → 禁用预签名(§3.7 降级)
 //	MINIO_PUBLIC_ENDPOINT   预签名 URL 的 host,须 Client 可达;空 → 用 MINIO_ENDPOINT
 //	MINIO_ACCESS_KEY        空 → 禁用预签名
@@ -54,8 +55,10 @@ import (
 	"hermes-devops/runtime/internal/activity"
 	"hermes-devops/runtime/internal/callbacks"
 	"hermes-devops/runtime/internal/feishu"
+	"hermes-devops/runtime/internal/feishucmd"
 	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/store"
+	"hermes-devops/runtime/internal/trigger"
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -81,6 +84,7 @@ func main() {
 	var st interface {
 		activity.Store
 		callbacks.Store
+		feishucmd.Store
 	}
 	if cfg.DatabaseURL != "" {
 		pg, err := store.OpenPG(ctx, cfg.DatabaseURL)
@@ -136,6 +140,31 @@ func main() {
 	})
 	acts.Feishu = feishuSender
 	log.Info().Str("mode", feishuMode).Msg("feishu notify mode")
+
+	// ---- 飞书指令 listener:白名单(FEISHU_CMD_WHITELIST)非空才启动;
+	// 需要 app 凭据(与通知共用)——长连接事件订阅只收白名单 open_id 的单聊指令 ----
+	if wl := feishucmd.ParseWhitelist(cfg.Activity.FeishuCmdWhitelist); len(wl) > 0 {
+		if cfg.Activity.FeishuAppID == "" || cfg.Activity.FeishuAppSecret == "" {
+			log.Warn().Msg("FEISHU_CMD_WHITELIST 已配置但缺 FEISHU_APP_ID/SECRET,listener=disabled")
+		} else {
+			exec := &feishucmd.Executor{
+				Store: st, Sender: feishuSender, Log: &log, Whitelist: wl,
+				Starter:          &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
+				ExpectedVariants: specCfg.VariantCount(),
+			}
+			listener := &feishucmd.Listener{
+				AppID: cfg.Activity.FeishuAppID, AppSecret: cfg.Activity.FeishuAppSecret, Exec: exec,
+			}
+			go func() {
+				if err := listener.Run(ctx); err != nil && ctx.Err() == nil {
+					log.Error().Err(err).Msg("feishu cmd listener exited")
+				}
+			}()
+			log.Info().Int("whitelist", len(wl)).Msg("feishu cmd listener=enabled")
+		}
+	} else {
+		log.Info().Msg("feishu cmd listener=disabled (FEISHU_CMD_WHITELIST empty)")
+	}
 
 	w := worker.New(tc, cfg.TemporalTaskQueue, worker.Options{})
 	w.RegisterWorkflowWithOptions(wf.DeviceTestWorkflow, workflow.RegisterOptions{

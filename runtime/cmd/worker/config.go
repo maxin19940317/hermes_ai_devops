@@ -113,6 +113,8 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			FeishuAppSecret:     getenv("FEISHU_APP_SECRET"),
 			FeishuReceiveID:     getenv("FEISHU_RECEIVE_ID"),      // open_id 单聊 / chat_id 群
 			FeishuReceiveIDType: getenv("FEISHU_RECEIVE_ID_TYPE"), // 空 → chat_id
+			// 飞书指令 listener 白名单(逗号分隔 open_id;空 = listener 不启动)
+			FeishuCmdWhitelist: getenv("FEISHU_CMD_WHITELIST"),
 			// §3.7:MINIO_ENDPOINT 或凭据为空即禁用预签名(优雅降级)。
 			MinIOEndpoint:       getenv("MINIO_ENDPOINT"),
 			MinIOPublicEndpoint: getenv("MINIO_PUBLIC_ENDPOINT"),

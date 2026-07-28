@@ -41,6 +41,10 @@ type fullStore interface {
 	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
 	SaveEvidenceSnapshot(ctx context.Context, snap EvidenceSnapshot) error
 	GetEvidenceSnapshot(ctx context.Context, evidenceID string) (*EvidenceSnapshot, error)
+	FleetOverview(ctx context.Context) (*FleetOverview, error)
+	UnquarantineDevice(ctx context.Context, deviceID string) (bool, error)
+	ListArtifacts(ctx context.Context, commitSHA string, pipelineID int) ([]Artifact, error)
+	NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -671,6 +675,99 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if missing, err := s.GetEvidenceSnapshot(ctx, "no-such"); err != nil || missing != nil {
 			t.Errorf("未知 id 应返回 (nil, nil): %+v %v", missing, err)
+		}
+	})
+
+	// 飞书指令查询面:FleetOverview 汇总 + UnquarantineDevice 解隔离。
+	t.Run("FleetOverviewAndUnquarantine", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		// 一台 BUSY 带活跃租约 + 一台任务非终态的 workflow
+		l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
+		if err != nil || l == nil {
+			t.Fatalf("acquire: %v %v", l, err)
+		}
+		_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w:t1:a1", WorkflowID: "w",
+			IdempotencyKey: "w:t1:a1", Status: "RUNNING"})
+		ov, err := s.FleetOverview(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ov.InflightWorkflows != 1 || ov.ActiveLeases != 1 || len(ov.Devices) != 1 {
+			t.Fatalf("overview = %+v", ov)
+		}
+		d := ov.Devices[0]
+		if d.DeviceID != "513cd3de" || d.Status != "BUSY" || d.LeaseTaskID != "w:t1:a1" ||
+			d.SOC != "trinket" {
+			t.Errorf("device = %+v", d)
+		}
+		// 任务终态后运行中数归零(租约释放后活跃租约归零)
+		if err := s.FinishTask(ctx, wf.FinishRequest{TaskID: "w:t1:a1", Status: "COMPLETED", Verdict: "PASSED"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "w:t1:a1", false, 3); err != nil {
+			t.Fatal(err)
+		}
+		ov, _ = s.FleetOverview(ctx)
+		if ov.InflightWorkflows != 0 || ov.ActiveLeases != 0 {
+			t.Errorf("终态后 overview = %+v", ov)
+		}
+		// 隔离 → 解隔离循环(3 次 INFRA → QUARANTINED,§10)
+		for i := 0; i < 3; i++ {
+			l2, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t2:a1", 120)
+			if l2 == nil {
+				t.Fatalf("第 %d 次 acquire", i+1)
+			}
+			_ = s.ReleaseDevice(ctx, l2.DeviceID, "w:t2:a1", true, 3)
+		}
+		ok, err := s.UnquarantineDevice(ctx, l.DeviceID)
+		if err != nil || !ok {
+			t.Fatalf("unquarantine: ok=%v err=%v", ok, err)
+		}
+		ov, _ = s.FleetOverview(ctx)
+		if ov.Devices[0].Status != "IDLE" || ov.Devices[0].FailStreak != 0 {
+			t.Errorf("解隔离后 device = %+v", ov.Devices[0])
+		}
+		if ok, _ := s.UnquarantineDevice(ctx, "ghost"); ok {
+			t.Error("未知设备应返回 false")
+		}
+	})
+
+	// 飞书指令 rerun 的数据面:ListArtifacts 按逻辑键取包,
+	// NextWorkflowAttemptAll 全键递增取 max(变体行可能因 kick retry 发散)。
+	t.Run("ListArtifactsAndAttemptAll", func(t *testing.T) {
+		s := newStore(t)
+		arts := []Artifact{
+			{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1",
+				BuildType: "Release", URL: "u1", SHA256: "s1", Size: 1, ManifestDigest: "m1"},
+			{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v2",
+				BuildType: "Release", URL: "u2", SHA256: "s2", Size: 2, ManifestDigest: "m2"},
+			{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 43, Variant: "v1",
+				BuildType: "Release", URL: "u3", SHA256: "s3", Size: 3, ManifestDigest: "m3"},
+		}
+		if err := s.RegisterArtifacts(ctx, arts); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.ListArtifacts(ctx, "abcd1234", 42)
+		if err != nil || len(got) != 2 {
+			t.Fatalf("list = %+v err=%v, want 2 行", got, err)
+		}
+		if got[0].Project != "grp/p" || got[0].URL == "" || got[0].ManifestDigest == "" {
+			t.Errorf("artifact 字段不全: %+v", got[0])
+		}
+		if none, _ := s.ListArtifacts(ctx, "abcd1234", 99); len(none) != 0 {
+			t.Errorf("无记录键应返回空: %+v", none)
+		}
+		// 变体级 retry 使 v1 行先发散到 1;bundle 级递增后应取 max=2
+		if n, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "v1"); err != nil || n != 1 {
+			t.Fatalf("variant attempt = %d err=%v", n, err)
+		}
+		n, err := s.NextWorkflowAttemptAll(ctx, "abcd1234", 42)
+		if err != nil || n != 2 {
+			t.Fatalf("attempt all = %d err=%v, want 2(max 发散值+1)", n, err)
+		}
+		if _, err := s.NextWorkflowAttemptAll(ctx, "abcd1234", 99); err == nil {
+			t.Error("无记录键应报错")
 		}
 	})
 

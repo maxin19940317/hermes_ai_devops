@@ -42,7 +42,11 @@ bot webhook (`FEISHU_WEBHOOK_URL`). `FEISHU_RECEIVE_ID` accepts an `open_id`
 (personal DM, set `FEISHU_RECEIVE_ID_TYPE=open_id`) or a `chat_id` (group chat,
 the default when the type is unset). All empty means notifications are silently
 skipped (dev mode). Messages are plain text in this version; interactive cards
-are a later milestone.
+are a later milestone. The worker also runs an optional command listener over the
+app's WebSocket event subscription: when `FEISHU_CMD_WHITELIST` (comma-separated
+open_ids) is set, whitelisted users can send the bot DM commands (`status`,
+`devices`, `rerun <sha8> <pipeline_iid> [variant]`, `unquarantine [device_id]`);
+messages from anyone else are silently ignored.
 
 ## MinIO evidence uploads
 
