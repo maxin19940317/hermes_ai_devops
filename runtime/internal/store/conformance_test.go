@@ -894,12 +894,13 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 	t.Run("RecentRunsFiltersByTestID", func(t *testing.T) {
 		s := newStore(t)
 		const proj, sha, iid = "Algo_Super_SDK", "9da3b9d9", 56 // 项目名含下划线:通配符地雷
-		v1, v2 := "aarch64_Android_SNPE_1.68", "aarch64_Android_SNPE_2.21"
+		v1, v2, v3 := "aarch64_Android_SNPE_1.68", "aarch64_Android_SNPE_2.21", "aarch64_Android_RKNN_2.3.2"
 		base := wf.BaseWorkflowID(proj, sha, iid)
 
 		if err := s.RegisterArtifacts(ctx, []Artifact{
 			{Project: proj, CommitSHA: sha, PipelineID: iid, Variant: v1, URL: "u1", SHA256: "s1"},
 			{Project: proj, CommitSHA: sha, PipelineID: iid, Variant: v2, URL: "u2", SHA256: "s2"},
+			{Project: proj, CommitSHA: sha, PipelineID: iid, Variant: v3, URL: "u3", SHA256: "s3"},
 		}); err != nil {
 			t.Fatalf("RegisterArtifacts: %v", err)
 		}
@@ -920,6 +921,22 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			}
 		}
 
+		// 纯变体级 workflow(无 bundle、无 retry 后缀):kick 单变体触发的最常见形态,
+		// Attempt=0 且 workflow_id = base-{variant},不带 -r{N}。
+		plainWF := base + "-" + v3
+		plainTask := plainWF + ":" + v3 + ":a1"
+		if err := s.CreateTask(ctx, wf.TaskRow{
+			TaskID: plainTask, WorkflowID: plainWF, TestID: v3, Attempt: 0,
+			IdempotencyKey: plainTask, Status: "RUNNING",
+		}); err != nil {
+			t.Fatalf("CreateTask plain variant-level: %v", err)
+		}
+		if err := s.FinishTask(ctx, wf.FinishRequest{
+			TaskID: plainTask, Status: "COMPLETED", Verdict: "PASSED",
+		}); err != nil {
+			t.Fatalf("FinishTask plain variant-level: %v", err)
+		}
+
 		runs, err := s.RecentRuns(ctx, 10)
 		if err != nil {
 			t.Fatalf("RecentRuns: %v", err)
@@ -933,6 +950,9 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if got := byVariant[v2].Verdict; got != "PASSED" {
 			t.Errorf("%s verdict = %q, want PASSED", v2, got)
+		}
+		if got := byVariant[v3].Verdict; got != "PASSED" {
+			t.Errorf("%s verdict = %q, want PASSED(纯变体级 workflow,无 bundle/retry 后缀)", v3, got)
 		}
 
 		// 变体级 retry workflow:更晚的行应覆盖 bundle 的结论
@@ -958,6 +978,50 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 				t.Errorf("retry 后 %s verdict = %q, want PASSED(应取最新一条)", v1, r.Verdict)
 			}
 		}
+
+		// 对抗性项目:与 proj 等长,仅在下划线位置替换为普通字符
+		// (Algo_Super_SDK → AlgoXSuper_SDK)。若查询实现从 starts_with 退化为
+		// LIKE,base 拼出的模式里那个下划线会退化成单字符通配符,adversary 的
+		// 变体级 workflow 就会被误判为 proj 的前缀匹配,顶掉 proj/v1 刚判定
+		// 出的 PASSED。
+		const advProj = "AlgoXSuper_SDK"
+		if len(advProj) != len(proj) {
+			t.Fatalf("adversary 项目名长度必须与 proj 一致才能对齐下划线位置: %d vs %d", len(advProj), len(proj))
+		}
+		advBase := wf.BaseWorkflowID(advProj, sha, iid)
+		// 复用与 proj 完全相同的 (commit, pipeline, variant) 三元组注册:
+		// artifacts 的唯一键不含 project(schema.sql: UNIQUE(commit_sha, pipeline_id,
+		// variant)),这里必然是空操作(proj 的 v1 行已占住该键),不影响下方断言,
+		// 保留调用只是如实反映"两个项目撞在同一逻辑键上"的场景。
+		if err := s.RegisterArtifacts(ctx, []Artifact{
+			{Project: advProj, CommitSHA: sha, PipelineID: iid, Variant: v1, URL: "adv", SHA256: "adv"},
+		}); err != nil {
+			t.Fatalf("RegisterArtifacts adversary: %v", err)
+		}
+		advWF := advBase + "-" + v1
+		advTask := advWF + ":" + v1 + ":a1"
+		if err := s.CreateTask(ctx, wf.TaskRow{
+			TaskID: advTask, WorkflowID: advWF, TestID: v1, Attempt: 1,
+			IdempotencyKey: advTask, Status: "RUNNING",
+		}); err != nil {
+			t.Fatalf("CreateTask adversary: %v", err)
+		}
+		if err := s.FinishTask(ctx, wf.FinishRequest{
+			TaskID: advTask, Status: "COMPLETED", Verdict: "INFRA_ERROR",
+		}); err != nil {
+			t.Fatalf("FinishTask adversary: %v", err)
+		}
+		runs, err = s.RecentRuns(ctx, 10)
+		if err != nil {
+			t.Fatalf("RecentRuns after adversary: %v", err)
+		}
+		byVariant = map[string]RecentRun{}
+		for _, r := range runs {
+			byVariant[r.Variant] = r
+		}
+		if got := byVariant[v1].Verdict; got != "PASSED" {
+			t.Errorf("%s verdict = %q, want PASSED(不得被下划线位置不同的对抗项目 %s 抢走结论)", v1, got, advProj)
+		}
 	})
 
 	t.Run("RecentRunsRespectsLimit", func(t *testing.T) {
@@ -965,8 +1029,10 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		arts := []Artifact{}
 		for i := 0; i < 5; i++ {
 			arts = append(arts, Artifact{
+				// 每个产物的 variant 各异,避免与 (commit_sha, pipeline_id, variant)
+				// 唯一键无关地互相覆盖——同时也让"是哪一行"可以只凭 Commit 辨认。
 				Project: "p", CommitSHA: fmt.Sprintf("sha%d", i), PipelineID: i + 1,
-				Variant: "v", URL: "u", SHA256: "s",
+				Variant: fmt.Sprintf("v%d", i), URL: "u", SHA256: "s",
 			})
 		}
 		if err := s.RegisterArtifacts(ctx, arts); err != nil {
@@ -977,7 +1043,16 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatalf("RecentRuns: %v", err)
 		}
 		if len(runs) != 3 {
-			t.Errorf("len = %d, want 3", len(runs))
+			t.Fatalf("len = %d, want 3", len(runs))
+		}
+		// 断言具体是"哪" 3 条、且新到旧排序——只查 count 时,从错误的一端截断
+		// (返回最旧的 3 条,或返回正确数量但顺序颠倒)也能通过。
+		wantCommits := []string{"sha4", "sha3", "sha2"} // 最后注册的 3 条,新→旧
+		for i, want := range wantCommits {
+			if runs[i].Commit != want {
+				t.Errorf("runs[%d].Commit = %q, want %q(应为最近注册的 3 条,新→旧排序)",
+					i, runs[i].Commit, want)
+			}
 		}
 	})
 }
