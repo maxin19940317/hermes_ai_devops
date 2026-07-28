@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "command.schema.json",
-  "title": "command v1",
+  "$id": "https://hermes-devops/contracts/command.schema.json",
+  "title": "command.json v1",
   "description": "飞书指令层 LLM 意图翻译输出(CLAUDE.md §12 Phase 2)。command 为封闭枚举,args 禁空白字符以保证渲染成一行指令文本后可被 strings.Fields 无损切回。",
   "type": "object",
   "additionalProperties": false,
