@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"strconv"
+	"time"
 
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -22,6 +23,8 @@ type taskRecord struct {
 	verdict  string
 	category string
 	reason   string
+	seq      int64     // 插入序,给"最新一条"提供确定顺序
+	endedAt  time.Time // FinishTask 落终态的时刻(UTC)
 }
 
 // CreateTask 登记任务;同幂等键(即 task_id)重复创建无副作用(§3 规则 7)。
@@ -31,7 +34,8 @@ func (s *MemStore) CreateTask(_ context.Context, row wf.TaskRow) error {
 	if _, ok := s.tasks[row.TaskID]; ok {
 		return nil
 	}
-	s.tasks[row.TaskID] = &taskRecord{row: row}
+	s.seq++
+	s.tasks[row.TaskID] = &taskRecord{row: row, seq: s.seq}
 	return nil
 }
 
@@ -67,6 +71,7 @@ func (s *MemStore) FinishTask(_ context.Context, req wf.FinishRequest) error {
 	}
 	rec.row.Status = req.Status
 	rec.verdict, rec.category, rec.reason = req.Verdict, req.Category, req.Reason
+	rec.endedAt = time.Now().UTC()
 	return nil
 }
 

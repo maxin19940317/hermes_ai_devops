@@ -2,7 +2,11 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+
+	wf "hermes-devops/runtime/internal/workflow"
 )
 
 // FleetOverview 汇总 fleet 状态(只读;三次简单查询,非热路径)。
@@ -101,4 +105,56 @@ func (s *PGStore) NextWorkflowAttemptAll(ctx context.Context, commitSHA string, 
 		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d", commitSHA, pipelineID)
 	}
 	return maxN, nil
+}
+
+// RecentRuns 见 MemStore 同名方法的语义说明(设计文档 §3.2)。
+// 实现为 1 + limit 次查询而非单条 SQL:baseID 的构造只在 Go 侧(wf.BaseWorkflowID)
+// 存在一份,不在 SQL 里重复拼接字符串——格式漂移在编译期即不可能。limit 为 10 量级,
+// 且只在人机交互路径上调用,查询次数可接受。
+func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT project, commit_sha, pipeline_id, variant
+		FROM artifacts
+		ORDER BY created_at DESC, artifact_id DESC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent runs: %w", err)
+	}
+	out := []RecentRun{}
+	for rows.Next() {
+		var r RecentRun
+		if err := rows.Scan(&r.Project, &r.Commit, &r.PipelineID, &r.Variant); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("recent runs: scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("recent runs: %w", err)
+	}
+	for i := range out {
+		base := wf.BaseWorkflowID(out[i].Project, out[i].Commit, out[i].PipelineID)
+		var verdict sql.NullString
+		var endedAt sql.NullTime
+		// starts_with 而非 LIKE:项目名可能含下划线(Algo_Super_SDK),
+		// 而 _ 是 LIKE 的单字符通配符,走 LIKE 就得加 ESCAPE。
+		err := s.DB.QueryRowContext(ctx, `
+			SELECT verdict, ended_at FROM tasks
+			WHERE test_id = $1
+			  AND (workflow_id = $2 OR starts_with(workflow_id, $2 || '-'))
+			ORDER BY created_at DESC, task_id DESC
+			LIMIT 1`, out[i].Variant, base).Scan(&verdict, &endedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("recent runs: lookup %s: %w", out[i].Variant, err)
+		}
+		out[i].Verdict = verdict.String
+		if endedAt.Valid {
+			out[i].EndedAt = endedAt.Time.UTC()
+		}
+	}
+	return out, nil
 }

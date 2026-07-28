@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -49,6 +50,7 @@ type fullStore interface {
 	NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error)
 	SaveCommandTranslation(ctx context.Context, row CommandTranslation) error
 	ListCommandTranslations(ctx context.Context, openID string, limit int) ([]CommandTranslation, error)
+	RecentRuns(ctx context.Context, limit int) ([]RecentRun, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -886,6 +888,96 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 				n = len(stored)
 			}
 			t.Errorf("截断后应带尾标记 %q, got %q...", truncatedMark, stored[:n])
+		}
+	})
+
+	t.Run("RecentRunsFiltersByTestID", func(t *testing.T) {
+		s := newStore(t)
+		const proj, sha, iid = "Algo_Super_SDK", "9da3b9d9", 56 // 项目名含下划线:通配符地雷
+		v1, v2 := "aarch64_Android_SNPE_1.68", "aarch64_Android_SNPE_2.21"
+		base := wf.BaseWorkflowID(proj, sha, iid)
+
+		if err := s.RegisterArtifacts(ctx, []Artifact{
+			{Project: proj, CommitSHA: sha, PipelineID: iid, Variant: v1, URL: "u1", SHA256: "s1"},
+			{Project: proj, CommitSHA: sha, PipelineID: iid, Variant: v2, URL: "u2", SHA256: "s2"},
+		}); err != nil {
+			t.Fatalf("RegisterArtifacts: %v", err)
+		}
+
+		// bundle workflow:两个变体的 task 挂在同一个 workflow_id 上,靠 test_id 区分
+		for _, tc := range []struct{ variant, verdict string }{{v1, "TEST_FAILED"}, {v2, "PASSED"}} {
+			taskID := base + ":" + tc.variant + ":a1"
+			if err := s.CreateTask(ctx, wf.TaskRow{
+				TaskID: taskID, WorkflowID: base, TestID: tc.variant, Attempt: 1,
+				IdempotencyKey: taskID, Status: "RUNNING",
+			}); err != nil {
+				t.Fatalf("CreateTask: %v", err)
+			}
+			if err := s.FinishTask(ctx, wf.FinishRequest{
+				TaskID: taskID, Status: "COMPLETED", Verdict: tc.verdict,
+			}); err != nil {
+				t.Fatalf("FinishTask: %v", err)
+			}
+		}
+
+		runs, err := s.RecentRuns(ctx, 10)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		byVariant := map[string]RecentRun{}
+		for _, r := range runs {
+			byVariant[r.Variant] = r
+		}
+		if got := byVariant[v1].Verdict; got != "TEST_FAILED" {
+			t.Errorf("%s verdict = %q, want TEST_FAILED(bundle 下必须按 test_id 过滤,不得串变体)", v1, got)
+		}
+		if got := byVariant[v2].Verdict; got != "PASSED" {
+			t.Errorf("%s verdict = %q, want PASSED", v2, got)
+		}
+
+		// 变体级 retry workflow:更晚的行应覆盖 bundle 的结论
+		retryWF := base + "-" + v1 + "-r2"
+		retryTask := retryWF + ":" + v1 + ":a1"
+		if err := s.CreateTask(ctx, wf.TaskRow{
+			TaskID: retryTask, WorkflowID: retryWF, TestID: v1, Attempt: 1,
+			IdempotencyKey: retryTask, Status: "RUNNING",
+		}); err != nil {
+			t.Fatalf("CreateTask retry: %v", err)
+		}
+		if err := s.FinishTask(ctx, wf.FinishRequest{
+			TaskID: retryTask, Status: "COMPLETED", Verdict: "PASSED",
+		}); err != nil {
+			t.Fatalf("FinishTask retry: %v", err)
+		}
+		runs, err = s.RecentRuns(ctx, 10)
+		if err != nil {
+			t.Fatalf("RecentRuns after retry: %v", err)
+		}
+		for _, r := range runs {
+			if r.Variant == v1 && r.Verdict != "PASSED" {
+				t.Errorf("retry 后 %s verdict = %q, want PASSED(应取最新一条)", v1, r.Verdict)
+			}
+		}
+	})
+
+	t.Run("RecentRunsRespectsLimit", func(t *testing.T) {
+		s := newStore(t)
+		arts := []Artifact{}
+		for i := 0; i < 5; i++ {
+			arts = append(arts, Artifact{
+				Project: "p", CommitSHA: fmt.Sprintf("sha%d", i), PipelineID: i + 1,
+				Variant: "v", URL: "u", SHA256: "s",
+			})
+		}
+		if err := s.RegisterArtifacts(ctx, arts); err != nil {
+			t.Fatalf("RegisterArtifacts: %v", err)
+		}
+		runs, err := s.RecentRuns(ctx, 3)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		if len(runs) != 3 {
+			t.Errorf("len = %d, want 3", len(runs))
 		}
 	})
 }

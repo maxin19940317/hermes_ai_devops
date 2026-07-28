@@ -56,6 +56,10 @@ type MemStore struct {
 	evidenceSnaps map[string]EvidenceSnapshot
 	// translations 是 command_translations 表(设计文档 §4.3)的内存视图。
 	translations []CommandTranslation
+	// seq 是插入序计数器,给 artifacts/tasks 提供确定的"最近"排序
+	// (内存实现无 created_at 列)。
+	seq    int64
+	rowSeq map[string]int64 // artifacts key → 插入序
 }
 
 func NewMemStore() *MemStore {
@@ -69,6 +73,7 @@ func NewMemStore() *MemStore {
 		outboxByKey:   map[string]*outboxRow{},
 		outboxByID:    map[int64]*outboxRow{},
 		evidenceSnaps: map[string]EvidenceSnapshot{},
+		rowSeq:        map[string]int64{},
 	}
 }
 
@@ -79,6 +84,8 @@ func (s *MemStore) RegisterArtifacts(_ context.Context, arts []Artifact) error {
 		key := a.CommitSHA + "|" + strconv.Itoa(a.PipelineID) + "|" + a.Variant
 		if _, exists := s.rows[key]; !exists {
 			s.rows[key] = a
+			s.seq++
+			s.rowSeq[key] = s.seq
 		}
 	}
 	return nil
