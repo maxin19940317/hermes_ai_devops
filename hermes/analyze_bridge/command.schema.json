@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-devops/contracts/command.schema.json",
+  "title": "command.json v1",
+  "description": "飞书指令层 LLM 意图翻译输出(CLAUDE.md §12 Phase 2)。command 为封闭枚举,args 禁空白字符以保证渲染成一行指令文本后可被 strings.Fields 无损切回。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["translation_version", "command", "confidence"],
+  "properties": {
+    "translation_version": { "const": 1 },
+    "command": {
+      "type": "string",
+      "enum": ["status", "devices", "rerun", "unquarantine", "none"],
+      "description": "none = 信息不足或输入根本不是指令"
+    },
+    "args": {
+      "type": "array",
+      "maxItems": 3,
+      "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" }
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "reason": { "type": "string", "maxLength": 200 }
+  }
+}
