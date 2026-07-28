@@ -494,7 +494,7 @@ func runAnalysis(ctx, dctx workflow.Context, taskID string, d rules.Decision, ev
 	}
 	row := DecisionRow{
 		TaskID: taskID, Actor: "hermes", InputDigest: ev.Digest,
-		PromptVersion: hermesclient.PromptVersion, Output: out,
+		PromptVersion: hermesclient.PromptVersionAnalyze, Output: out,
 		// 快照引用(差距 #6 决策可回放);降级(未持久化)时为空
 		EvidenceSnapshotID: ev.SnapshotID,
 	}

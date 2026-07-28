@@ -508,7 +508,7 @@ func TestAnalysisSavedOnFailure(t *testing.T) {
 		t.Errorf("rule 裁决 = %+v", rule)
 	}
 	if herm.Actor != "hermes" || herm.InputDigest != "deadbeef" ||
-		herm.PromptVersion != hermesclient.PromptVersion ||
+		herm.PromptVersion != hermesclient.PromptVersionAnalyze ||
 		!strings.Contains(string(herm.Output), "delegate fell back to CPU") {
 		t.Errorf("hermes 裁决 = %+v(需带 evidence 摘要/prompt 版本/分析本体)", herm)
 	}

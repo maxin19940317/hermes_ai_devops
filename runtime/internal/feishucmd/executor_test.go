@@ -4,7 +4,9 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
+	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -240,5 +242,279 @@ func TestUnquarantine(t *testing.T) {
 	exec2.HandleMessage(ctx, wlOpenID, "unquarantine ghost")
 	if !strings.Contains(sender2.texts[0], "无此设备") {
 		t.Errorf("reply = %q", sender2.texts[0])
+	}
+}
+
+// seedQuarantinedDevice 登记一台设备并驱动其连续 3 次 INFRA 失败进入 QUARANTINED
+// (§10 缺省阈值)。设备登记复用 TestUnquarantine 里的同一套 UpsertClientDevices
+// 调用;没有直接的"设为 QUARANTINED"store 方法,驱动到位是 store 包自身测试
+// (conformance_test.go QuarantineAfterConsecutiveInfraFailures)已在用的既有路径。
+func seedQuarantinedDevice(t *testing.T, s *store.MemStore, deviceID string) {
+	t.Helper()
+	if err := s.UpsertClientDevices(ctx, store.Client{ClientID: "c1"},
+		[]store.Device{{DeviceID: deviceID, Serial: deviceID, ClientID: "c1"}}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "seed-task", 120)
+		if err != nil || l == nil {
+			t.Fatalf("seedQuarantinedDevice: AcquireDevice #%d: lease=%+v err=%v", i+1, l, err)
+		}
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "seed-task", true, 3); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// lastText 返回最后一条回复;无回复时返回空串。
+func lastText(s *fakeSender) string {
+	if len(s.texts) == 0 {
+		return ""
+	}
+	return s.texts[len(s.texts)-1]
+}
+
+// countOutcome 统计审计行里某 outcome 的条数——只看回复文本会漏掉审计层的
+// bug(比如 outcome 常量被写反,回复文案照样正确),Finding 2 就是这么漏过去的。
+func countOutcome(rows []store.CommandTranslation, outcome string) int {
+	n := 0
+	for _, r := range rows {
+		if r.Outcome == outcome {
+			n++
+		}
+	}
+	return n
+}
+
+func TestHandleMessageTranslatesUnknownInput(t *testing.T) {
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 1, Command: "devices", Confidence: 0.95,
+	}}
+	st := store.NewMemStore()
+	sender := &fakeSender{}
+	e := &Executor{Store: st, Sender: sender, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st)}
+	e.HandleMessage(context.Background(), "ou_1", "看下设备都什么状态")
+	if f.calls != 1 {
+		t.Fatalf("translator calls = %d, want 1", f.calls)
+	}
+	if !strings.Contains(lastText(sender), "已理解为: devices") {
+		t.Errorf("回复应告知理解结果,便于用户下次直接打: %q", lastText(sender))
+	}
+}
+
+func TestHandleMessageKnownCommandSkipsTranslator(t *testing.T) {
+	f := &fakeTranslator{}
+	st := store.NewMemStore()
+	e := &Executor{Store: st, Sender: &fakeSender{}, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st)}
+	e.HandleMessage(context.Background(), "ou_1", "devices")
+	if f.calls != 0 {
+		t.Errorf("已能解析的指令不得走翻译层, calls = %d", f.calls)
+	}
+}
+
+func TestHandleMessageNonWhitelistNeverCallsTranslator(t *testing.T) {
+	f := &fakeTranslator{}
+	st := store.NewMemStore()
+	e := &Executor{Store: st, Sender: &fakeSender{}, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st)}
+	e.HandleMessage(context.Background(), "ou_evil", "帮我重跑一下")
+	if f.calls != 0 {
+		t.Errorf("非白名单必须零 LLM 调用, calls = %d", f.calls)
+	}
+}
+
+func TestConfirmFlowExecutesOnYes(t *testing.T) {
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 1, Command: "unquarantine", Args: []string{"dev-1"}, Confidence: 0.95,
+	}}
+	st := store.NewMemStore()
+	seedQuarantinedDevice(t, st, "dev-1") // 见既有测试里的设备准备辅助函数
+	sender := &fakeSender{}
+	e := &Executor{Store: st, Sender: sender, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st)}
+	e.HandleMessage(context.Background(), "ou_1", "把那台板子放出来")
+	if !strings.Contains(lastText(sender), "将执行") {
+		t.Fatalf("应先回执待确认: %q", lastText(sender))
+	}
+	e.HandleMessage(context.Background(), "ou_1", "y")
+	if !strings.Contains(lastText(sender), "已解隔离") {
+		t.Errorf("确认后应执行: %q", lastText(sender))
+	}
+
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2 (pending_confirm + confirmed)", rows)
+	}
+	if n := countOutcome(rows, store.OutcomePendingConfirm); n != 1 {
+		t.Errorf("pending_confirm 行数 = %d, want 1", n)
+	}
+	if n := countOutcome(rows, store.OutcomeConfirmed); n != 1 {
+		t.Errorf("confirmed 行数 = %d, want 1", n)
+	}
+}
+
+func TestConfirmFlowCancelsOnNoWithoutTranslating(t *testing.T) {
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 1, Command: "unquarantine", Args: []string{"dev-1"}, Confidence: 0.95,
+	}}
+	st := store.NewMemStore()
+	seedQuarantinedDevice(t, st, "dev-1")
+	sender := &fakeSender{}
+	e := &Executor{Store: st, Sender: sender, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st)}
+	e.HandleMessage(context.Background(), "ou_1", "把那台板子放出来")
+	before := f.calls
+	e.HandleMessage(context.Background(), "ou_1", "n")
+	if f.calls != before {
+		t.Errorf("n 必须短路,不得再触发翻译: calls %d → %d", before, f.calls)
+	}
+	if !strings.Contains(lastText(sender), "已取消") {
+		t.Errorf("reply = %q", lastText(sender))
+	}
+
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2 (pending_confirm + declined)", rows)
+	}
+	if n := countOutcome(rows, store.OutcomePendingConfirm); n != 1 {
+		t.Errorf("pending_confirm 行数 = %d, want 1", n)
+	}
+	if n := countOutcome(rows, store.OutcomeDeclined); n != 1 {
+		t.Errorf("declined 行数 = %d, want 1", n)
+	}
+}
+
+func TestConfirmFlowFallsThroughOnOtherInput(t *testing.T) {
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 1, Command: "unquarantine", Args: []string{"dev-1"}, Confidence: 0.95,
+	}}
+	st := store.NewMemStore()
+	seedQuarantinedDevice(t, st, "dev-1")
+	sender := &fakeSender{}
+	e := &Executor{Store: st, Sender: sender, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st)}
+	e.HandleMessage(context.Background(), "ou_1", "把那台板子放出来")
+	e.HandleMessage(context.Background(), "ou_1", "devices")
+	if !strings.Contains(lastText(sender), "已取消上一条待确认") {
+		t.Errorf("改口时应提示待确认已取消: %q", lastText(sender))
+	}
+	if !strings.Contains(lastText(sender), "dev-1") && !strings.Contains(lastText(sender), "serial") {
+		t.Errorf("devices 应被执行: %q", lastText(sender))
+	}
+
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2 (pending_confirm + declined)", rows)
+	}
+	if n := countOutcome(rows, store.OutcomePendingConfirm); n != 1 {
+		t.Errorf("pending_confirm 行数 = %d, want 1", n)
+	}
+	if n := countOutcome(rows, store.OutcomeDeclined); n != 1 {
+		t.Errorf("declined 行数 = %d, want 1", n)
+	}
+}
+
+func TestConfirmExpires(t *testing.T) {
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 1, Command: "unquarantine", Args: []string{"dev-1"}, Confidence: 0.95,
+	}}
+	st := store.NewMemStore()
+	seedQuarantinedDevice(t, st, "dev-1")
+	sender := &fakeSender{}
+	now := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+	e := &Executor{Store: st, Sender: sender, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st), Now: func() time.Time { return now }}
+	e.HandleMessage(context.Background(), "ou_1", "把那台板子放出来")
+	now = now.Add(121 * time.Second)
+	e.HandleMessage(context.Background(), "ou_1", "y")
+	if strings.Contains(lastText(sender), "已解隔离") {
+		t.Error("TTL 过期后 y 不得执行")
+	}
+
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if n := countOutcome(rows, store.OutcomeExpired); n != 1 {
+		t.Errorf("TTL 到期应落一行 expired(设计文档 §4.3 的两个独立触发之一,"+
+			"另一个是 TestNewTranslationSupersedesPending 覆盖的被覆盖场景), got %d, rows=%+v", n, rows)
+	}
+	if n := countOutcome(rows, store.OutcomeConfirmed); n != 0 {
+		t.Errorf("TTL 过期后不得落 confirmed, got %d", n)
+	}
+}
+
+func TestNewTranslationSupersedesPending(t *testing.T) {
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 1, Command: "unquarantine", Args: []string{"dev-1"}, Confidence: 0.95,
+	}}
+	st := store.NewMemStore()
+	seedQuarantinedDevice(t, st, "dev-1")
+	e := &Executor{Store: st, Sender: &fakeSender{}, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st)}
+	e.HandleMessage(context.Background(), "ou_1", "把那台板子放出来")
+	e.HandleMessage(context.Background(), "ou_1", "再放一次")
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	var expired int
+	for _, r := range rows {
+		if r.Outcome == store.OutcomeExpired {
+			expired++
+		}
+	}
+	if expired != 1 {
+		t.Errorf("被覆盖的待确认应落一行 expired, got %d", expired)
+	}
+}
+
+// TestBlankMessageSkipsTranslatorEvenWhenEnabled 挡住"贴图/图片等非文本消息
+// 触发一次 LLM 调用"的回归:listener.extractMessage 对非文本消息返回空文本,
+// Parse("") 命中 help,若不特判空串,help 分支的翻译旁路会把每一条贴图都送去
+// hermes -z(13s 热/76s 冷),还写一行 raw_text 为空串的垃圾审计并取消待确认。
+// 空输入必须原样落到改动前就有的 usage 回复,且翻译层零调用。
+func TestBlankMessageSkipsTranslatorEvenWhenEnabled(t *testing.T) {
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 1, Command: "devices", Confidence: 0.95,
+	}}
+	st := store.NewMemStore()
+	sender := &fakeSender{}
+	e := &Executor{Store: st, Sender: sender, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st)}
+	e.HandleMessage(context.Background(), "ou_1", "")
+	if f.calls != 0 {
+		t.Errorf("空文本(贴图/图片等非文本消息)不得触发翻译, calls = %d", f.calls)
+	}
+	if lastText(sender) != usage {
+		t.Errorf("空文本应回今天的 usage,与翻译层禁用时逐字节一致:\n got %q\nwant %q", lastText(sender), usage)
+	}
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("空文本不应留下任何 raw_text='' 的翻译审计行, rows=%+v", rows)
+	}
+}
+
+func TestTranslatorDisabledFallsBackToUsage(t *testing.T) {
+	st := store.NewMemStore()
+	sender := &fakeSender{}
+	e := &Executor{Store: st, Sender: sender, Whitelist: map[string]bool{"ou_1": true}}
+	e.HandleMessage(context.Background(), "ou_1", "随便说点什么")
+	if lastText(sender) != usage {
+		t.Errorf("翻译层禁用时必须与改动前逐字节一致:\n got %q\nwant %q", lastText(sender), usage)
 	}
 }

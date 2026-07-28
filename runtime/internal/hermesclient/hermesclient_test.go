@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -58,8 +59,8 @@ func TestAnalyze(t *testing.T) {
 				if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 					t.Errorf("请求体不是合法 JSON: %v", err)
 				}
-				if p.TaskID != "task-1" || p.PromptVersion != PromptVersion ||
-					p.Prompt != Prompt || p.RuleCategory != "INFRA" || len(p.Evidence) == 0 {
+				if p.TaskID != "task-1" || p.PromptVersion != PromptVersionAnalyze ||
+					p.Prompt != PromptAnalyze || p.RuleCategory != "INFRA" || len(p.Evidence) == 0 {
 					t.Errorf("请求体字段不符合规范: %+v", p)
 				}
 				if p.Model != "" { // 未指定模型时 omitempty 生效
@@ -221,5 +222,126 @@ func TestModelPassthrough(t *testing.T) {
 func TestNewHTTPClientEmptyEndpoint(t *testing.T) {
 	if c := NewHTTPClient(Config{}); c != nil {
 		t.Fatal("空 Endpoint 应返回 nil(调用方判未启用)")
+	}
+}
+
+func TestTranslateURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://h:18100/analyze", "http://h:18100/translate"},
+		{"http://h:18100/analyze/", "http://h:18100/translate"},
+		{"http://h/hermes/analyze", "http://h/hermes/translate"},
+	}
+	for _, c := range cases {
+		got, err := translateURL(c.in)
+		if err != nil {
+			t.Fatalf("translateURL(%q): %v", c.in, err)
+		}
+		if got != c.want {
+			t.Errorf("translateURL(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestTranslateOK(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte(`{"translation_version":1,"command":"devices","args":[],"confidence":0.95}`))
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+	tr, err := c.Translate(context.Background(), TranslateRequest{
+		RawText: "看下设备状态", Context: json.RawMessage(`{"now":"2026-07-28T09:12:00Z"}`),
+	})
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	if gotPath != "/translate" {
+		t.Errorf("path = %q, want /translate", gotPath)
+	}
+	if tr.Command != "devices" || tr.Confidence != 0.95 {
+		t.Errorf("unexpected translation: %+v", tr)
+	}
+}
+
+func TestTranslateRejectsInvalidSchema(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// command 不在闭枚举内:必须被本地 Schema 校验挡下(跨进程边界不信任对端)
+		_, _ = w.Write([]byte(`{"translation_version":1,"command":"reboot","confidence":0.9}`))
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+	_, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"})
+	if err == nil {
+		t.Fatal("want error for schema-invalid response, got nil")
+	}
+	// Schema 失败必须能与网络/超时/非 2xx 等基础设施错误区分开(审计要能分辨
+	// "prompt 需要迭代" vs "桥不可达"),因此必须满足 errors.Is(err, ErrSchemaInvalid)。
+	if !errors.Is(err, ErrSchemaInvalid) {
+		t.Fatalf("want errors.Is(err, ErrSchemaInvalid), got %v", err)
+	}
+}
+
+// TestTranslateSchemaInvalidIncludesBodySnippet 验证 §4.3 的 output 截断路径确实
+// 可达:schema 校验失败时,wrapped error 必须携带响应原文的一段可辨识片段
+// (此前只落 {"error": Go 错误字符串},该字符串不含平台实际返回值,截断逻辑形同虚设)。
+func TestTranslateSchemaInvalidIncludesBodySnippet(t *testing.T) {
+	const marker = "reboot-xyz-distinctive-marker"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"translation_version":1,"command":"` + marker + `","confidence":0.9}`))
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+	_, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"})
+	if err == nil {
+		t.Fatal("want error for schema-invalid response, got nil")
+	}
+	if !strings.Contains(err.Error(), marker) {
+		t.Fatalf("error should include a snippet of the offending response body, got: %v", err)
+	}
+	if !errors.Is(err, ErrSchemaInvalid) {
+		t.Fatalf("want errors.Is(err, ErrSchemaInvalid), got %v", err)
+	}
+}
+
+func TestTranslateNon2xx(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+	_, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"})
+	if err == nil {
+		t.Fatal("want error for 502, got nil")
+	}
+	// 非 2xx 是基础设施问题,不应被误判成"prompt 需要迭代"的 schema 失败。
+	if errors.Is(err, ErrSchemaInvalid) {
+		t.Fatalf("502 不应满足 errors.Is(err, ErrSchemaInvalid): %v", err)
+	}
+}
+
+// TestCommandSchemaRejectsArgTrailingNewline 是 command.schema.json args pattern
+// 的锚点漂移回归测试:Python 的 re 把 "$" 当作也匹配"换行符之前"(不是严格字符串
+// 结尾),Go 的 regexp 不会,因此 "9da3b9d9\n" 对 Python 校验器合法、对 Go 校验器
+// 非法。companion 的 anchor-free "not" 约束必须让两侧行为一致地拒绝它;这里独立
+// 验证 Go 侧(contracts/tests/test_command_schema.py 用同一份 fixture 验证 Python 侧)。
+func TestCommandSchemaRejectsArgTrailingNewline(t *testing.T) {
+	raw := []byte(`{"translation_version":1,"command":"unquarantine","args":["9da3b9d9\n"],"confidence":0.9}`)
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	if err := commandSchema.Validate(doc); err == nil {
+		t.Fatal("want validation error for trailing-newline arg (anchor-free companion pattern should reject it), got nil")
+	}
+}
+
+func TestCommandSchemaCopyMatchesContracts(t *testing.T) {
+	src, err := os.ReadFile("../../../contracts/command.schema.json")
+	if err != nil {
+		t.Fatalf("read contracts copy: %v", err)
+	}
+	if string(src) != commandSchemaJSON {
+		t.Error("command.schema.json 与 contracts/ 不一致,请同步副本")
 	}
 }

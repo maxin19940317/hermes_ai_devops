@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 
 	"gopkg.in/yaml.v3"
 
@@ -78,6 +79,20 @@ func (c *SpecConfig) VariantCount() int {
 		return 0
 	}
 	return len(c.file.Variants)
+}
+
+// VariantNames 返回全部已声明变体名(排序后顺序稳定),供翻译层的上下文快照与
+// 变体存在性校验使用。
+func (c *SpecConfig) VariantNames() []string {
+	if c == nil {
+		return []string{}
+	}
+	out := make([]string, 0, len(c.file.Variants))
+	for name := range c.file.Variants {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // SignaturesForVariant 合并 defaults.signatures_common_android 与

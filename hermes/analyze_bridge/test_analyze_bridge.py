@@ -186,3 +186,77 @@ def test_schema_copy_matches_contracts():
     assert json.loads(contracts.read_text(encoding="utf-8")) == json.loads(
         ab.SCHEMA_PATH.read_text(encoding="utf-8")
     ), "analysis.schema.json 与 contracts/ 不一致,请重新拷贝"
+
+
+# ---------------------------------------------------------------------------
+# /translate — 飞书指令层意图翻译(同构 /analyze:同样 -t "" 禁工具、同样服务端
+# 定形校验、同样打回重试上限)
+# ---------------------------------------------------------------------------
+
+TRANSLATE_VALID = {
+    "translation_version": 1,
+    "command": "devices",
+    "args": [],
+    "confidence": 0.95,
+    "reason": "询问设备状态",
+}
+
+TRANSLATE_PAYLOAD = {
+    "prompt": "把用户输入翻译成一条指令",
+    "raw_text": "看下设备都什么状态",
+    "context": {"now": "2026-07-28T09:12:00Z", "variants": [], "recent_runs": [], "devices": []},
+}
+
+
+def test_translate_missing_fields(client):
+    r = client.post("/translate", json={"prompt": "x"}, headers=auth())
+    assert r.status_code == 400
+
+
+def test_translate_unauthorized(client):
+    r = client.post(
+        "/translate", json=TRANSLATE_PAYLOAD, headers={"Authorization": "Bearer wrong"}
+    )
+    assert r.status_code == 401
+
+
+def test_translate_ok(client, fake_hermes):
+    put(fake_hermes, "resp_default.json", TRANSLATE_VALID)
+    r = client.post("/translate", json=TRANSLATE_PAYLOAD, headers=auth())
+    assert r.status_code == 200
+    assert r.json()["command"] == "devices"
+
+
+def test_translate_retries_then_succeeds(client, fake_hermes):
+    put(fake_hermes, "resp1.json", "not json at all")
+    put(fake_hermes, "resp2.json", TRANSLATE_VALID)
+    r = client.post("/translate", json=TRANSLATE_PAYLOAD, headers=auth())
+    assert r.status_code == 200
+    calls = fake_hermes.parent.joinpath("calls.log").read_text(encoding="utf-8")
+    assert calls.count("ARG:-z\n") == 2
+
+
+def test_translate_exhausts_attempts(client, fake_hermes):
+    # "reboot" 不在 command 封闭枚举里,且缺 translation_version/confidence,
+    # 每次都会校验失败,直到打回重试耗尽。
+    put(fake_hermes, "resp_default.json", '{"command": "reboot"}')
+    r = client.post("/translate", json=TRANSLATE_PAYLOAD, headers=auth())
+    assert r.status_code == 502
+
+
+def test_translate_disables_tools(client, fake_hermes):
+    """§3 工具白名单:/translate 每次调用也必须 -t ""(空工具集)。"""
+    put(fake_hermes, "resp_default.json", TRANSLATE_VALID)
+    r = client.post("/translate", json=TRANSLATE_PAYLOAD, headers=auth())
+    assert r.status_code == 200
+    calls = fake_hermes.parent.joinpath("calls.log").read_text(encoding="utf-8")
+    assert "ARG:-t\nARG:\n" in calls
+
+
+def test_command_schema_copy_matches_contracts():
+    """防契约漂移:bridge 内嵌副本必须与 contracts/command.schema.json 一致(逐字节)。"""
+    src = (Path(__file__).resolve().parents[2] / "contracts" / "command.schema.json").read_text(
+        encoding="utf-8"
+    )
+    dst = Path(__file__).with_name("command.schema.json").read_text(encoding="utf-8")
+    assert src == dst

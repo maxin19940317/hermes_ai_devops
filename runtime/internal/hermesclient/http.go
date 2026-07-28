@@ -5,14 +5,20 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
 )
+
+// ErrSchemaInvalid 标记"平台响应不符合契约 Schema"这一类失败,与网络/超时/非 2xx
+// 区分开:前者是 prompt 需要迭代的信号,后者是基础设施问题(审计要能分辨)。
+var ErrSchemaInvalid = errors.New("hermesclient: 响应不符合契约 Schema")
 
 // 缺省请求超时(Config.Timeout <= 0 时生效)。
 const defaultTimeout = 60 * time.Second
@@ -24,15 +30,21 @@ const errBodyLimit = 200
 var analysisSchemaJSON string
 
 // analysisSchema 是编译期嵌入的 contracts/analysis.schema.json(Draft2020)。
-var analysisSchema = mustCompileAnalysisSchema()
+var analysisSchema = mustCompileSchema("analysis.schema.json", analysisSchemaJSON)
 
-func mustCompileAnalysisSchema() *jsonschema.Schema {
+//go:embed command.schema.json
+var commandSchemaJSON string
+
+// commandSchema 是编译期嵌入的 contracts/command.schema.json(Draft2020)。
+var commandSchema = mustCompileSchema("command.schema.json", commandSchemaJSON)
+
+func mustCompileSchema(name, body string) *jsonschema.Schema {
 	c := jsonschema.NewCompiler()
 	c.Draft = jsonschema.Draft2020
-	if err := c.AddResource("analysis.schema.json", strings.NewReader(analysisSchemaJSON)); err != nil {
+	if err := c.AddResource(name, strings.NewReader(body)); err != nil {
 		panic(err)
 	}
-	return c.MustCompile("analysis.schema.json")
+	return c.MustCompile(name)
 }
 
 // Config 是 HTTPClient 的配置。HTTPDoer 可注入 *http.Client 便于测试。
@@ -84,9 +96,9 @@ type analyzePayload struct {
 func (c *HTTPClient) Analyze(ctx context.Context, req AnalyzeRequest) (*Analysis, error) {
 	body, err := json.Marshal(analyzePayload{
 		TaskID:        req.TaskID,
-		PromptVersion: PromptVersion,
+		PromptVersion: PromptVersionAnalyze,
 		Model:         req.Model,
-		Prompt:        Prompt,
+		Prompt:        PromptAnalyze,
 		RuleCategory:  req.RuleCategory,
 		Evidence:      req.Evidence,
 	})
@@ -129,4 +141,92 @@ func (c *HTTPClient) Analyze(ctx context.Context, req AnalyzeRequest) (*Analysis
 		return nil, fmt.Errorf("hermesclient: 解析 Analysis 失败: %w", err)
 	}
 	return &a, nil
+}
+
+// translatePayload 是发往 bridge POST /translate 的请求格式(§3.3)。
+type translatePayload struct {
+	PromptVersion string          `json:"prompt_version"`
+	Model         string          `json:"model,omitempty"`
+	Prompt        string          `json:"prompt"`
+	RawText       string          `json:"raw_text"`
+	Context       json.RawMessage `json:"context"`
+}
+
+// translateURL 由 Endpoint(指向 /analyze)推导出同一 bridge 的 /translate:
+// 替换路径最后一段。不新增环境变量,避免两个 URL 被配到不同实例上(设计文档 §7)。
+func translateURL(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("hermesclient: Endpoint 不是合法 URL: %w", err)
+	}
+	p := strings.TrimRight(u.Path, "/")
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		u.Path = p[:i] + "/translate"
+	} else {
+		u.Path = "/translate"
+	}
+	return u.String(), nil
+}
+
+// Translate 调用 bridge 执行一次意图翻译:响应经内嵌 command.schema.json 校验后
+// 解析;校验不过或非 2xx 均返回 wrapped error,由调用方回退 usage(设计文档 §6)。
+func (c *HTTPClient) Translate(ctx context.Context, req TranslateRequest) (*Translation, error) {
+	endpoint, err := translateURL(c.cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	ctxJSON := req.Context
+	if len(ctxJSON) == 0 {
+		ctxJSON = json.RawMessage(`{}`)
+	}
+	body, err := json.Marshal(translatePayload{
+		PromptVersion: PromptVersionTranslate,
+		Model:         req.Model,
+		Prompt:        PromptTranslate,
+		RawText:       req.RawText,
+		Context:       ctxJSON,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 编码翻译请求失败: %w", err)
+	}
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 构造翻译请求失败: %w", err)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	if c.cfg.AuthToken != "" {
+		hreq.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
+	}
+	resp, err := c.hc.Do(hreq)
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 调用 %s 失败: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 读取翻译响应失败: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		snippet := string(raw)
+		if len(snippet) > errBodyLimit {
+			snippet = snippet[:errBodyLimit] + "..."
+		}
+		return nil, fmt.Errorf("hermesclient: 平台返回 %d: %s", resp.StatusCode, snippet)
+	}
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("hermesclient: 翻译响应不是合法 JSON: %w", err)
+	}
+	if err := commandSchema.Validate(doc); err != nil {
+		snippet := string(raw)
+		if len(snippet) > errBodyLimit {
+			snippet = snippet[:errBodyLimit] + "..."
+		}
+		return nil, fmt.Errorf("hermesclient: 响应不符合 command.schema.json(视为翻译失败): %w: %w: body=%s", ErrSchemaInvalid, err, snippet)
+	}
+	var tr Translation
+	if err := json.Unmarshal(raw, &tr); err != nil {
+		return nil, fmt.Errorf("hermesclient: 解析 Translation 失败: %w", err)
+	}
+	return &tr, nil
 }

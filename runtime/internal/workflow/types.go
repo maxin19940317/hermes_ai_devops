@@ -36,11 +36,18 @@ type DeviceTestInput struct {
 	Attempt int `json:"attempt,omitempty"`
 }
 
+// BaseWorkflowID 是 workflow ID 去掉 scope/attempt 后缀的公共前缀。
+// RecentRuns 用它回查 tasks(设计文档 §3.2):格式只此一处定义,Go 侧单一真相来源,
+// 不在 SQL 里重复拼接,格式漂移在编译期就不可能发生。
+func BaseWorkflowID(project, commit string, pipelineID int) string {
+	return "device-test-" + project + "-g" + commit + "-p" + strconv.Itoa(pipelineID)
+}
+
 // WorkflowID 返回确定性的 workflow ID:同一 bundle(或同一变体 kick)重复
 // 触发得到同一 ID,由 Temporal 的 ID 唯一性完成天然去重(幂等键思想,§3 规则 7);
 // 显式 retry(Attempt>0)派生新 ID 起新 run,普通重放永远命中原 ID 被拒绝。
 func (in DeviceTestInput) WorkflowID() string {
-	id := "device-test-" + in.Project + "-g" + in.Commit + "-p" + strconv.Itoa(in.PipelineID)
+	id := BaseWorkflowID(in.Project, in.Commit, in.PipelineID)
 	if in.Scope != "" {
 		id += "-" + in.Scope
 	}

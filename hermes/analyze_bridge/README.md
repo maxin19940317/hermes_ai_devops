@@ -1,9 +1,17 @@
 # analyze_bridge — hermes-agent 平台的 Analyzer HTTP 适配层
 
 Runtime(`hermesclient`)与 hermes-agent 平台之间的唯一适配点(CLAUDE.md §4/§12
-Phase 2):把 Runtime 的 `POST /analyze` 翻译成平台内 `hermes -z` 一次性调用,
-输出经 `analysis.schema.json` 校验后返回;平台失败/输出不合规返回 502,
-Runtime 按 §9 降级到规则引擎保底。
+Phase 2):把 Runtime 的请求翻译成平台内 `hermes -z` 一次性调用,输出经 Schema
+校验后返回;平台失败/输出不合规返回 502。
+
+- `POST /analyze` — Analyzer:evidence → analysis.schema.json
+- `POST /translate` — 飞书指令层意图翻译:自然语言 + 上下文快照 → command.schema.json
+
+> 部署提醒:本服务**不在 `deploy/docker-compose.yml` 里**,由实例内
+> `start-analyze-bridge` 启停。Runtime 侧启用 `FEISHU_CMD_NL` 之前,必须先拉新代码
+> 重启本服务,并 `curl -X POST .../translate` 确认路由存在,否则全部自然语言请求 502。
+
+`/analyze` 失败时 Runtime 按 §9 降级到规则引擎保底。
 
 - 工具白名单(§3):每次调用固定 `-t ""`(空工具集),Analyzer 无任何工具能力。
 - 打回重试:输出未过 Schema 校验时,把校验错误附进 prompt 重试,上限
@@ -15,12 +23,14 @@ Runtime 按 §9 降级到规则引擎保底。
 
 ## 文件
 
-- `analyze_bridge.py` — FastAPI 应用(`GET /health`、`POST /analyze`)
+- `analyze_bridge.py` — FastAPI 应用(`GET /health`、`POST /analyze`、`POST /translate`)
 - `analysis.schema.json` — `contracts/analysis.schema.json` 的部署副本
   (防漂移由 `test_analyze_bridge.py::test_schema_copy_matches_contracts` 保证)
+- `command.schema.json` — `contracts/command.schema.json` 的部署副本
+  (防漂移由 `test_analyze_bridge.py::test_command_schema_copy_matches_contracts` 保证)
 - `start-analyze-bridge` — 实例内启动脚本(env 文件 + pidfile + nohup uvicorn,
   幂等;形态同实例既有 `start-queinfer-gitlab-bridge`)
-- `test_analyze_bridge.py` — pytest(假 hermes CLI 驱动,13 例)
+- `test_analyze_bridge.py` — pytest(假 hermes CLI 驱动,20 例)
 
 ## 测试
 
@@ -44,7 +54,7 @@ docker run --rm -v hermes-analyzer-data:/opt/data nousresearch/hermes-agent:late
 # 参照现有实例 /opt/data 的同名文件,秘钥不落 Git。
 
 # 2. 拷贝 bridge 文件到实例 home
-for f in analyze_bridge.py analysis.schema.json start-analyze-bridge; do
+for f in analyze_bridge.py analysis.schema.json command.schema.json start-analyze-bridge; do
   docker run --rm -v "$PWD/hermes/analyze_bridge:/src:ro" \
     -v hermes-analyzer-data:/opt/data alpine:3.22.1 \
     sh -c "cp /src/$f /opt/data/bin/ && chmod +x /opt/data/bin/start-analyze-bridge || true"
