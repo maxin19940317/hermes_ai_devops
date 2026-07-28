@@ -54,6 +54,8 @@ type MemStore struct {
 	outboxSeq   int64
 	// evidenceSnaps 是 evidence_snapshots 表(差距 #6)的内存视图。
 	evidenceSnaps map[string]EvidenceSnapshot
+	// translations 是 command_translations 表(设计文档 §4.3)的内存视图。
+	translations []CommandTranslation
 }
 
 func NewMemStore() *MemStore {

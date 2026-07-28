@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"reflect"
@@ -45,6 +46,8 @@ type fullStore interface {
 	UnquarantineDevice(ctx context.Context, deviceID string) (bool, error)
 	ListArtifacts(ctx context.Context, commitSHA string, pipelineID int) ([]Artifact, error)
 	NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error)
+	SaveCommandTranslation(ctx context.Context, row CommandTranslation) error
+	ListCommandTranslations(ctx context.Context, openID string, limit int) ([]CommandTranslation, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -822,6 +825,57 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		assertJSONEqual(llm.Output, got[1].Output)
 		if none, err := s.ListDecisions(ctx, "no-such"); err != nil || len(none) != 0 {
 			t.Errorf("未知任务应返回空: %v %v", none, err)
+		}
+	})
+
+	// 飞书指令层自然语言翻译审计(设计文档 §4.3):追加式,确认流程不更新
+	// 已有行,只追加新行;同 open_id 按时序读就是完整证据链,最新在前。
+	t.Run("CommandTranslationsAppendOnly", func(t *testing.T) {
+		s := newStore(t)
+		rows := []CommandTranslation{
+			{OpenID: "ou_1", RawText: "看下设备状态", PromptVersion: "cmd_translate_v1",
+				Model: "m", ContextDigest: "abc", Output: []byte(`{"command":"devices"}`),
+				Rendered: "devices", Outcome: OutcomeExecuted},
+			{OpenID: "ou_1", RawText: "重跑昨天那个", ContextDigest: "def",
+				Output: []byte(`{"command":"rerun"}`), Rendered: "rerun 9da3b9d9 56",
+				Outcome: OutcomePendingConfirm},
+			{OpenID: "ou_1", RawText: "y", Rendered: "rerun 9da3b9d9 56", Outcome: OutcomeConfirmed},
+		}
+		for _, r := range rows {
+			if err := s.SaveCommandTranslation(ctx, r); err != nil {
+				t.Fatalf("SaveCommandTranslation: %v", err)
+			}
+		}
+		// 追加式审计:三行都在,顺序即时序
+		got, err := s.ListCommandTranslations(ctx, "ou_1", 10)
+		if err != nil {
+			t.Fatalf("ListCommandTranslations: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("len = %d, want 3", len(got))
+		}
+		if got[0].Outcome != OutcomeConfirmed {
+			t.Errorf("最新一行 outcome = %q, want %q", got[0].Outcome, OutcomeConfirmed)
+		}
+	})
+
+	t.Run("CommandTranslationTruncatesOutput", func(t *testing.T) {
+		s := newStore(t)
+		big := append([]byte(`{"junk":"`), bytes.Repeat([]byte("x"), 8000)...)
+		big = append(big, []byte(`"}`)...)
+		if err := s.SaveCommandTranslation(ctx, CommandTranslation{
+			OpenID: "ou_2", RawText: "x", Output: big, Outcome: OutcomeRejectedSchema,
+		}); err != nil {
+			t.Fatalf("SaveCommandTranslation: %v", err)
+		}
+		got, err := s.ListCommandTranslations(ctx, "ou_2", 1)
+		if err != nil {
+			t.Fatalf("ListCommandTranslations: %v", err)
+		}
+		// 上限留一倍余量:PG 侧非法 JSON 会被包装成 {"raw":"..."} 再存,
+		// 转义后略长于 outputLimit,断言的是"截断生效"而非精确字节数。
+		if len(got[0].Output) > outputLimit*2 {
+			t.Errorf("output 未截断: %d(原始 8000+)", len(got[0].Output))
 		}
 	})
 }
