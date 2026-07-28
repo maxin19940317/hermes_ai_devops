@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -872,10 +873,19 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if err != nil {
 			t.Fatalf("ListCommandTranslations: %v", err)
 		}
-		// 上限留一倍余量:PG 侧非法 JSON 会被包装成 {"raw":"..."} 再存,
-		// 转义后略长于 outputLimit,断言的是"截断生效"而非精确字节数。
-		if len(got[0].Output) > outputLimit*2 {
-			t.Errorf("output 未截断: %d(原始 8000+)", len(got[0].Output))
+		// 断言"确实截断了",而非仅仅"没有超过某个宽松上限"(原始 8011 字节本身
+		// 就合法 JSON 且小于 outputLimit*2,松散上限无法区分"正确截断"与"完全
+		// 没截断")。两个后端都应满足:落库字节数严格小于原始输入,且带尾标记。
+		stored := string(got[0].Output)
+		if len(stored) >= len(big) {
+			t.Errorf("output 未截断: %d 字节(原始 %d)", len(stored), len(big))
+		}
+		if !strings.Contains(stored, truncatedMark) {
+			n := 80
+			if len(stored) < n {
+				n = len(stored)
+			}
+			t.Errorf("截断后应带尾标记 %q, got %q...", truncatedMark, stored[:n])
 		}
 	})
 }

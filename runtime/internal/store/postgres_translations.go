@@ -14,7 +14,7 @@ func (s *PGStore) SaveCommandTranslation(ctx context.Context, row CommandTransla
 	if len(out) == 0 || !json.Valid(out) {
 		wrapped, err := json.Marshal(map[string]string{"raw": string(out)})
 		if err != nil {
-			return fmt.Errorf("save command translation: wrap output: %w", err)
+			return fmt.Errorf("save command translation %s: wrap output: %w", row.OpenID, err)
 		}
 		out = wrapped
 	}
@@ -25,7 +25,7 @@ func (s *PGStore) SaveCommandTranslation(ctx context.Context, row CommandTransla
 		row.OpenID, row.RawText, row.PromptVersion, row.Model, row.ContextDigest,
 		string(out), row.Rendered, row.Outcome)
 	if err != nil {
-		return fmt.Errorf("save command translation: %w", err)
+		return fmt.Errorf("save command translation %s: %w", row.OpenID, err)
 	}
 	return nil
 }
@@ -39,7 +39,7 @@ func (s *PGStore) ListCommandTranslations(ctx context.Context, openID string, li
 		ORDER BY created_at DESC, translation_id DESC
 		LIMIT $2`, openID, limit)
 	if err != nil {
-		return nil, fmt.Errorf("list command translations: %w", err)
+		return nil, fmt.Errorf("list command translations %s: %w", openID, err)
 	}
 	defer rows.Close()
 	out := []CommandTranslation{}
@@ -48,10 +48,13 @@ func (s *PGStore) ListCommandTranslations(ctx context.Context, openID string, li
 		var output string
 		if err := rows.Scan(&r.OpenID, &r.RawText, &r.PromptVersion, &r.Model,
 			&r.ContextDigest, &output, &r.Rendered, &r.Outcome); err != nil {
-			return nil, fmt.Errorf("list command translations: scan: %w", err)
+			return nil, fmt.Errorf("list command translations %s: scan: %w", openID, err)
 		}
 		r.Output = []byte(output)
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list command translations %s: %w", openID, err)
+	}
+	return out, nil
 }
