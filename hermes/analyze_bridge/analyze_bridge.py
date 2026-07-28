@@ -139,30 +139,43 @@ def run_hermes(prompt: str, model: str | None) -> str:
     return cp.stdout
 
 
-def run_with_schema(payload: dict, schema: dict, prompt_builder, label: str, fallback_msg: str) -> dict:
+def run_with_schema(payload: dict, schema: dict, prompt_builder, log_ok, log_retry, fallback_msg: str) -> dict:
     """调 hermes 并做 Schema 校验打回重试;全部失败抛 BridgeError(502)。
-    校验用哪份 schema 由路由写死,不接受请求方指定(契约选择权不外放)。"""
+    校验用哪份 schema 由路由写死,不接受请求方指定(契约选择权不外放)。
+    log_ok(attempt) / log_retry(attempt, err) 由各路由提供,
+    使每条路由保留自己的日志文案(analyze 的文案不得因抽取而改变)。"""
     errors: list[str] = []
     for attempt in range(1, MAX_ATTEMPTS + 1):
         stdout = run_hermes(prompt_builder(payload, errors), payload.get("model") or None)
         try:
             doc = extract_json(stdout)
             jsonschema.validate(doc, schema)
-            log.info("%s ok: attempt=%d", label, attempt)
+            log_ok(attempt)
             return doc
         except (ValueError, jsonschema.ValidationError) as e:
-            log.warning("%s attempt %d 校验失败: %s", label, attempt, str(e)[:ERR_SNIPPET])
+            log_retry(attempt, str(e)[:ERR_SNIPPET])
             errors.append(str(e)[:ERR_SNIPPET])
     raise BridgeError(502, f"输出连续 {MAX_ATTEMPTS} 次未通过 Schema 校验,{fallback_msg}")
 
 
 def run_analysis(payload: dict) -> dict:
-    label = f"analyze task={payload.get('task_id')}"
-    return run_with_schema(payload, ANALYSIS_SCHEMA, build_prompt, label, "降级规则引擎")
+    def log_ok(attempt: int) -> None:
+        log.info("analyze ok: task=%s attempt=%d", payload.get("task_id"), attempt)
+
+    def log_retry(attempt: int, err: str) -> None:
+        log.warning("analyze attempt %d 校验失败: %s", attempt, err)
+
+    return run_with_schema(payload, ANALYSIS_SCHEMA, build_prompt, log_ok, log_retry, "降级规则引擎")
 
 
 def run_translation(payload: dict) -> dict:
-    return run_with_schema(payload, COMMAND_SCHEMA, build_translate_prompt, "translate", "降级调用方保底")
+    def log_ok(attempt: int) -> None:
+        log.info("translate ok: attempt=%d", attempt)
+
+    def log_retry(attempt: int, err: str) -> None:
+        log.warning("translate attempt %d 校验失败: %s", attempt, err)
+
+    return run_with_schema(payload, COMMAND_SCHEMA, build_translate_prompt, log_ok, log_retry, "降级调用方保底")
 
 
 @app.get("/health")

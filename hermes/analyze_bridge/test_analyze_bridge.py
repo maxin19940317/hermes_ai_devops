@@ -208,12 +208,12 @@ TRANSLATE_PAYLOAD = {
 }
 
 
-def test_translate_missing_fields(client, fake_hermes):
+def test_translate_missing_fields(client):
     r = client.post("/translate", json={"prompt": "x"}, headers=auth())
     assert r.status_code == 400
 
 
-def test_translate_unauthorized(client, fake_hermes):
+def test_translate_unauthorized(client):
     r = client.post(
         "/translate", json=TRANSLATE_PAYLOAD, headers={"Authorization": "Bearer wrong"}
     )
