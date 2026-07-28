@@ -145,6 +145,40 @@ func TestLoadConfigRequiresCallbackBaseURL(t *testing.T) {
 	}
 }
 
+func TestFeishuCmdNLConfig(t *testing.T) {
+	cfg, err := loadConfig(lookup(map[string]string{
+		"VARIANTS_CONFIG":           "../../ci/variants.yaml",
+		"CALLBACK_BASE_URL":         "https://runtime.example",
+		"FEISHU_CMD_NL":             "true",
+		"FEISHU_CMD_NL_TIMEOUT_SEC": "90",
+	}))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.Activity.FeishuCmdNL {
+		t.Error("FeishuCmdNL = false, want true")
+	}
+	if cfg.Activity.FeishuCmdNLTimeout != 90*time.Second {
+		t.Errorf("timeout = %v, want 90s", cfg.Activity.FeishuCmdNLTimeout)
+	}
+}
+
+func TestFeishuCmdNLDefaults(t *testing.T) {
+	cfg, err := loadConfig(lookup(map[string]string{
+		"VARIANTS_CONFIG":   "../../ci/variants.yaml",
+		"CALLBACK_BASE_URL": "https://runtime.example",
+	}))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.Activity.FeishuCmdNL {
+		t.Error("缺省必须关闭(灰度)")
+	}
+	if cfg.Activity.FeishuCmdNLTimeout != 60*time.Second {
+		t.Errorf("timeout 缺省 = %v, want 60s", cfg.Activity.FeishuCmdNLTimeout)
+	}
+}
+
 func TestLoadConfigRejectsInvalidInt(t *testing.T) {
 	_, err := loadConfig(lookup(map[string]string{
 		"VARIANTS_CONFIG":   "v.yaml",

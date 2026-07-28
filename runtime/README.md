@@ -31,6 +31,17 @@ bundle webhook 启动前还会跳过已测变体:kick 变体级 workflow 已出�
 Postgres 集成测试由 `TEST_DATABASE_URL` 门控(本机跳过,服务器部署后必须跑通);
 其余测试含真实 dev server 上的启动/去重 e2e(`internal/testtemporal` 拉起)。
 
+## Worker 服务(Phase 1.6 / Phase 2)
+
+`cmd/worker`:Temporal worker + Client 回调 HTTP 服务,配置见
+`cmd/worker/main.go` 头注释(环境变量全表)。飞书指令自然语言翻译新增两项
+(设计文档 2026-07-28,详见 `../deploy/README.md` "飞书指令自然语言翻译"小节):
+
+| 变量 | 缺省 | 说明 |
+|---|---|---|
+| `FEISHU_CMD_NL` | `false` | 翻译旁路总开关(灰度)。真正启用还需 `HERMES_ENDPOINT` 非空且 `FEISHU_CMD_WHITELIST` 非空(指令 listener 已启用),三者合取 |
+| `FEISHU_CMD_NL_TIMEOUT_SEC` | `60` | `/translate` 调用超时,不复用 `HERMES_TIMEOUT_SEC`(bridge 实测 `-t ""` 冷/热约 76s/13s,这是交互路径,需单独调) |
+
 ## Spike 结论(2026-07-17)
 
 三个最小示例以 e2e 测试形式落在 `spike/`,测试自行拉起

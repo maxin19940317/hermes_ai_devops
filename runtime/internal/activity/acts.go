@@ -58,6 +58,13 @@ type Config struct {
 	HermesAuthToken string
 	HermesModel     string // 可选透传;模型主体由平台配置
 	HermesTimeout   time.Duration
+	// §12 Phase 2 / 设计文档 §3.1:飞书指令层自然语言翻译旁路总开关(缺省关,灰度)。
+	// 启用需三者合取:FeishuCmdNL && HermesEndpoint 非空 && 指令 listener 本身已启用
+	// (FeishuCmdWhitelist 非空)——装配逻辑见 cmd/worker/main.go。
+	FeishuCmdNL bool
+	// FeishuCmdNLTimeout 是 /translate 调用超时,不复用 HermesTimeout:bridge 实测
+	// -t "" 冷/热约 76s/13s,这是人在飞书里等回复的交互路径,需单独调(缺省 60s)。
+	FeishuCmdNLTimeout time.Duration
 }
 
 // Acts carries all activities; method names are the activity name strings referenced in workflow.

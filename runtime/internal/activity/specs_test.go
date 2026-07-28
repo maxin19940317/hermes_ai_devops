@@ -134,6 +134,22 @@ func TestSignaturesForVariant(t *testing.T) {
 	}
 }
 
+// TestVariantNamesSorted:map 遍历序不确定,必须排序后才能给翻译层的上下文快照
+// 提供稳定顺序(否则 context_digest 随遍历序抖动,审计回放对不上)。
+func TestVariantNamesSorted(t *testing.T) {
+	a := testActs(t)
+	got := a.SpecCfg.VariantNames()
+	want := []string{"aarch64_Android_RKNN_2.3.2", "aarch64_Android_SNPE_2.21", "aarch64_Linux_SNPE_2.21"}
+	if len(got) != len(want) {
+		t.Fatalf("VariantNames() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("VariantNames()[%d] = %q, want %q (顺序必须稳定排序)", i, got[i], want[i])
+		}
+	}
+}
+
 func TestLoadSpecConfigMissingFile(t *testing.T) {
 	if _, err := LoadSpecConfig("testdata/nonexistent.yaml", SpecDefaults{}); err == nil {
 		t.Error("缺失文件应报错(worker 启动时 fail fast)")

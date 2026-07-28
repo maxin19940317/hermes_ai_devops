@@ -48,6 +48,22 @@ open_ids) is set, whitelisted users can send the bot DM commands (`status`,
 `devices`, `rerun <sha8> <pipeline_iid> [variant]`, `unquarantine [device_id]`);
 messages from anyone else are silently ignored.
 
+### 飞书指令自然语言翻译(可选)
+
+`FEISHU_CMD_NL=true` 后,不在 `status|devices|rerun|unquarantine` 里的输入会经
+hermes-agent 翻译成一条指令再执行。启用前置条件(三者合取):
+
+1. `FEISHU_CMD_WHITELIST` 非空(指令 listener 本身已启用)
+2. `HERMES_ENDPOINT` 非空
+3. **analyze_bridge 已部署 `/translate` 路由** —— 它不在本 compose 内,由
+   hermes-agent 实例内的 `start-analyze-bridge` 启停。先
+   `curl -X POST -H "Authorization: Bearer $HERMES_AUTH_TOKEN" .../translate`
+   确认路由存在,否则全部自然语言请求 502(手打指令不受影响)。
+
+行为要点:只读指令(status/devices)直接执行;副作用指令(rerun/unquarantine)
+先回执待确认,回复 `y` 执行、`n` 取消,120 秒过期。每次翻译在
+`command_translations` 表留痕。
+
 ## MinIO evidence uploads
 
 The `minio` service stores run evidence (result.json, junit.xml, logcat.txt,

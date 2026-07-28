@@ -25,6 +25,9 @@
 //	FEISHU_RECEIVE_ID       可选;接收方 open_id(个人单聊)或 chat_id(群)
 //	FEISHU_RECEIVE_ID_TYPE  可选;chat_id|open_id,缺省 chat_id
 //	FEISHU_CMD_WHITELIST    可选;指令 listener 白名单(逗号分隔 open_id),空 = 不启动
+//	FEISHU_CMD_NL           可选;飞书指令自然语言翻译旁路总开关,缺省 false(灰度)。
+//	                        启用需三者合取:=true && HERMES_ENDPOINT 非空 && FEISHU_CMD_WHITELIST 非空
+//	FEISHU_CMD_NL_TIMEOUT_SEC 可选;/translate 调用超时,缺省 60(不复用 HERMES_TIMEOUT_SEC)
 //	MINIO_ENDPOINT          集群内 endpoint(如 minio:9000);空 → 禁用预签名(§3.7 降级)
 //	MINIO_PUBLIC_ENDPOINT   预签名 URL 的 host,须 Client 可达;空 → 用 MINIO_ENDPOINT
 //	MINIO_ACCESS_KEY        空 → 禁用预签名
@@ -151,6 +154,31 @@ func main() {
 				Store: st, Sender: feishuSender, Log: &log, Whitelist: wl,
 				Starter:          &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
 				ExpectedVariants: specCfg.VariantCount(),
+			}
+			// 自然语言翻译旁路(设计文档 §3.1):三个条件合取才启用——
+			// 开关打开、bridge 端点已配、指令 listener 本身已启用。
+			nlReason := ""
+			switch {
+			case !cfg.Activity.FeishuCmdNL:
+				nlReason = "FEISHU_CMD_NL != true"
+			case cfg.Activity.HermesEndpoint == "":
+				nlReason = "HERMES_ENDPOINT empty"
+			}
+			if nlReason == "" {
+				nlClient := hermesclient.NewHTTPClient(hermesclient.Config{
+					Endpoint:  cfg.Activity.HermesEndpoint,
+					AuthToken: cfg.Activity.HermesAuthToken,
+					Timeout:   cfg.Activity.FeishuCmdNLTimeout,
+				})
+				exec.Translator = &feishucmd.Translator{
+					Client:   nlClient,
+					Store:    st,
+					Variants: specCfg.VariantNames(),
+					Model:    cfg.Activity.HermesModel,
+				}
+				log.Info().Dur("timeout", cfg.Activity.FeishuCmdNLTimeout).Msg("feishu cmd nl=enabled")
+			} else {
+				log.Info().Str("reason", nlReason).Msg("feishu cmd nl=disabled")
 			}
 			listener := &feishucmd.Listener{
 				AppID: cfg.Activity.FeishuAppID, AppSecret: cfg.Activity.FeishuAppSecret, Exec: exec,

@@ -93,6 +93,12 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// 翻译超时不复用 HERMES_TIMEOUT_SEC:bridge 实测 -t "" 冷/热约 76s/13s,
+	// 分析用 60s 起步,交互用需要单独调(设计文档 §6)。
+	nlTimeoutSec, err := envInt("FEISHU_CMD_NL_TIMEOUT_SEC", 60)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		TemporalAddress:    env("TEMPORAL_ADDRESS", "127.0.0.1:7233"),
@@ -115,6 +121,9 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			FeishuReceiveIDType: getenv("FEISHU_RECEIVE_ID_TYPE"), // 空 → chat_id
 			// 飞书指令 listener 白名单(逗号分隔 open_id;空 = listener 不启动)
 			FeishuCmdWhitelist: getenv("FEISHU_CMD_WHITELIST"),
+			// §12 Phase 2:自然语言翻译旁路总开关(缺省关,灰度)。
+			FeishuCmdNL:        getenv("FEISHU_CMD_NL") == "true",
+			FeishuCmdNLTimeout: time.Duration(nlTimeoutSec) * time.Second,
 			// §3.7:MINIO_ENDPOINT 或凭据为空即禁用预签名(优雅降级)。
 			MinIOEndpoint:       getenv("MINIO_ENDPOINT"),
 			MinIOPublicEndpoint: getenv("MINIO_PUBLIC_ENDPOINT"),
