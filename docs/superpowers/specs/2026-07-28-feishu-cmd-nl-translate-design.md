@@ -2,7 +2,8 @@
 
 日期：2026-07-28
 
-状态：待批准
+状态：待批准（2026-07-28 评审后修订：补 §3.3 bridge 适配、§3.2 查询语义、
+§5.2 待确认期输入处理、§6 超时基线）
 
 ## 1. 背景与决策
 
@@ -36,6 +37,9 @@
 7. **审计单开 `command_translations` 表**。`decisions.task_id` 是
    `NOT NULL REFERENCES tasks(task_id)`（`schema.sql:103`），而翻译发生在任何 task 存在
    之前，没有 task_id 可填。
+8. **`analyze_bridge` 加一条与 `/analyze` 同构的 `POST /translate`**，而不是把 bridge
+   泛化成"prompt + schema 路径"的参数化服务。校验用哪份 schema 必须由服务端写死，
+   不能由请求方指定（§3.3）。
 
 不采用的方案：
 
@@ -58,7 +62,10 @@
 - `feishucmd/executor.go`：`help` 分支旁路 + 待确认态
 - `store`：`RecentRuns` / `SaveCommandTranslation` 双实现 + `command_translations` 表
   + 迁移文件
-- 配置项 `FEISHU_CMD_NL`（缺省 false）与 `deploy/.env.example`、`deploy/README.md` 更新
+- **`analyze_bridge` 加 `POST /translate` 路由** + `command.schema.json` 部署副本
+  + 防漂移测试 + bridge 侧校验打回重试（详见 §3.3）
+- 配置项 `FEISHU_CMD_NL`、`FEISHU_CMD_NL_TIMEOUT_SEC` 与 `deploy/.env.example`、
+  `deploy/README.md`、`hermes/analyze_bridge/README.md` 更新
 
 不交付（明确排除）：
 
@@ -79,7 +86,9 @@ Listener（不变）──► Executor.HandleMessage
                       │
                       ├─ 白名单判定（不变，永远在最前）
                       │
-                      ├─ 待确认态命中？（y/n）──► 执行或放弃 ──► 回复
+                      ├─ 待确认槽非空？
+                      │    ├─ 输入是 y/yes ──► 执行待确认指令 ──► 回复（流程终止）
+                      │    └─ 其他 ──► 清槽 + 落 declined ──► 继续往下当新消息处理
                       │
                       ├─ Parse(text)
                       │    ├─ 命中四指令 ──────────────────► execute（完全不变）
@@ -104,6 +113,7 @@ Listener（不变）──► Executor.HandleMessage
 |---|---|---|
 | `Translator` | `feishucmd/translate.go`（新） | 快照组装、调用、渲染、回灌解析、复校、门限。不碰 `execute`，不碰飞书 SDK |
 | `hermesclient.Translate` | `hermesclient/http.go`（扩展） | HTTP 调用 + `command.schema.json` 校验。与 `Analyze` 对称 |
+| `POST /translate` | `hermes/analyze_bridge/analyze_bridge.py`（扩展） | 平台适配：prompt 拼装、`hermes -z`、Schema 校验打回重试（§3.3） |
 | `Executor` 旁路 | `feishucmd/executor.go`（改） | `help` 分支接入、待确认态存取 |
 | `store.RecentRuns` | `store/fleet.go` + `postgres_fleet.go`（扩展） | 快照的历史运行来源 |
 | `store.SaveCommandTranslation` | `store/translations.go`（新） | 审计落库 |
@@ -111,18 +121,81 @@ Listener（不变）──► Executor.HandleMessage
 `PromptVersion` 常量拆为 `PromptVersionAnalyze` / `PromptVersionTranslate`；现有
 `PromptVersion` 只在 `http.go:87` 用了一处，改动面极小。
 
-### 3.2 `RecentRuns` 的已知耦合
+### 3.2 `RecentRuns` 的已知耦合与查询语义
 
 仓库里**没有 `workflows` 表**（CLAUDE.md §11 列了，`schema.sql` 里不存在）。verdict 只在
-`tasks` 上，而 tasks 与 `(commit, pipeline_iid, variant)` 的关联只经由 `workflow_id`
-字符串（`workflow/types.go:42`：`device-test-{project}-g{sha}-p{iid}[-{scope}][-r{N}]`）。
+`tasks` 上，而 tasks 与 `(commit, pipeline_iid, variant)` 的关联只经由两个字段：
 
-因此 `RecentRuns(ctx, limit)` 的实现是：取最近 `limit` 条 `artifacts`，按上述前缀
-`LIKE` 回查 `tasks` 取最新一条的 verdict/ended_at。这是对 `WorkflowID()` 格式的隐式
-依赖，必须有一个单测把前缀构造函数与 `WorkflowID()` 钉在一起——格式一改测试就红。
+- `tasks.workflow_id` = `WorkflowID()` 的输出（`workflow/types.go:42`）：
+  `device-test-{project}-g{sha}-p{iid}[-{scope}][-r{N}]`
+- `tasks.test_id` = 变体名（`activity/specs.go:141`：`TestID: p.Variant`）
+
+同一个 `(commit, iid, variant)` 的 task 可能挂在三种 workflow 下：变体级 kick 起的
+`baseID-{variant}`、bundle 级起的 `baseID`（`Scope=""`）、以及两者各自的 `-r{N}` 重跑。
+**bundle workflow 下 8 个变体的 task 全挂在同一个 `workflow_id` 上**（task_id 靠
+`{wfID}:{test_id}:a{attempt}` 区分，`devicetest.go:289`），所以查询必须同时按
+`test_id` 过滤，否则会串变体。
+
+正确语义：
+
+```sql
+-- baseID := 'device-test-' || project || '-g' || commit_sha || '-p' || pipeline_id
+WHERE test_id = $variant
+  AND (workflow_id = $baseID OR starts_with(workflow_id, $baseID || '-'))
+ORDER BY created_at DESC
+LIMIT 1
+```
+
+用 `starts_with()` 而非 `LIKE`：项目名可能含下划线（业务仓库存在 `Algo_Super_SDK`
+这种写法），而 `_` 是 `LIKE` 的单字符通配符，走 `LIKE` 就得加 `ESCAPE` 子句。
+`starts_with()`（Postgres 11+）没有通配符语义，从根上免掉转义，也更易读。
+
+这仍是对 `WorkflowID()` 字符串格式的隐式依赖，必须有测试钉住，且测试内容是**完整
+语义**而非仅前缀：构造 bundle workflow（多变体同 `workflow_id`）、变体 workflow、
+`-r{N}` 重跑三种行，断言 `RecentRuns` 各自取到正确变体的最新 verdict；再断言前缀
+构造函数与 `WorkflowID()` 对同一输入产出一致的 baseID——格式一改测试就红。
 
 本设计不新建 `workflows` 表：那是 §11 的独立欠账，牵动 trigger/workflow 多处写入，
 不应搭车进这一轮。
+
+### 3.3 `analyze_bridge` 适配（对岸改造）
+
+`hermesclient` 对面是 `hermes/analyze_bridge/analyze_bridge.py`（FastAPI，跑在专用
+hermes-agent 实例容器内，**不在 `deploy/docker-compose.yml` 里**，由实例内
+`start-analyze-bridge` 脚本启停）。它今天只有 `POST /analyze` 一条业务路由，且：
+
+- `REQUIRED_FIELDS = ("task_id", "prompt", "rule_category", "evidence")` 是硬编码的
+  （`analyze_bridge.py:44`），翻译请求没有 `task_id` / `rule_category` / `evidence`，
+  直接 400
+- `ANALYSIS_SCHEMA` 从单一文件加载（`analyze_bridge.py:40`），校验对象写死
+
+因此必须给 bridge 加一条 `POST /translate`，与 `/analyze` **同构**：
+
+| 关注点 | `/analyze`（现状） | `/translate`（新增） |
+|---|---|---|
+| 必填字段 | `task_id, prompt, rule_category, evidence` | `prompt, context`（无 task_id——翻译发生在任何 task 之前） |
+| prompt 拼装 | 平台 prompt + rule_category + evidence JSON | 平台 prompt + 上下文快照 JSON + 用户原文 |
+| 调用形态 | `hermes -z <prompt> -t ""` | 同左（工具集全禁，§3 工具白名单不放宽） |
+| 校验 | `analysis.schema.json` | `command.schema.json` |
+| 打回重试 | ≤ `ANALYZE_MAX_ATTEMPTS`（缺省 3） | 同一常量，同一机制 |
+| 失败 | 502 → Runtime 降级规则引擎 | 502 → Runtime 回 usage |
+
+不把 bridge 泛化成"prompt + schema 路径"参数化服务：那会让调用方能指定校验用哪份
+schema，等于把契约选择权交给请求方，与"平台输出永远不可信、由服务端定形校验"的
+原则相悖。两条同构路由的重复量很小（可共用 `run_with_schema(payload, schema, ...)`
+内部函数），换来的是每条路由的契约在服务端写死。
+
+**校验在两侧都做，这是既有形态而非重复**：bridge 侧校验并把错误喂回重试（
+`analyze_bridge.py:123`），是"让模型自我修正"的机制；`hermesclient` 侧再校验一次
+（`http.go:124`），是"跨进程边界不信任对端"的防御。翻译沿用同一对称结构。
+
+`command.schema.json` 需要一份 bridge 目录下的部署副本，并照搬既有的防漂移测试
+（`test_analyze_bridge.py::test_schema_copy_matches_contracts`）——`analysis.schema.json`
+已经是这个形态，不照做契约会两边跑偏。
+
+部署影响：analyzer 容器需随本轮重新部署（拉新代码 + 重启 `start-analyze-bridge`），
+这一步要写进 `hermes/analyze_bridge/README.md`。它不在 compose 里，`docker compose up`
+不会带上它——容易漏。
 
 ## 4. 契约
 
@@ -174,6 +247,8 @@ Listener（不变）──► Executor.HandleMessage
 - `devices` 取 `FleetOverview`，只含 `device_id`/`serial`/`status`
 - 快照只含调度元数据，**不含日志、不含 evidence、不含 result.json**
 - 整体量级几 KB；`context_digest` = 快照 JSON 的 sha256，落审计
+- 传输形态：作为 `POST /translate` 请求体的 `context` 字段（与用户原文 `raw_text`
+  一起），由 bridge 拼进 prompt（§3.3）
 
 ### 4.3 `command_translations` 表
 
@@ -185,7 +260,7 @@ CREATE TABLE IF NOT EXISTS command_translations (
     prompt_version TEXT        NOT NULL DEFAULT '',
     model          TEXT        NOT NULL DEFAULT '',
     context_digest TEXT        NOT NULL DEFAULT '',   -- 快照 sha256,可回放"当时看到了什么"
-    output         JSONB       NOT NULL DEFAULT '{}', -- LLM 原始输出(校验失败也存)
+    output         JSONB       NOT NULL DEFAULT '{}', -- LLM 原始输出(校验失败也存,截断至 4KB)
     rendered       TEXT        NOT NULL DEFAULT '',   -- 渲染出的那行指令
     outcome        TEXT        NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -213,6 +288,9 @@ CREATE INDEX IF NOT EXISTS command_translations_open_id_idx
 `confirmed`（`raw_text='y'`，`rendered` 为同一行指令）。只需一个 insert 方法，同 open_id
 按时序读即完整证据链。`context_digest` 存摘要而非快照全文，与 `persistEvidenceSnapshot`
 的思路一致，表不会被撑爆。
+
+`output` 落库前**截断至 4KB**：Schema 校验失败时平台返回的可能是任意长度的自由文本
+（模型跑飞时尤其如此），审计要留证但不该让一行把表撑坏。截断时在末尾标 `...(truncated)`。
 
 DDL 同时进 `runtime/internal/store/schema.sql` 与
 `deploy/postgres/migrations/2026-07-28-command-translations.sql`（仓库现有惯例）。
@@ -256,8 +334,12 @@ DDL 同时进 `runtime/internal/store/schema.sql` 与
 
 - 单槽：同一 open_id 的新翻译覆盖旧待确认，被覆盖的落一行 `expired`
 - TTL 120s：过期后回 `y` 视同未理解，回 usage，并落 `expired`
-- `y` 判定：`strings.TrimSpace` 后小写等于 `y` 或 `yes`；其余任何输入都不是确认
-  （包括 `n`——落 `declined` 并清槽），确认词绝不做模糊匹配
+- `y` 判定：`strings.TrimSpace` 后小写等于 `y` 或 `yes`；其余任何输入都不是确认，
+  确认词绝不做模糊匹配
+- **非确认词的输入：清槽 + 落 `declined` + 把该输入当作新消息继续处理**（继续走
+  `Parse`，未命中则继续走翻译）。即 `n` 只是"不确认"的一种普通写法，不是特殊指令；
+  用户在待确认期间直接改主意打 `devices`，会取消待确认并执行 `devices`，而不是
+  被吞掉。回复里带一句"已取消上一条待确认"，避免用户以为确认成功了
 - 待确认态检查在 `Parse` **之前**：这样用户打 `y` 不会被当成未知指令
 
 ### 5.3 参数复校（渲染之后、执行之前）
@@ -295,17 +377,30 @@ DDL 同时进 `runtime/internal/store/schema.sql` 与
 非白名单 open_id 的处理**完全不变**：在翻译之前静默忽略，翻译层永远看不到非白名单
 消息，token 消耗不受外部消息影响。
 
-超时：翻译请求 `context.WithTimeout` 15s（比 `Analyze` 的 60s 短——人在等回复）。
-`HERMES_TIMEOUT_SEC` 是分析用的，翻译单独用常量 `translateTimeout = 15 * time.Second`。
+超时：翻译请求单独配 `FEISHU_CMD_NL_TIMEOUT_SEC`，**缺省 60s**，不复用
+`HERMES_TIMEOUT_SEC`。
+
+这个值不能按"人在飞书里等回复"的直觉往小了设。`hermes/analyze_bridge/README.md`
+记录的实测基线（2026-07-22，deepseek-v4-pro）是 `-t ""` 冷/热约 **76s / 13s**，
+并建议 Runtime 侧 `HERMES_TIMEOUT_SEC ≥ 120`。热路径 13s 对交互勉强可接受，冷启动
+76s 会超；60s 是"绝大多数热调用能过、冷启动失败并明确告知"的折中——超时的代价只是
+一句"翻译服务暂时不可用"加 usage，用户手打指令永远不受影响。若实测冷启动频繁命中，
+调大这个环境变量即可，无需改代码。
 
 ## 7. 配置
 
 | 变量 | 缺省 | 说明 |
 |---|---|---|
 | `FEISHU_CMD_NL` | `false` | 翻译层总开关。灰度用：先让四指令跑稳，再打开 |
-| `HERMES_ENDPOINT` | 空 | 复用分析用的同一平台端点；为空则翻译层不启用 |
-| `HERMES_AUTH_TOKEN` | 空 | 复用 |
+| `FEISHU_CMD_NL_TIMEOUT_SEC` | `60` | 翻译请求超时（§6 有实测依据） |
+| `HERMES_ENDPOINT` | 空 | 复用分析用的同一 bridge 基址；为空则翻译层不启用 |
+| `HERMES_AUTH_TOKEN` | 空 | 复用（对应 bridge 的 `ANALYZE_BRIDGE_TOKEN`） |
 | `HERMES_MODEL` | 空 | 复用 |
+
+`HERMES_ENDPOINT` 现状是 `/analyze` 的完整 URL（`hermesclient.Config.Endpoint` 的注释
+即"完整调用 URL"）。翻译需要同一 bridge 的 `/translate`，实现上取 `HERMES_ENDPOINT`
+的路径部分替换为 `/translate`——不新增环境变量，避免两个 URL 配到不同实例上。
+这条替换规则要有单测覆盖（含尾斜杠、带端口、带子路径三种形态）。
 
 启用条件是三者的合取：`FEISHU_CMD_NL=true` 且 `HERMES_ENDPOINT` 非空 且指令 listener
 本身已启用（`FEISHU_CMD_WHITELIST` 非空）。任一不满足，`help` 分支回今天的 usage，
@@ -327,7 +422,9 @@ DDL 同时进 `runtime/internal/store/schema.sql` 与
 - **渲染-解析往返**：对 schema 允许的全部 args 形态，断言
   `Parse(render(cmd)) == cmd`（这是方案 1 封闭性的核心断言）
 - 只读指令直接执行；副作用指令进待确认不执行（断言 fake Starter 未被调用）
-- `y` / `yes` 确认执行；`n` 放弃；其他输入不算确认
+- `y` / `yes` 确认执行
+- 非确认词清槽后**继续处理该输入**：待确认期间打 `devices` → 落 `declined` 且
+  `devices` 被执行；打 `n` → 落 `declined` 且回 usage（`n` 走翻译或 usage 路径）
 - TTL 过期后 `y` 不执行
 - 新翻译覆盖旧待确认（旧的落 `expired`）
 - 待确认态检查先于 `Parse`：用户打 `y` 时不落到 usage
@@ -339,24 +436,50 @@ DDL 同时进 `runtime/internal/store/schema.sql` 与
 ### 8.3 `hermesclient.Translate` 单测
 
 沿用 `hermesclient_test.go` 的 httptest 模式：2xx + 合法 JSON、2xx + 不合法 JSON、
-非 2xx、超时、响应非 JSON —— 断言错误分类与 `Analyze` 对称。
+非 2xx、超时、响应非 JSON —— 断言错误分类与 `Analyze` 对称。另加 `/analyze` →
+`/translate` 的 URL 推导测试（尾斜杠、带端口、带子路径，§7）。
 
-### 8.4 store 一致性测试
+### 8.4 `analyze_bridge` 测试（pytest）
+
+沿用 `test_analyze_bridge.py` 的假 hermes CLI 驱动模式，为 `/translate` 补：
+
+- 缺必填字段 → 400；鉴权失败 → 401
+- 合法输出一次通过；不合法输出打回重试后通过；连续失败耗尽 → 502
+- `-t ""` 始终存在于命令行（工具白名单断言，与 analyze 同款）
+- `command.schema.json` 部署副本与 `contracts/` 一致（照搬
+  `test_schema_copy_matches_contracts`）
+
+### 8.5 store 一致性测试
+
 
 `RecentRuns` / `SaveCommandTranslation` 进 `conformance_test.go`，MemStore 与 PGStore
-双实现跑同一组断言（仓库既有约束）。另加 `RecentRuns` 的前缀构造与
-`WorkflowID()` 的同步断言测试（§3.2）。
+双实现跑同一组断言（仓库既有约束）。
 
-### 8.5 手工验收
+`RecentRuns` 的测试要覆盖 §3.2 的**完整语义**，而不只是前缀拼接：
+
+- bundle workflow（`Scope=""`，同一 `workflow_id` 下多个变体的 task）→ 断言按
+  `test_id` 取到正确变体，不串行
+- 变体级 workflow（`baseID-{variant}`）→ 断言命中
+- `-r{N}` 重跑行存在时取最新一条
+- 前缀构造函数与 `WorkflowID()` 对同一输入产出一致的 baseID（格式一改就红）
+- 项目名含下划线（如 `Algo_Super_SDK`）时不发生通配符误匹配
+
+### 8.6 手工验收
+
+前置：**analyzer 容器已拉新代码并重启**（`start-analyze-bridge`）——它不在 compose 里，
+`docker compose up` 带不上，漏了这步全部自然语言都会 502。先 `curl` 一次
+`POST /translate` 确认路由存在。
 
 `FEISHU_CMD_NL=true` 打开后，白名单账号在飞书单聊依次验证：
 
 1. "看下设备状态" → 直接返回 devices 列表，回复含"已理解为: devices"
 2. "帮我重跑昨天 SNPE 1.68 那个失败的" → 回执待确认 → 回 `y` → workflow 启动，
    ID 含 `-r{N}` 后缀
-3. 同上但回 `n` → 不执行，`command_translations` 有 `pending_confirm` + `declined` 两行
-4. "今天天气怎么样" → 回 usage，落 `rejected_none`
-5. 停掉 Hermes 端点 → 自然语言回"翻译服务暂时不可用" + usage，四个手打指令照常工作
+3. 同上但回 `n` → 不执行，回 usage，`command_translations` 有 `pending_confirm`
+   + `declined` 两行
+4. 同上但改口打 `devices` → 待确认取消，`devices` 被执行（验证 §5.2 的"继续处理"）
+5. "今天天气怎么样" → 回 usage，落 `rejected_none`
+6. 停掉 bridge → 自然语言回"翻译服务暂时不可用" + usage，四个手打指令照常工作
 
 ## 9. 验收标准
 
@@ -366,6 +489,9 @@ DDL 同时进 `runtime/internal/store/schema.sql` 与
 - 每次翻译在 `command_translations` 留痕，含原文、`context_digest`、渲染结果、outcome
 - 副作用指令未经用户确认不会执行（有测试）
 - 非白名单消息不触发任何 LLM 调用（有测试）
+- bridge `/translate` 与 `/analyze` 同构：工具集全禁、服务端定形校验、打回重试上限
+  共用同一常量（有测试）
+- `command.schema.json` 的 bridge 部署副本与 `contracts/` 一致（有防漂移测试）
 
 ## 10. 后续（不在本轮）
 
@@ -373,3 +499,11 @@ DDL 同时进 `runtime/internal/store/schema.sql` 与
   本轮沉淀的 prompt 管理、输出 Schema 校验、翻译审计三件积木可直接复用。
 - 飞书交互卡片确认按钮替代文本 `y`（与 Phase 2 卡片改造合并）。
 - `workflows` 表补齐，`RecentRuns` 摆脱对 `WorkflowID()` 字符串格式的依赖。
+- **回复路由到消息发送者**。`feishu.Sender.SendText` 现在只发往静态
+  `FEISHU_RECEIVE_ID`（`feishu.go:260`）。白名单只有 1 人时无差别；多人白名单那天，
+  A 的指令回执会发到 B 眼前。届时给 `Sender` 加 `SendTextTo(ctx, openID, text)`，
+  指令回复走它，通知仍走静态目标。本设计的其余部分不受影响。
+- **按 `message_id` 去重**。飞书长连接重连时可能重投 `im.message.receive_v1` 事件；
+  今天四个指令重复执行是幂等的（`rerun` 由 Temporal `RejectDuplicate` 挡住），但重投
+  会白白多花一次 LLM 调用。正解是拿事件的 `message_id` 做去重，比"每人 N 秒冷却"
+  更准——冷却挡不住间隔较长的重投，也会误伤连打两条指令的正常用户。
