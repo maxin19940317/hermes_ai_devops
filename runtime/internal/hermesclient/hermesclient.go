@@ -37,3 +37,28 @@ type AnalyzeRequest struct {
 type Client interface {
 	Analyze(ctx context.Context, req AnalyzeRequest) (*Analysis, error)
 }
+
+// Translation 与 contracts/command.schema.json 字段一一对应,是意图翻译的结构化输出。
+// Command 是封闭枚举(status|devices|rerun|unquarantine|none);none 表示信息不足
+// 或输入根本不是指令。
+type Translation struct {
+	TranslationVersion int      `json:"translation_version"` // 契约固定为 1
+	Command            string   `json:"command"`
+	Args               []string `json:"args,omitempty"`
+	Confidence         float64  `json:"confidence"`
+	Reason             string   `json:"reason,omitempty"`
+}
+
+// TranslateRequest 是一次意图翻译请求的入参。Context 是 Runtime 组装的只读上下文
+// 快照(设计文档 §4.2);Model 可选透传。
+type TranslateRequest struct {
+	RawText string
+	Context json.RawMessage
+	Model   string
+}
+
+// Translator 是意图翻译能力的抽象。实现需保证:尊重 ctx 超时;响应必须通过内嵌
+// command.schema.json 校验,否则返回错误(校验不过视为翻译失败,调用方回 usage)。
+type Translator interface {
+	Translate(ctx context.Context, req TranslateRequest) (*Translation, error)
+}

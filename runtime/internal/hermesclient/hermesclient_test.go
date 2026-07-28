@@ -58,8 +58,8 @@ func TestAnalyze(t *testing.T) {
 				if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 					t.Errorf("请求体不是合法 JSON: %v", err)
 				}
-				if p.TaskID != "task-1" || p.PromptVersion != PromptVersion ||
-					p.Prompt != Prompt || p.RuleCategory != "INFRA" || len(p.Evidence) == 0 {
+				if p.TaskID != "task-1" || p.PromptVersion != PromptVersionAnalyze ||
+					p.Prompt != PromptAnalyze || p.RuleCategory != "INFRA" || len(p.Evidence) == 0 {
 					t.Errorf("请求体字段不符合规范: %+v", p)
 				}
 				if p.Model != "" { // 未指定模型时 omitempty 生效
@@ -221,5 +221,77 @@ func TestModelPassthrough(t *testing.T) {
 func TestNewHTTPClientEmptyEndpoint(t *testing.T) {
 	if c := NewHTTPClient(Config{}); c != nil {
 		t.Fatal("空 Endpoint 应返回 nil(调用方判未启用)")
+	}
+}
+
+func TestTranslateURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://h:18100/analyze", "http://h:18100/translate"},
+		{"http://h:18100/analyze/", "http://h:18100/translate"},
+		{"http://h/hermes/analyze", "http://h/hermes/translate"},
+	}
+	for _, c := range cases {
+		got, err := translateURL(c.in)
+		if err != nil {
+			t.Fatalf("translateURL(%q): %v", c.in, err)
+		}
+		if got != c.want {
+			t.Errorf("translateURL(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestTranslateOK(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte(`{"translation_version":1,"command":"devices","args":[],"confidence":0.95}`))
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+	tr, err := c.Translate(context.Background(), TranslateRequest{
+		RawText: "看下设备状态", Context: json.RawMessage(`{"now":"2026-07-28T09:12:00Z"}`),
+	})
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	if gotPath != "/translate" {
+		t.Errorf("path = %q, want /translate", gotPath)
+	}
+	if tr.Command != "devices" || tr.Confidence != 0.95 {
+		t.Errorf("unexpected translation: %+v", tr)
+	}
+}
+
+func TestTranslateRejectsInvalidSchema(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// command 不在闭枚举内:必须被本地 Schema 校验挡下(跨进程边界不信任对端)
+		_, _ = w.Write([]byte(`{"translation_version":1,"command":"reboot","confidence":0.9}`))
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+	if _, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"}); err == nil {
+		t.Fatal("want error for schema-invalid response, got nil")
+	}
+}
+
+func TestTranslateNon2xx(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+	if _, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"}); err == nil {
+		t.Fatal("want error for 502, got nil")
+	}
+}
+
+func TestCommandSchemaCopyMatchesContracts(t *testing.T) {
+	src, err := os.ReadFile("../../../contracts/command.schema.json")
+	if err != nil {
+		t.Fatalf("read contracts copy: %v", err)
+	}
+	if string(src) != commandSchemaJSON {
+		t.Error("command.schema.json 与 contracts/ 不一致,请同步副本")
 	}
 }
