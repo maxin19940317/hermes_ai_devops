@@ -1,0 +1,1 @@
+{ "translation_version": 1, "command": "status", "confidence": 0.9, "raw_sql": "DROP TABLE tasks" }
