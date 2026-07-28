@@ -282,6 +282,28 @@ func TestTranslateRejectsInvalidSchema(t *testing.T) {
 	}
 }
 
+// TestTranslateSchemaInvalidIncludesBodySnippet 验证 §4.3 的 output 截断路径确实
+// 可达:schema 校验失败时,wrapped error 必须携带响应原文的一段可辨识片段
+// (此前只落 {"error": Go 错误字符串},该字符串不含平台实际返回值,截断逻辑形同虚设)。
+func TestTranslateSchemaInvalidIncludesBodySnippet(t *testing.T) {
+	const marker = "reboot-xyz-distinctive-marker"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"translation_version":1,"command":"` + marker + `","confidence":0.9}`))
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+	_, err := c.Translate(context.Background(), TranslateRequest{RawText: "x"})
+	if err == nil {
+		t.Fatal("want error for schema-invalid response, got nil")
+	}
+	if !strings.Contains(err.Error(), marker) {
+		t.Fatalf("error should include a snippet of the offending response body, got: %v", err)
+	}
+	if !errors.Is(err, ErrSchemaInvalid) {
+		t.Fatalf("want errors.Is(err, ErrSchemaInvalid), got %v", err)
+	}
+}
+
 func TestTranslateNon2xx(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusBadGateway)
@@ -295,6 +317,22 @@ func TestTranslateNon2xx(t *testing.T) {
 	// 非 2xx 是基础设施问题,不应被误判成"prompt 需要迭代"的 schema 失败。
 	if errors.Is(err, ErrSchemaInvalid) {
 		t.Fatalf("502 不应满足 errors.Is(err, ErrSchemaInvalid): %v", err)
+	}
+}
+
+// TestCommandSchemaRejectsArgTrailingNewline 是 command.schema.json args pattern
+// 的锚点漂移回归测试:Python 的 re 把 "$" 当作也匹配"换行符之前"(不是严格字符串
+// 结尾),Go 的 regexp 不会,因此 "9da3b9d9\n" 对 Python 校验器合法、对 Go 校验器
+// 非法。companion 的 anchor-free "not" 约束必须让两侧行为一致地拒绝它;这里独立
+// 验证 Go 侧(contracts/tests/test_command_schema.py 用同一份 fixture 验证 Python 侧)。
+func TestCommandSchemaRejectsArgTrailingNewline(t *testing.T) {
+	raw := []byte(`{"translation_version":1,"command":"unquarantine","args":["9da3b9d9\n"],"confidence":0.9}`)
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	if err := commandSchema.Validate(doc); err == nil {
+		t.Fatal("want validation error for trailing-newline arg (anchor-free companion pattern should reject it), got nil")
 	}
 }
 

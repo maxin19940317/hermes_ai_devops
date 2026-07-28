@@ -218,7 +218,11 @@ func (c *HTTPClient) Translate(ctx context.Context, req TranslateRequest) (*Tran
 		return nil, fmt.Errorf("hermesclient: 翻译响应不是合法 JSON: %w", err)
 	}
 	if err := commandSchema.Validate(doc); err != nil {
-		return nil, fmt.Errorf("hermesclient: 响应不符合 command.schema.json(视为翻译失败): %w: %w", ErrSchemaInvalid, err)
+		snippet := string(raw)
+		if len(snippet) > errBodyLimit {
+			snippet = snippet[:errBodyLimit] + "..."
+		}
+		return nil, fmt.Errorf("hermesclient: 响应不符合 command.schema.json(视为翻译失败): %w: %w: body=%s", ErrSchemaInvalid, err, snippet)
 	}
 	var tr Translation
 	if err := json.Unmarshal(raw, &tr); err != nil {

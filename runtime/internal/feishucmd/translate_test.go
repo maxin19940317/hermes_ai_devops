@@ -50,6 +50,12 @@ func TestRenderParseRoundTrip(t *testing.T) {
 		{"rerun", []string{"9da3b9d9", "56", "aarch64_Android_SNPE_1.68"}},
 		{"unquarantine", []string{"dev-1"}},
 		{"unquarantine", []string{"a.b_c-d"}},
+		// schema 对任意指令的 args 都允许 maxItems: 3,不止 rerun。
+		{"unquarantine", []string{"dev-1", "dev-2", "dev-3"}},
+		// 大写字母在 pattern 值域内。
+		{"rerun", []string{"ABCDEF12", "56", "AARCH64_ANDROID_SNPE_1.68"}},
+		// pattern 上界 {1,64}。
+		{"unquarantine", []string{strings.Repeat("a", 64)}},
 	}
 	for _, c := range cases {
 		line := render(c.cmd, c.args)

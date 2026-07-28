@@ -112,6 +112,9 @@ func (s *PGStore) NextWorkflowAttemptAll(ctx context.Context, commitSHA string, 
 // 存在一份,不在 SQL 里重复拼接字符串——格式漂移在编译期即不可能。limit 为 10 量级,
 // 且只在人机交互路径上调用,查询次数可接受。
 func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT project, commit_sha, pipeline_id, variant
 		FROM artifacts

@@ -66,7 +66,7 @@ def check_auth(req: Request) -> JSONResponse | None:
     return None
 
 
-def build_prompt(payload: dict, prev_errors: list[str], schema_name: str = "analysis.schema.json") -> str:
+def build_prompt(payload: dict, prev_errors: list[str]) -> str:
     """拼一次性 prompt:平台 prompt 模板 + 规则类别 + evidence + (重试时)校验错误。"""
     parts = [
         payload["prompt"],
@@ -79,7 +79,7 @@ def build_prompt(payload: dict, prev_errors: list[str], schema_name: str = "anal
     if prev_errors:
         parts += [
             "",
-            f"注意:你上一次的输出未通过 {schema_name} 校验,错误如下。",
+            "注意:你上一次的输出未通过 analysis.schema.json 校验,错误如下。",
             "这次只输出修正后的 JSON 对象本身,不要任何其他文本:",
             *[f"- {e}" for e in prev_errors[-2:]],  # 只带最近两条,控制长度
         ]

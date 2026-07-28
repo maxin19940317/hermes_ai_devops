@@ -129,6 +129,9 @@ type RecentRun struct {
 // workflow(ID = base)、变体 workflow(base-variant)或两者的 -r{N} 重跑下,
 // 且 bundle 下多个变体共享同一 workflow_id——必须同时按 test_id 过滤才不串变体。
 func (s *MemStore) RecentRuns(_ context.Context, limit int) ([]RecentRun, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	type keyed struct {

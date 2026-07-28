@@ -125,7 +125,7 @@ func (e *Executor) HandleMessage(ctx context.Context, openID, text string) {
 	}
 
 	cmd := Parse(trimmed)
-	if cmd.Name == "help" && e.Translator != nil {
+	if cmd.Name == "help" && trimmed != "" && e.Translator != nil {
 		e.reply(ctx, prefix+e.handleTranslated(ctx, openID, trimmed, superseded))
 		return
 	}
@@ -240,13 +240,18 @@ func (e *Executor) putPending(ctx context.Context, openID string, pend pendingCm
 }
 
 // audit 追加一行翻译审计(确认/取消/过期这些非翻译事件也留痕,设计文档 §4.3)。
+// 落库失败只记 error 日志,不阻断(设计文档 §6:审计落库失败 → 记日志,不阻断执行)。
 func (e *Executor) audit(ctx context.Context, openID, rawText, rendered, outcome string) {
 	if e.Store == nil {
 		return
 	}
-	_ = e.Store.SaveCommandTranslation(ctx, store.CommandTranslation{
+	if err := e.Store.SaveCommandTranslation(ctx, store.CommandTranslation{
 		OpenID: openID, RawText: rawText, Rendered: rendered, Outcome: outcome,
-	})
+	}); err != nil {
+		log := e.log()
+		log.Error().Err(err).Str("open_id", openID).Str("outcome", outcome).
+			Msg("save command translation audit failed")
+	}
 }
 
 // reply 发送回复;Sender 为 nil 时只执行不回复(测试)。

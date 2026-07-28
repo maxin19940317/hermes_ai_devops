@@ -16,7 +16,11 @@
     "args": {
       "type": "array",
       "maxItems": 3,
-      "items": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" }
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._-]{1,64}$",
+        "not": { "pattern": "[^A-Za-z0-9._-]" }
+      }
     },
     "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
     "reason": { "type": "string", "maxLength": 200 }

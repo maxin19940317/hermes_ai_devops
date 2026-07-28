@@ -480,6 +480,35 @@ func TestNewTranslationSupersedesPending(t *testing.T) {
 	}
 }
 
+// TestBlankMessageSkipsTranslatorEvenWhenEnabled 挡住"贴图/图片等非文本消息
+// 触发一次 LLM 调用"的回归:listener.extractMessage 对非文本消息返回空文本,
+// Parse("") 命中 help,若不特判空串,help 分支的翻译旁路会把每一条贴图都送去
+// hermes -z(13s 热/76s 冷),还写一行 raw_text 为空串的垃圾审计并取消待确认。
+// 空输入必须原样落到改动前就有的 usage 回复,且翻译层零调用。
+func TestBlankMessageSkipsTranslatorEvenWhenEnabled(t *testing.T) {
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 1, Command: "devices", Confidence: 0.95,
+	}}
+	st := store.NewMemStore()
+	sender := &fakeSender{}
+	e := &Executor{Store: st, Sender: sender, Whitelist: map[string]bool{"ou_1": true},
+		Translator: newTranslator(f, st)}
+	e.HandleMessage(context.Background(), "ou_1", "")
+	if f.calls != 0 {
+		t.Errorf("空文本(贴图/图片等非文本消息)不得触发翻译, calls = %d", f.calls)
+	}
+	if lastText(sender) != usage {
+		t.Errorf("空文本应回今天的 usage,与翻译层禁用时逐字节一致:\n got %q\nwant %q", lastText(sender), usage)
+	}
+	rows, err := st.ListCommandTranslations(context.Background(), "ou_1", 10)
+	if err != nil {
+		t.Fatalf("ListCommandTranslations: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("空文本不应留下任何 raw_text='' 的翻译审计行, rows=%+v", rows)
+	}
+}
+
 func TestTranslatorDisabledFallsBackToUsage(t *testing.T) {
 	st := store.NewMemStore()
 	sender := &fakeSender{}

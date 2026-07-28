@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/store"
 )
@@ -43,6 +45,8 @@ type Translator struct {
 	Variants []string // 合法变体名单(来自 specCfg)
 	Model    string
 	Now      func() time.Time // 可注入,便于测试
+	// Log 可选;nil 用 Nop(镜像 Executor.Log 的处理)。
+	Log *zerolog.Logger
 }
 
 func (t *Translator) now() time.Time {
@@ -50,6 +54,13 @@ func (t *Translator) now() time.Time {
 		return t.Now()
 	}
 	return time.Now().UTC()
+}
+
+func (t *Translator) log() zerolog.Logger {
+	if t.Log != nil {
+		return *t.Log
+	}
+	return zerolog.Nop()
 }
 
 // render 把翻译结果拼成一行指令文本。args 各项已由 command.schema.json 保证不含
@@ -249,8 +260,12 @@ func containsDevice(devices []snapshotDev, deviceID string) bool {
 	return false
 }
 
-// save 落审计;失败只记日志不阻断(与 persistEvidenceSnapshot 的降级一致)。
+// save 落审计;失败只记 error 日志不阻断(与 persistEvidenceSnapshot 的降级一致)。
 // Store 是必填依赖(buildSnapshot 已无条件解引用它),这里不再重复判空。
 func (t *Translator) save(ctx context.Context, row store.CommandTranslation) {
-	_ = t.Store.SaveCommandTranslation(ctx, row)
+	if err := t.Store.SaveCommandTranslation(ctx, row); err != nil {
+		log := t.log()
+		log.Error().Err(err).Str("open_id", row.OpenID).Str("outcome", row.Outcome).
+			Msg("save command translation audit failed")
+	}
 }

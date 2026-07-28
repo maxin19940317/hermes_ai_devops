@@ -175,6 +175,7 @@ func main() {
 					Store:    st,
 					Variants: specCfg.VariantNames(),
 					Model:    cfg.Activity.HermesModel,
+					Log:      &log,
 				}
 				log.Info().Dur("timeout", cfg.Activity.FeishuCmdNLTimeout).Msg("feishu cmd nl=enabled")
 			} else {
