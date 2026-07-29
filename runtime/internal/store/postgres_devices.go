@@ -211,27 +211,38 @@ func (s *PGStore) GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time
 	return &exp, nil
 }
 
-// ReleaseDevice 归还租约(置 released_at,行保留作审计;§10/差距 #15)。
-// infraFail=true 时 fail_streak+1,达到 quarantineAfter(§10 缺省 3)则 QUARANTINED;
-// 成功归还清零 fail_streak。非持有者释放/租约已易主/重复释放(已 released):
-// 幂等,无副作用(WHERE 匹配不到行,语句空转,fail_streak 不重复计数)。
-func (s *PGStore) ReleaseDevice(ctx context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error {
+// ReleaseDevice 归还租约并按归因记账(差距 #10,设计文档 §4)。语义见 MemStore 同名方法。
+// 三段 CTE 一条语句 = 单事务:lease 实际释放了才会有下游行,因此重复释放/
+// 非持有者释放天然不计数(WHERE 匹配不到行,整条语句空转)。
+func (s *PGStore) ReleaseDevice(ctx context.Context, deviceID, taskID string, scope wf.FailScope, quarantineAfter int) error {
 	_, err := s.DB.ExecContext(ctx, `
 		WITH lease AS (
 			UPDATE device_leases SET released_at = now()
 			WHERE device_id = $1 AND task_id = $2 AND released_at IS NULL
 			RETURNING device_id
+		), dev AS (
+			UPDATE devices SET
+				status = CASE
+					WHEN $3 = 'device' AND fail_streak + 1 >= $4 THEN 'QUARANTINED'
+					ELSE 'IDLE'
+				END,
+				fail_streak = CASE
+					WHEN $3 = 'device' THEN fail_streak + 1
+					WHEN $3 = 'ok'     THEN 0
+					ELSE fail_streak
+				END
+			WHERE device_id IN (SELECT device_id FROM lease)
+			RETURNING client_id
 		)
-		UPDATE devices SET
-			status = CASE
-				WHEN $3 AND fail_streak + 1 >= $4 THEN 'QUARANTINED'
-				ELSE 'IDLE'
-			END,
-			fail_streak = CASE WHEN $3 THEN fail_streak + 1 ELSE 0 END
-		WHERE device_id IN (SELECT device_id FROM lease)`,
-		deviceID, taskID, infraFail, quarantineAfter)
+		UPDATE clients SET fail_streak = CASE
+			WHEN $3 = 'client' THEN fail_streak + 1
+			WHEN $3 = 'ok'     THEN 0
+			ELSE fail_streak
+		END
+		WHERE client_id IN (SELECT client_id FROM dev)`,
+		deviceID, taskID, string(scope), quarantineAfter)
 	if err != nil {
-		return fmt.Errorf("release device: %w", err)
+		return fmt.Errorf("release device %s scope=%s: %w", deviceID, scope, err)
 	}
 	return nil
 }

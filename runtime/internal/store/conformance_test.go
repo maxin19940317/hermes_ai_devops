@@ -23,7 +23,7 @@ type fullStore interface {
 	RegisterArtifacts(ctx context.Context, arts []Artifact) error
 	UpsertClientDevices(ctx context.Context, c Client, devs []Device) error
 	AcquireDevice(ctx context.Context, sel wf.DeviceSelector, taskID string, leaseSeconds int) (*wf.Lease, error)
-	ReleaseDevice(ctx context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error
+	ReleaseDevice(ctx context.Context, deviceID, taskID string, scope wf.FailScope, quarantineAfter int) error
 	RenewLease(ctx context.Context, cred LeaseCredential, leaseSeconds int) (bool, error)
 	GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error)
 	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
@@ -130,7 +130,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Errorf("BUSY 设备不得重复出租: %+v", l2)
 		}
 		// 释放后可再获取
-		if err := s.ReleaseDevice(ctx, l.DeviceID, "t1", false, 3); err != nil {
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "t1", wf.FailScopeOK, 3); err != nil {
 			t.Fatal(err)
 		}
 		if l3, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t3", 120); l3 == nil {
@@ -175,17 +175,17 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatal("no lease")
 		}
 		// 非持有者释放:无副作用
-		if err := s.ReleaseDevice(ctx, l.DeviceID, "other-task", true, 3); err != nil {
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "other-task", wf.FailScopeDevice, 3); err != nil {
 			t.Fatal(err)
 		}
 		if l2, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t2", 120); l2 != nil {
 			t.Fatalf("非持有者释放不得生效: %+v", l2)
 		}
 		// 持有者释放 + 重复释放幂等
-		if err := s.ReleaseDevice(ctx, l.DeviceID, "t1", false, 3); err != nil {
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "t1", wf.FailScopeOK, 3); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.ReleaseDevice(ctx, l.DeviceID, "t1", true, 3); err != nil {
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "t1", wf.FailScopeDevice, 3); err != nil {
 			t.Fatal(err) // 重复释放(infraFail=true)不得计入 fail_streak
 		}
 		l3, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t3", 120)
@@ -202,7 +202,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			if l == nil {
 				t.Fatalf("第 %d 次应能获取", i+1)
 			}
-			_ = s.ReleaseDevice(ctx, l.DeviceID, "t", true, 3)
+			_ = s.ReleaseDevice(ctx, l.DeviceID, "t", wf.FailScopeDevice, 3)
 		}
 		if l, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t", 120); l != nil {
 			t.Error("QUARANTINED 设备不得出租")
@@ -218,16 +218,144 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		seed(t, s)
 		for i := 0; i < 2; i++ {
 			l, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t", 120)
-			_ = s.ReleaseDevice(ctx, l.DeviceID, "t", true, 3)
+			_ = s.ReleaseDevice(ctx, l.DeviceID, "t", wf.FailScopeDevice, 3)
 		}
 		l, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t", 120)
-		_ = s.ReleaseDevice(ctx, l.DeviceID, "t", false, 3) // 成功:清零
+		_ = s.ReleaseDevice(ctx, l.DeviceID, "t", wf.FailScopeOK, 3) // 成功:清零
 		for i := 0; i < 2; i++ {
 			l, _ = s.AcquireDevice(ctx, wf.DeviceSelector{}, "t", 120)
 			if l == nil {
 				t.Fatal("fail_streak 清零后 2 次 INFRA 不应隔离")
 			}
-			_ = s.ReleaseDevice(ctx, l.DeviceID, "t", true, 3)
+			_ = s.ReleaseDevice(ctx, l.DeviceID, "t", wf.FailScopeDevice, 3)
+		}
+	})
+
+	// 归因记账(差距 #10):四个 scope 各记各的账,互不串味。
+	t.Run("ReleaseDeviceFailScopes", func(t *testing.T) {
+		cases := []struct {
+			name           string
+			scope          wf.FailScope
+			wantDeviceFail int
+			wantClientFail int
+			wantStatus     string
+		}{
+			{"device 只增设备计数", wf.FailScopeDevice, 1, 0, "IDLE"},
+			{"client 只增 client 计数", wf.FailScopeClient, 0, 1, "IDLE"},
+			{"none 两个都不动", wf.FailScopeNone, 0, 0, "IDLE"},
+			{"ok 两个都清零", wf.FailScopeOK, 0, 0, "IDLE"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newStore(t)
+				seed(t, s)
+				lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
+				if err != nil || lease == nil {
+					t.Fatalf("acquire = %+v err=%v", lease, err)
+				}
+				if err := s.ReleaseDevice(ctx, lease.DeviceID, "w:t1:a1", tc.scope, 3); err != nil {
+					t.Fatalf("release: %v", err)
+				}
+				ov, err := s.FleetOverview(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				d := ov.Devices[0]
+				if d.FailStreak != tc.wantDeviceFail {
+					t.Errorf("device fail_streak = %d, want %d", d.FailStreak, tc.wantDeviceFail)
+				}
+				if d.Status != tc.wantStatus {
+					t.Errorf("status = %q, want %q", d.Status, tc.wantStatus)
+				}
+				if d.ClientFailStreak != tc.wantClientFail {
+					t.Errorf("client fail_streak = %d, want %d", d.ClientFailStreak, tc.wantClientFail)
+				}
+			})
+		}
+	})
+
+	// 只有 device scope 触发隔离;client/none 累积再多也不隔离设备
+	// ——这正是差距 #10 要消灭的误伤。
+	t.Run("ReleaseDeviceOnlyDeviceScopeQuarantines", func(t *testing.T) {
+		for _, scope := range []wf.FailScope{wf.FailScopeClient, wf.FailScopeNone} {
+			t.Run(string(scope), func(t *testing.T) {
+				s := newStore(t)
+				seed(t, s)
+				for i := 1; i <= 5; i++ {
+					taskID := fmt.Sprintf("w:t%d:a1", i)
+					lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, taskID, 120)
+					if err != nil || lease == nil {
+						t.Fatalf("acquire %d = %+v err=%v", i, lease, err)
+					}
+					if err := s.ReleaseDevice(ctx, lease.DeviceID, taskID, scope, 3); err != nil {
+						t.Fatal(err)
+					}
+				}
+				ov, err := s.FleetOverview(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ov.Devices[0].Status == "QUARANTINED" {
+					t.Errorf("%s 连续 5 次仍不得隔离设备(差距 #10 的误伤)", scope)
+				}
+			})
+		}
+	})
+
+	// device scope 达阈值才隔离,且 ok 能把计数清回去。
+	t.Run("ReleaseDeviceQuarantineAndReset", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		for i := 1; i <= 2; i++ {
+			taskID := fmt.Sprintf("w:t%d:a1", i)
+			lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, taskID, 120)
+			if err != nil || lease == nil {
+				t.Fatalf("acquire %d: %+v %v", i, lease, err)
+			}
+			if err := s.ReleaseDevice(ctx, lease.DeviceID, taskID, wf.FailScopeDevice, 3); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// 第 3 次成功 → 清零,不该隔离
+		lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t3:a1", 120)
+		if err != nil || lease == nil {
+			t.Fatalf("acquire3: %+v %v", lease, err)
+		}
+		if err := s.ReleaseDevice(ctx, lease.DeviceID, "w:t3:a1", wf.FailScopeOK, 3); err != nil {
+			t.Fatal(err)
+		}
+		ov, err := s.FleetOverview(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ov.Devices[0].FailStreak != 0 || ov.Devices[0].Status == "QUARANTINED" {
+			t.Errorf("ok 应清零且不隔离, got %+v", ov.Devices[0])
+		}
+	})
+
+	// 幂等:重复释放/非持有者释放不得重复计数(既有语义,加 scope 后必须保持)。
+	t.Run("ReleaseDeviceScopeIdempotent", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
+		if err != nil || lease == nil {
+			t.Fatalf("acquire: %+v %v", lease, err)
+		}
+		for i := 0; i < 3; i++ {
+			if err := s.ReleaseDevice(ctx, lease.DeviceID, "w:t1:a1", wf.FailScopeClient, 3); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// 非持有者释放
+		if err := s.ReleaseDevice(ctx, lease.DeviceID, "w:other:a1", wf.FailScopeClient, 3); err != nil {
+			t.Fatal(err)
+		}
+		ov, err := s.FleetOverview(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ov.Devices[0].ClientFailStreak != 1 {
+			t.Errorf("client fail_streak = %d, want 1(只第一次生效)", ov.Devices[0].ClientFailStreak)
 		}
 	})
 
@@ -334,7 +462,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 				}
 				tc.mutate(&cred)
 				if tc.releaseFirst {
-					if err := s.ReleaseDevice(ctx, l.DeviceID, "w:t1:a1", false, 3); err != nil {
+					if err := s.ReleaseDevice(ctx, l.DeviceID, "w:t1:a1", wf.FailScopeOK, 3); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -394,7 +522,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if time.Until(*exp) < 100*time.Second {
 			t.Errorf("expiry = %v, want ~120s 后", exp)
 		}
-		if err := s.ReleaseDevice(ctx, l.DeviceID, "w:t1:a1", false, 3); err != nil {
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "w:t1:a1", wf.FailScopeOK, 3); err != nil {
 			t.Fatal(err)
 		}
 		if exp, err := s.GetLeaseExpiry(ctx, "w:t1:a1"); err != nil || exp != nil {
@@ -435,7 +563,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if err != nil || l2 == nil {
 			t.Fatalf("reclaim: lease=%v err=%v", l2, err)
 		}
-		if err := s.ReleaseDevice(ctx, l.DeviceID, "dead-task", true, 3); err != nil {
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "dead-task", wf.FailScopeDevice, 3); err != nil {
 			t.Fatal(err)
 		}
 		if l3, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t3", 120); l3 != nil {
@@ -797,7 +925,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if err := s.FinishTask(ctx, wf.FinishRequest{TaskID: "w:t1:a1", Status: "COMPLETED", Verdict: "PASSED"}); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.ReleaseDevice(ctx, l.DeviceID, "w:t1:a1", false, 3); err != nil {
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "w:t1:a1", wf.FailScopeOK, 3); err != nil {
 			t.Fatal(err)
 		}
 		ov, _ = s.FleetOverview(ctx)
@@ -810,7 +938,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			if l2 == nil {
 				t.Fatalf("第 %d 次 acquire", i+1)
 			}
-			_ = s.ReleaseDevice(ctx, l2.DeviceID, "w:t2:a1", true, 3)
+			_ = s.ReleaseDevice(ctx, l2.DeviceID, "w:t2:a1", wf.FailScopeDevice, 3)
 		}
 		ok, err := s.UnquarantineDevice(ctx, l.DeviceID)
 		if err != nil || !ok {

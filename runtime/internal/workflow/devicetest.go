@@ -185,6 +185,24 @@ type AnalyzeRequest struct {
 	EvidenceJSON json.RawMessage `json:"evidence_json"`
 }
 
+// FailScope 是一次设备释放的失败归因(设计文档 §4)。四个取值互斥:
+//
+//	ok     终态且非 INFRA 类判定 → 两个计数器都清零
+//	device 设备级失败           → devices.fail_streak+1,达阈值 QUARANTINED
+//	client Client Agent 或与它之间的网络 → clients.fail_streak+1
+//	none   Runtime 自身故障/取消/成因两可 → 两个计数器都不动
+//
+// none 与 ok 不可合并:Runtime 挂了既不是设备健康的证据(不能清零),
+// 也不是设备的错(不能加一)。改动前这两种情况都被记成"设备又坏了一次"。
+type FailScope string
+
+const (
+	FailScopeOK     FailScope = "ok"
+	FailScopeDevice FailScope = "device"
+	FailScopeClient FailScope = "client"
+	FailScopeNone   FailScope = "none"
+)
+
 type ReleaseRequest struct {
 	DeviceID  string `json:"device_id"`
 	TaskID    string `json:"task_id"`

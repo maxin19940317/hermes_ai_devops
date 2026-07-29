@@ -56,6 +56,10 @@ type MemStore struct {
 	evidenceSnaps map[string]EvidenceSnapshot
 	// translations 是 command_translations 表(设计文档 §4.3)的内存视图。
 	translations []CommandTranslation
+	// clientFailStreak 是 clients.fail_streak 的内存视图(差距 #10)。
+	// 不放进 Client 结构体:那是心跳载荷,UpsertClientDevices 整体覆写,
+	// 放进去会被每 10s 一次的心跳清零。
+	clientFailStreak map[string]int
 	// seq 是插入序计数器,给 artifacts/tasks 提供确定的"最近"排序
 	// (内存实现无 created_at 列)。
 	seq    int64
@@ -64,16 +68,17 @@ type MemStore struct {
 
 func NewMemStore() *MemStore {
 	return &MemStore{
-		rows:          map[string]Artifact{},
-		clients:       map[string]Client{},
-		devices:       map[string]*deviceRow{},
-		tasks:         map[string]*taskRecord{},
-		events:        map[string]TaskEvent{},
-		results:       map[string]wf.ResultRecord{},
-		outboxByKey:   map[string]*outboxRow{},
-		outboxByID:    map[int64]*outboxRow{},
-		evidenceSnaps: map[string]EvidenceSnapshot{},
-		rowSeq:        map[string]int64{},
+		rows:             map[string]Artifact{},
+		clients:          map[string]Client{},
+		devices:          map[string]*deviceRow{},
+		tasks:            map[string]*taskRecord{},
+		events:           map[string]TaskEvent{},
+		results:          map[string]wf.ResultRecord{},
+		outboxByKey:      map[string]*outboxRow{},
+		outboxByID:       map[int64]*outboxRow{},
+		evidenceSnaps:    map[string]EvidenceSnapshot{},
+		rowSeq:           map[string]int64{},
+		clientFailStreak: map[string]int{},
 	}
 }
 
