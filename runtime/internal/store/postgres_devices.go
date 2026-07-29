@@ -196,6 +196,8 @@ func (s *PGStore) RenewLease(ctx context.Context, cred LeaseCredential, leaseSec
 }
 
 // VerifyLease 见 MemStore 同名方法的语义说明(差距 #8)。纯 SELECT,无副作用。
+// device_leases 行只由 AcquireDevice 写入,因此从未被 acquire 过的设备在此表中
+// 天然无行(n=0)——这一属性使 PG 侧不需要像 MemStore 那样另外判 status=BUSY。
 func (s *PGStore) VerifyLease(ctx context.Context, cred LeaseCredential) (bool, error) {
 	var n int
 	err := s.DB.QueryRowContext(ctx, `
@@ -208,7 +210,9 @@ func (s *PGStore) VerifyLease(ctx context.Context, cred LeaseCredential) (bool, 
 	if err != nil {
 		return false, fmt.Errorf("verify lease %s: %w", cred.TaskID, err)
 	}
-	return n == 1, nil
+	// attempt 与 task_id 后缀的一致性校验在 SQL 之外(task_id 编码 attempt,差距 #14),
+	// 与 RenewLease 做法一致。
+	return n == 1 && attemptMatches(cred.TaskID, cred.Attempt), nil
 }
 
 // GetLeaseExpiry 返回 taskID 当前持有租约的到期时刻(CheckLease 活动,

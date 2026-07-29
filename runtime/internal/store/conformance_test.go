@@ -670,6 +670,46 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 	})
 
+	// 从未被 AcquireDevice 过的设备(仅心跳注册)不得通过零值凭据校验——
+	// MemStore 的 UpsertClientDevices 为新设备写入零值 deviceRow(LeaseTaskID/
+	// LeaseID/Generation 均为 Go 零值),若 VerifyLease 不要求 status=BUSY,
+	// 零值凭据会与零值行"巧合匹配"而被判真,陌生人即可对任意从未跑过任务的
+	// 设备换到写入 URL。
+	t.Run("VerifyLeaseRejectsNeverLeasedDevice", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		ok, err := s.VerifyLease(ctx, LeaseCredential{
+			DeviceID: "513cd3de", ClientID: "c1", TaskID: "", LeaseID: "", Generation: 0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Error("从未 AcquireDevice 过的设备不得通过零值凭据校验")
+		}
+	})
+
+	// attempt 是端点唯一的鉴权依据之一:即便 device/client/task/lease_id/
+	// generation 全部匹配一个真实活跃的租约,attempt 对不上也必须判否。
+	t.Run("VerifyLeaseRejectsAttemptMismatch", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
+		if err != nil || lease == nil {
+			t.Fatalf("acquire: %+v %v", lease, err)
+		}
+		ok, err := s.VerifyLease(ctx, LeaseCredential{
+			DeviceID: lease.DeviceID, ClientID: lease.ClientID, TaskID: "w:t1:a1",
+			Attempt: 99, LeaseID: lease.LeaseID, Generation: lease.Generation,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Error("attempt 与 task_id 后缀不一致应判否")
+		}
+	})
+
 	// NextWorkflowAttempt(差距 #11):显式 retry 计数按逻辑键原子单调递增;
 	// 未登记的键报错。
 	t.Run("NextWorkflowAttemptMonotonic", func(t *testing.T) {

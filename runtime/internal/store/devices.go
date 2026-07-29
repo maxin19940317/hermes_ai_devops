@@ -193,17 +193,25 @@ func (s *MemStore) RenewLease(_ context.Context, cred LeaseCredential, leaseSeco
 
 // VerifyLease 只读校验凭据是否为该任务当前的租约持有者(差距 #8 的签发端点鉴权)。
 // 与 RenewLease 的区别:**不续期**——签发一次 URL 不构成"任务仍然活着"的证据,
-// 续期只能由心跳做。校验项与 RenewLease 完全一致(device/client/task/lease_id/
-// generation 全匹配且未释放),失配返回 (false, nil) 而非错误。
+// 续期只能由心跳做。校验项与 RenewLease 完全一致(status=BUSY 即"确有一个活跃
+// 租约"/device/client/task/attempt/lease_id/generation 全匹配且未释放),失配
+// 返回 (false, nil) 而非错误。
+//
+// 注:UpsertClientDevices 为每台新心跳上来、从未 AcquireDevice 过的设备写入
+// Status=DeviceIdle 的零值行(LeaseTaskID/LeaseID/Generation 均为零值)。若省略
+// Status==DeviceBusy 这一条,零值凭据(TaskID:"", LeaseID:"", Generation:0)会
+// 与该零值行"匹配"而被判真——必须要求设备当前确实处于 BUSY(即存在一个被
+// AcquireDevice 授予过的活跃租约),零值行天然不满足。
 func (s *MemStore) VerifyLease(_ context.Context, cred LeaseCredential) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.devices[cred.DeviceID]
-	if !ok || row.Released {
+	if !ok || row.Status != DeviceBusy || row.Released {
 		return false, nil
 	}
 	if row.ClientID != cred.ClientID || row.LeaseTaskID != cred.TaskID ||
-		row.LeaseID != cred.LeaseID || row.LeaseGeneration != cred.Generation {
+		row.LeaseID != cred.LeaseID || row.LeaseGeneration != cred.Generation ||
+		!attemptMatches(cred.TaskID, cred.Attempt) {
 		return false, nil
 	}
 	return true, nil
