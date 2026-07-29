@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hermes-devops/contracts/evidence.schema.json",
   "title": "evidence.json v3",
-  "description": "Runtime Evidence Extractor 的确定性产出(CLAUDE.md §12 Phase 2):单遍流式扫描完整日志并保留签名命中处 ±50 行上下文、全局行号、有界兜底摘录、junit 失败和指标快照。普通大文件不再受 8MiB 尾部窗口限制;超过 1MiB 的单行会降级截断扫描。输出仍受体积预算约束,是 Analyzer(LLM)的唯一输入——严禁把原始日志全量灌入 LLM。本契约对未知字段宽容,已知字段严格校验。",
+  "description": "Runtime Evidence Extractor 的确定性产出(CLAUDE.md §12 Phase 2):单遍流式扫描完整日志并保留签名命中处 ±50 行上下文、全局行号、有界兜底摘录、junit 失败和指标快照。普通大文件不再受 8MiB 尾部窗口限制;超过 1MiB 的单行会降级截断扫描。签名上下文与兜底摘录共享 96KiB 内容预算;该预算不等同于整个序列化 evidence.json 的硬上限。evidence.json 是 Analyzer(LLM)的唯一输入——严禁把原始日志全量灌入 LLM。本契约对未知字段宽容,已知字段严格校验。",
   "type": "object",
   "required": ["evidence_version", "task_id", "variant", "status", "exit_code", "cases", "signatures", "junit_failures", "inputs"],
   "properties": {

@@ -2,7 +2,7 @@
 import pytest
 from jsonschema import ValidationError
 
-from contract_helpers import load_example
+from contract_helpers import EXAMPLES_DIR, load_example
 
 
 class TestEvidenceSchema:
@@ -14,3 +14,22 @@ class TestEvidenceSchema:
     def test_invalid_examples_rejected(self, validators, invalid_case):
         with pytest.raises(ValidationError):
             validators["evidence"].validate(load_example(invalid_case))
+
+    @pytest.mark.parametrize(
+        ("fixture_name", "expected_path"),
+        [
+            ("bad_where_enum.json", ("signatures", 0, "where")),
+            ("line_no_below_one.json", ("signatures", 0, "matches", 0, "line_no")),
+        ],
+    )
+    def test_field_invalid_examples_report_intended_path_without_version_error(
+        self, validators, fixture_name, expected_path
+    ):
+        example = load_example(EXAMPLES_DIR / "evidence" / "invalid" / fixture_name)
+        error_paths = {
+            tuple(error.absolute_path)
+            for error in validators["evidence"].iter_errors(example)
+        }
+
+        assert expected_path in error_paths
+        assert ("evidence_version",) not in error_paths
