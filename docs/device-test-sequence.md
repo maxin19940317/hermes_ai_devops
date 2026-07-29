@@ -234,7 +234,7 @@ sequenceDiagram
             W->>W: 下一 attempt(回到获取设备)
         else 终态
             W->>R: FinishTask + ReleaseDevice Activity
-            R->>D: PASSED / TEST_FAILED / PERF_REGRESSION<br/>→ fail_streak 清零;<br/>device_fail_streak 连续 3 → QUARANTINED
+            R->>D: PASSED / TEST_FAILED / PERF_REGRESSION<br/>→ fail_streak 清零;<br/>device_fail_streak 连续 3 → QUARANTINED(当前无信号源,暂不触发,见差距 #10)
         end
     end
 
@@ -274,7 +274,7 @@ sequenceDiagram
 | 7 | Rule Engine 版本化(plan.rule_version 路由) | rules.Decide 无版本,升级即破坏重放确定性 | **新建**:plan/契约加 rule_version,版本路由,历史实现保留 |
 | 8 | 预签名 URL 按需签发(收集时请求) | 派单时一次性签发(1h TTL),长任务可能过期 | **改造**:callbacks 加 upload-requests 端点,派单载荷改 endpoint |
 | 9 | 日志流式全扫(不只尾部 8MB) | readWindow 只保留尾部 8MB,前部错误可能丢失 | 改造 evidence 提取:流式扫描,只留命中上下文/首 error/尾部 |
-| 10 | 失败归因 device/client 分离 + 明确重置规则 | 单一 fail_streak,网络问题可能误隔离设备 | store 扩 client_fail_streak,定义归因与清零语义 |
+| 10 | 失败归因 device/client 分离 + 明确重置规则 | **已实现**(2026-07-29):四值归因 ok/device/client/none,Runtime 自身故障不再计入任何一方 | 遗留:`device` 无信号源(rules.CategoryDevice 无人产出),故设备隔离暂不触发,恢复路径见 `docs/superpowers/specs/2026-07-29-fail-streak-attribution-design.md` §7 |
 | 11 | Workflow ID 冲突策略精细化(失败仅显式 retry) | AllowDuplicateFailedOnly:失败 workflow 可被 webhook 重放自动重启 | Trigger 侧区分显式 retry 与普通重放 |
 | 12 | Client 只读 Deploy Token(原则 5) | bearer PAT(高权限) | 配置变更:read_package_registry Deploy Token 替换 `ARTIFACT_AUTH_TOKEN` |
 | 13 | kick 精确产物地址(原则 4) | `/kick` 与 `ci/kick.py` 已实现;业务仓库 CI 未接线;webhook 兜底保留 | 业务仓库 CI 接 `kick.py` + 配 `TRIGGER_KICK_URL/TOKEN` |

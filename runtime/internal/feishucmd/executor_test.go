@@ -260,7 +260,7 @@ func seedQuarantinedDevice(t *testing.T, s *store.MemStore, deviceID string) {
 		if err != nil || l == nil {
 			t.Fatalf("seedQuarantinedDevice: AcquireDevice #%d: lease=%+v err=%v", i+1, l, err)
 		}
-		if err := s.ReleaseDevice(ctx, l.DeviceID, "seed-task", true, 3); err != nil {
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "seed-task", wf.FailScopeDevice, 3); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -516,5 +516,25 @@ func TestTranslatorDisabledFallsBackToUsage(t *testing.T) {
 	e.HandleMessage(context.Background(), "ou_1", "随便说点什么")
 	if lastText(sender) != usage {
 		t.Errorf("翻译层禁用时必须与改动前逐字节一致:\n got %q\nwant %q", lastText(sender), usage)
+	}
+}
+
+// 归因拆分后,client 计数必须在飞书输出里可见——否则"这个 client 是不是在
+// 持续出问题"无处可查(设计文档决策 2:只计数与展示)。
+func TestStatusAndDevicesShowClientFailStreak(t *testing.T) {
+	st := store.NewMemStore()
+	seedQuarantinedDevice(t, st, "dev-1")
+	sender := &fakeSender{}
+	e := newExec(st, &fakeStarter{}, sender)
+	for _, cmd := range []string{"status", "devices"} {
+		sender.texts = nil
+		e.HandleMessage(context.Background(), wlOpenID, cmd)
+		got := lastText(sender)
+		if !strings.Contains(got, "client=") {
+			t.Errorf("%s 输出应含 client=, got %q", cmd, got)
+		}
+		if !strings.Contains(got, "client_fail=") {
+			t.Errorf("%s 输出应含 client_fail=, got %q", cmd, got)
+		}
 	}
 }

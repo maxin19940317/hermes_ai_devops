@@ -116,10 +116,19 @@ func (s *MemStore) AcquireDevice(_ context.Context, sel wf.DeviceSelector, taskI
 	return nil, nil
 }
 
-// ReleaseDevice 归还租约(置 released_at,行保留作审计;§10/差距 #15)。
-// infraFail=true 时 fail_streak+1,达到 quarantineAfter(§10 缺省 3)则 QUARANTINED;
-// 成功归还清零 fail_streak。非租约持有者释放/租约已易主/重复释放:幂等,无副作用。
-func (s *MemStore) ReleaseDevice(_ context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error {
+// ReleaseDevice 归还租约(置 released_at,行保留作审计;§10/差距 #15)并按归因记账
+// (差距 #10,设计文档 §4):
+//
+//	device → 设备计数 +1,达 quarantineAfter 则 QUARANTINED
+//	client → 该设备所属 client 的计数 +1,设备计数不动
+//	none   → 两个计数器都不动(Runtime 自身故障不是设备的错,也不是它健康的证据)
+//	ok     → 两个计数器都清零
+//
+// 非租约持有者释放/租约已易主/重复释放:幂等,无副作用,且不计数。
+//
+// 注:device scope 目前无信号源(rules.CategoryDevice 无人产出,见设计 §7),
+// 因此 devices.fail_streak 恒为 0、隔离不再触发——这是预期状态,不是缺陷。
+func (s *MemStore) ReleaseDevice(_ context.Context, deviceID, taskID string, scope wf.FailScope, quarantineAfter int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.devices[deviceID]
@@ -129,14 +138,20 @@ func (s *MemStore) ReleaseDevice(_ context.Context, deviceID, taskID string, inf
 	row.Released = true
 	row.LeaseTaskID = ""
 	row.LeaseExpiresAt = time.Time{}
-	if infraFail {
+	switch scope {
+	case wf.FailScopeDevice:
 		row.FailStreak++
 		if row.FailStreak >= quarantineAfter {
 			row.Status = DeviceQuarantined
 			return nil
 		}
-	} else {
+	case wf.FailScopeClient:
+		s.clientFailStreak[row.ClientID]++
+	case wf.FailScopeOK:
 		row.FailStreak = 0
+		s.clientFailStreak[row.ClientID] = 0
+	case wf.FailScopeNone:
+		// 两个计数器都不动
 	}
 	row.Status = DeviceIdle
 	return nil

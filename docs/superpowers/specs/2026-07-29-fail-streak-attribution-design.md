@@ -2,7 +2,7 @@
 
 日期：2026-07-29
 
-状态：待批准
+状态：**已批准**（2026-07-29 评审通过；修订含 §4.1 callbacks 宕机盲区、§6 历史值归零、§7 签名链路已在生产验证）
 
 ## 1. 背景
 
@@ -97,6 +97,23 @@ Client/网络级 → `client_fail_streak+1`，终态成功类 → 清零，`devi
 终态那三行需要 `res.Status`，而 `d.Category` 单独不足以区分 FAILED 与 TIMEOUT——两者都是
 `CategoryInfra`。归因函数因此同时吃 category 与 status。
 
+### 4.1 已知盲区：callbacks 宕机会被归成 client 失联
+
+`lease expired (no heartbeat)` → `client` 这一行有一个 workflow 视角内**无法区分**的情形：
+若 callbacks 进程自身宕机 ≥120s，Client 的心跳送不达，租约照样过期，CheckLease 照样判
+"失联"——但故障方是 Runtime，不是 Client。
+
+workflow 只能看到"租约没续上"，看不到"是谁没送到"。要区分需要额外事实（如 callbacks 侧
+的自身可用性记录），本轮不做。
+
+本轮代价为零：`client_fail_streak` 只计数不驱动行为（决策 2），误计不会导致任何自动处置。
+**但若将来用它做自动处置（达阈值停止向该 client 派单），这条必须先解决**，否则 Runtime
+自己重启一次就会把整个 fleet 的 client 全停掉。
+
+可用的判别特征：callbacks 宕机时**全 fleet 的 client 计数同时 +1**，而单个 Client Agent
+故障只影响它自己。这个特征可以作为将来自动处置的护栏（同一时间窗内多 client 同时计数
+上涨 → 判为 Runtime 侧故障，不计）。
+
 归因是一个纯函数，表驱动单测：
 
 ```go
@@ -107,8 +124,16 @@ func failScope(site releaseSite, category rules.Category, resultStatus string) s
 
 ## 5. Temporal 重放兼容
 
-`ReleaseRequest` 是 activity 输入，进 workflow history。改变 workflow 传给 `ReleaseDevice`
-的载荷会让**在途 workflow 重放时命令与历史不匹配**，判非确定性失败。
+**订正（2026-07-29 复审）**：Temporal 的非确定性检查比较的是**命令**（activity 类型、
+调用顺序、activity ID），不是序列化后的 activity 输入。单纯给 `ReleaseRequest` 加一个
+字段、`ReleaseDevice` 仍在同一位置以同一 activity 类型调用一次，**不会**因此导致重放
+判非确定性——本节最初的论证站不住。
+
+真正的动机是**行为稳定性**，不是重放安全性：不加版本门，一个在旧代码下已经跑到
+release 步骤、attempt 1 已按旧语义（`InfraFail`）记过账的在途 workflow，重放到同一步骤
+时会因为 worker 已升级而突然按新语义（`FailScope`）解释同一段历史——同一次 attempt 的
+归因在两次重放之间不一致。版本门保证的是：一个跑在部署之前就已启动的 workflow，
+全程只看到部署前的记账行为，不会在重放时被静默切换语义。
 
 因此：
 
@@ -122,12 +147,35 @@ func failScope(site releaseSite, category rules.Category, resultStatus string) s
 不采用"挑无在途任务的窗口部署"：Phase 1 规模下确实可行，但把正确性寄托在部署时机上，
 下次规模变大就会踩到。
 
+**未写明的代价**：`GetVersion` 一旦执行，`"release-fail-scope"` 这个 marker 就永久写入
+该 workflow 的 history——它不是一次性开关，而是从此该 workflow 每次重放都会读到的记录。
+连带地，`ReleaseRequest.InfraFail` 字段与 `release()` 闭包里"legacyInfraFail 与 scope
+并存"的双参数写法必须无限期保留，不能在下个版本清理。
+
+**移除标准**：当"部署前已启动、且仍可能在跑"的 workflow 集合为空时，才能移除
+`workflow.DefaultVersion` 分支、`InfraFail` 字段与双参数 release 闭包。设备测试受
+`HARD_TIMEOUT_MARGIN_SEC`（缺省 1200s，叠加在 manifest timeout 上）限界，单次 attempt
+不可能无限期运行，这个窗口是**小时级**，不是月级——部署后运维等待一个工作日再清理即可，
+不需要额外的追踪机制。
+
+**接受的后果**：对一个 attempt 1 在部署前就已 release 过的在途 workflow，`GetVersion`
+会在首次重放时把 `workflow.DefaultVersion` 缓存下来并用于该 workflow 的整个剩余生命
+周期——即使 attempt 2、3 发生在部署之后，也仍然按旧的（会误伤设备的）语义记账。这是
+Temporal 安全的正确选择：同一个 workflow 内部不能出现语义中途切换。影响面由 §6 的
+迁移（把 `devices.fail_streak` 清零）兜底：即使某个在途 workflow 的后续 attempt 按旧
+语义又误计了一两次，也不会累积到迁移前的旧计数上。
+
 ## 6. 数据模型
 
 ```sql
 -- clients 表加 client 级失败计数(差距 #10)。
 -- devices.fail_streak 保留原名,语义收窄为"设备级"。
 ALTER TABLE clients ADD COLUMN IF NOT EXISTS fail_streak INTEGER NOT NULL DEFAULT 0;
+
+-- 历史值按旧(错误)语义累计:client 侧失败、超时、Runtime 自身故障都记在设备头上。
+-- 语义既然收窄为"设备级",旧值就不该带进新语义——归零重新开始计。
+-- (线上现值恰好是 0,这一句是把语义意图写明,不是修数据。)
+UPDATE devices SET fail_streak = 0;
 ```
 
 `ReleaseDevice` 不需要新增 client 参数：`devices.client_id` 已经记录归属，
@@ -153,8 +201,15 @@ ClientFailStreak int   // 该 client 的连续失败计数(差距 #10)
 - 或约定一组保留签名 id（如 `adb_disconnected`），由 `ci/variants.yaml` 以
   `classify: DEVICE` 声明，走既有的签名→类别链路，无需改契约。
 
-第二条更省事（复用现成链路，`rules` 已支持 `SignatureCategory` → `CategoryDevice`），
-但要求 agent 把 adb 层错误写进它采集的日志流里。选型留给该轮设计。
+第二条明显更省事，而且成本比"复用现成链路"还要低一档：`88caf07`（feat(runtime): let rule
+engine consume runtime-extracted signature hits）之后，**Runtime 侧确定性提取的签名命中已经
+直接进规则判定**（`devicetest.go:416` 的 `mergeSignatureHits` → 二次 `rules.Decide`）。
+也就是说签名 → `CategoryDevice` 这条路今天是**已在生产中跑通的链路，零 rules 改动**，
+唯一前置是 agent 把 adb 层错误写进它采集的日志流（logcat/stderr），再在
+`ci/variants.yaml` 里以 `classify: DEVICE` 声明一条签名。
+
+届时隔离机制可以在正确的信号源上复活——不需要改判定逻辑，只需要让真正的设备故障
+第一次拥有信号。
 
 在此之前，`device_fail_streak` 恒为 0 是**预期状态**，不是缺陷。代码与文档都要写明，
 否则下一个读代码的人会把它当 bug"修"回去。

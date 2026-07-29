@@ -23,9 +23,10 @@ func (s *PGStore) FleetOverview(ctx context.Context) (*FleetOverview, error) {
 	}
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT d.device_id, d.serial, d.soc, d.status, d.fail_streak,
-		       COALESCE(l.task_id, '')
+		       COALESCE(l.task_id, ''), d.client_id, COALESCE(c.fail_streak, 0)
 		FROM devices d
 		LEFT JOIN device_leases l ON l.device_id = d.device_id AND l.released_at IS NULL
+		LEFT JOIN clients c ON c.client_id = d.client_id
 		ORDER BY d.device_id`)
 	if err != nil {
 		return nil, fmt.Errorf("fleet overview: list devices: %w", err)
@@ -33,7 +34,8 @@ func (s *PGStore) FleetOverview(ctx context.Context) (*FleetOverview, error) {
 	defer rows.Close()
 	for rows.Next() {
 		var d DeviceStatus
-		if err := rows.Scan(&d.DeviceID, &d.Serial, &d.SOC, &d.Status, &d.FailStreak, &d.LeaseTaskID); err != nil {
+		if err := rows.Scan(&d.DeviceID, &d.Serial, &d.SOC, &d.Status, &d.FailStreak,
+			&d.LeaseTaskID, &d.ClientID, &d.ClientFailStreak); err != nil {
 			return nil, fmt.Errorf("fleet overview: scan device: %w", err)
 		}
 		out.Devices = append(out.Devices, d)

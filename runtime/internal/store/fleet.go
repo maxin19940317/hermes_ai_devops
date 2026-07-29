@@ -19,6 +19,9 @@ type DeviceStatus struct {
 	Status      string // IDLE|BUSY|OFFLINE|QUARANTINED
 	FailStreak  int
 	LeaseTaskID string // 活跃租约持有任务;空 = 无租约
+
+	ClientID         string // 归属 client
+	ClientFailStreak int    // 该 client 的连续失败计数(差距 #10)
 }
 
 // FleetOverview 是 status 指令的汇总视图。
@@ -56,6 +59,7 @@ func (s *MemStore) FleetOverview(_ context.Context) (*FleetOverview, error) {
 		out.Devices = append(out.Devices, DeviceStatus{
 			DeviceID: row.DeviceID, Serial: row.Serial, SOC: row.SOC,
 			Status: row.Status, FailStreak: row.FailStreak, LeaseTaskID: leaseTask,
+			ClientID: row.ClientID, ClientFailStreak: s.clientFailStreak[row.ClientID],
 		})
 	}
 	return out, nil

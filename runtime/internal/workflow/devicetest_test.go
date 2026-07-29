@@ -241,6 +241,17 @@ func TestHappyPathPassed(t *testing.T) {
 		t.Errorf("PASSED 不应触发证据提取/分析: evidence=%d analyze=%d",
 			len(f.evidenceCalls), len(f.analyzeCalls))
 	}
+	// 新版本分支(设计文档 §5):workflow.GetVersion 对新 workflow 恒返回最大版本,
+	// 所以本用例走的是 FailScope 载荷,而不是旧的 InfraFail 布尔。
+	if len(f.released) != 1 {
+		t.Fatalf("released = %d 次, want 1", len(f.released))
+	}
+	if got := f.released[0].FailScope; got != FailScopeOK {
+		t.Errorf("PASSED 终态的 FailScope = %q, want %q", got, FailScopeOK)
+	}
+	if f.released[0].InfraFail {
+		t.Error("新版本分支不该再填 InfraFail")
+	}
 }
 
 func TestLeaseExpiryRetriesThenInfraError(t *testing.T) {
@@ -267,8 +278,10 @@ func TestLeaseExpiryRetriesThenInfraError(t *testing.T) {
 		t.Errorf("canceled = %+v, 每次租约过期应尽力取消", f.canceled)
 	}
 	for _, r := range f.released {
-		if !r.InfraFail {
-			t.Errorf("release = %+v, 租约过期必须计入 fail_streak", r)
+		// 租约过期 = agent 失联(设计文档 §4):归 client,不是笼统的 "infra fail"。
+		// InfraFail 是旧载荷字段,新版本分支不再填(由 FailScope 携带归因)。
+		if r.FailScope != FailScopeClient {
+			t.Errorf("release = %+v, 租约过期应归因 client(agent 失联)", r)
 		}
 	}
 }
@@ -664,5 +677,40 @@ func TestDispatchFailureRetriesOnFreshTask(t *testing.T) {
 	// 幂等键随 attempt 变化,禁止复用
 	if f.dispatched[len(f.dispatched)-1].IdempotencyKey != taskID("a2") {
 		t.Errorf("dispatched = %+v", f.dispatched)
+	}
+}
+
+// 归因表(设计文档 §4)。每一行一个用例;特别钉住两条改动前会误伤设备的:
+// check lease 失败 → none(不是 device),终态 INFRA+FAILED → client(不是 device)。
+func TestFailScope(t *testing.T) {
+	cases := []struct {
+		name     string
+		site     releaseSite
+		category rules.Category
+		status   string
+		want     FailScope
+	}{
+		{"CreateTask 失败是 Runtime 侧", siteCreateTaskFailed, "", "", FailScopeNone},
+		{"Dispatch 失败连不上 agent", siteDispatchFailed, "", "", FailScopeClient},
+		{"租约过期即 agent 失联", siteLeaseExpired, "", "", FailScopeClient},
+		{"CheckLease 自身失败是 Runtime 侧", siteCheckLeaseFailed, "", "", FailScopeNone},
+		{"hard deadline 成因两可", siteHardDeadline, "", "", FailScopeNone},
+		{"人为取消", siteCanceled, "", "", FailScopeNone},
+		{"LoadResult 失败是 outbox/DB", siteLoadResultFailed, "", "", FailScopeNone},
+		{"终态 CANCELED 与 siteCanceled 一致归 none", siteTerminal, "", "CANCELED", FailScopeNone},
+		{"终态 DEVICE 类", siteTerminal, rules.CategoryDevice, "FAILED", FailScopeDevice},
+		{"终态 INFRA+FAILED 是 client 流水线", siteTerminal, rules.CategoryInfra, "FAILED", FailScopeClient},
+		{"终态 INFRA+TIMEOUT 是工作负载属性", siteTerminal, rules.CategoryInfra, "TIMEOUT", FailScopeNone},
+		{"终态 PASSED", siteTerminal, "", "COMPLETED", FailScopeOK},
+		{"终态 CODE 类测试失败", siteTerminal, rules.CategoryCode, "COMPLETED", FailScopeOK},
+		{"未覆盖组合保守取 none", releaseSite("unknown"), "", "", FailScopeNone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := failScope(tc.site, tc.category, tc.status); got != tc.want {
+				t.Errorf("failScope(%q, %q, %q) = %q, want %q",
+					tc.site, tc.category, tc.status, got, tc.want)
+			}
+		})
 	}
 }

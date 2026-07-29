@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS clients (
     host           TEXT        NOT NULL DEFAULT '',
     version        TEXT        NOT NULL DEFAULT '',
     base_url       TEXT        NOT NULL DEFAULT '',   -- 派单地址(§8.1),来源于心跳注册
-    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT now()
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT now(),
+    fail_streak    INTEGER     NOT NULL DEFAULT 0   -- client 级连续失败(差距 #10)
 );
 
 -- 设备状态(§11):IDLE|BUSY|OFFLINE|QUARANTINED。心跳(UpsertClientDevices)只刷新属性,
