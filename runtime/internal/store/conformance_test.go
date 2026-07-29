@@ -25,6 +25,7 @@ type fullStore interface {
 	AcquireDevice(ctx context.Context, sel wf.DeviceSelector, taskID string, leaseSeconds int) (*wf.Lease, error)
 	ReleaseDevice(ctx context.Context, deviceID, taskID string, scope wf.FailScope, quarantineAfter int) error
 	RenewLease(ctx context.Context, cred LeaseCredential, leaseSeconds int) (bool, error)
+	VerifyLease(ctx context.Context, cred LeaseCredential) (bool, error)
 	GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error)
 	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
 	CreateTask(ctx context.Context, row wf.TaskRow) error
@@ -573,6 +574,99 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if exp, err := s.GetLeaseExpiry(ctx, "w:t1:a1"); err != nil || exp != nil {
 			t.Errorf("释放后: exp=%v err=%v, want (nil, nil)", exp, err)
+		}
+	})
+
+	// 只读租约校验(差距 #8 的签发端点鉴权依据):校验通过不得有任何副作用,
+	// 尤其不得像 RenewLease 那样续期——签一次 URL 不等于任务还活着。
+	t.Run("VerifyLeaseIsReadOnly", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
+		if err != nil || lease == nil {
+			t.Fatalf("acquire: %+v %v", lease, err)
+		}
+		cred := LeaseCredential{
+			DeviceID: lease.DeviceID, ClientID: lease.ClientID, TaskID: "w:t1:a1",
+			Attempt: 1, LeaseID: lease.LeaseID, Generation: lease.Generation,
+		}
+		before, err := s.GetLeaseExpiry(ctx, "w:t1:a1")
+		if err != nil || before == nil {
+			t.Fatalf("expiry before: %v %v", before, err)
+		}
+		ok, err := s.VerifyLease(ctx, cred)
+		if err != nil || !ok {
+			t.Fatalf("VerifyLease = %v, %v; want true, nil", ok, err)
+		}
+		after, err := s.GetLeaseExpiry(ctx, "w:t1:a1")
+		if err != nil || after == nil {
+			t.Fatalf("expiry after: %v %v", after, err)
+		}
+		if !after.Equal(*before) {
+			t.Errorf("校验不得续期: %v → %v", before, after)
+		}
+	})
+
+	// 凭据任一项失配都必须判否——这是端点唯一的鉴权依据。
+	t.Run("VerifyLeaseRejectsMismatch", func(t *testing.T) {
+		base := func(l *wf.Lease) LeaseCredential {
+			return LeaseCredential{
+				DeviceID: l.DeviceID, ClientID: l.ClientID, TaskID: "w:t1:a1",
+				Attempt: 1, LeaseID: l.LeaseID, Generation: l.Generation,
+			}
+		}
+		cases := []struct {
+			name   string
+			mutate func(c *LeaseCredential)
+		}{
+			{"错 lease_id", func(c *LeaseCredential) { c.LeaseID = "bogus" }},
+			{"错 generation", func(c *LeaseCredential) { c.Generation += 1 }},
+			{"错 client_id", func(c *LeaseCredential) { c.ClientID = "other" }},
+			{"错 task_id", func(c *LeaseCredential) { c.TaskID = "w:other:a1" }},
+			{"错 device_id", func(c *LeaseCredential) { c.DeviceID = "no-such-device" }},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newStore(t)
+				seed(t, s)
+				lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
+				if err != nil || lease == nil {
+					t.Fatalf("acquire: %+v %v", lease, err)
+				}
+				cred := base(lease)
+				tc.mutate(&cred)
+				ok, err := s.VerifyLease(ctx, cred)
+				if err != nil {
+					t.Fatalf("VerifyLease err = %v", err)
+				}
+				if ok {
+					t.Errorf("%s 应判否", tc.name)
+				}
+			})
+		}
+	})
+
+	// 已释放的租约不再是持有者(任务结束后不得继续换 URL)。
+	t.Run("VerifyLeaseRejectsReleased", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
+		if err != nil || lease == nil {
+			t.Fatalf("acquire: %+v %v", lease, err)
+		}
+		cred := LeaseCredential{
+			DeviceID: lease.DeviceID, ClientID: lease.ClientID, TaskID: "w:t1:a1",
+			Attempt: 1, LeaseID: lease.LeaseID, Generation: lease.Generation,
+		}
+		if err := s.ReleaseDevice(ctx, lease.DeviceID, "w:t1:a1", wf.FailScopeOK, 3); err != nil {
+			t.Fatal(err)
+		}
+		ok, err := s.VerifyLease(ctx, cred)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Error("已释放的租约不得通过校验")
 		}
 	})
 

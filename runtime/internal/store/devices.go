@@ -191,6 +191,24 @@ func (s *MemStore) RenewLease(_ context.Context, cred LeaseCredential, leaseSeco
 	return true, nil
 }
 
+// VerifyLease 只读校验凭据是否为该任务当前的租约持有者(差距 #8 的签发端点鉴权)。
+// 与 RenewLease 的区别:**不续期**——签发一次 URL 不构成"任务仍然活着"的证据,
+// 续期只能由心跳做。校验项与 RenewLease 完全一致(device/client/task/lease_id/
+// generation 全匹配且未释放),失配返回 (false, nil) 而非错误。
+func (s *MemStore) VerifyLease(_ context.Context, cred LeaseCredential) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.devices[cred.DeviceID]
+	if !ok || row.Released {
+		return false, nil
+	}
+	if row.ClientID != cred.ClientID || row.LeaseTaskID != cred.TaskID ||
+		row.LeaseID != cred.LeaseID || row.LeaseGeneration != cred.Generation {
+		return false, nil
+	}
+	return true, nil
+}
+
 // GetLeaseExpiry 返回 taskID 当前持有租约的到期时刻(CheckLease 活动,
 // 原则 6);租约不存在/已释放/已易主返回 (nil, nil)——即"未续期"。
 func (s *MemStore) GetLeaseExpiry(_ context.Context, taskID string) (*time.Time, error) {

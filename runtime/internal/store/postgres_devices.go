@@ -195,6 +195,22 @@ func (s *PGStore) RenewLease(ctx context.Context, cred LeaseCredential, leaseSec
 	return n == 1 && attemptMatches(cred.TaskID, cred.Attempt), nil
 }
 
+// VerifyLease 见 MemStore 同名方法的语义说明(差距 #8)。纯 SELECT,无副作用。
+func (s *PGStore) VerifyLease(ctx context.Context, cred LeaseCredential) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM device_leases l JOIN devices d ON d.device_id = l.device_id
+		WHERE l.device_id = $1 AND d.client_id = $2 AND l.task_id = $3
+		  AND l.lease_id = $4 AND l.lease_generation = $5
+		  AND l.released_at IS NULL`,
+		cred.DeviceID, cred.ClientID, cred.TaskID, cred.LeaseID, cred.Generation).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("verify lease %s: %w", cred.TaskID, err)
+	}
+	return n == 1, nil
+}
+
 // GetLeaseExpiry 返回 taskID 当前持有租约的到期时刻(CheckLease 活动,
 // 原则 6);租约不存在/已释放返回 (nil, nil)——即"未续期"。
 func (s *PGStore) GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error) {
