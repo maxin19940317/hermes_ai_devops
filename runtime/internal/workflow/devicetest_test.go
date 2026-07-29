@@ -697,6 +697,7 @@ func TestFailScope(t *testing.T) {
 		{"hard deadline 成因两可", siteHardDeadline, "", "", FailScopeNone},
 		{"人为取消", siteCanceled, "", "", FailScopeNone},
 		{"LoadResult 失败是 outbox/DB", siteLoadResultFailed, "", "", FailScopeNone},
+		{"终态 CANCELED 与 siteCanceled 一致归 none", siteTerminal, "", "CANCELED", FailScopeNone},
 		{"终态 DEVICE 类", siteTerminal, rules.CategoryDevice, "FAILED", FailScopeDevice},
 		{"终态 INFRA+FAILED 是 client 流水线", siteTerminal, rules.CategoryInfra, "FAILED", FailScopeClient},
 		{"终态 INFRA+TIMEOUT 是工作负载属性", siteTerminal, rules.CategoryInfra, "TIMEOUT", FailScopeNone},

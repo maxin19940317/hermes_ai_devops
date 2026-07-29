@@ -234,7 +234,7 @@ sequenceDiagram
             W->>W: 下一 attempt(回到获取设备)
         else 终态
             W->>R: FinishTask + ReleaseDevice Activity
-            R->>D: PASSED / TEST_FAILED / PERF_REGRESSION<br/>→ fail_streak 清零;<br/>device_fail_streak 连续 3 → QUARANTINED
+            R->>D: PASSED / TEST_FAILED / PERF_REGRESSION<br/>→ fail_streak 清零;<br/>device_fail_streak 连续 3 → QUARANTINED(当前无信号源,暂不触发,见差距 #10)
         end
     end
 

@@ -338,12 +338,20 @@ func failScope(site releaseSite, category rules.Category, resultStatus string) F
 		return FailScopeNone
 	case siteTerminal:
 		switch {
+		case resultStatus == "CANCELED":
+			// 取消不是任何一方的错,也不是"干完了"的证据(设计 §4:取消归 none)。
+			// 与 siteCanceled 保持一致:同一类事件不因谁先观察到而改变归因。
+			return FailScopeNone
 		case category == rules.CategoryDevice:
+			// 目前无人产出 rules.CategoryDevice(设计 §7:设备级信号源本轮不做),
+			// 这个分支恒不可达,device_fail_streak 因此恒为 0——不是缺陷,是保留位。
 			return FailScopeDevice
 		case category == rules.CategoryInfra && resultStatus == "FAILED":
 			return FailScopeClient
 		case category == rules.CategoryInfra:
-			return FailScopeNone // TIMEOUT 及其余 INFRA:不归任何一方
+			// 覆盖 TIMEOUT,以及未来任何 classify: INFRA 的签名命中
+			// (ci/variants.yaml 新增该分类时,判定落在这里,不落 FAILED 分支)。
+			return FailScopeNone
 		default:
 			return FailScopeOK
 		}

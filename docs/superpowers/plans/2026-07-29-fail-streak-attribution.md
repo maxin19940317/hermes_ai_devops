@@ -873,7 +873,9 @@ git commit -m "feat(feishu): surface client fail streak; close gap #10"
 ## 完成后的手工验收
 
 1. 跑迁移：`psql "$DATABASE_URL" -f deploy/postgres/migrations/2026-07-29-client-fail-streak.sql`，
-   确认 `\d clients` 有 `fail_streak` 列且 `SELECT fail_streak FROM devices` 全为 0。
+   确认 `\d clients` 有 `fail_streak` 列且 `SELECT fail_streak FROM devices` 全为 0；
+   并确认 `SELECT count(*) FROM devices WHERE status = 'QUARANTINED'` 为 0
+   （迁移会把遗留的 QUARANTINED 一并归位到 IDLE，避免设备在新语义下永久悬挂）。
 2. 飞书发 `devices`，确认每行带 `client=… client_fail=…`。
 3. 制造一次 client 级失败（停掉 Client Agent 后触发一次 kick），确认：
    `clients.fail_streak` +1、`devices.fail_streak` 仍为 0、设备状态回到 `IDLE` 而非 `QUARANTINED`。

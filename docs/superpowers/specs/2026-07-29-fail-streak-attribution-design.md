@@ -124,8 +124,16 @@ func failScope(site releaseSite, category rules.Category, resultStatus string) s
 
 ## 5. Temporal 重放兼容
 
-`ReleaseRequest` 是 activity 输入，进 workflow history。改变 workflow 传给 `ReleaseDevice`
-的载荷会让**在途 workflow 重放时命令与历史不匹配**，判非确定性失败。
+**订正（2026-07-29 复审）**：Temporal 的非确定性检查比较的是**命令**（activity 类型、
+调用顺序、activity ID），不是序列化后的 activity 输入。单纯给 `ReleaseRequest` 加一个
+字段、`ReleaseDevice` 仍在同一位置以同一 activity 类型调用一次，**不会**因此导致重放
+判非确定性——本节最初的论证站不住。
+
+真正的动机是**行为稳定性**，不是重放安全性：不加版本门，一个在旧代码下已经跑到
+release 步骤、attempt 1 已按旧语义（`InfraFail`）记过账的在途 workflow，重放到同一步骤
+时会因为 worker 已升级而突然按新语义（`FailScope`）解释同一段历史——同一次 attempt 的
+归因在两次重放之间不一致。版本门保证的是：一个跑在部署之前就已启动的 workflow，
+全程只看到部署前的记账行为，不会在重放时被静默切换语义。
 
 因此：
 
@@ -138,6 +146,24 @@ func failScope(site releaseSite, category rules.Category, resultStatus string) s
 
 不采用"挑无在途任务的窗口部署"：Phase 1 规模下确实可行，但把正确性寄托在部署时机上，
 下次规模变大就会踩到。
+
+**未写明的代价**：`GetVersion` 一旦执行，`"release-fail-scope"` 这个 marker 就永久写入
+该 workflow 的 history——它不是一次性开关，而是从此该 workflow 每次重放都会读到的记录。
+连带地，`ReleaseRequest.InfraFail` 字段与 `release()` 闭包里"legacyInfraFail 与 scope
+并存"的双参数写法必须无限期保留，不能在下个版本清理。
+
+**移除标准**：当"部署前已启动、且仍可能在跑"的 workflow 集合为空时，才能移除
+`workflow.DefaultVersion` 分支、`InfraFail` 字段与双参数 release 闭包。设备测试受
+`HARD_TIMEOUT_MARGIN_SEC`（缺省 1200s，叠加在 manifest timeout 上）限界，单次 attempt
+不可能无限期运行，这个窗口是**小时级**，不是月级——部署后运维等待一个工作日再清理即可，
+不需要额外的追踪机制。
+
+**接受的后果**：对一个 attempt 1 在部署前就已 release 过的在途 workflow，`GetVersion`
+会在首次重放时把 `workflow.DefaultVersion` 缓存下来并用于该 workflow 的整个剩余生命
+周期——即使 attempt 2、3 发生在部署之后，也仍然按旧的（会误伤设备的）语义记账。这是
+Temporal 安全的正确选择：同一个 workflow 内部不能出现语义中途切换。影响面由 §6 的
+迁移（把 `devices.fail_streak` 清零）兜底：即使某个在途 workflow 的后续 attempt 按旧
+语义又误计了一两次，也不会累积到迁移前的旧计数上。
 
 ## 6. 数据模型
 

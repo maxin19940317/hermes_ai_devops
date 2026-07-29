@@ -167,6 +167,28 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 	})
 
+	// clients.fail_streak 的姊妹陷阱(差距 #10):心跳只应刷新设备属性,
+	// 不得顺带清空 client 级计数器——否则 client 侧的连续失败永远数不到 2。
+	t.Run("HeartbeatMustNotResetClientFailStreak", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		l, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t1", 120)
+		if err != nil || l == nil {
+			t.Fatalf("lease=%v err=%v", l, err)
+		}
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "t1", wf.FailScopeClient, 3); err != nil {
+			t.Fatal(err)
+		}
+		seed(t, s) // 心跳重注册:只刷新属性,不得把 clients.fail_streak 清零
+		ov, err := s.FleetOverview(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ov.Devices[0].ClientFailStreak != 1 {
+			t.Errorf("心跳后 client fail_streak = %d, want 1(心跳不得清空该计数器)", ov.Devices[0].ClientFailStreak)
+		}
+	})
+
 	t.Run("ReleaseIsIdempotentAndOwnerChecked", func(t *testing.T) {
 		s := newStore(t)
 		seed(t, s)

@@ -157,13 +157,6 @@ func (s *MemStore) ReleaseDevice(_ context.Context, deviceID, taskID string, sco
 	return nil
 }
 
-// ClientFailStreak 返回某 client 的连续失败计数(差距 #10);无记录返回 0。
-func (s *MemStore) ClientFailStreak(clientID string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.clientFailStreak[clientID]
-}
-
 // leasable 判定设备当前是否可出租:IDLE 可租;BUSY 仅当租约已过期
 // (lease_expires_at 由心跳经 RenewLease 续期,过期 = 持有者失联)可懒回收;
 // QUARANTINED 永不可租(只能由人工/后续机制解除)。

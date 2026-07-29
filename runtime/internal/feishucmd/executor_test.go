@@ -530,6 +530,9 @@ func TestStatusAndDevicesShowClientFailStreak(t *testing.T) {
 		sender.texts = nil
 		e.HandleMessage(context.Background(), wlOpenID, cmd)
 		got := lastText(sender)
+		if !strings.Contains(got, "client=") {
+			t.Errorf("%s 输出应含 client=, got %q", cmd, got)
+		}
 		if !strings.Contains(got, "client_fail=") {
 			t.Errorf("%s 输出应含 client_fail=, got %q", cmd, got)
 		}
