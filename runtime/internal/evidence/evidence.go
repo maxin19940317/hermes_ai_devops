@@ -177,7 +177,7 @@ func Extract(in Input) Evidence {
 	for _, key := range []string{"logcat", "stdout", "stderr"} {
 		if r, ok := in.Files[key]; ok && r != nil {
 			scans[key] = scanStream(r, matchers[key], key == "logcat")
-			if scans[key].truncated {
+			if scans[key].truncated || scans[key].readErr != nil {
 				ev.Truncated = true
 			}
 		}

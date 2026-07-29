@@ -3,6 +3,7 @@ package evidence
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -452,6 +453,22 @@ func TestExtractOversizedLineMarksFileTruncated(t *testing.T) {
 	}
 	if !match.Truncated {
 		t.Error("match context clipped by oversized line must be truncated")
+	}
+}
+
+func TestExtractPartialReadWithoutMatchMarksEvidenceTruncated(t *testing.T) {
+	injected := errors.New("injected read failure")
+	in := baseInput()
+	in.Signatures = []Signature{{ID: "missing", Where: "stdout", Pattern: "NEVER-MATCH", Classify: "CODE"}}
+	in.Files["stdout"] = &dataAndErrorReader{data: []byte("partial log\n"), err: injected}
+
+	ev := Extract(in)
+
+	if got := ev.Signatures[0].Error; !strings.Contains(got, "read stdout: injected read failure") {
+		t.Errorf("signature error = %q, want read error", got)
+	}
+	if !ev.Truncated {
+		t.Error("partial read must set top-level truncated")
 	}
 }
 
