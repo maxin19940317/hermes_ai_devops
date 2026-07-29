@@ -260,7 +260,7 @@ func seedQuarantinedDevice(t *testing.T, s *store.MemStore, deviceID string) {
 		if err != nil || l == nil {
 			t.Fatalf("seedQuarantinedDevice: AcquireDevice #%d: lease=%+v err=%v", i+1, l, err)
 		}
-		if err := s.ReleaseDevice(ctx, l.DeviceID, "seed-task", true, 3); err != nil {
+		if err := s.ReleaseDevice(ctx, l.DeviceID, "seed-task", wf.FailScopeDevice, 3); err != nil {
 			t.Fatal(err)
 		}
 	}
