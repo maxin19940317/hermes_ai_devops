@@ -664,7 +664,7 @@ func TestExtractContextBudget(t *testing.T) {
 // TestEvidenceSchemaValidation 构造完整 Evidence,序列化后必须过契约校验。
 func TestEvidenceSchemaValidation(t *testing.T) {
 	full := Evidence{
-		EvidenceVersion: 2, TaskID: "task-1", Variant: "v", Status: "FAILED",
+		EvidenceVersion: 3, TaskID: "task-1", Variant: "v", Status: "FAILED",
 		ExitCode: 1, DurationSec: 12.5,
 		Cases:                 Cases{Total: 10, Passed: 8, Failed: 1, Skipped: 1},
 		SignaturesHitReported: []string{"native_crash"},

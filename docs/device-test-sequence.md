@@ -273,7 +273,7 @@ sequenceDiagram
 | 6 | Evidence 快照独立存 evidence_snapshots + MinIO | evidence 瞬态,decisions 只存 sha256 | **新建**:evidence_snapshots 表 + ExtractEvidence 上传 MinIO + SaveEvidenceSnapshot |
 | 7 | Rule Engine 版本化(plan.rule_version 路由) | rules.Decide 无版本,升级即破坏重放确定性 | **新建**:plan/契约加 rule_version,版本路由,历史实现保留 |
 | 8 | 预签名 URL 按需签发(收集时请求) | **已实现**(2026-07-29):callbacks 新增 upload-requests,租约凭据鉴权,收集完成后秒级签发;顺带修复 collect glob(logs/*.log、dumps/**)从未上传的缺陷 | 遗留:派单时的 presigned_uploads 保留作滚动升级与端点不可达时的回退,下线条件见 `docs/superpowers/specs/2026-07-29-on-demand-presign-design.md` §7 |
-| 9 | 日志流式全扫(不只尾部 8MB) | readWindow 只保留尾部 8MB,前部错误可能丢失 | 改造 evidence 提取:流式扫描,只留命中上下文/首 error/尾部 |
+| 9 | 日志流式全扫(不只尾部 8MB) | **已实现**(2026-07-30):单遍流式扫描完整日志,签名命中使用真实全局行号;仅保留命中 ±50 行上下文与有界兜底摘录,普通大文件不再有尾部盲区 | 遗留:Evidence v3 对单行扫描设 1MiB 上限,超长单行明确降级并记入 `truncated_files`;整体输出仍受预算约束 |
 | 10 | 失败归因 device/client 分离 + 明确重置规则 | **已实现**(2026-07-29):四值归因 ok/device/client/none,Runtime 自身故障不再计入任何一方 | 遗留:`device` 无信号源(rules.CategoryDevice 无人产出),故设备隔离暂不触发,恢复路径见 `docs/superpowers/specs/2026-07-29-fail-streak-attribution-design.md` §7 |
 | 11 | Workflow ID 冲突策略精细化(失败仅显式 retry) | AllowDuplicateFailedOnly:失败 workflow 可被 webhook 重放自动重启 | Trigger 侧区分显式 retry 与普通重放 |
 | 12 | Client 只读 Deploy Token(原则 5) | bearer PAT(高权限) | 配置变更:read_package_registry Deploy Token 替换 `ARTIFACT_AUTH_TOKEN` |

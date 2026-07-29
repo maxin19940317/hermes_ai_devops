@@ -1,4 +1,4 @@
-"""evidence.json v1 (CLAUDE.md §12 Phase 2, Runtime Evidence Extractor 产出) 的正反例校验测试。"""
+"""evidence.json v3 (CLAUDE.md §12 Phase 2, Runtime Evidence Extractor 产出) 的正反例校验测试。"""
 import pytest
 from jsonschema import ValidationError
 

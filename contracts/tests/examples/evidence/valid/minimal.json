@@ -1,5 +1,5 @@
 {
-  "evidence_version": 2,
+  "evidence_version": 3,
   "task_id": "wf-1:t1:a2",
   "variant": "aarch64_Android_TFLite_2.21.0",
   "status": "TIMEOUT",

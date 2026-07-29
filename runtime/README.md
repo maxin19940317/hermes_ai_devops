@@ -37,6 +37,10 @@ Postgres 集成测试由 `TEST_DATABASE_URL` 门控(本机跳过,服务器部署
 `cmd/worker/main.go` 头注释(环境变量全表)。飞书指令自然语言翻译新增两项
 (设计文档 2026-07-28,详见 `../deploy/README.md` "飞书指令自然语言翻译"小节):
 
+当前 Evidence v3 提取器会单遍流式扫描完整日志,保留真实全局行号、签名命中
+±50 行上下文和有界兜底摘录,已无只读尾部 8MiB 的盲区;输出仍受 96KB
+上下文预算约束,超过 1MiB 的单行会明确降级并标记截断。
+
 | 变量 | 缺省 | 说明 |
 |---|---|---|
 | `FEISHU_CMD_NL` | `false` | 翻译旁路总开关(灰度)。真正启用还需 `HERMES_ENDPOINT` 非空且 `FEISHU_CMD_WHITELIST` 非空(指令 listener 已启用),三者合取 |

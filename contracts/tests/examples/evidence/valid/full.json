@@ -1,5 +1,5 @@
 {
-  "evidence_version": 2,
+  "evidence_version": 3,
   "task_id": "device-test-aios/algo_super_sdk-g108e0d72-p46:aarch64_Android_SNPE_2.21:a1",
   "variant": "aarch64_Android_SNPE_2.21",
   "status": "COMPLETED",

@@ -138,7 +138,7 @@ var fileNames = map[string]string{
 // Extract 执行确定性证据提取。任何缺失/异常都降级进输出,不返回 error。
 func Extract(in Input) Evidence {
 	ev := Evidence{
-		EvidenceVersion:       2,
+		EvidenceVersion:       3,
 		TaskID:                in.TaskID,
 		Variant:               in.Variant,
 		Status:                in.Status,
@@ -249,7 +249,7 @@ func Extract(in Input) Evidence {
 		ev.JunitFailures = parseJunit(r)
 	}
 
-	// ---- 兜底摘录(契约 v2):全部签名未命中时提供有界原文——
+	// ---- 兜底摘录(契约 v3):全部签名未命中时提供有界原文——
 	// 否则 evidence 只有文件元数据,Analyzer 只能回答"证据不足"
 	// (实证:2026-07-27 p56 SNPE_1.68 seg 模型错误全漏签名,Hermes 无法分析)。
 	if totalMatched == 0 {

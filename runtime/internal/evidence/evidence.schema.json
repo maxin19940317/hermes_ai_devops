@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hermes-devops/contracts/evidence.schema.json",
-  "title": "evidence.json v1",
-  "description": "Runtime Evidence Extractor 的确定性产出(CLAUDE.md §12 Phase 2):签名匹配(含命中处 ±50 行上下文)+ junit 失败 + 指标快照,几十 KB 级,是 Analyzer(LLM)的唯一输入——严禁把原始日志全量灌入 LLM。本契约对未知字段宽容,已知字段严格校验。指标差值(基线比较)依赖 metrics 表,属后续阶段;v1 只携带原始 metrics 快照。",
+  "title": "evidence.json v3",
+  "description": "Runtime Evidence Extractor 的确定性产出(CLAUDE.md §12 Phase 2):单遍流式扫描完整日志并保留签名命中处 ±50 行上下文、全局行号、有界兜底摘录、junit 失败和指标快照。普通大文件不再受 8MiB 尾部窗口限制;超过 1MiB 的单行会降级截断扫描。输出仍受体积预算约束,是 Analyzer(LLM)的唯一输入——严禁把原始日志全量灌入 LLM。本契约对未知字段宽容,已知字段严格校验。",
   "type": "object",
   "required": ["evidence_version", "task_id", "variant", "status", "exit_code", "cases", "signatures", "junit_failures", "inputs"],
   "properties": {
-    "evidence_version": { "const": 2 },
+    "evidence_version": { "const": 3 },
     "task_id": { "type": "string", "minLength": 1, "maxLength": 256 },
     "variant": { "type": "string", "minLength": 1 },
     "status": {
@@ -51,7 +51,7 @@
                 "line_no": { "type": "integer", "minimum": 1 },
                 "context": {
                   "type": "string",
-                  "description": "命中行 ±50 行上下文;文件读取超限截断时只含尾部窗口"
+                  "description": "命中行 ±50 行上下文;超长单行会裁剪展示"
                 },
                 "truncated": { "type": "boolean", "default": false }
               }
@@ -111,7 +111,7 @@
         },
         "truncated_files": {
           "type": "array",
-          "description": "因超过单文件读取上限只取尾部的文件",
+          "description": "提取过程中因超长单行发生扫描截断的文件;普通大文件会完整扫描,不进入此列表",
           "items": { "type": "string" },
           "default": []
         }
