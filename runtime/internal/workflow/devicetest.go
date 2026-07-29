@@ -305,6 +305,52 @@ func runTest(ctx workflow.Context, spec TestSpec, ruleVersion string, resultCh w
 	return sum
 }
 
+// releaseSite 标识释放发生在 workflow 的哪个失败分支(设计文档 §4)。
+// 用枚举而不是解析 reason 字符串:workflow 本来就知道自己站在哪个分支上。
+type releaseSite string
+
+const (
+	siteCreateTaskFailed releaseSite = "create_task_failed"
+	siteDispatchFailed   releaseSite = "dispatch_failed"
+	siteLeaseExpired     releaseSite = "lease_expired"
+	siteCheckLeaseFailed releaseSite = "check_lease_failed"
+	siteHardDeadline     releaseSite = "hard_deadline"
+	siteCanceled         releaseSite = "canceled"
+	siteLoadResultFailed releaseSite = "load_result_failed"
+	siteTerminal         releaseSite = "terminal"
+)
+
+// failScope 决定一次释放该记在谁头上(设计文档 §4 归因表)。纯函数,表驱动单测。
+//
+// 终态分支需要 resultStatus:d.Category 单独不足以区分 FAILED(client 侧流水线
+// 失败)与 TIMEOUT(工作负载属性)——两者都是 CategoryInfra。
+func failScope(site releaseSite, category rules.Category, resultStatus string) FailScope {
+	switch site {
+	case siteDispatchFailed, siteLeaseExpired:
+		// 已知盲区(设计文档 §4.1):callbacks 进程自身宕机 ≥120s 时,心跳送不达、
+		// 租约照样过期,这里会把 Runtime 的故障记成 client 失联。workflow 视角内
+		// 无法区分。本轮无代价(计数不驱动行为);若将来用它做自动处置,必须先解决,
+		// 否则 Runtime 重启一次就会把整个 fleet 的 client 全停掉。
+		// 判别特征:callbacks 宕机时全 fleet 的 client 计数同时上涨。
+		return FailScopeClient
+	case siteCreateTaskFailed, siteCheckLeaseFailed, siteHardDeadline,
+		siteCanceled, siteLoadResultFailed:
+		return FailScopeNone
+	case siteTerminal:
+		switch {
+		case category == rules.CategoryDevice:
+			return FailScopeDevice
+		case category == rules.CategoryInfra && resultStatus == "FAILED":
+			return FailScopeClient
+		case category == rules.CategoryInfra:
+			return FailScopeNone // TIMEOUT 及其余 INFRA:不归任何一方
+		default:
+			return FailScopeOK
+		}
+	}
+	return FailScopeNone // 未覆盖组合保守处理:不加不减
+}
+
 func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt int, resultCh workflow.ReceiveChannel) TaskSummary {
 	wfID := workflow.GetInfo(ctx).WorkflowExecution.ID
 	// 幂等键 = {workflow_id}:{test_id}:{attempt}(§12.6),task_id 同值
@@ -342,15 +388,22 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 	// 终态以 results/tasks 表为准),但绝不能静默:释放失败意味着设备要等到
 	// 租约过期才回池,落终态失败意味着 tasks 表与 workflow 结论不一致——
 	// 两者都只能靠日志发现。
-	release := func(infraFail bool) {
+	// legacyInfraFail 是改动前传给 activity 的原值;scope 是新归因(差距 #10)。
+	// 两者并存是为了让 workflow.GetVersion 的旧分支能重放出一模一样的载荷(设计 §5)。
+	release := func(legacyInfraFail bool, scope FailScope) {
 		if released {
 			return
 		}
 		released = true
-		if err := workflow.ExecuteActivity(dctx, "ReleaseDevice",
-			ReleaseRequest{DeviceID: lease.DeviceID, TaskID: taskID, InfraFail: infraFail}).Get(dctx, nil); err != nil {
+		req := ReleaseRequest{DeviceID: lease.DeviceID, TaskID: taskID}
+		if workflow.GetVersion(dctx, "release-fail-scope", workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+			req.InfraFail = legacyInfraFail // 在途 workflow:原样重放
+		} else {
+			req.FailScope = scope
+		}
+		if err := workflow.ExecuteActivity(dctx, "ReleaseDevice", req).Get(dctx, nil); err != nil {
 			workflow.GetLogger(dctx).Error("release device failed, lease will expire on its own",
-				"task", taskID, "device", lease.DeviceID, "error", err)
+				"task", taskID, "device", lease.DeviceID, "scope", scope, "error", err)
 		}
 	}
 
@@ -360,7 +413,7 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 		IdempotencyKey: taskID, ClientID: lease.ClientID, DeviceID: lease.DeviceID,
 		Status: "DISPATCHING",
 	}).Get(ctx, nil); err != nil {
-		release(false)
+		release(false, failScope(siteCreateTaskFailed, "", ""))
 		return infra("create task: "+err.Error(), true)
 	}
 	finish := func(status, verdict, category, reason string) {
@@ -389,15 +442,15 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 		LeaseID: lease.LeaseID, LeaseGeneration: lease.Generation,
 	}).Get(ctx, nil); err != nil {
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), "dispatch failed")
-		release(true)
+		release(true, failScope(siteDispatchFailed, "", ""))
 		return infra("dispatch: "+err.Error(), true)
 	}
 
 	// ---- await_result:signal 驱动 + 租约到期 Durable Timer/CheckLease(原则 6,§14) ----
-	if infraReason := awaitResult(ctx, taskID, spec, resultCh); infraReason != "" {
+	if site, infraReason := awaitResult(ctx, taskID, spec, resultCh); infraReason != "" {
 		cancel(infraReason)
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), infraReason)
-		release(true)
+		release(true, failScope(site, "", ""))
 		return infra(infraReason, true)
 	}
 
@@ -413,7 +466,7 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 		}
 		cancel(reason)
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), reason)
-		release(true)
+		release(true, failScope(siteLoadResultFailed, "", ""))
 		return infra(reason, true)
 	}
 	res := &rec.Result
@@ -456,7 +509,7 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 		sum.Analysis = runAnalysis(ctx, dctx, taskID, d, ev)
 	}
 	finish(res.Status, sum.Verdict, sum.Category, sum.Reason)
-	release(d.Category == rules.CategoryInfra)
+	release(d.Category == rules.CategoryInfra, failScope(siteTerminal, d.Category, res.Status))
 	return sum
 }
 
@@ -550,7 +603,7 @@ func runAnalysis(ctx, dctx workflow.Context, taskID string, d rules.Decision, ev
 // 同 task_id 的重复 signal(Relay 至少一次重投)幂等:首个匹配即返回,
 // 其余留在 channel 缓冲中随 workflow 结束丢弃;陌生/历史 attempt 的迟到
 // 结果按 task_id 不匹配直接忽略。
-func awaitResult(ctx workflow.Context, taskID string, spec TestSpec, resultCh workflow.ReceiveChannel) string {
+func awaitResult(ctx workflow.Context, taskID string, spec TestSpec, resultCh workflow.ReceiveChannel) (releaseSite, string) {
 	lease := time.Duration(spec.LeaseSeconds) * time.Second
 	hardDeadline := workflow.Now(ctx).Add(time.Duration(spec.HardTimeoutSec) * time.Second)
 	leaseExpiry := workflow.Now(ctx).Add(lease)
@@ -559,17 +612,17 @@ func awaitResult(ctx workflow.Context, taskID string, spec TestSpec, resultCh wo
 	for {
 		now := workflow.Now(ctx)
 		if now.After(hardDeadline) || now.Equal(hardDeadline) {
-			return "hard deadline exceeded"
+			return siteHardDeadline, "hard deadline exceeded"
 		}
 		if now.After(leaseExpiry) || now.Equal(leaseExpiry) {
 			// 租约到期:CheckLease 读库确认(心跳只续 DB 租约,§10)
 			var expiry *time.Time
 			if err := workflow.ExecuteActivity(ctx, "CheckLease",
 				CheckLeaseRequest{TaskID: taskID}).Get(ctx, &expiry); err != nil {
-				return "check lease: " + err.Error()
+				return siteCheckLeaseFailed, "check lease: " + err.Error()
 			}
 			if expiry == nil || !expiry.After(now) {
-				return "lease expired (no heartbeat)"
+				return siteLeaseExpired, "lease expired (no heartbeat)"
 			}
 			leaseExpiry = *expiry // 已续期:按库内新 expires_at 重设 Timer
 			continue
@@ -594,10 +647,10 @@ func awaitResult(ctx workflow.Context, taskID string, spec TestSpec, resultCh wo
 		cancelTimer()
 
 		if matched {
-			return ""
+			return "", ""
 		}
 		if ctx.Err() != nil {
-			return "workflow canceled"
+			return siteCanceled, "workflow canceled"
 		}
 	}
 }
