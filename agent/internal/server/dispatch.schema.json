@@ -61,6 +61,10 @@
       "minimum": 1,
       "description": "租约代数,与 lease_id 配对使用(同上)"
     },
+    "upload_request_url": {
+      "type": "string",
+      "description": "按需签发端点的完整 URL(差距 #8),形如 {callback_base_url}/callbacks/v1/upload-requests。Agent 收集完成后用它换取本次实际收集到的文件的预签名 PUT URL。为空 = Runtime 未启用按需签发,Agent 沿用 presigned_uploads[]。"
+    },
     "presigned_uploads": {
       "type": "array",
       "default": [],

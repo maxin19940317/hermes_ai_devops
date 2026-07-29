@@ -98,3 +98,40 @@ func TestUtcNowMsFormat(t *testing.T) {
 		t.Errorf("utcNowMs() = %q, want UTC millisecond ISO-8601", utcNowMs())
 	}
 }
+
+// 401 表示租约已非己有,调用方必须能区分它与"端点挂了"——前者不回退,后者回退。
+func TestRequestUploadsDistinguishesUnauthorized(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     int
+		wantUnauth bool
+		wantErr    bool
+	}{
+		{"200 正常", http.StatusOK, false, false},
+		{"401 租约失配", http.StatusUnauthorized, true, true},
+		{"503 未配置", http.StatusServiceUnavailable, false, true},
+		{"500 服务端错", http.StatusInternalServerError, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				if tc.status == http.StatusOK {
+					_, _ = w.Write([]byte(`{"uploads":[],"rejected":[]}`))
+				}
+			}))
+			defer srv.Close()
+			c := &Client{BaseURL: srv.URL}
+			_, err := c.RequestUploads(context.Background(), srv.URL, UploadRequest{
+				TaskID: "t1", ClientID: "c1", DeviceID: "d1", Attempt: 1,
+				LeaseID: "l1", LeaseGeneration: 1, Files: []string{"a.log"},
+			})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if got := errors.Is(err, ErrLeaseNotOwned); got != tc.wantUnauth {
+				t.Errorf("ErrLeaseNotOwned = %v, want %v (err=%v)", got, tc.wantUnauth, err)
+			}
+		})
+	}
+}

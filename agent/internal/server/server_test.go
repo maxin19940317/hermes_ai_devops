@@ -815,6 +815,157 @@ func TestDiagnostics(t *testing.T) {
 
 // ---- healthz ----
 
+// ---- 差距 #8:按需签发上传 URL 与固定键集回退 ----
+
+// fakeUploader 记录每次 Upload 收到的键,便于断言"传了哪些"。
+type fakeUploader struct{ gotKeys [][]string }
+
+func (f *fakeUploader) Upload(_ context.Context, p []uploader.PresignedUpload,
+	_ map[string]string) []reporter.Attachment {
+	keys := make([]string, 0, len(p))
+	for _, x := range p {
+		keys = append(keys, x.ObjectKey)
+	}
+	f.gotKeys = append(f.gotKeys, keys)
+	return nil
+}
+
+// newTestServer 是差距 #8 测试专用的最小 Server 构造:只关心
+// uploadAttachments,Store/Runner/Events/Results 走最省事的假实现以满足
+// New() 的必填依赖校验;Reporter 恒非 nil,按需签发路径由
+// Dispatch.UploadRequestURL 是否为空决定是否触发。
+func newTestServer(t *testing.T, up AttachmentUploader) *Server {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	client := &reporter.Client{}
+	return New(Config{
+		Store:    st,
+		Runner:   newFakeADB(),
+		Events:   &reporter.EventReporter{Store: st, Client: client},
+		Results:  &reporter.ResultReporter{Store: st, Client: client},
+		Uploader: up,
+		Reporter: client,
+		RunsRoot: t.TempDir(),
+	})
+}
+
+// seedOutDir 造出 out_dir 与三个文件,返回目录路径。
+func seedOutDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, rel := range []string{"device/results/result.json", "logs/run.log", "dumps/0001.bin"} {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// fixedSetFor 产出与 Dispatch.PresignedUploads 同形的五条固定键集条目,
+// 供回退路径测试使用;URL 值本身不参与断言,随便填。
+func fixedSetFor(taskID string) []struct {
+	ObjectKey string `json:"object_key"`
+	URL       string `json:"url"`
+	ExpiresAt string `json:"expires_at"`
+} {
+	prefix := "runs/" + taskID + "/"
+	names := []string{"result.json", "junit.xml", "logcat.txt", "stdout.log", "stderr.log"}
+	type entry = struct {
+		ObjectKey string `json:"object_key"`
+		URL       string `json:"url"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	out := make([]entry, 0, len(names))
+	for _, n := range names {
+		out = append(out, entry{ObjectKey: prefix + n, URL: "http://minio/put/" + n})
+	}
+	return out
+}
+
+// glob 命中的文件(dumps/**、logs/*.log)在按需签发路径下必须能上传——
+// 这是关闭 presign.go 那条 CONTRACT-ISSUE 的证据。
+func TestUploadAttachmentsOnDemandCoversGlobFiles(t *testing.T) {
+	outDir := seedOutDir(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req reporter.UploadRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		grants := make([]reporter.UploadGrant, 0, len(req.Files))
+		for _, p := range req.Files {
+			grants = append(grants, reporter.UploadGrant{
+				Path: p, ObjectKey: "runs/" + req.TaskID + "/" + p, URL: "http://minio/put"})
+		}
+		_ = json.NewEncoder(w).Encode(reporter.UploadRequestResult{Uploads: grants})
+	}))
+	defer srv.Close()
+
+	up := &fakeUploader{}
+	s := newTestServer(t, up)
+	d := Dispatch{TaskID: "t1", UploadRequestURL: srv.URL,
+		LeaseID: "l1", LeaseGeneration: 1, DeviceSerial: "d1"}
+	s.uploadAttachments(context.Background(), d, outDir)
+
+	if len(up.gotKeys) != 1 {
+		t.Fatalf("Upload 调用次数 = %d, want 1", len(up.gotKeys))
+	}
+	joined := strings.Join(up.gotKeys[0], ",")
+	for _, want := range []string{"dumps/0001.bin", "logs/run.log", "device/results/result.json"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("按需签发应覆盖 %s, got %v", want, up.gotKeys[0])
+		}
+	}
+}
+
+// 端点不可达 → 回退固定键集,附件不能因此全丢。
+func TestUploadAttachmentsFallsBackWhenEndpointDown(t *testing.T) {
+	outDir := seedOutDir(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	up := &fakeUploader{}
+	s := newTestServer(t, up)
+	d := Dispatch{TaskID: "t1", UploadRequestURL: srv.URL,
+		LeaseID: "l1", LeaseGeneration: 1, DeviceSerial: "d1",
+		PresignedUploads: fixedSetFor("t1")}
+	s.uploadAttachments(context.Background(), d, outDir)
+
+	if len(up.gotKeys) != 1 {
+		t.Fatalf("应回退并上传一次, Upload 调用 = %d", len(up.gotKeys))
+	}
+	if !strings.Contains(strings.Join(up.gotKeys[0], ","), "runs/t1/result.json") {
+		t.Errorf("回退应走固定键集, got %v", up.gotKeys[0])
+	}
+}
+
+// 401 不回退:租约已非己有,继续上传会污染别人的证据。
+func TestUploadAttachmentsDoesNotFallBackOnUnauthorized(t *testing.T) {
+	outDir := seedOutDir(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	up := &fakeUploader{}
+	s := newTestServer(t, up)
+	d := Dispatch{TaskID: "t1", UploadRequestURL: srv.URL,
+		LeaseID: "l1", LeaseGeneration: 1, DeviceSerial: "d1",
+		PresignedUploads: fixedSetFor("t1")}
+	s.uploadAttachments(context.Background(), d, outDir)
+
+	if len(up.gotKeys) != 0 {
+		t.Errorf("401 时不得上传任何东西, got %v", up.gotKeys)
+	}
+}
+
 func TestHealthz(t *testing.T) {
 	env := newTestEnv(t)
 	rec := doReq(t, env.handler, http.MethodGet, "/healthz", nil)

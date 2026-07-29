@@ -206,6 +206,72 @@ func (c *Client) post(ctx context.Context, path string, payload, out any) error 
 	return nil
 }
 
+// ErrLeaseNotOwned 标记按需签发端点返回 401:租约已非己有(任务易主或已回收)。
+// 调用方**不得**回退到派单时的 URL——继续上传会污染别人的证据。
+var ErrLeaseNotOwned = errors.New("reporter: lease not owned")
+
+// UploadRequest 是 POST /callbacks/v1/upload-requests 的请求体(差距 #8)。
+type UploadRequest struct {
+	TaskID          string   `json:"task_id"`
+	ClientID        string   `json:"client_id"`
+	DeviceID        string   `json:"device_id"`
+	Attempt         int      `json:"attempt"`
+	LeaseID         string   `json:"lease_id"`
+	LeaseGeneration int      `json:"lease_generation"`
+	Files           []string `json:"files"`
+}
+
+// UploadGrant 是单个已签发条目。
+type UploadGrant struct {
+	Path      string `json:"path"`
+	ObjectKey string `json:"object_key"`
+	URL       string `json:"url"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// UploadRequestResult 是端点响应。Rejected 里是被拒的路径与原因(部分拒绝不是错误)。
+type UploadRequestResult struct {
+	Uploads  []UploadGrant `json:"uploads"`
+	Rejected []struct {
+		Path   string `json:"path"`
+		Reason string `json:"reason"`
+	} `json:"rejected"`
+}
+
+// RequestUploads 换取本次实际收集到的文件的预签名 PUT URL(差距 #8)。
+// endpoint 是 dispatch 载荷下发的完整 URL(不同于 c.BaseURL 的相对路径拼接,
+// upload_request_url 本身就是全 URL)。
+// 401 返回 ErrLeaseNotOwned;其余非 2xx 返回普通错误(调用方可回退)。
+func (c *Client) RequestUploads(ctx context.Context, endpoint string, req UploadRequest) (*UploadRequestResult, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("request uploads: encode: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout())
+	defer cancel()
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("request uploads: build: %w", err)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient().Do(hreq)
+	if err != nil {
+		return nil, fmt.Errorf("request uploads: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrLeaseNotOwned
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("request uploads: status %d", resp.StatusCode)
+	}
+	var out UploadRequestResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("request uploads: decode: %w", err)
+	}
+	return &out, nil
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

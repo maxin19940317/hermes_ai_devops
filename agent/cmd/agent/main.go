@@ -305,8 +305,10 @@ func runAgent(ctx context.Context, cfg Config) error {
 		Events:       events,
 		Results:      results,
 		Uploader:     &uploader.Uploader{Logf: logf},
+		Reporter:     client, // 差距 #8:按需签发 upload-requests 复用回调客户端
 		RunsRoot:     cfg.RunsRoot,
 		AgentVersion: cfg.Version,
+		ClientID:     cfg.ClientID,
 		SOCAliases:   cfg.SOCAliases,
 		Capabilities: cfg.Capabilities,
 		Logf:         logf,

@@ -64,6 +64,13 @@ func ValidateDispatch(data []byte) error {
 	return nil
 }
 
+// AttachmentUploader 上传预签名附件。既有 uploader.Uploader 满足该接口;
+// 定义为接口是为了让测试注入 fake,观察实际上传了哪些键(差距 #8 按需签发
+// 与固定键集回退都要能被断言到)。
+type AttachmentUploader interface {
+	Upload(ctx context.Context, presigned []uploader.PresignedUpload, files map[string]string) []reporter.Attachment
+}
+
 // Config 是 Server 的依赖与参数。Store/Runner/Events/Results 必填;
 // Uploader 为 nil 时跳过预签名直传(附件缺失不阻断结果上报)。
 type Config struct {
@@ -71,10 +78,14 @@ type Config struct {
 	Runner   adb.Runner // 设备交互(可注入 fake)
 	Events   *reporter.EventReporter
 	Results  *reporter.ResultReporter
-	Uploader *uploader.Uploader
+	Uploader AttachmentUploader
+	// Reporter 用于按需签发换取上传 URL(差距 #8,POST upload-requests)。
+	// nil → 即使 dispatch 携带 upload_request_url 也直接走固定键集回退。
+	Reporter *reporter.Client
 
 	RunsRoot      string // out_dir = RunsRoot/<task_id>
 	AgentVersion  string
+	ClientID      string            // 上报 upload-requests 用(差距 #8);与心跳的 client_id 一致
 	DeviceWorkdir string            // 设备 df 探测路径;空 → reporter.DefaultDeviceWorkdir
 	SOCAliases    map[string]string // 平台代号 → SoC 型号(如 trinket→QCM6125)
 	Capabilities  []string          // 设备能力声明(如 hexagon),调度子集匹配用

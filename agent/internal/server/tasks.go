@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -56,8 +58,12 @@ type Dispatch struct {
 	// 租约所有权凭据(差距 #15,契约只加不删):新 Runtime 派单携带,
 	// 落库后心跳续租时原样回传;旧 Runtime 不携带(空 = 无凭据,
 	// 心跳按旧字符串格式上报)。
-	LeaseID          string `json:"lease_id"`
-	LeaseGeneration  int    `json:"lease_generation"`
+	LeaseID         string `json:"lease_id"`
+	LeaseGeneration int    `json:"lease_generation"`
+	// UploadRequestURL 是按需签发端点的完整 URL(差距 #8);为空表示 Runtime
+	// 未启用按需签发(旧 Runtime 或未配置 CALLBACK_BASE_URL),沿用
+	// PresignedUploads 固定键集(设计 §4.2)。
+	UploadRequestURL string `json:"upload_request_url"`
 	PresignedUploads []struct {
 		ObjectKey string `json:"object_key"`
 		URL       string `json:"url"`
@@ -267,7 +273,9 @@ func (s *Server) currentStatus(taskID string) executor.Status {
 }
 
 // wellKnownFiles 是固定键集(设计决策 1):runs/{task_id}/ 下的对象名 →
-// out_dir 内相对路径。
+// out_dir 内相对路径。差距 #8 之后,它只服务于 uploadFixedSet 回退路径——
+// 按需签发路径(uploadOnDemand)直接用 out_dir 内的相对路径本身,不再需要
+// 这张映射(设计 §5.3)。
 var wellKnownFiles = map[string]string{
 	"result.json": "device/results/result.json",
 	"junit.xml":   "device/results/junit.xml",
@@ -276,9 +284,115 @@ var wellKnownFiles = map[string]string{
 	"stderr.log":  "stderr.log",
 }
 
-// uploadAttachments 按 dispatch.presigned_uploads 直传收集到的固定键集文件;
-// 键不在映射内或文件缺失均降级跳过(uploader 语义,设计 §3.4)。
+// onDemandRetries 是按需签发端点不可达时的重试次数上限,重试间隔与
+// §10 的 ADB 命令级重试同量级(设计 §5.2)。
+const onDemandRetries = 2
+
+// onDemandRetryDelay 是 onDemandRetries 每次重试之间的等待。
+const onDemandRetryDelay = 3 * time.Second
+
+// uploadAttachments 上传收集到的附件。优先按需签发(差距 #8):用 out_dir 内实际
+// 存在的文件换 URL,glob 命中的文件(logs/*.log、dumps/**)因此第一次能被上传。
+// 端点不可达时回退到派单时的固定键集;401(租约已非己有)不回退。
 func (s *Server) uploadAttachments(ctx context.Context, d Dispatch, outDir string) []reporter.Attachment {
+	if s.cfg.Uploader == nil {
+		return nil
+	}
+	if d.UploadRequestURL != "" && s.cfg.Reporter != nil {
+		atts, err := s.uploadOnDemand(ctx, d, outDir)
+		if err == nil {
+			return atts
+		}
+		if errors.Is(err, reporter.ErrLeaseNotOwned) {
+			s.logf("task %s: 租约已非己有,放弃上传(不回退)", d.TaskID)
+			return nil
+		}
+		s.logf("task %s: 按需签发失败(%v),回退固定键集", d.TaskID, err)
+	}
+	return s.uploadFixedSet(ctx, d, outDir)
+}
+
+// uploadOnDemand 遍历 out_dir 得到本次实际收集到的相对路径清单,向
+// UploadRequestURL 换取预签名 URL 后交给既有 Uploader.Upload(差距 #8)。
+// 端点不可达 / 5xx / 超时重试 onDemandRetries 次,间隔 onDemandRetryDelay;
+// 401 立即返回 reporter.ErrLeaseNotOwned,调用方据此不回退(设计 §5.2)。
+func (s *Server) uploadOnDemand(ctx context.Context, d Dispatch, outDir string) ([]reporter.Attachment, error) {
+	rels, err := collectRelPaths(outDir)
+	if err != nil {
+		return nil, fmt.Errorf("list out_dir: %w", err)
+	}
+	if len(rels) == 0 {
+		return nil, nil
+	}
+	req := reporter.UploadRequest{
+		TaskID: d.TaskID, ClientID: s.cfg.ClientID, DeviceID: d.DeviceSerial,
+		Attempt: d.Attempt, LeaseID: d.LeaseID, LeaseGeneration: d.LeaseGeneration,
+		Files: rels,
+	}
+	var result *reporter.UploadRequestResult
+	for attempt := 0; ; attempt++ {
+		result, err = s.cfg.Reporter.RequestUploads(ctx, d.UploadRequestURL, req)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, reporter.ErrLeaseNotOwned) {
+			return nil, err
+		}
+		if attempt >= onDemandRetries {
+			return nil, err
+		}
+		s.logf("task %s: 请求上传 URL 失败(%v),%v 后重试(%d/%d)", d.TaskID, err, onDemandRetryDelay, attempt+1, onDemandRetries)
+		time.Sleep(onDemandRetryDelay)
+	}
+
+	presigned := make([]uploader.PresignedUpload, 0, len(result.Uploads))
+	files := map[string]string{}
+	for _, g := range result.Uploads {
+		pu := uploader.PresignedUpload{ObjectKey: g.ObjectKey, URL: g.URL}
+		if g.ExpiresAt != "" {
+			if ts, terr := time.Parse(time.RFC3339, g.ExpiresAt); terr == nil {
+				pu.ExpiresAt = ts
+			} else {
+				s.logf("task %s: %s expires_at 不可解析(%v),按不过期处理", d.TaskID, g.ObjectKey, terr)
+			}
+		}
+		presigned = append(presigned, pu)
+		files[g.ObjectKey] = filepath.Join(outDir, filepath.FromSlash(g.Path))
+	}
+	for _, rj := range result.Rejected {
+		s.logf("task %s: 按需签发拒绝 %s: %s", d.TaskID, rj.Path, rj.Reason)
+	}
+	return s.cfg.Uploader.Upload(ctx, presigned, files), nil
+}
+
+// collectRelPaths 递归遍历 outDir,返回相对路径清单(仅文件,跳过目录),
+// 统一为 '/' 分隔以匹配 upload-requests 契约(设计 §4.1)。
+func collectRelPaths(outDir string) ([]string, error) {
+	var rels []string
+	err := filepath.Walk(outDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(outDir, path)
+		if err != nil {
+			return err
+		}
+		rels = append(rels, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rels, nil
+}
+
+// uploadFixedSet 按 dispatch.presigned_uploads 直传收集到的固定键集文件;
+// 键不在映射内或文件缺失均降级跳过(uploader 语义,设计 §3.4)。这是按需签发
+// (uploadOnDemand)不可用时的回退路径(设计 §5.2)。
+func (s *Server) uploadFixedSet(ctx context.Context, d Dispatch, outDir string) []reporter.Attachment {
 	if s.cfg.Uploader == nil || len(d.PresignedUploads) == 0 {
 		return nil
 	}
