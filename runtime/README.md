@@ -41,6 +41,7 @@ Postgres 集成测试由 `TEST_DATABASE_URL` 门控(本机跳过,服务器部署
 |---|---|---|
 | `FEISHU_CMD_NL` | `false` | 翻译旁路总开关(灰度)。真正启用还需 `HERMES_ENDPOINT` 非空且 `FEISHU_CMD_WHITELIST` 非空(指令 listener 已启用),三者合取 |
 | `FEISHU_CMD_NL_TIMEOUT_SEC` | `60` | `/translate` 调用超时,不复用 `HERMES_TIMEOUT_SEC`(bridge 实测 `-t ""` 冷/热约 76s/13s,这是交互路径,需单独调) |
+| `UPLOAD_REQUEST_MAX_FILES` | `64` | `POST /callbacks/v1/upload-requests` 单次请求文件数上限(差距 #8 按需签发,2026-07-29),超限整请求拒绝而非截断 |
 
 ## Spike 结论(2026-07-17)
 

@@ -8,8 +8,10 @@ import (
 	"hermes-devops/runtime/internal/presign"
 )
 
-// EvidenceFiles 是 dispatch 时按 §3.7 固定预签的证据键集;
-// 键形如 runs/{task_id}/{file}。glob 命中的集合外文件本轮不上传(CONTRACT-ISSUE,§1)。
+// EvidenceFiles 是 dispatch 时预签的固定键集。差距 #8 之后它只是**回退路径**:
+// 正常路径由 Agent 在收集完成后经 callbacks 的 upload-requests 按需换取 URL,
+// glob 命中的文件(logs/*.log、dumps/**)因此已能上传——原 CONTRACT-ISSUE 关闭,
+// 详见 docs/superpowers/specs/2026-07-29-on-demand-presign-design.md。
 var EvidenceFiles = []string{"result.json", "junit.xml", "logcat.txt", "stdout.log", "stderr.log"}
 
 // PresignedUpload 是 §8.1 派单载荷 presigned_uploads[] 的条目。

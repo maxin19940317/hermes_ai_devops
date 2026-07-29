@@ -110,10 +110,13 @@ Key environment variables (see `.env.example`):
   signature covers the Host header and cannot be rewritten afterwards. If the endpoint
   or credentials are empty the worker degrades gracefully: `presigned_uploads` is empty
   and dispatch still succeeds.
-- `MINIO_PRESIGN_TTL` (default `1h`) — presigned URL lifetime. It must exceed the
-  longest task duration (download + deploy + `test.timeout_sec` + collect):
-  URLs are signed at dispatch, and a task finishing after expiry silently keeps
-  its attachments local.
+- `MINIO_PRESIGN_TTL` (default `1h`) — presigned URL lifetime. Since gap #8 the normal path
+  signs URLs **after** collection finishes, seconds before upload, so this no longer needs to
+  exceed the longest task. It still bounds the dispatch-time fallback set, which is used when
+  the agent is older than the endpoint or the endpoint is unreachable mid-run.
+- `UPLOAD_REQUEST_MAX_FILES` (default `64`) — per-request file cap for `POST /callbacks/v1/upload-requests`.
+  Over the cap the whole request is rejected rather than truncated, so a client never believes it
+  uploaded everything when it did not.
 - `MINIO_BIND_IP` / `MINIO_HOST_PORT` (default `0.0.0.0:9000`) — API exposure;
   `MINIO_CONSOLE_PORT` (default `9001`) is published on `127.0.0.1` only.
 

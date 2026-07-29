@@ -20,6 +20,7 @@ Phase 1 闭环的最后缺口是：Runtime 无法向 Client 派单，Client 执�
    CONTRACT-ISSUE：manifest collect 的 glob（如 `dumps/**`）在派发期无法预知文件名，
    不在预签集内的命中文件本轮不上传（本地保留并记日志）。后续可加
    "按需申请预签名"回调端点（契约只加字段不删字段）。
+   （2026-07-29 关闭：按需签发已落地，见 2026-07-29-on-demand-presign-design.md。）
 2. **UAT 期间 LAN 暴露**。Worker callbacks（18091）与 MinIO（9000）绑 q-uat LAN；
    Windows Client 与服务器同网段。`deploy/README.md` 标注：测试网段专用，
    Phase 3 mTLS 落地前不得暴露到更大范围。`CALLBACK_BASE_URL` 随之改为
