@@ -284,7 +284,7 @@ func Extract(in Input) Evidence {
 // logcatErrLine 匹配 logcat 的错误/致命行(级别列 E/F)。
 var logcatErrLine = regexp.MustCompile(` [EF] `)
 
-// buildStreamExcerpts 构造兜底摘录:stdout/stderr 尾部 + logcat 尾部中的错误行。
+// buildStreamExcerpts 构造兜底摘录:stdout/stderr 尾部 + logcat 全文件中有界保留的最早错误行。
 func buildStreamExcerpts(scans map[string]*streamScan) []Excerpt {
 	out := make([]Excerpt, 0, 3)
 	budget := contextBudgetBytes

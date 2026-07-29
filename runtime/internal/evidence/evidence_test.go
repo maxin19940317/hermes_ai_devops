@@ -398,6 +398,56 @@ func TestExtractScansWholeLargeFile(t *testing.T) {
 	}
 }
 
+func TestExtractFallbackUsesWholeLargeLog(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("07-01 01:25:47.2 1 1 E tag: FIRST-ERROR\n")
+	padding := "07-01 01:25:48.3 1 1 D tag: padding\n"
+	for b.Len() <= 9<<20 {
+		b.WriteString(padding)
+	}
+
+	in := baseInput()
+	in.Signatures = []Signature{{ID: "nomatch", Where: "logcat", Pattern: "NEVER-MATCH", Classify: "CODE"}}
+	in.Files["logcat"] = strings.NewReader(b.String())
+	ev := Extract(in)
+
+	if len(ev.Excerpts) != 1 {
+		t.Fatalf("missing FIRST-ERROR logcat fallback: excerpts = %+v", ev.Excerpts)
+	}
+	excerpt := ev.Excerpts[0]
+	if excerpt.File != "logcat.txt" || excerpt.Kind != "error_lines" {
+		t.Fatalf("excerpt = %+v, want one logcat error_lines excerpt", excerpt)
+	}
+	if !strings.Contains(excerpt.Content, "FIRST-ERROR") {
+		t.Errorf("logcat fallback missing FIRST-ERROR: %+v", excerpt)
+	}
+}
+
+func TestExtractLargeStdoutFallbackKeepsTail(t *testing.T) {
+	var b strings.Builder
+	padding := strings.Repeat("p", 199) + "\n"
+	for b.Len() <= 9<<20 {
+		b.WriteString(padding)
+	}
+	b.WriteString("FINAL-DIAGNOSTIC\n")
+
+	in := baseInput()
+	in.Signatures = []Signature{{ID: "nomatch", Where: "stdout", Pattern: "NEVER-MATCH", Classify: "CODE"}}
+	in.Files["stdout"] = strings.NewReader(b.String())
+	ev := Extract(in)
+
+	if len(ev.Excerpts) != 1 {
+		t.Fatalf("excerpts = %+v, want one stdout tail excerpt", ev.Excerpts)
+	}
+	excerpt := ev.Excerpts[0]
+	if excerpt.File != "stdout.log" || excerpt.Kind != "tail" {
+		t.Fatalf("excerpt = %+v, want one stdout tail excerpt", excerpt)
+	}
+	if !strings.Contains(excerpt.Content, "FINAL-DIAGNOSTIC") {
+		t.Errorf("stdout fallback missing FINAL-DIAGNOSTIC: %+v", excerpt)
+	}
+}
+
 func TestExtractStreamingContextAcrossReadBoundaries(t *testing.T) {
 	var b strings.Builder
 	for i := 1; i <= 140; i++ {

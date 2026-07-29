@@ -135,6 +135,11 @@ func scanStream(r io.Reader, matchers []streamMatcher, logcat bool) *streamScan 
 			out.truncated = true
 		}
 
+		if logcat && len(out.errorLines) < excerptLogcatMaxLines &&
+			logcatErrLine.MatchString(current.text) {
+			out.errorLines = append(out.errorLines, current.text)
+		}
+
 		for index, candidates := range out.candidates {
 			for i := range candidates {
 				if candidates[i].remaining == 0 {
@@ -217,15 +222,5 @@ func scanStream(r io.Reader, matchers []streamMatcher, logcat bool) *streamScan 
 		break
 	}
 
-	if logcat {
-		for _, text := range out.tail {
-			if logcatErrLine.MatchString(text) {
-				out.errorLines = append(out.errorLines, text)
-				if len(out.errorLines) == excerptLogcatMaxLines {
-					break
-				}
-			}
-		}
-	}
 	return out
 }
