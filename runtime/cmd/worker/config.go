@@ -89,6 +89,11 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// 单次按需签发请求的文件数上限(差距 #8)。超限整体拒绝,不截断。
+	uploadMaxFiles, err := envInt("UPLOAD_REQUEST_MAX_FILES", 64)
+	if err != nil {
+		return Config{}, err
+	}
 	hermesTimeoutSec, err := envInt("HERMES_TIMEOUT_SEC", 60)
 	if err != nil {
 		return Config{}, err
@@ -131,6 +136,7 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			MinIOSecretKey:      getenv("MINIO_SECRET_KEY"),
 			MinIOBucket:         env("MINIO_BUCKET", "hermes-evidence"),
 			MinIOPresignTTL:     presignTTL,
+			UploadMaxFiles:      uploadMaxFiles,
 			// §12 Phase 2:HERMES_ENDPOINT 空 → Analyzer 禁用,规则引擎保底。
 			HermesEndpoint:  getenv("HERMES_ENDPOINT"),
 			HermesAuthToken: getenv("HERMES_AUTH_TOKEN"),

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -32,8 +33,19 @@ func (a *Acts) Dispatch(ctx context.Context, req wf.DispatchRequest) error {
 		"lease_id":          req.LeaseID,
 		"lease_generation":  req.LeaseGeneration,
 		"presigned_uploads": a.presignedUploads(ctx, req.TaskID), // §3.7;禁用时为空集降级
+		// 按需签发端点(差距 #8);CALLBACK_BASE_URL 为空时也为空,Agent 沿用 presigned_uploads
+		"upload_request_url": uploadRequestURL(a.Cfg.CallbackBaseURL),
 	}
 	return a.post(ctx, req.ClientBaseURL+"/api/v1/tasks", payload, http.StatusAccepted)
+}
+
+// uploadRequestURL 由回调基址派生按需签发端点地址(差距 #8)。
+// 不新增配置项:与 callback_base_url 同一来源,避免两处配置漂移。
+func uploadRequestURL(base string) string {
+	if base == "" {
+		return ""
+	}
+	return strings.TrimRight(base, "/") + "/callbacks/v1/upload-requests"
 }
 
 // CancelTask 尽力而为取消(§8.1);404 表示 Client 已无此任务,视为成功。

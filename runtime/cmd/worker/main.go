@@ -60,6 +60,7 @@ import (
 	"hermes-devops/runtime/internal/feishu"
 	"hermes-devops/runtime/internal/feishucmd"
 	"hermes-devops/runtime/internal/hermesclient"
+	"hermes-devops/runtime/internal/presign"
 	"hermes-devops/runtime/internal/store"
 	"hermes-devops/runtime/internal/trigger"
 	wf "hermes-devops/runtime/internal/workflow"
@@ -203,6 +204,17 @@ func main() {
 
 	// ---- Client 回调 HTTP 服务(§8.2) ----
 	cb := callbacks.New(st, tc, &log, cfg.Activity.LeaseSeconds)
+	// 按需签发(差距 #8):MinIO 未配置时 Presign 为 nil,端点返回 503,Agent 回退。
+	if signer, err := presign.NewSigner(presign.Config{
+		Endpoint: cfg.Activity.MinIOEndpoint, PublicEndpoint: cfg.Activity.MinIOPublicEndpoint,
+		AccessKey: cfg.Activity.MinIOAccessKey, SecretKey: cfg.Activity.MinIOSecretKey,
+		Bucket: cfg.Activity.MinIOBucket, TTL: cfg.Activity.MinIOPresignTTL,
+	}); err != nil {
+		log.Warn().Err(err).Msg("presign signer init failed; upload-requests will return 503")
+	} else {
+		cb.Presign = signer
+	}
+	cb.UploadMaxFiles = cfg.Activity.UploadMaxFiles
 	callbackSrv := &http.Server{
 		Addr:              cfg.CallbacksAddr,
 		Handler:           cb.Mux(),

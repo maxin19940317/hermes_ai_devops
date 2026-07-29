@@ -52,6 +52,9 @@ type Config struct {
 	MinIOSecretKey      string
 	MinIOBucket         string        // 缺省 hermes-evidence
 	MinIOPresignTTL     time.Duration // 缺省 1h
+	// UploadMaxFiles 是按需签发端点单次请求的文件数上限(差距 #8);缺省 64。
+	// 这里只做配置透传落地(callbacks.Handler 才是消费方),Acts 本身不用它。
+	UploadMaxFiles int
 	// Phase 2 Analyzer(§12):复用 q-uat hermes-agent 平台(§4)。
 	// HermesEndpoint 为空即禁用 Analyzer(优雅降级,verdict 由规则引擎保底)。
 	HermesEndpoint  string

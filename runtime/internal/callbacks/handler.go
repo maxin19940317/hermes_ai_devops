@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/santhosh-tekuri/jsonschema/v5"
 
+	"hermes-devops/runtime/internal/presign"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -42,6 +43,7 @@ type Store interface {
 	SetTaskStatus(ctx context.Context, taskID, status string) error
 	GetTask(ctx context.Context, taskID string) (*wf.TaskRow, error)
 	SaveResultWithOutbox(ctx context.Context, rec wf.ResultRecord, ev store.OutboxEvent) (bool, error)
+	VerifyLease(ctx context.Context, cred store.LeaseCredential) (bool, error)
 }
 
 // Signaler 是 temporal client.Client 的 signal 子集。
@@ -54,6 +56,11 @@ type Handler struct {
 	signaler Signaler
 	log      zerolog.Logger
 	leaseSec int
+
+	// Presign 非 nil 时启用按需签发端点(差距 #8);nil = MinIO 未配置,端点返回 503。
+	Presign *presign.Signer
+	// UploadMaxFiles 是单次请求的文件数上限;<=0 时用 defaultUploadMaxFiles。
+	UploadMaxFiles int
 }
 
 func New(s Store, sig Signaler, log *zerolog.Logger, leaseSeconds int) *Handler {
@@ -76,6 +83,7 @@ func (h *Handler) Mux() *http.ServeMux {
 	mux.HandleFunc("POST /callbacks/v1/heartbeat", h.heartbeat)
 	mux.HandleFunc("POST /callbacks/v1/task-events", h.taskEvent)
 	mux.HandleFunc("POST /callbacks/v1/results", h.result)
+	mux.HandleFunc("POST /callbacks/v1/upload-requests", h.uploadRequests)
 	return mux
 }
 
@@ -83,6 +91,12 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"code": code, "message": msg})
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // ---- heartbeat ----

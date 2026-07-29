@@ -189,3 +189,19 @@ func TestLoadConfigRejectsInvalidInt(t *testing.T) {
 		t.Fatal("非法整数应报错")
 	}
 }
+
+// TestUploadRequestMaxFilesDefault:差距 #8 按需签发端点的文件数上限缺省 64。
+// 注:CALLBACK_BASE_URL 必填(fail fast,见 TestLoadConfigRequiresCallbackBaseURL),
+// brief 原始用例缺了这个键会在到达 UploadMaxFiles 断言前就返回 err,这里补上。
+func TestUploadRequestMaxFilesDefault(t *testing.T) {
+	cfg, err := loadConfig(lookup(map[string]string{
+		"VARIANTS_CONFIG":   "../../ci/variants.yaml",
+		"CALLBACK_BASE_URL": "https://runtime.example:8091",
+	}))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.Activity.UploadMaxFiles != 64 {
+		t.Errorf("UploadMaxFiles = %d, want 64", cfg.Activity.UploadMaxFiles)
+	}
+}
