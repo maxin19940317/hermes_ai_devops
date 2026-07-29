@@ -9,8 +9,6 @@
 package evidence
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/xml"
 	"io"
 	"regexp"
@@ -19,12 +17,11 @@ import (
 
 // 提取规则常量(契约注释中的上限)。
 const (
-	contextLines          = 50          // 命中行上下文 ±50 行
-	maxMatchesPerSignature = 3           // 每签名最多保留 3 处命中
-	maxFileBytes          = 8 << 20     // 单文件读取上限 8MB,超出只留尾部
-	maxJunitFailures      = 20          // junit 失败最多 20 条
-	maxJunitMessageBytes  = 2 << 10     // junit message 截断 2KB
-	contextBudgetBytes    = 96 << 10    // 签名上下文总量预算,逼近 100KB 整体目标即截断
+	contextLines           = 50       // 命中行上下文 ±50 行
+	maxMatchesPerSignature = 3        // 每签名最多保留 3 处命中
+	maxJunitFailures       = 20       // junit 失败最多 20 条
+	maxJunitMessageBytes   = 2 << 10  // junit message 截断 2KB
+	contextBudgetBytes     = 96 << 10 // 签名上下文总量预算,逼近 100KB 整体目标即截断
 	// 兜底摘录(全部签名未命中时):单文件上限与 logcat 错误行上限,
 	// 总量同样受 contextBudgetBytes 约束——有界,不是全量灌入。
 	excerptFileBytes      = 16 << 10
@@ -47,7 +44,7 @@ type Input struct {
 
 	CasesTotal, CasesPassed, CasesFailed, CasesSkipped int
 
-	SignaturesHitReported []string          // 设备自报(result.json),原样透传
+	SignaturesHitReported []string           // 设备自报(result.json),原样透传
 	Metrics               map[string]float64 // 原始指标快照,原样透传
 
 	Signatures []Signature
@@ -102,7 +99,7 @@ type SignatureResult struct {
 }
 
 type Match struct {
-	LineNo    int    `json:"line_no"` // 从 1 起;文件超限截断时基于所保留的尾部窗口
+	LineNo    int    `json:"line_no"` // 从 1 起的原文件全局行号
 	Context   string `json:"context"` // 命中行 ±50 行,文件头尾自然截短
 	Truncated bool   `json:"truncated,omitempty"`
 }
@@ -138,51 +135,6 @@ var fileNames = map[string]string{
 	"junit":  "junit.xml",
 }
 
-// fileWindow 是单文件读取后的行窗口(超限只留尾部 maxFileBytes)。
-type fileWindow struct {
-	lines     []string
-	truncated bool
-	size      int64
-}
-
-// readWindow 流式读完全文,只保留尾部 maxFileBytes 窗口(超限丢弃头部,
-// 避免大文件占内存;丢弃窗口开头被截断的半行,窗口首个完整行视为第 1 行)。
-func readWindow(r io.Reader) (*fileWindow, error) {
-	buf := make([]byte, 0, maxFileBytes)
-	tmp := make([]byte, 64<<10)
-	truncated := false
-	for {
-		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if len(buf) > maxFileBytes {
-				truncated = true
-				tail := make([]byte, maxFileBytes)
-				copy(tail, buf[len(buf)-maxFileBytes:])
-				buf = tail
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-	}
-	if truncated {
-		if i := bytes.IndexByte(buf, '\n'); i >= 0 {
-			buf = buf[i+1:]
-		}
-	}
-	fw := &fileWindow{truncated: truncated, size: int64(len(buf))}
-	sc := bufio.NewScanner(bytes.NewReader(buf))
-	sc.Buffer(make([]byte, 64<<10), 1<<20) // 容忍单行最长 1MB
-	for sc.Scan() {
-		fw.lines = append(fw.lines, sc.Text())
-	}
-	return fw, nil
-}
-
 // Extract 执行确定性证据提取。任何缺失/异常都降级进输出,不返回 error。
 func Extract(in Input) Evidence {
 	ev := Evidence{
@@ -203,47 +155,53 @@ func Extract(in Input) Evidence {
 		},
 	}
 
-	// 重复文件(如 logcat 被多签名引用)只读一次。
-	windows := map[string]*fileWindow{}
-	readErr := map[string]error{}
-	load := func(key string) (*fileWindow, error) {
-		if w, ok := windows[key]; ok {
-			return w, readErr[key]
-		}
-		r, ok := in.Files[key]
-		if !ok || r == nil {
-			windows[key] = nil
-			return nil, nil
-		}
-		w, err := readWindow(r)
-		windows[key] = w
-		readErr[key] = err
-		return w, err
-	}
-
-	// ---- 签名匹配(按声明序)----
-	used := 0 // 已用上下文预算
-	totalMatched := 0
-	budgetOut := false
-	for _, sig := range in.Signatures {
-		res := SignatureResult{
+	results := make([]SignatureResult, len(in.Signatures))
+	compiled := make(map[int]*regexp.Regexp)
+	matchers := make(map[string][]streamMatcher)
+	for i, sig := range in.Signatures {
+		results[i] = SignatureResult{
 			ID: sig.ID, Where: sig.Where, Classify: sig.Classify,
 			Matches: make([]Match, 0),
 		}
 		re, err := regexp.Compile(sig.Pattern)
 		if err != nil {
-			res.Error = "regex compile: " + err.Error()
+			results[i].Error = "regex compile: " + err.Error()
+			continue
+		}
+		compiled[i] = re
+		matchers[sig.Where] = append(matchers[sig.Where], streamMatcher{index: i, re: re})
+	}
+
+	// 每个日志只做一次有界状态的完整流式扫描。
+	scans := make(map[string]*streamScan)
+	for _, key := range []string{"logcat", "stdout", "stderr"} {
+		if r, ok := in.Files[key]; ok && r != nil {
+			scans[key] = scanStream(r, matchers[key], key == "logcat")
+			if scans[key].truncated {
+				ev.Truncated = true
+			}
+		}
+	}
+
+	// ---- 签名结果组装(按声明序)----
+	used := 0 // 已用上下文预算
+	totalMatched := 0
+	budgetOut := false
+	for i, sig := range in.Signatures {
+		res := results[i]
+		if _, ok := compiled[i]; !ok {
 			ev.Signatures = append(ev.Signatures, res)
 			continue
 		}
-		w, rerr := load(sig.Where)
-		switch {
-		case rerr != nil:
-			res.Error = "read " + sig.Where + ": " + rerr.Error()
+		scan := scans[sig.Where]
+		if scan == nil {
+			res.Error = "log missing: " + sig.Where
 			ev.Signatures = append(ev.Signatures, res)
 			continue
-		case w == nil:
-			res.Error = "log missing: " + sig.Where
+		}
+		candidates := scan.candidates[i]
+		if scan.readErr != nil && len(candidates) == 0 {
+			res.Error = "read " + sig.Where + ": " + scan.readErr.Error()
 			ev.Signatures = append(ev.Signatures, res)
 			continue
 		}
@@ -252,32 +210,17 @@ func Extract(in Input) Evidence {
 			ev.Signatures = append(ev.Signatures, res)
 			continue
 		}
-		overflow := false // 命中超过 maxMatchesPerSignature
-		for i, line := range w.lines {
-			if !re.MatchString(line) {
-				continue
-			}
-			if len(res.Matches) >= maxMatchesPerSignature {
-				overflow = true
-				continue
-			}
-			lo := i - contextLines
-			if lo < 0 {
-				lo = 0
-			}
-			hi := i + contextLines + 1
-			if hi > len(w.lines) {
-				hi = len(w.lines)
-			}
-			ctx := strings.Join(w.lines[lo:hi], "\n")
+		for _, candidate := range candidates {
+			ctx := candidate.context()
 			if used+len(ctx) > contextBudgetBytes {
-				// 整体目标 <100KB:停止追加新命中
 				budgetOut = true
 				ev.Truncated = true
 				break
 			}
 			used += len(ctx)
-			res.Matches = append(res.Matches, Match{LineNo: i + 1, Context: ctx})
+			res.Matches = append(res.Matches, Match{
+				LineNo: candidate.lineNo, Context: ctx, Truncated: candidate.truncated,
+			})
 		}
 		if budgetOut {
 			// 预算在本次扫描中耗尽:无命中则该签名降级(Error 含 budget),
@@ -287,8 +230,12 @@ func Extract(in Input) Evidence {
 			} else {
 				res.Matches[len(res.Matches)-1].Truncated = true
 			}
-		} else if overflow && len(res.Matches) > 0 {
+		} else if scan.overflow[i] && len(res.Matches) > 0 {
 			res.Matches[len(res.Matches)-1].Truncated = true
+		}
+		if scan.readErr != nil && len(res.Matches) > 0 {
+			res.Matches[len(res.Matches)-1].Truncated = true
+			ev.Truncated = true
 		}
 		res.Matched = len(res.Matches) > 0
 		if res.Matched {
@@ -306,27 +253,28 @@ func Extract(in Input) Evidence {
 	// 否则 evidence 只有文件元数据,Analyzer 只能回答"证据不足"
 	// (实证:2026-07-27 p56 SNPE_1.68 seg 模型错误全漏签名,Hermes 无法分析)。
 	if totalMatched == 0 {
-		ev.Excerpts = buildExcerpts(load)
+		ev.Excerpts = buildStreamExcerpts(scans)
 	}
 
 	// ---- inputs.attachments / truncated_files(固定顺序,确定性输出)----
 	for _, key := range fileKeys {
-		w := windows[key]
-		if w == nil {
-			if key == "junit" {
-				if _, ok := in.Files["junit"]; ok {
-					// junit 只走流式解析,未入行窗口缓存;大小未知,记 0 占位。
-					name := fileNames[key]
-					ev.Inputs.Attachments = append(ev.Inputs.Attachments,
-						Attachment{Name: name, ObjectKey: name})
-				}
+		if key == "junit" {
+			if _, ok := in.Files[key]; ok {
+				// junit 只走流式解析,大小未知,记 0 占位。
+				name := fileNames[key]
+				ev.Inputs.Attachments = append(ev.Inputs.Attachments,
+					Attachment{Name: name, ObjectKey: name})
 			}
+			continue
+		}
+		scan := scans[key]
+		if scan == nil {
 			continue
 		}
 		name := fileNames[key]
 		ev.Inputs.Attachments = append(ev.Inputs.Attachments,
-			Attachment{Name: name, ObjectKey: name, Size: w.size})
-		if w.truncated {
+			Attachment{Name: name, ObjectKey: name, Size: scan.size})
+		if scan.truncated {
 			ev.Inputs.TruncatedFiles = append(ev.Inputs.TruncatedFiles, name)
 		}
 	}
@@ -336,53 +284,45 @@ func Extract(in Input) Evidence {
 // logcatErrLine 匹配 logcat 的错误/致命行(级别列 E/F)。
 var logcatErrLine = regexp.MustCompile(` [EF] `)
 
-// buildExcerpts 构造兜底摘录:stdout/stderr 尾部 + logcat 错误行,
-// 共享 contextBudgetBytes 总预算(此时签名上下文为零,预算全部可用)。
-// load 与签名扫描同一读取缓存,已读文件不重复读。
-func buildExcerpts(load func(string) (*fileWindow, error)) []Excerpt {
+// buildStreamExcerpts 构造兜底摘录:stdout/stderr 尾部 + logcat 尾部中的错误行。
+func buildStreamExcerpts(scans map[string]*streamScan) []Excerpt {
 	out := make([]Excerpt, 0, 3)
 	budget := contextBudgetBytes
 	tail := func(key, name string) {
 		if budget <= 0 {
 			return
 		}
-		w, err := load(key)
-		if err != nil || w == nil || len(w.lines) == 0 {
+		scan := scans[key]
+		if scan == nil || scan.readErr != nil || len(scan.tail) == 0 {
 			return
 		}
 		limit := excerptFileBytes
 		if budget < limit {
 			limit = budget
 		}
-		content, truncated := tailLines(w.lines, limit)
+		content, truncated := tailLines(scan.tail, limit)
 		if content == "" {
 			return
 		}
-		out = append(out, Excerpt{File: name, Kind: "tail", Content: content, Truncated: truncated})
+		out = append(out, Excerpt{
+			File: name, Kind: "tail", Content: content,
+			Truncated: truncated || scan.lineCount > len(scan.tail),
+		})
 		budget -= len(content)
 	}
 	tail("stdout", "stdout.log")
 	tail("stderr", "stderr.log")
 
 	if budget > 0 {
-		if w, err := load("logcat"); err == nil && w != nil {
-			var lines []string
-			for _, ln := range w.lines {
-				if logcatErrLine.MatchString(ln) {
-					lines = append(lines, ln)
-					if len(lines) >= excerptLogcatMaxLines {
-						break
-					}
-				}
-			}
-			if len(lines) > 0 {
+		if scan := scans["logcat"]; scan != nil && scan.readErr == nil {
+			if len(scan.errorLines) > 0 {
 				limit := excerptFileBytes
 				if budget < limit {
 					limit = budget
 				}
-				content, truncated := headLines(lines, limit)
+				content, truncated := headLines(scan.errorLines, limit)
 				out = append(out, Excerpt{File: "logcat.txt", Kind: "error_lines",
-					Content: content, Truncated: truncated || len(lines) >= excerptLogcatMaxLines})
+					Content: content, Truncated: truncated || len(scan.errorLines) >= excerptLogcatMaxLines})
 			}
 		}
 	}
