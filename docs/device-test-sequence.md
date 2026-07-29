@@ -210,7 +210,7 @@ sequenceDiagram
             W->>R: ExtractEvidence Activity
             R->>M: 流式扫描日志全文(不整载入内存),保留<br/>签名命中 ±50 行 + 首个 error + 尾部 N 行
             M-->>R: 日志内容
-            R->>M: evidence.json 上传 MinIO(≤96KB,<br/>随 Decision 保留周期)
+            R->>M: evidence.json 上传 MinIO(签名上下文/兜底摘录<br/>共享 96KiB 内容预算,随 Decision 保留周期)
             W->>R: SaveEvidenceSnapshot Activity
             R->>D: evidence_snapshots(object_key + sha256 +<br/>extractor_version + task_id/attempt)
 
@@ -361,4 +361,5 @@ extractor_version TEXT
 created_at        TIMESTAMPTZ
 ```
 
-原始大日志可按生命周期清理;evidence 快照(≤96KB)保留周期与 Decision 一致。
+原始大日志可按生命周期清理;evidence 快照中的签名上下文/兜底摘录共享
+96KiB 内容预算(并非整个快照的硬上限),快照保留周期与 Decision 一致。
