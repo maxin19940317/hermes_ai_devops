@@ -344,35 +344,131 @@ func junitMany(n int) string {
 	return b.String()
 }
 
-func TestExtractFileTruncation(t *testing.T) {
-	// 构造 >8MB 的 logcat:头部标记 + 大量填充 + 尾部命中行
+func TestExtractScansWholeLargeFile(t *testing.T) {
+	// 构造 >9MB 的 logcat:头部和尾部签名都必须使用真实全局行号命中。
 	var b strings.Builder
 	b.WriteString("HEAD-MARKER\n")
 	line := strings.Repeat("p", 199) + "\n" // 200B/行
-	for b.Len() < maxFileBytes+1<<20 {
+	lineCount := 1
+	for b.Len() <= 9<<20 {
 		b.WriteString(line)
+		lineCount++
 	}
 	b.WriteString("TAIL-MARKER fatal\n")
+	lineCount++
+	inputLen := b.Len()
 
 	in := baseInput()
-	in.Signatures = []Signature{{ID: "s", Where: "logcat", Pattern: "TAIL-MARKER", Classify: "CODE"}}
+	in.Signatures = []Signature{
+		{ID: "head", Where: "logcat", Pattern: "HEAD-MARKER", Classify: "CODE"},
+		{ID: "tail", Where: "logcat", Pattern: "TAIL-MARKER", Classify: "CODE"},
+	}
 	in.Files["logcat"] = strings.NewReader(b.String())
 	ev := Extract(in)
 
-	if len(ev.Inputs.TruncatedFiles) != 1 || ev.Inputs.TruncatedFiles[0] != "logcat.txt" {
-		t.Fatalf("truncated_files = %v", ev.Inputs.TruncatedFiles)
+	if len(ev.Inputs.TruncatedFiles) != 0 {
+		t.Fatalf("ordinary large file must not be truncated: %v", ev.Inputs.TruncatedFiles)
 	}
-	s := ev.Signatures[0]
-	if !s.Matched || len(s.Matches) != 1 {
-		t.Fatalf("尾部命中应保留: %+v", s)
+	if !ev.Signatures[0].Matched || len(ev.Signatures[0].Matches) != 1 {
+		t.Fatalf("head signature = %+v", ev.Signatures[0])
 	}
-	if strings.Contains(s.Matches[0].Context, "HEAD-MARKER") {
-		t.Error("超限后上下文不应包含文件头")
+	if got := ev.Signatures[0].Matches[0].LineNo; got != 1 {
+		t.Errorf("head line_no = %d, want 1", got)
 	}
+	if !ev.Signatures[1].Matched || len(ev.Signatures[1].Matches) != 1 {
+		t.Fatalf("tail signature = %+v", ev.Signatures[1])
+	}
+	if got := ev.Signatures[1].Matches[0].LineNo; got != lineCount {
+		t.Errorf("tail line_no = %d, want %d", got, lineCount)
+	}
+	var logcat *Attachment
 	for _, a := range ev.Inputs.Attachments {
-		if a.Name == "logcat.txt" && a.Size > maxFileBytes {
-			t.Errorf("attachment size = %d, 超过窗口上限", a.Size)
+		if a.Name == "logcat.txt" {
+			a := a
+			logcat = &a
+			break
 		}
+	}
+	if logcat == nil {
+		t.Fatal("logcat attachment missing")
+	}
+	if got := logcat.Size; got != int64(inputLen) {
+		t.Errorf("attachment size = %d, want full input size %d", got, inputLen)
+	}
+}
+
+func TestExtractStreamingContextAcrossReadBoundaries(t *testing.T) {
+	var b strings.Builder
+	for i := 1; i <= 140; i++ {
+		prefix := fmt.Sprintf("line-%03d ", i)
+		if i == 70 {
+			prefix += "MATCH-HERE "
+		}
+		b.WriteString(prefix)
+		b.WriteString(strings.Repeat("p", 899-len(prefix)))
+		b.WriteByte('\n')
+	}
+
+	in := baseInput()
+	in.Signatures = []Signature{{ID: "middle", Where: "stdout", Pattern: "MATCH-HERE", Classify: "CODE"}}
+	in.Files["stdout"] = strings.NewReader(b.String())
+	ev := Extract(in)
+
+	if !ev.Signatures[0].Matched || len(ev.Signatures[0].Matches) != 1 {
+		t.Fatalf("signature = %+v", ev.Signatures[0])
+	}
+	match := ev.Signatures[0].Matches[0]
+	if match.LineNo != 70 {
+		t.Errorf("line_no = %d, want 70", match.LineNo)
+	}
+	lines := strings.Split(match.Context, "\n")
+	if len(lines) != 101 {
+		t.Fatalf("context lines = %d, want 101", len(lines))
+	}
+	if !strings.HasPrefix(lines[0], "line-020 ") || !strings.HasPrefix(lines[100], "line-120 ") {
+		t.Errorf("context range = %q .. %q, want lines 20..120", lines[0], lines[100])
+	}
+}
+
+func TestExtractOversizedLineMarksFileTruncated(t *testing.T) {
+	input := strings.Repeat("x", (1<<20)+1) + "\nMATCH-AFTER\n"
+	in := baseInput()
+	in.Signatures = []Signature{{ID: "after", Where: "stderr", Pattern: "MATCH-AFTER", Classify: "CODE"}}
+	in.Files["stderr"] = strings.NewReader(input)
+	ev := Extract(in)
+
+	if !ev.Truncated {
+		t.Error("oversized line must set top-level truncated")
+	}
+	if len(ev.Inputs.TruncatedFiles) != 1 || ev.Inputs.TruncatedFiles[0] != "stderr.log" {
+		t.Errorf("truncated_files = %v, want [stderr.log]", ev.Inputs.TruncatedFiles)
+	}
+	if !ev.Signatures[0].Matched || len(ev.Signatures[0].Matches) != 1 {
+		t.Fatalf("signature after oversized line = %+v", ev.Signatures[0])
+	}
+	match := ev.Signatures[0].Matches[0]
+	if got := match.LineNo; got != 2 {
+		t.Errorf("line_no = %d, want 2", got)
+	}
+	if !match.Truncated {
+		t.Error("match context clipped by oversized line must be truncated")
+	}
+}
+
+func TestExtractMultipleSignaturesShareOneStreamingRead(t *testing.T) {
+	in := baseInput()
+	in.Signatures = []Signature{
+		{ID: "first", Where: "stdout", Pattern: "FIRST", Classify: "CODE"},
+		{ID: "second", Where: "stdout", Pattern: "SECOND", Classify: "CODE"},
+	}
+	in.Files["stdout"] = strings.NewReader("before\nFIRST\nbetween\nSECOND\nafter\n")
+	ev := Extract(in)
+
+	if !ev.Signatures[0].Matched || len(ev.Signatures[0].Matches) != 1 {
+		t.Errorf("first signature = %+v", ev.Signatures[0])
+	}
+	if !ev.Signatures[1].Matched || len(ev.Signatures[1].Matches) != 1 {
+		t.Errorf("second signature = %+v", ev.Signatures[1])
 	}
 }
 
