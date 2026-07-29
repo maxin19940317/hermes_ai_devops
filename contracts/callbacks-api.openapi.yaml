@@ -67,6 +67,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /callbacks/v1/upload-requests:
+    post:
+      operationId: requestUploads
+      summary: 按需签发附件上传 URL(差距 #8)
+      description: |
+        Agent 在收集完成后用本端点换取本次实际收集到的文件的预签名 PUT URL。
+        与派单时一次性签发相比:URL 在上传前秒级签发,不再有 TTL 过期问题;
+        且 collect 的 glob(logs/*.log、dumps/**)命中的文件第一次能被上传。
+
+        **鉴权**:必须携带派单时下发的租约所有权凭据(lease_id/lease_generation)。
+        callbacks 其余端点是接收数据,本端点签发的是写入凭据——无凭据请求
+        必须拿不到任何 URL。签发的 object key 一律限定在 runs/{task_id}/ 前缀内。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UploadRequest' }
+      responses:
+        '200':
+          description: 已签发(可能部分拒绝)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadRequestResult' }
+        '400': { description: "请求形态非法(缺字段/files 为空/超上限)" }
+        '401': { description: "租约凭据校验不通过;Agent 不得回退,应放弃上传" }
+        '503': { description: "MinIO 未配置或签名失败;Agent 可回退 presigned_uploads" }
 components:
   securitySchemes:
     mtls:
@@ -206,3 +232,42 @@ components:
         result:
           type: object
           description: result.json v1 全文,Runtime 消费前必须用 contracts/result.schema.json 校验(红线 §14)
+    UploadRequest:
+      type: object
+      additionalProperties: false
+      required: [task_id, client_id, device_id, attempt, lease_id, lease_generation, files]
+      properties:
+        task_id: { type: string, minLength: 1 }
+        client_id: { type: string, minLength: 1 }
+        device_id: { type: string, minLength: 1 }
+        attempt: { type: integer, minimum: 1 }
+        lease_id: { type: string, minLength: 1 }
+        lease_generation: { type: integer, minimum: 1 }
+        files:
+          type: array
+          minItems: 1
+          description: out_dir 内的相对路径;绝对路径、含 .. 的段一律被拒。
+          items: { type: string, minLength: 1 }
+    UploadRequestResult:
+      type: object
+      required: [uploads, rejected]
+      properties:
+        uploads:
+          type: array
+          items:
+            type: object
+            required: [path, object_key, url, expires_at]
+            properties:
+              path: { type: string }
+              object_key: { type: string }
+              url: { type: string }
+              expires_at: { type: string, format: date-time }
+        rejected:
+          type: array
+          description: 非法路径逐项返回原因;部分拒绝不是错误,其余照签。
+          items:
+            type: object
+            required: [path, reason]
+            properties:
+              path: { type: string }
+              reason: { type: string }

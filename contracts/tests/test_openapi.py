@@ -48,6 +48,11 @@ def _load_callbacks_spec():
         return yaml.safe_load(f)
 
 
+def _load_agent_spec():
+    with (CONTRACTS_DIR / "client-agent-api.openapi.yaml").open(encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
 def _resolve_local_refs(schema, spec):
     """把 '#/components/schemas/X' 形式的本地 $ref 就地展开(测试用,非通用解析器)。"""
     import copy
@@ -148,3 +153,29 @@ def test_heartbeat_string_form_is_deprecated_not_removed():
     assert all(
         "deprecated" not in b for b in items["oneOf"] if b.get("type") != "string"
     ), "ActiveTask 引用分支不得标 deprecated"
+
+
+def test_upload_requests_endpoint_shape():
+    """按需签发端点(差距 #8):请求必须带全套租约凭据,响应区分 uploads 与 rejected。"""
+    spec = _load_callbacks_spec()
+    op = spec["paths"]["/callbacks/v1/upload-requests"]["post"]
+    req = _resolve_local_refs(
+        op["requestBody"]["content"]["application/json"]["schema"], spec)
+    # 鉴权靠凭据,少一项都不行——这是端点唯一的门禁
+    for field in ("task_id", "client_id", "device_id", "attempt",
+                  "lease_id", "lease_generation", "files"):
+        assert field in req["required"], f"{field} 必须是必填(端点鉴权依据)"
+    resp = _resolve_local_refs(
+        op["responses"]["200"]["content"]["application/json"]["schema"], spec)
+    assert "uploads" in resp["properties"]
+    assert "rejected" in resp["properties"], "部分拒绝不是错误,必须单列"
+    # 401 是租约失配的唯一出口,Agent 据此决定不回退
+    assert "401" in op["responses"]
+
+
+def test_dispatch_keeps_presigned_uploads_and_adds_endpoint():
+    """契约只加不删:upload_request_url 新增,presigned_uploads 保留作回退。"""
+    spec = _load_agent_spec()
+    props = spec["components"]["schemas"]["TaskDispatchRequest"]["properties"]
+    assert "upload_request_url" in props, "按需签发端点地址(差距 #8)"
+    assert "presigned_uploads" in props, "回退路径的载体,本轮不得移除"

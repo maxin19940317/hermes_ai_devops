@@ -203,10 +203,20 @@ components:
           type: integer
           minimum: 1
           description: 租约代数,与 lease_id 配对使用(同上)
+        upload_request_url:
+          type: string
+          description: |
+            按需签发端点的完整 URL(差距 #8),形如
+            {callback_base_url}/callbacks/v1/upload-requests。
+            Agent 收集完成后用它换取本次实际收集到的文件的预签名 PUT URL。
+            为空 = Runtime 未启用按需签发,Agent 沿用 presigned_uploads[]。
         presigned_uploads:
           type: array
           default: []
-          description: MinIO 预签名上传地址,附件直传不经 Runtime(红线 §14)
+          description: |
+            MinIO 预签名上传地址,附件直传不经 Runtime(红线 §14)。
+            新 Agent 仅在按需签发不可用(upload_request_url 为空或端点不可达)时用它兜底;
+            本字段是回退路径的载体,不得移除。
           items:
             type: object
             additionalProperties: false
