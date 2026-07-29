@@ -39,6 +39,7 @@ type fullStore interface {
 	ClaimUnpublished(ctx context.Context, limit int) ([]OutboxEvent, error)
 	MarkPublished(ctx context.Context, id int64) error
 	MarkFailed(ctx context.Context, id int64, cause string) error
+	OutboxBacklog(ctx context.Context, stuckAttempts int) (*OutboxBacklog, error)
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
 	ListDecisions(ctx context.Context, taskID string) ([]wf.DecisionRow, error)
 	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
@@ -609,6 +610,91 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 					}
 				}
 			})
+		}
+	})
+
+	// 积压监控(第四批):pending/stuck 计数、最老行定位、诊断用 last_error 采样。
+	// 两套实现必须给出同样的结论,否则内存模式下的告警演练不能代表生产。
+	t.Run("OutboxBacklog", func(t *testing.T) {
+		s := newStore(t)
+		seed := func(taskID string) int64 {
+			t.Helper()
+			if err := s.CreateTask(ctx, wf.TaskRow{TaskID: taskID, IdempotencyKey: taskID}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.SaveResultWithOutbox(ctx,
+				wf.ResultRecord{TaskID: taskID, Result: wf.TaskResultSignal{TaskID: taskID}},
+				OutboxEvent{AggregateType: "task", AggregateID: taskID,
+					EventType: EventTypeTaskResult, EventKey: taskID + ":result",
+					Payload: json.RawMessage(`{}`)}); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := s.ClaimUnpublished(ctx, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return rows[len(rows)-1].ID // 最新插入的一行
+		}
+
+		// 空 outbox:全零,且不得把"没有行"报成年龄非零。
+		b, err := s.OutboxBacklog(ctx, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Pending != 0 || b.Stuck != 0 || b.OldestAge != 0 || b.OldestID != 0 {
+			t.Fatalf("空 outbox backlog = %+v, want 全零", b)
+		}
+
+		oldest := seed("w:t1:a1")
+		newest := seed("w:t2:a1")
+
+		// 两行待投,都没失败过 → 不算卡住;最老行是先插入的那条。
+		b, err = s.OutboxBacklog(ctx, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Pending != 2 || b.Stuck != 0 {
+			t.Errorf("backlog = %+v, want pending=2 stuck=0", b)
+		}
+		if b.OldestID != oldest {
+			t.Errorf("OldestID = %d, want %d(先入库的那行)", b.OldestID, oldest)
+		}
+
+		// 让新的那行失败 3 次 → 达到阈值算卡住;采样的 last_error 取尝试最多的行。
+		for i := 0; i < 3; i++ {
+			if err := s.MarkFailed(ctx, newest, "boom"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		b, err = s.OutboxBacklog(ctx, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Pending != 2 || b.Stuck != 1 {
+			t.Errorf("backlog = %+v, want pending=2 stuck=1", b)
+		}
+		if b.SampleError != "boom" {
+			t.Errorf("SampleError = %q, want boom(尝试次数最多那行的 last_error)", b.SampleError)
+		}
+		// 阈值可调:抬到 4 就不该再算卡住。
+		b, err = s.OutboxBacklog(ctx, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Stuck != 0 {
+			t.Errorf("阈值 4 时 stuck = %d, want 0", b.Stuck)
+		}
+
+		// 投递掉最老一行 → pending 递减,最老行前移。
+		if err := s.MarkPublished(ctx, oldest); err != nil {
+			t.Fatal(err)
+		}
+		b, err = s.OutboxBacklog(ctx, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Pending != 1 || b.OldestID != newest {
+			t.Errorf("backlog = %+v, want pending=1 oldest=%d", b, newest)
 		}
 	})
 

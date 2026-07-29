@@ -9,6 +9,12 @@
 //	RELAY_BATCH_SIZE     每轮 claim 上限,缺省 100
 //	RELAY_POLL_INTERVAL  空转间隔,缺省 1s(Go duration)
 //	RELAY_MAX_BACKOFF    claim 连续失败的退避上限,缺省 30s
+//
+// 积压监控(第四批):
+//
+//	RELAY_BACKLOG_INTERVAL   积压报告间隔,缺省 1m;设 0 关闭
+//	RELAY_STUCK_ATTEMPTS     attempts >= 此值算"卡住",缺省 3
+//	RELAY_BACKLOG_WARN_AGE   最老未投递行超过此年龄升级为 warn,缺省 5m
 package main
 
 import (
@@ -62,6 +68,9 @@ func main() {
 	r := &relay.Relay{
 		Store: st, Signaler: tc, Log: &log,
 		BatchSize: cfg.BatchSize, PollInterval: cfg.PollInterval, MaxBackoff: cfg.MaxBackoff,
+		BacklogInterval: cfg.BacklogInterval,
+		StuckAttempts:   cfg.StuckAttempts,
+		BacklogWarnAge:  cfg.BacklogWarnAge,
 	}
 	log.Info().Dur("poll_interval", cfg.PollInterval).Msg("outbox relay starting")
 	if err := r.Run(ctx); err != nil {

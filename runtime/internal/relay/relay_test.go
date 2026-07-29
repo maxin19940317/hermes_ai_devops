@@ -1,13 +1,16 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
@@ -207,4 +210,69 @@ func TestRelayE2ENotFoundConsumed(t *testing.T) {
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("行应已投递: rows=%+v err=%v", rows, err)
 	}
+}
+
+// backlogLevels 断言积压报告的分级:卡住的行或过老的积压必须升到 warn,
+// 否则日志无法直接当告警条件用(只是流水就没人看)。
+func TestReportBacklogLevels(t *testing.T) {
+	cases := []struct {
+		name      string
+		attempts  int // 对唯一一行调用 MarkFailed 的次数
+		published bool
+		warnAge   time.Duration
+		wantLevel string
+	}{
+		{name: "empty is debug", published: true, wantLevel: "debug"},
+		{name: "pending is info", wantLevel: "info"},
+		{name: "stuck is warn", attempts: 3, wantLevel: "warn"},
+		{name: "old backlog is warn", warnAge: time.Nanosecond, wantLevel: "warn"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := store.NewMemStore()
+			id := seedOutbox(t, st, resultEvent(t, "wf-1", "t1"))
+			for i := 0; i < tc.attempts; i++ {
+				if err := st.MarkFailed(ctx, id, "boom"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.published {
+				if err := st.MarkPublished(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var buf bytes.Buffer
+			log := zerolog.New(&buf).Level(zerolog.DebugLevel)
+			r := &Relay{Store: st, Log: &log, StuckAttempts: 3, BacklogWarnAge: tc.warnAge}
+			r.reportBacklog(ctx)
+
+			var got map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+				t.Fatalf("log not JSON: %v (%q)", err, buf.String())
+			}
+			if got["level"] != tc.wantLevel {
+				t.Errorf("level = %v, want %v (log: %s)", got["level"], tc.wantLevel, buf.String())
+			}
+			if got["message"] != "outbox backlog" {
+				t.Errorf("message = %v", got["message"])
+			}
+		})
+	}
+}
+
+// 查询失败不得中断投递循环——监控挂了不该拖垮被监控的东西。
+func TestReportBacklogQueryErrorIsNonFatal(t *testing.T) {
+	var buf bytes.Buffer
+	log := zerolog.New(&buf)
+	r := &Relay{Store: backlogErrStore{store.NewMemStore()}, Log: &log}
+	r.reportBacklog(ctx) // 不 panic 即通过
+	if !strings.Contains(buf.String(), "outbox backlog query failed") {
+		t.Errorf("查询失败必须留痕, got %q", buf.String())
+	}
+}
+
+type backlogErrStore struct{ *store.MemStore }
+
+func (backlogErrStore) OutboxBacklog(context.Context, int) (*store.OutboxBacklog, error) {
+	return nil, errors.New("db down")
 }

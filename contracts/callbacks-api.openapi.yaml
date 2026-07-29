@@ -118,11 +118,22 @@ components:
             过渡期双格式(差距 #15):元素为对象时携带租约所有权凭据
             (lease_id/lease_generation,派单时下发),执行条件续租,
             失配在响应 not_owned 中逐项返回 LEASE_NOT_OWNED;
-            元素为纯字符串(旧格式)时仅续 client 心跳、不续租、不报错
-            ——旧 Client 滚动升级窗口,全部升级后应下线字符串格式。
+            元素为纯字符串(旧格式)时仅续 client 心跳、不续租、不报错。
+
+            字符串格式已 **deprecated**(2026-07-29)。所有在役 Agent 均已升级到
+            会发对象格式的版本,但 Agent 仍保留字符串回退:本地任务记录里没有
+            lease_id 时(即该任务由尚未下发凭据的旧 Runtime 派出)只能发字符串。
+            因此下线条件不是"Agent 升级完",而是"不再存在无 lease_id 的在途任务"
+            ——即全部 Agent 升级 **且** 升级前派出的任务都已走到终态。
+            届时才可删除本 oneOf 的 string 分支(契约只加不删,删除属破坏性变更,
+            需 *_version 递增与双向版本协商)。
           items:
             oneOf:
               - type: string
+                deprecated: true
+                description: |
+                  旧格式:仅任务 id。Runtime 收到时只续 client 心跳,不续租、不报错。
+                  见上方 active_task_ids 的下线条件。
               - $ref: '#/components/schemas/ActiveTask'
     ActiveTask:
       type: object

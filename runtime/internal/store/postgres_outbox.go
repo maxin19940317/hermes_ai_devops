@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -89,4 +91,38 @@ func (s *PGStore) MarkFailed(ctx context.Context, id int64, cause string) error 
 		return fmt.Errorf("mark outbox %d failed: %w", id, err)
 	}
 	return nil
+}
+
+// OutboxBacklog 汇总未投递行(第四批:backlog/失败监控)。单条聚合查询,
+// 走 outbox_unpublished_idx 的部分索引;stuckAttempts <= 0 按 1 处理。
+// 同一语义另有 SQL 视图 outbox_backlog(schema.sql)供人工排查。
+func (s *PGStore) OutboxBacklog(ctx context.Context, stuckAttempts int) (*OutboxBacklog, error) {
+	if stuckAttempts <= 0 {
+		stuckAttempts = 1
+	}
+	var (
+		out       OutboxBacklog
+		oldestAge sql.NullFloat64
+		oldestID  sql.NullInt64
+		sampleErr sql.NullString
+	)
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE attempts >= $1),
+		       EXTRACT(EPOCH FROM (now() - min(created_at))),
+		       (SELECT id FROM outbox WHERE published_at IS NULL
+		         ORDER BY created_at, id LIMIT 1),
+		       (SELECT last_error FROM outbox WHERE published_at IS NULL
+		         ORDER BY attempts DESC, id LIMIT 1)
+		FROM outbox WHERE published_at IS NULL`, stuckAttempts).
+		Scan(&out.Pending, &out.Stuck, &oldestAge, &oldestID, &sampleErr)
+	if err != nil {
+		return nil, fmt.Errorf("outbox backlog: %w", err)
+	}
+	if oldestAge.Valid && oldestAge.Float64 > 0 {
+		out.OldestAge = time.Duration(oldestAge.Float64 * float64(time.Second))
+	}
+	out.OldestID = oldestID.Int64
+	out.SampleError = sampleErr.String
+	return &out, nil
 }

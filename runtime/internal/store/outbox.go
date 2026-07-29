@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -33,10 +34,22 @@ type ResultEventPayload struct {
 	Result     wf.TaskResultSignal `json:"result"`
 }
 
-// outboxRow 是 MemStore 内部的 outbox 行:事件本体 + 投递标记。
+// outboxRow 是 MemStore 内部的 outbox 行:事件本体 + 投递标记 + 入库时刻
+// (backlog 报告要算积压时长,PG 侧用 created_at 列)。
 type outboxRow struct {
 	ev        OutboxEvent
 	published bool
+	createdAt time.Time
+}
+
+// OutboxBacklog 是 outbox 积压快照(第四批:backlog/失败监控)。
+// 用途是回答两个运维问题:有没有积压、有没有卡住投不出去的行。
+type OutboxBacklog struct {
+	Pending     int           // 未投递行数
+	Stuck       int           // 未投递且 attempts >= 阈值(重试多次仍不成功)
+	OldestAge   time.Duration // 最老未投递行的年龄;无积压时为 0
+	OldestID    int64         // 最老未投递行 id;无积压时为 0
+	SampleError string        // 尝试次数最多的未投递行的 last_error(诊断入口)
 }
 
 // SaveResultWithOutbox 单事务写 results + outbox(原则 3:消灭"写库成功但
@@ -52,7 +65,7 @@ func (s *MemStore) SaveResultWithOutbox(_ context.Context, rec wf.ResultRecord, 
 	}
 	if _, ok := s.outboxByKey[ev.EventKey]; !ok {
 		s.outboxSeq++
-		row := &outboxRow{ev: ev}
+		row := &outboxRow{ev: ev, createdAt: time.Now().UTC()}
 		row.ev.ID = s.outboxSeq
 		s.outbox = append(s.outbox, row)
 		s.outboxByKey[ev.EventKey] = row
@@ -99,4 +112,37 @@ func (s *MemStore) MarkFailed(_ context.Context, id int64, cause string) error {
 		row.ev.LastError = cause
 	}
 	return nil
+}
+
+// OutboxBacklog 汇总未投递行(第四批:backlog/失败监控)。stuckAttempts 是
+// "卡住"的判定阈值(attempts >= 该值);<=0 时按 1 处理,即任何失败过的行都算卡住。
+func (s *MemStore) OutboxBacklog(_ context.Context, stuckAttempts int) (*OutboxBacklog, error) {
+	if stuckAttempts <= 0 {
+		stuckAttempts = 1
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	out := &OutboxBacklog{}
+	var oldest time.Time
+	maxAttempts := -1
+	for _, row := range s.outbox {
+		if row.published {
+			continue
+		}
+		out.Pending++
+		if row.ev.Attempts >= stuckAttempts {
+			out.Stuck++
+		}
+		if oldest.IsZero() || row.createdAt.Before(oldest) {
+			oldest, out.OldestID = row.createdAt, row.ev.ID
+		}
+		if row.ev.Attempts > maxAttempts {
+			maxAttempts, out.SampleError = row.ev.Attempts, row.ev.LastError
+		}
+	}
+	if !oldest.IsZero() {
+		out.OldestAge = now.Sub(oldest)
+	}
+	return out, nil
 }

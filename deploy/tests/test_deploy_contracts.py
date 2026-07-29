@@ -256,6 +256,18 @@ class ComposeContracts(unittest.TestCase):
             re.compile(r"depends_on:\n(\s+\w+:\n\s+condition: service_healthy\n)*\s+minio:"),
         )
 
+    def test_compose_minio_lifecycle_rules(self):
+        """生命周期按前缀分:runs/ 到期清理,evidence/ 不设过期(随 decisions 长期)。"""
+        text = COMPOSE.read_text(encoding="utf-8")
+        init_block = text.split("  minio-init:", 1)[1]
+        # 幂等:先清空再重建,重复执行不叠加规则。
+        self.assertIn("mc ilm rule rm --all --force", init_block)
+        self.assertIn('--prefix "runs/"', init_block)
+        self.assertIn("MINIO_RUNS_RETAIN_DAYS", init_block)
+        # evidence/ 绝不能有过期规则——快照是 decisions 的回放依据(差距 #6)。
+        self.assertNotIn('--prefix "evidence/"', init_block)
+        self.assertIn("MINIO_RUNS_RETAIN_DAYS=", ENV_EXAMPLE.read_text(encoding="utf-8"))
+
     def test_compose_health_chain_and_in_container_probes(self):
         text = COMPOSE.read_text(encoding="utf-8")
         # postgres → temporal → trigger → worker, plus temporal-ui → temporal.

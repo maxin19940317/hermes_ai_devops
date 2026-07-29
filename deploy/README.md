@@ -69,7 +69,36 @@ hermes-agent 翻译成一条指令再执行。启用前置条件(三者合取):
 The `minio` service stores run evidence (result.json, junit.xml, logcat.txt,
 stdout.log, stderr.log) uploaded directly by Clients against presigned PUT URLs the
 worker signs at dispatch time (design §3.7). `minio-init` is a one-shot container that
-creates the bucket (`MINIO_BUCKET`, default `hermes-evidence`) once `minio` is healthy.
+creates the bucket (`MINIO_BUCKET`, default `hermes-evidence`) once `minio` is healthy
+and installs the bucket's lifecycle rules.
+
+### Retention (lifecycle rules)
+
+The bucket holds two object classes with deliberately different retention, so the
+rules are keyed on prefix:
+
+| Prefix | Contents | Retention |
+|---|---|---|
+| `runs/{task_id}/` | raw attachments (logcat, stdout/stderr, junit, dumps) — the bulky ones | expire after `MINIO_RUNS_RETAIN_DAYS` (default 90) |
+| `evidence/{task_id}/` | evidence snapshots (≤96KB) | **no expiry** — they are the replay record behind a `decisions` row |
+
+`minio-init` rebuilds the whole lifecycle configuration on every run (`mc ilm rule rm
+--all` then `mc ilm rule add`), so it is idempotent and changing
+`MINIO_RUNS_RETAIN_DAYS` takes effect by re-running the container:
+
+```bash
+docker compose --env-file .env run --rm minio-init
+mc ilm rule ls hermes/hermes-evidence   # or read minio-init's own log line
+```
+
+Deliberately not implemented: the finer "PASSED logs 7 days, failures 90 days" split
+named in CLAUDE.md §12 Phase 3. Verdict is not part of the object key and is unknown
+at upload time (attachments are uploaded before the rule engine runs), so an
+S3 lifecycle rule cannot see it. Getting the 7-day half requires tagging each object
+with its verdict once the task reaches a terminal state and adding a tag-filtered
+rule — a runtime change, not a bucket-config change. Until then `runs/` uses the
+conservative bound (90 days), which keeps failure evidence for its full window at the
+cost of keeping passing runs' logs longer than necessary.
 
 Key environment variables (see `.env.example`):
 
@@ -147,6 +176,40 @@ ssh -L 18080:127.0.0.1:18080 "$Q_UAT_HOST"
 docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
   -f deploy/docker-compose.yml logs -f --tail 100 trigger worker relay
 ```
+
+## Outbox backlog monitoring
+
+Results reach Temporal through a transactional outbox: the worker writes the result row
+and an outbox row in one transaction, and `relay` delivers the signal. A row that cannot
+be delivered stays put with `attempts` and `last_error` recorded, so a growing backlog is
+the signal that deliveries are failing.
+
+`relay` reports the backlog on a timer (`RELAY_BACKLOG_INTERVAL`, default `1m`) under the
+message `outbox backlog`, and picks the level so the log line can *be* the alert
+condition rather than a stream someone has to watch:
+
+| Level | When |
+|---|---|
+| `warn` | any row with `attempts >= RELAY_STUCK_ATTEMPTS` (default 3), **or** oldest pending row older than `RELAY_BACKLOG_WARN_AGE` (default `5m`) |
+| `info` | backlog exists but nothing is stuck — delivery is in progress |
+| `debug` | no backlog (healthy runs quiet) |
+
+Fields: `pending`, `stuck`, `oldest_age`, `oldest_id`, `sample_error` (the `last_error` of
+the most-retried pending row — the diagnostic entry point).
+
+```bash
+# alert on it
+docker compose ... logs relay | grep '"message":"outbox backlog"' | grep '"level":"warn"'
+
+# ad-hoc check against the database
+psql "$DATABASE_URL" -c 'SELECT * FROM outbox_backlog;'
+psql "$DATABASE_URL" -c "SELECT id, event_key, attempts, last_error, created_at
+                         FROM outbox WHERE published_at IS NULL ORDER BY attempts DESC LIMIT 20;"
+```
+
+The `outbox_backlog` view uses a fixed `attempts >= 3` for its `stuck` column; it is the
+human-facing coarse filter, while `RELAY_STUCK_ATTEMPTS` is the configurable threshold the
+relay's own log uses. Set `RELAY_BACKLOG_INTERVAL=0` to turn the periodic report off.
 
 ## Upgrade
 

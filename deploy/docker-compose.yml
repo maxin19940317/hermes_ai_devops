@@ -163,11 +163,15 @@ services:
         condition: service_healthy
     environment:
       <<: *runtime-environment
-      # 事务性 Outbox 投递(设计基线 v1.0 原则 3):无监听端口,崩溃由 restart 策略拉起;
-      # 未投递积压与 last_error 查 outbox 表(published_at IS NULL)。
+      # 事务性 Outbox 投递(设计基线 v1.0 原则 3):无监听端口,崩溃由 restart 策略拉起。
       RELAY_BATCH_SIZE: ${RELAY_BATCH_SIZE:-100}
       RELAY_POLL_INTERVAL: ${RELAY_POLL_INTERVAL:-1s}
       RELAY_MAX_BACKOFF: ${RELAY_MAX_BACKOFF:-30s}
+      # 积压监控:relay 定期把 pending/stuck/最老行年龄打进日志("outbox backlog"),
+      # 卡住或积压过久升 warn,可直接作告警条件;人工排查见视图 outbox_backlog。
+      RELAY_BACKLOG_INTERVAL: ${RELAY_BACKLOG_INTERVAL:-1m}
+      RELAY_STUCK_ATTEMPTS: ${RELAY_STUCK_ATTEMPTS:-3}
+      RELAY_BACKLOG_WARN_AGE: ${RELAY_BACKLOG_WARN_AGE:-5m}
 
   minio:
     image: ${MINIO_IMAGE:?MINIO_IMAGE must come from images.lock.env}
@@ -203,11 +207,22 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
       MINIO_BUCKET: ${MINIO_BUCKET:-hermes-evidence}
+      MINIO_RUNS_RETAIN_DAYS: ${MINIO_RUNS_RETAIN_DAYS:-90}
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >-
+      - |
+        set -e
         mc alias set hermes http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
-        && mc mb --ignore-existing "hermes/$$MINIO_BUCKET"
+        mc mb --ignore-existing "hermes/$$MINIO_BUCKET"
+        # 生命周期(§12 Phase 3)。两类对象保留语义不同,按前缀分开配:
+        #   runs/      原始附件(logcat/stdout/junit/dump),体量大,到期清理
+        #   evidence/  证据快照(≤96KB),保留周期随 decisions 行,故**不设过期规则**
+        # (device-test-sequence.md:364:"原始大日志可按生命周期清理;evidence 快照
+        #  保留周期与 Decision 一致")。
+        # 幂等:先清空整个 lifecycle 配置再重建,重复执行不会叠加规则。
+        mc ilm rule rm --all --force "hermes/$$MINIO_BUCKET" 2>/dev/null || true
+        mc ilm rule add --expire-days "$$MINIO_RUNS_RETAIN_DAYS" --prefix "runs/" "hermes/$$MINIO_BUCKET"
+        mc ilm rule ls "hermes/$$MINIO_BUCKET"
 
 networks:
   runtime:

@@ -144,6 +144,19 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS outbox_unpublished_idx ON outbox(id) WHERE published_at IS NULL;
 
+-- outbox 积压视图(第四批:backlog/失败监控)。Relay 会定期把同样的数字打进日志,
+-- 这个视图是人工排查入口:`SELECT * FROM outbox_backlog;`
+-- stuck 的判定阈值在 Relay 侧可配(RELAY_STUCK_ATTEMPTS),视图固定用 3——
+-- 视图是给人看的粗筛,精确阈值以 Relay 日志为准。
+CREATE OR REPLACE VIEW outbox_backlog AS
+SELECT count(*)                                            AS pending,
+       count(*) FILTER (WHERE attempts >= 3)               AS stuck,
+       coalesce(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)::bigint
+                                                           AS oldest_age_sec,
+       max(attempts)                                       AS max_attempts
+FROM outbox
+WHERE published_at IS NULL;
+
 -- 飞书指令层自然语言翻译审计(设计文档 §4.3)。翻译发生在任何 task 存在之前,
 -- 无 task_id 可填,故不能复用 decisions 表(其 task_id 是 NOT NULL 外键)。
 -- 追加式:确认流程不更新已有行,pending_confirm 与 confirmed 各占一行。

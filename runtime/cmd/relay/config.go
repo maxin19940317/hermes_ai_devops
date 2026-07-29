@@ -13,6 +13,11 @@ type Config struct {
 	BatchSize       int
 	PollInterval    time.Duration
 	MaxBackoff      time.Duration
+
+	// 积压监控(第四批)。BacklogInterval=0 关闭定期报告。
+	BacklogInterval time.Duration
+	StuckAttempts   int
+	BacklogWarnAge  time.Duration
 }
 
 // loadConfig 从 getenv(通常是 os.Getenv)派生 Config;
@@ -59,11 +64,31 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// 积压报告间隔。缺省 1 分钟:比投递轮询稀疏得多,足够及时又不刷日志。
+	backlogInterval, err := envDuration("RELAY_BACKLOG_INTERVAL", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	// attempts >= 此值算"卡住"。3 与 §10 的机械重试上限同量级:
+	// 重试三次仍投不出去的行,不会靠再等一轮自愈。
+	stuckAttempts, err := envInt("RELAY_STUCK_ATTEMPTS", 3)
+	if err != nil {
+		return Config{}, err
+	}
+	// 最老未投递行超过此年龄升级为 warn。5 分钟:正常投递是秒级,
+	// 积压到分钟级说明 Temporal 侧或 DB 侧有事。
+	backlogWarnAge, err := envDuration("RELAY_BACKLOG_WARN_AGE", 5*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
 		TemporalAddress: env("TEMPORAL_ADDRESS", "127.0.0.1:7233"),
 		DatabaseURL:     getenv("DATABASE_URL"),
 		BatchSize:       batchSize,
 		PollInterval:    pollInterval,
 		MaxBackoff:      maxBackoff,
+		BacklogInterval: backlogInterval,
+		StuckAttempts:   stuckAttempts,
+		BacklogWarnAge:  backlogWarnAge,
 	}, nil
 }

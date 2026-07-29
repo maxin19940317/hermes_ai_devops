@@ -135,3 +135,16 @@ def test_dispatch_auth_supports_basic_deploy_token():
     assert "bearer" in types and "job_token" in types  # 只加不删
     assert "username" in auth["properties"], "auth 缺可选 username"
     assert "username" not in auth.get("required", []), "username 必须可选(旧载荷兼容)"
+
+
+def test_heartbeat_string_form_is_deprecated_not_removed():
+    """字符串格式标 deprecated 但必须仍然合法(契约只加不删):
+    Agent 在任务无 lease_id 时仍会发它,删分支等于让在途任务的心跳被拒。"""
+    spec = _load_callbacks_spec()
+    items = spec["components"]["schemas"]["Heartbeat"]["properties"]["active_task_ids"]["items"]
+    string_branch = next(b for b in items["oneOf"] if b.get("type") == "string")
+    assert string_branch.get("deprecated") is True, "string 分支应标 deprecated"
+    # 对象格式不得被误标:它是现行格式。
+    assert all(
+        "deprecated" not in b for b in items["oneOf"] if b.get("type") != "string"
+    ), "ActiveTask 引用分支不得标 deprecated"

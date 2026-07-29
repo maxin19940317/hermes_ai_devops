@@ -316,13 +316,20 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 		}
 	}
 	released := false
+	// 清理动作的错误不改变 workflow 结论(设备最终会被 AcquireDevice 懒回收,
+	// 终态以 results/tasks 表为准),但绝不能静默:释放失败意味着设备要等到
+	// 租约过期才回池,落终态失败意味着 tasks 表与 workflow 结论不一致——
+	// 两者都只能靠日志发现。
 	release := func(infraFail bool) {
 		if released {
 			return
 		}
 		released = true
-		_ = workflow.ExecuteActivity(dctx, "ReleaseDevice",
-			ReleaseRequest{DeviceID: lease.DeviceID, TaskID: taskID, InfraFail: infraFail}).Get(dctx, nil)
+		if err := workflow.ExecuteActivity(dctx, "ReleaseDevice",
+			ReleaseRequest{DeviceID: lease.DeviceID, TaskID: taskID, InfraFail: infraFail}).Get(dctx, nil); err != nil {
+			workflow.GetLogger(dctx).Error("release device failed, lease will expire on its own",
+				"task", taskID, "device", lease.DeviceID, "error", err)
+		}
 	}
 
 	// ---- 登记任务 + dispatch ----
@@ -335,9 +342,21 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 		return infra("create task: "+err.Error(), true)
 	}
 	finish := func(status, verdict, category, reason string) {
-		_ = workflow.ExecuteActivity(dctx, "FinishTask", FinishRequest{
+		if err := workflow.ExecuteActivity(dctx, "FinishTask", FinishRequest{
 			TaskID: taskID, Status: status, Verdict: verdict, Category: category, Reason: reason,
-		}).Get(dctx, nil)
+		}).Get(dctx, nil); err != nil {
+			workflow.GetLogger(dctx).Error("finish task failed, tasks row left non-terminal",
+				"task", taskID, "status", status, "verdict", verdict, "error", err)
+		}
+	}
+	// 取消是尽力而为(§8.1):Client 可能已离线,失败不改变结论,但要留痕——
+	// 取消没送达意味着设备上可能还有进程在跑。
+	cancel := func(why string) {
+		if err := workflow.ExecuteActivity(dctx, "CancelTask",
+			CancelRequest{TaskID: taskID, ClientBaseURL: lease.ClientBaseURL}).Get(dctx, nil); err != nil {
+			workflow.GetLogger(dctx).Error("cancel task failed, device process may still be running",
+				"task", taskID, "why", why, "error", err)
+		}
 	}
 	if err := workflow.ExecuteActivity(ctx, "Dispatch", DispatchRequest{
 		TaskID: taskID, IdempotencyKey: taskID, Attempt: attempt,
@@ -354,8 +373,7 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 
 	// ---- await_result:signal 驱动 + 租约到期 Durable Timer/CheckLease(原则 6,§14) ----
 	if infraReason := awaitResult(ctx, taskID, spec, resultCh); infraReason != "" {
-		_ = workflow.ExecuteActivity(dctx, "CancelTask",
-			CancelRequest{TaskID: taskID, ClientBaseURL: lease.ClientBaseURL}).Get(dctx, nil)
+		cancel(infraReason)
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), infraReason)
 		release(true)
 		return infra(infraReason, true)
@@ -371,8 +389,7 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 		if loadErr != nil {
 			reason = "load result: " + loadErr.Error()
 		}
-		_ = workflow.ExecuteActivity(dctx, "CancelTask",
-			CancelRequest{TaskID: taskID, ClientBaseURL: lease.ClientBaseURL}).Get(dctx, nil)
+		cancel(reason)
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), reason)
 		release(true)
 		return infra(reason, true)
