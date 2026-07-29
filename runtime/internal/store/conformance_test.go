@@ -232,7 +232,14 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 	})
 
 	// 归因记账(差距 #10):四个 scope 各记各的账,互不串味。
+	//
+	// none 与 ok 的关键区别只有在计数器非零时才可观察(0 不动 vs 0 清零看起来
+	// 一样),所以每个子用例先用 device/client scope 把两个计数器都垫到 1,
+	// 再对种子后的状态跑被测 scope。quarantineAfter 取 5:种子的 1 次 device
+	// 释放 + device 用例自身再 1 次 = 2,远低于阈值,不会把设备提前隔离而
+	// 搅乱断言。
 	t.Run("ReleaseDeviceFailScopes", func(t *testing.T) {
+		const quarantineAfter = 5
 		cases := []struct {
 			name           string
 			scope          wf.FailScope
@@ -240,20 +247,37 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			wantClientFail int
 			wantStatus     string
 		}{
-			{"device 只增设备计数", wf.FailScopeDevice, 1, 0, "IDLE"},
-			{"client 只增 client 计数", wf.FailScopeClient, 0, 1, "IDLE"},
-			{"none 两个都不动", wf.FailScopeNone, 0, 0, "IDLE"},
+			{"device 只增设备计数", wf.FailScopeDevice, 2, 1, "IDLE"},
+			{"client 只增 client 计数", wf.FailScopeClient, 1, 2, "IDLE"},
+			{"none 两个都不动", wf.FailScopeNone, 1, 1, "IDLE"},
 			{"ok 两个都清零", wf.FailScopeOK, 0, 0, "IDLE"},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				s := newStore(t)
 				seed(t, s)
+
+				// 种子:设备计数、client 计数各垫到 1。
+				seedDev, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:seed-device:a1", 120)
+				if err != nil || seedDev == nil {
+					t.Fatalf("seed device acquire = %+v err=%v", seedDev, err)
+				}
+				if err := s.ReleaseDevice(ctx, seedDev.DeviceID, "w:seed-device:a1", wf.FailScopeDevice, quarantineAfter); err != nil {
+					t.Fatalf("seed device release: %v", err)
+				}
+				seedClient, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:seed-client:a1", 120)
+				if err != nil || seedClient == nil {
+					t.Fatalf("seed client acquire = %+v err=%v", seedClient, err)
+				}
+				if err := s.ReleaseDevice(ctx, seedClient.DeviceID, "w:seed-client:a1", wf.FailScopeClient, quarantineAfter); err != nil {
+					t.Fatalf("seed client release: %v", err)
+				}
+
 				lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "w:t1:a1", 120)
 				if err != nil || lease == nil {
 					t.Fatalf("acquire = %+v err=%v", lease, err)
 				}
-				if err := s.ReleaseDevice(ctx, lease.DeviceID, "w:t1:a1", tc.scope, 3); err != nil {
+				if err := s.ReleaseDevice(ctx, lease.DeviceID, "w:t1:a1", tc.scope, quarantineAfter); err != nil {
 					t.Fatalf("release: %v", err)
 				}
 				ov, err := s.FleetOverview(ctx)

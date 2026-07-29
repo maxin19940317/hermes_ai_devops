@@ -53,6 +53,12 @@ func TestStoreActsPassConfigThrough(t *testing.T) {
 
 // 在途 workflow 重放会送来没有 FailScope 的旧载荷,活动必须按旧语义翻译,
 // 否则重放期间的记账与当初不一致(设计文档 §5)。
+//
+// none 与"旧载荷 InfraFail=false"(翻译为 ok)的差别只有在计数器非零时才
+// 可观察,所以每个子用例先用 device/client scope 把两个计数器都垫到 1,
+// 再对种子后的状态跑被测载荷;否则 none(不动)与被误翻译成 ok(清零)
+// 在从 (0,0) 出发时都停在 (0,0),测不出回归。QuarantineAfter 维持 3:
+// 种子的 1 次 device 释放 + device 用例自身再 1 次 = 2,仍低于阈值。
 func TestReleaseDeviceScopeTranslation(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -60,15 +66,33 @@ func TestReleaseDeviceScopeTranslation(t *testing.T) {
 		wantDeviceFail int
 		wantClientFail int
 	}{
-		{"新载荷 client", wf.ReleaseRequest{FailScope: wf.FailScopeClient}, 0, 1},
-		{"新载荷 none 不被当成空", wf.ReleaseRequest{FailScope: wf.FailScopeNone}, 0, 0},
-		{"旧载荷 InfraFail=true → device", wf.ReleaseRequest{InfraFail: true}, 1, 0},
+		{"新载荷 client", wf.ReleaseRequest{FailScope: wf.FailScopeClient}, 1, 2},
+		{"新载荷 none 不被当成空", wf.ReleaseRequest{FailScope: wf.FailScopeNone}, 1, 1},
+		{"旧载荷 InfraFail=true → device", wf.ReleaseRequest{InfraFail: true}, 2, 1},
 		{"旧载荷 InfraFail=false → ok", wf.ReleaseRequest{InfraFail: false}, 0, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := storeWithDevice(t)
 			a := &Acts{Store: s, Cfg: Config{LeaseSeconds: 120, QuarantineAfter: 3}}
+
+			// 种子:设备计数、client 计数各垫到 1(用 store 自身的 scope-aware
+			// release,不碰内部字段)。
+			seedDev, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "seed-device", 120)
+			if err != nil || seedDev == nil {
+				t.Fatalf("seed device acquire: %+v %v", seedDev, err)
+			}
+			if err := s.ReleaseDevice(ctx, seedDev.DeviceID, "seed-device", wf.FailScopeDevice, a.Cfg.QuarantineAfter); err != nil {
+				t.Fatalf("seed device release: %v", err)
+			}
+			seedClient, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, "seed-client", 120)
+			if err != nil || seedClient == nil {
+				t.Fatalf("seed client acquire: %+v %v", seedClient, err)
+			}
+			if err := s.ReleaseDevice(ctx, seedClient.DeviceID, "seed-client", wf.FailScopeClient, a.Cfg.QuarantineAfter); err != nil {
+				t.Fatalf("seed client release: %v", err)
+			}
+
 			l, err := a.AcquireDevice(ctx, wf.AcquireRequest{TaskID: "t1"})
 			if err != nil || l == nil {
 				t.Fatalf("acquire: %+v %v", l, err)
