@@ -204,16 +204,30 @@ Agent 请求 upload-requests 失败（连接失败 / 5xx / 超时）时：
 
 ## 7. 兼容与下线
 
-滚动升级四种组合都必须可用：
+> **CONTRACT-ISSUE(final-review 修正,曾在此处误判为"降级,与今天一致"）：**
+> "新 Runtime × 旧 Agent" 这一行**是坏的,不是降级**。`agent/internal/server/dispatch.schema.json`
+> 根级原为 `additionalProperties: false`,任何新增 dispatch 字段(本次的
+> `upload_request_url`、更早的 `lease_id` 同理)对已部署的旧 Agent 都是破坏性
+> 变更:旧 Agent 校验时直接返回 `400 schema_violation`,派单**整体失败**并按
+> INFRA 走重试/隔离,而不是"忽略未知字段,退化用 `presigned_uploads[]`"。本轮
+> 已把 Agent 侧 schema 根级 `additionalProperties` 放宽(该文件同步移除),但
+> 这只对**下一个版本起**的 Agent 生效,救不回已经部署、仍是旧 schema 的 Agent。
+
+滚动升级四种组合的现状(并非都"可用"):
 
 | Runtime | Agent | 行为 |
 |---|---|---|
 | 旧 | 旧 | 今天的行为 |
-| 新 | 旧 | Agent 不认识 `upload_request_url`，用 `presigned_uploads[]` —— 与今天一致 |
-| 旧 | 新 | `upload_request_url` 为空，Agent 走 `presigned_uploads[]` |
-| 新 | 新 | 按需签发，glob 文件也能上传 |
+| 新 | 旧(仍是根级 `additionalProperties:false` 的旧 schema) | **坏的**:对含 `upload_request_url` 的 dispatch 载荷返回 `400 schema_violation`,派单失败,不会退化到 `presigned_uploads[]`。 |
+| 新 | 旧(已升级到放宽根级 `additionalProperties` 的版本,但未消费 `upload_request_url` 字段本身) | 忽略未知字段,走 `presigned_uploads[]` —— 与今天一致 |
+| 旧 | 新 | `upload_request_url` 为空,Agent 走 `presigned_uploads[]` |
+| 新 | 新 | 按需签发,glob 文件也能上传 |
 
-`presigned_uploads[]` 的下线条件：**全部 Agent 升级完，且不再有依赖回退路径的运行**。
+**要求的部署顺序**:凡是要给 dispatch 载荷新增字段的 Runtime 变更,必须**先升级
+Agent,或 Runtime/Agent 同批发布**;不得让新 Runtime 单独先于所有 Agent 上线。
+`deploy/README.md` 的升级步骤据此更新。
+
+`presigned_uploads[]` 的下线条件:**全部 Agent 升级完,且不再有依赖回退路径的运行**。
 与心跳字符串格式（`callbacks-api.openapi.yaml`）一样，标 `deprecated` 但保留，
 删除属破坏性变更。本轮不标 deprecated——它还是回退路径的载体，现在标会误导。
 

@@ -165,8 +165,8 @@ func (a *Acts) fetchEvidenceFiles(ctx context.Context, atts []wf.Attachment) (ma
 }
 
 // evidenceClient 用集群内 endpoint 构造 MinIO 客户端(读路径);
-// 与 presignClient(纯离线签名,用 public host)不同,这里发起真实网络请求,
-// 必须用集群内可达的 MINIO_ENDPOINT。
+// 与 presign.NewSigner(纯离线签名,用 public host,见 internal/presign)不同,
+// 这里发起真实网络请求,必须用集群内可达的 MINIO_ENDPOINT。
 func evidenceClient(c Config) (*minio.Client, error) {
 	secure := false
 	host := c.MinIOEndpoint

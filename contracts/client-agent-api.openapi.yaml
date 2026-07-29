@@ -149,7 +149,15 @@ components:
         message: { type: string }
     TaskDispatchRequest:
       type: object
-      additionalProperties: false
+      # 根级 additionalProperties 故意不设为 false(不同于内层 artifact/auth/
+      # presigned_uploads 条目):契约"只加字段不删字段"演进,但 §14 严格
+      # 校验会让每个新增 dispatch 字段(如 lease_id、upload_request_url)对
+      # 已部署的旧 Agent 变成破坏性变更——旧 Agent 收到含新字段的载荷会直接
+      # 400 schema_violation,而不是按设计忽略未知字段退化使用。放宽只从下一个
+      # Agent 版本起生效,救不回已部署、仍是 additionalProperties:false 的旧
+      # Agent;新 Runtime × 旧 Agent 组合仍需按发布顺序先升级 Agent
+      # (见 docs/superpowers/specs/2026-07-29-on-demand-presign-design.md §7,
+      # deploy/README.md 升级步骤)。
       required:
         - task_id
         - idempotency_key

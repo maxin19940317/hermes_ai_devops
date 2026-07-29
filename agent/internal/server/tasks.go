@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -246,7 +245,8 @@ func (s *Server) runTask(d Dispatch, outDir string, exec *executor.Executor) {
 		s.cfg.Events.OnTransition(d.TaskID, s.currentStatus(d.TaskID), to, "")
 	}
 
-	if _, err := exec.Execute(ctx, executor.Options{
+	var collected []string
+	if sum, err := exec.Execute(ctx, executor.Options{
 		PackageURL: d.Artifact.URL,
 		SHA256:     d.Artifact.SHA256,
 		Auth:       &artifact.Auth{Type: d.Artifact.Auth.Type, Token: d.Artifact.Auth.Token, Username: d.Artifact.Auth.Username},
@@ -254,9 +254,14 @@ func (s *Server) runTask(d Dispatch, outDir string, exec *executor.Executor) {
 		OutDir:     outDir,
 	}); err != nil {
 		s.logf("task %s: execute: %v", d.TaskID, err) // FAILED 迁移已由 executor 发出
+		if sum != nil {
+			collected = sum.Collected
+		}
+	} else {
+		collected = sum.Collected
 	}
 
-	attachments := s.uploadAttachments(ctx, d, outDir)
+	attachments := s.uploadAttachments(ctx, d, outDir, collected)
 	if err := s.cfg.Results.Report(ctx, d.TaskID, attachments); err != nil {
 		s.logf("task %s: report result: %v", d.TaskID, err)
 	}
@@ -291,15 +296,22 @@ const onDemandRetries = 2
 // onDemandRetryDelay 是 onDemandRetries 每次重试之间的等待。
 const onDemandRetryDelay = 3 * time.Second
 
-// uploadAttachments 上传收集到的附件。优先按需签发(差距 #8):用 out_dir 内实际
-// 存在的文件换 URL,glob 命中的文件(logs/*.log、dumps/**)因此第一次能被上传。
+// uploadAttachments 上传收集到的附件。优先按需签发(差距 #8):用本次实际收集到
+// 的文件换 URL,glob 命中的文件(logs/*.log、dumps/**)因此第一次能被上传。
 // 端点不可达时回退到派单时的固定键集;401(租约已非己有)不回退。
-func (s *Server) uploadAttachments(ctx context.Context, d Dispatch, outDir string) []reporter.Attachment {
+//
+// collected 是 executor.Summary.Collected(设备侧按 manifest collect 列表拉取
+// 的、相对于 out_dir/device/ 的路径清单)。CRITICAL:不能改回遍历 out_dir——
+// out_dir 根还留着下载的 package.tar.gz 与解包出的 package/ 子树(SDK 全量,
+// 数百个文件),两者都不是"收集到的输出",遍历会把它们全部当附件请求签发,
+// 撞上 upload-requests 的文件数上限,导致按需签发整体失败并回退到固定键集
+// (等价于本分支要修的问题重新出现)。
+func (s *Server) uploadAttachments(ctx context.Context, d Dispatch, outDir string, collected []string) []reporter.Attachment {
 	if s.cfg.Uploader == nil {
 		return nil
 	}
 	if d.UploadRequestURL != "" && s.cfg.Reporter != nil {
-		atts, err := s.uploadOnDemand(ctx, d, outDir)
+		atts, err := s.uploadOnDemand(ctx, d, outDir, collected)
 		if err == nil {
 			return atts
 		}
@@ -312,15 +324,35 @@ func (s *Server) uploadAttachments(ctx context.Context, d Dispatch, outDir strin
 	return s.uploadFixedSet(ctx, d, outDir)
 }
 
-// uploadOnDemand 遍历 out_dir 得到本次实际收集到的相对路径清单,向
+// agentRootFiles 是 executor 直接写在 out_dir 根、但不属于设备采集
+// (executor.Summary.Collected)的产物:logcat 转储、entry 的 stdout/stderr、
+// 运行摘要。是否存在取决于运行到了哪个阶段(如 dumpLogcat 失败则 logcat.txt
+// 缺失),按需签发时逐个探测存在性,不存在则跳过。
+var agentRootFiles = []string{"logcat.txt", "stdout.log", "stderr.log", "run-summary.json"}
+
+// buildAttachmentPaths 组装按需签发请求的相对路径清单:collected(相对于
+// out_dir/device/,加上 "device/" 前缀落到实际文件位置)+ 存在的
+// agentRootFiles。不遍历 out_dir 文件系统,因此天然排除 package.tar.gz 与
+// 解包出的 package/ 子树。
+func buildAttachmentPaths(outDir string, collected []string) []string {
+	rels := make([]string, 0, len(collected)+len(agentRootFiles))
+	for _, c := range collected {
+		rels = append(rels, "device/"+filepath.ToSlash(c))
+	}
+	for _, name := range agentRootFiles {
+		if _, err := os.Stat(filepath.Join(outDir, name)); err == nil {
+			rels = append(rels, name)
+		}
+	}
+	return rels
+}
+
+// uploadOnDemand 用 buildAttachmentPaths 得到本次实际收集到的相对路径清单,向
 // UploadRequestURL 换取预签名 URL 后交给既有 Uploader.Upload(差距 #8)。
 // 端点不可达 / 5xx / 超时重试 onDemandRetries 次,间隔 onDemandRetryDelay;
 // 401 立即返回 reporter.ErrLeaseNotOwned,调用方据此不回退(设计 §5.2)。
-func (s *Server) uploadOnDemand(ctx context.Context, d Dispatch, outDir string) ([]reporter.Attachment, error) {
-	rels, err := collectRelPaths(outDir)
-	if err != nil {
-		return nil, fmt.Errorf("list out_dir: %w", err)
-	}
+func (s *Server) uploadOnDemand(ctx context.Context, d Dispatch, outDir string, collected []string) ([]reporter.Attachment, error) {
+	rels := buildAttachmentPaths(outDir, collected)
 	if len(rels) == 0 {
 		return nil, nil
 	}
@@ -330,6 +362,7 @@ func (s *Server) uploadOnDemand(ctx context.Context, d Dispatch, outDir string) 
 		Files: rels,
 	}
 	var result *reporter.UploadRequestResult
+	var err error
 	for attempt := 0; ; attempt++ {
 		result, err = s.cfg.Reporter.RequestUploads(ctx, d.UploadRequestURL, req)
 		if err == nil {
@@ -338,11 +371,22 @@ func (s *Server) uploadOnDemand(ctx context.Context, d Dispatch, outDir string) 
 		if errors.Is(err, reporter.ErrLeaseNotOwned) {
 			return nil, err
 		}
-		if attempt >= onDemandRetries {
+		// 只重试网络错误/超时/5xx;其余 4xx(载荷错误/文件数超限等)是
+		// 确定性失败,重试只会白等 onDemandRetryDelay 后拿到同样的结果
+		// (MINOR 3)。
+		if attempt >= onDemandRetries || !reporter.Retryable(err) {
 			return nil, err
 		}
 		s.logf("task %s: 请求上传 URL 失败(%v),%v 后重试(%d/%d)", d.TaskID, err, onDemandRetryDelay, attempt+1, onDemandRetries)
-		time.Sleep(onDemandRetryDelay)
+		// 用 select 而非裸 time.Sleep,让已取消的任务不必等满
+		// onDemandRetryDelay 才发现取消(MINOR 4)。
+		timer := time.NewTimer(onDemandRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 
 	presigned := make([]uploader.PresignedUpload, 0, len(result.Uploads))
@@ -363,30 +407,6 @@ func (s *Server) uploadOnDemand(ctx context.Context, d Dispatch, outDir string) 
 		s.logf("task %s: 按需签发拒绝 %s: %s", d.TaskID, rj.Path, rj.Reason)
 	}
 	return s.cfg.Uploader.Upload(ctx, presigned, files), nil
-}
-
-// collectRelPaths 递归遍历 outDir,返回相对路径清单(仅文件,跳过目录),
-// 统一为 '/' 分隔以匹配 upload-requests 契约(设计 §4.1)。
-func collectRelPaths(outDir string) ([]string, error) {
-	var rels []string
-	err := filepath.Walk(outDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-		rel, err := filepath.Rel(outDir, path)
-		if err != nil {
-			return err
-		}
-		rels = append(rels, filepath.ToSlash(rel))
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return rels, nil
 }
 
 // uploadFixedSet 按 dispatch.presigned_uploads 直传收集到的固定键集文件;

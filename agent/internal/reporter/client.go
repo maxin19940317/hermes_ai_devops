@@ -263,7 +263,11 @@ func (c *Client) RequestUploads(ctx context.Context, endpoint string, req Upload
 		return nil, ErrLeaseNotOwned
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("request uploads: status %d", resp.StatusCode)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		// *StatusError(而非裸 fmt.Errorf)让调用方能用 Retryable 区分
+		// "值得重试"(网络错误/5xx)与"确定性失败"(其余 4xx,如 400
+		// 载荷/文件数超限):重试后者只是白等 3s。
+		return nil, &StatusError{Code: resp.StatusCode, Body: truncate(string(respBody), maxErrorBody)}
 	}
 	var out UploadRequestResult
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {

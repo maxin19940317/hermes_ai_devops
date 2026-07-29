@@ -4,7 +4,6 @@
   "title": "TaskDispatchRequest",
   "description": "由 contracts/client-agent-api.openapi.yaml 的 TaskDispatchRequest 组件忠实派生;一致性由 TestEmbeddedSchemaMatchesContract 防漂移。",
   "type": "object",
-  "additionalProperties": false,
   "required": [
     "task_id",
     "idempotency_key",

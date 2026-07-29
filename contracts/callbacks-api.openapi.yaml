@@ -246,8 +246,12 @@ components:
         files:
           type: array
           minItems: 1
-          description: out_dir 内的相对路径;绝对路径、含 .. 的段一律被拒。
-          items: { type: string, minLength: 1 }
+          description: |
+            out_dir 内的相对路径;绝对路径、含 .. 的段一律被拒。
+            允许空字符串:handler 把它当非法路径处理并计入 rejected[]
+            (部分拒绝语义),而非在 Schema 层先行拒绝整个请求——
+            两者若不一致,contract 与 handler 就会各说各话。
+          items: { type: string }
     UploadRequestResult:
       type: object
       required: [uploads, rejected]
@@ -256,17 +260,19 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [path, object_key, url, expires_at]
             properties:
               path: { type: string }
               object_key: { type: string }
-              url: { type: string }
+              url: { type: string, format: uri }
               expires_at: { type: string, format: date-time }
         rejected:
           type: array
           description: 非法路径逐项返回原因;部分拒绝不是错误,其余照签。
           items:
             type: object
+            additionalProperties: false
             required: [path, reason]
             properties:
               path: { type: string }

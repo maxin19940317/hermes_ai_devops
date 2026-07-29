@@ -79,6 +79,11 @@ func TestUploadRequestsKeyConfinement(t *testing.T) {
 		if !strings.HasPrefix(u.ObjectKey, prefix) {
 			t.Errorf("object_key %q 越出前缀 %q", u.ObjectKey, prefix)
 		}
+		// 只断言 object_key 前缀不够:一个返回空 URL 的 handler 也能通过——
+		// Agent 拿着空 URL 去 PUT 必然失败,必须一并确认签出了真 URL。
+		if u.URL == "" {
+			t.Errorf("path %q 的 url 为空,签发未生效", u.Path)
+		}
 	}
 }
 

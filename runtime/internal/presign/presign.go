@@ -72,9 +72,6 @@ func NewSigner(c Config) (*Signer, error) {
 	return &Signer{cli: cli, bucket: c.Bucket, ttl: ttl}, nil
 }
 
-// TTL 返回签发使用的有效期。
-func (s *Signer) TTL() time.Duration { return s.ttl }
-
 // PutURL 为单个 object key 签发 PUT URL,并返回其过期时刻。
 // URL 含签名,调用方**不得**落日志(只记 object key)。
 func (s *Signer) PutURL(ctx context.Context, key string) (string, time.Time, error) {

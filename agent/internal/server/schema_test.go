@@ -115,6 +115,9 @@ func TestValidateDispatchAcceptsValid(t *testing.T) {
 				map[string]any{"object_key": "runs/t-1/result.json", "url": "http://minio:9000/b/runs/t-1/result.json?sig=x", "expires_at": "2026-07-21T10:00:00Z"},
 			}
 		},
+		// 根级 additionalProperties 故意不设为 false(IMPORTANT 2):未来新增的
+		// dispatch 字段对下一版 Agent 不再是破坏性变更,这里锁定该放宽。
+		"顶层未知字段(向前兼容,不拒绝)": func(d map[string]any) { d["future_field"] = "x" },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -148,7 +151,6 @@ func TestValidateDispatchRejectsInvalid(t *testing.T) {
 		"auth 缺 token": func(d map[string]any) {
 			d["artifact"].(map[string]any)["auth"] = map[string]any{"type": "bearer"}
 		},
-		"顶层多余字段":        func(d map[string]any) { d["extra"] = 1 },
 		"artifact 多余字段": func(d map[string]any) { d["artifact"].(map[string]any)["extra"] = 1 },
 		"presigned_uploads 缺 url": func(d map[string]any) {
 			d["presigned_uploads"] = []any{map[string]any{"object_key": "runs/t-1/a.txt"}}

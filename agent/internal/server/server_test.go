@@ -853,11 +853,14 @@ func newTestServer(t *testing.T, up AttachmentUploader) *Server {
 	})
 }
 
-// seedOutDir 造出 out_dir 与三个文件,返回目录路径。
-func seedOutDir(t *testing.T) string {
+// seedOutDir 造出 out_dir 与三个"设备采集到"的文件,返回目录路径与
+// executor.Summary.Collected 形态的相对路径清单(相对于 out_dir/device/,
+// 与 executor.collect() 的实际产出一致——CRITICAL 1 之前这里把 logs/dumps
+// 错放在 out_dir 根,与真实布局不符,掩盖了遍历 out_dir 的问题)。
+func seedOutDir(t *testing.T) (dir string, collected []string) {
 	t.Helper()
-	dir := t.TempDir()
-	for _, rel := range []string{"device/results/result.json", "logs/run.log", "dumps/0001.bin"} {
+	dir = t.TempDir()
+	for _, rel := range []string{"device/results/result.json", "device/logs/run.log", "device/dumps/0001.bin"} {
 		full := filepath.Join(dir, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			t.Fatal(err)
@@ -866,7 +869,49 @@ func seedOutDir(t *testing.T) string {
 			t.Fatal(err)
 		}
 	}
-	return dir
+	return dir, []string{"results/result.json", "logs/run.log", "dumps/0001.bin"}
+}
+
+// seedRealisticOutDir 造出与真实一次运行一致的 out_dir(CRITICAL 1 的回归用例):
+//   - package.tar.gz:executor 下载的整包,从不删除
+//   - package/ 子树:解包出的 SDK 产物(现实中 455 个文件,这里用少量代表)
+//   - device/ 下的设备采集产物(executor.Summary.Collected 落盘的位置)
+//   - out_dir 根的 agent 产出文件(logcat/stdout/stderr/run-summary)
+//
+// 曾经的 collectRelPaths 会把 package.tar.gz 与 package/ 子树也一并请求签发,
+// 现实中导致 ~460 个路径撞上 upload-requests 的 64 上限。
+func seedRealisticOutDir(t *testing.T) (dir string, collected []string) {
+	t.Helper()
+	dir = t.TempDir()
+	write := func(rel string) {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("package.tar.gz")
+	for _, rel := range []string{
+		"package/manifest.yaml",
+		"package/bin/run.sh",
+		"package/lib/libfoo.so",
+		"package/lib/libbar.so",
+	} {
+		write(rel)
+	}
+	for _, rel := range []string{
+		"device/results/result.json",
+		"device/logs/run.log",
+		"device/dumps/0001.bin",
+	} {
+		write(rel)
+	}
+	for _, rel := range []string{"logcat.txt", "stdout.log", "stderr.log", "run-summary.json"} {
+		write(rel)
+	}
+	return dir, []string{"results/result.json", "logs/run.log", "dumps/0001.bin"}
 }
 
 // fixedSetFor 产出与 Dispatch.PresignedUploads 同形的五条固定键集条目,
@@ -893,7 +938,7 @@ func fixedSetFor(taskID string) []struct {
 // glob 命中的文件(dumps/**、logs/*.log)在按需签发路径下必须能上传——
 // 这是关闭 presign.go 那条 CONTRACT-ISSUE 的证据。
 func TestUploadAttachmentsOnDemandCoversGlobFiles(t *testing.T) {
-	outDir := seedOutDir(t)
+	outDir, collected := seedOutDir(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req reporter.UploadRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -910,7 +955,7 @@ func TestUploadAttachmentsOnDemandCoversGlobFiles(t *testing.T) {
 	s := newTestServer(t, up)
 	d := Dispatch{TaskID: "t1", UploadRequestURL: srv.URL,
 		LeaseID: "l1", LeaseGeneration: 1, DeviceSerial: "d1"}
-	s.uploadAttachments(context.Background(), d, outDir)
+	s.uploadAttachments(context.Background(), d, outDir, collected)
 
 	if len(up.gotKeys) != 1 {
 		t.Fatalf("Upload 调用次数 = %d, want 1", len(up.gotKeys))
@@ -923,9 +968,70 @@ func TestUploadAttachmentsOnDemandCoversGlobFiles(t *testing.T) {
 	}
 }
 
+// CRITICAL 1 回归用例:out_dir 里除了"收集到的输出"还留着下载的
+// package.tar.gz 与解包出的 package/ 子树(SDK 全量,现实中 455 个文件)。
+// 按需签发请求的 files 清单必须只含 executor.Summary.Collected 报告过的
+// 设备产物,加上 agent 根级产物(logcat/stdout/stderr/run-summary);绝不能
+// 把包产物也报进去——那正是曾经把真实一次运行的请求撑到 ~460 个路径、
+// 撞上 64 上限、导致按需签发整体失败并静默退化回固定键集的原因。
+func TestUploadAttachmentsOnDemandExcludesPackageArtifacts(t *testing.T) {
+	outDir, collected := seedRealisticOutDir(t)
+	var gotFiles []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req reporter.UploadRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotFiles = req.Files
+		grants := make([]reporter.UploadGrant, 0, len(req.Files))
+		for _, p := range req.Files {
+			grants = append(grants, reporter.UploadGrant{
+				Path: p, ObjectKey: "runs/" + req.TaskID + "/" + p, URL: "http://minio/put"})
+		}
+		_ = json.NewEncoder(w).Encode(reporter.UploadRequestResult{Uploads: grants})
+	}))
+	defer srv.Close()
+
+	up := &fakeUploader{}
+	s := newTestServer(t, up)
+	d := Dispatch{TaskID: "t1", UploadRequestURL: srv.URL,
+		LeaseID: "l1", LeaseGeneration: 1, DeviceSerial: "d1"}
+	s.uploadAttachments(context.Background(), d, outDir, collected)
+
+	if gotFiles == nil {
+		t.Fatal("按需签发端点未被调用")
+	}
+	joined := strings.Join(gotFiles, ",")
+	for _, bad := range []string{
+		"package.tar.gz", "package/manifest.yaml", "package/bin/run.sh",
+		"package/lib/libfoo.so", "package/lib/libbar.so",
+	} {
+		if strings.Contains(joined, bad) {
+			t.Errorf("请求文件清单不应包含包产物 %s, got %v", bad, gotFiles)
+		}
+	}
+	want := []string{
+		"device/results/result.json", "device/logs/run.log", "device/dumps/0001.bin",
+		"logcat.txt", "stdout.log", "stderr.log", "run-summary.json",
+	}
+	for _, w := range want {
+		found := false
+		for _, f := range gotFiles {
+			if f == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("请求文件清单应包含 %s, got %v", w, gotFiles)
+		}
+	}
+	if len(gotFiles) != len(want) {
+		t.Errorf("请求文件数 = %d, want %d(不含包产物), got %v", len(gotFiles), len(want), gotFiles)
+	}
+}
+
 // 端点不可达 → 回退固定键集,附件不能因此全丢。
 func TestUploadAttachmentsFallsBackWhenEndpointDown(t *testing.T) {
-	outDir := seedOutDir(t)
+	outDir, collected := seedOutDir(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -936,7 +1042,7 @@ func TestUploadAttachmentsFallsBackWhenEndpointDown(t *testing.T) {
 	d := Dispatch{TaskID: "t1", UploadRequestURL: srv.URL,
 		LeaseID: "l1", LeaseGeneration: 1, DeviceSerial: "d1",
 		PresignedUploads: fixedSetFor("t1")}
-	s.uploadAttachments(context.Background(), d, outDir)
+	s.uploadAttachments(context.Background(), d, outDir, collected)
 
 	if len(up.gotKeys) != 1 {
 		t.Fatalf("应回退并上传一次, Upload 调用 = %d", len(up.gotKeys))
@@ -946,9 +1052,72 @@ func TestUploadAttachmentsFallsBackWhenEndpointDown(t *testing.T) {
 	}
 }
 
+// MINOR 3:400(载荷错误/文件数超限等)是确定性失败,重试只是白等
+// onDemandRetryDelay 拿到同样的结果——必须立即回退,不重试。
+func TestUploadAttachmentsFallsBackImmediatelyOn400(t *testing.T) {
+	outDir, collected := seedOutDir(t)
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	up := &fakeUploader{}
+	s := newTestServer(t, up)
+	d := Dispatch{TaskID: "t1", UploadRequestURL: srv.URL,
+		LeaseID: "l1", LeaseGeneration: 1, DeviceSerial: "d1",
+		PresignedUploads: fixedSetFor("t1")}
+
+	start := time.Now()
+	s.uploadAttachments(context.Background(), d, outDir, collected)
+	elapsed := time.Since(start)
+
+	if hits != 1 {
+		t.Errorf("400 不应重试,端点应恰好被调用 1 次, got %d", hits)
+	}
+	if elapsed >= onDemandRetryDelay {
+		t.Errorf("400 应立即回退,不等待重试延迟;耗时 = %v", elapsed)
+	}
+	if len(up.gotKeys) != 1 {
+		t.Fatalf("应回退并上传一次, Upload 调用 = %d", len(up.gotKeys))
+	}
+}
+
+// MINOR 4:重试间的等待须能被取消提前打断,而不是死等满
+// onDemandRetryDelay 才发现调用方已经不需要结果了。
+func TestUploadOnDemandRetrySleepRespectsCancellation(t *testing.T) {
+	outDir, collected := seedOutDir(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError) // 5xx:可重试,才会走到等待
+	}))
+	defer srv.Close()
+
+	up := &fakeUploader{}
+	s := newTestServer(t, up)
+	d := Dispatch{TaskID: "t1", UploadRequestURL: srv.URL,
+		LeaseID: "l1", LeaseGeneration: 1, DeviceSerial: "d1"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err := s.uploadOnDemand(ctx, d, outDir, collected)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("取消后应返回错误")
+	}
+	if elapsed >= onDemandRetryDelay {
+		t.Errorf("取消应打断重试等待,不应等满 %v;实际耗时 %v", onDemandRetryDelay, elapsed)
+	}
+}
+
 // 401 不回退:租约已非己有,继续上传会污染别人的证据。
 func TestUploadAttachmentsDoesNotFallBackOnUnauthorized(t *testing.T) {
-	outDir := seedOutDir(t)
+	outDir, collected := seedOutDir(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -959,7 +1128,7 @@ func TestUploadAttachmentsDoesNotFallBackOnUnauthorized(t *testing.T) {
 	d := Dispatch{TaskID: "t1", UploadRequestURL: srv.URL,
 		LeaseID: "l1", LeaseGeneration: 1, DeviceSerial: "d1",
 		PresignedUploads: fixedSetFor("t1")}
-	s.uploadAttachments(context.Background(), d, outDir)
+	s.uploadAttachments(context.Background(), d, outDir, collected)
 
 	if len(up.gotKeys) != 0 {
 		t.Errorf("401 时不得上传任何东西, got %v", up.gotKeys)

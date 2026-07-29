@@ -216,6 +216,17 @@ relay's own log uses. Set `RELAY_BACKLOG_INTERVAL=0` to turn the periodic report
 
 ## Upgrade
 
+**Deployment order when a release adds a dispatch payload field** (e.g. `lease_id`,
+`upload_request_url`): upgrade the Windows Client Agent first, or roll out Runtime and
+Agent together. Do not upgrade Runtime alone and leave old Agents running. Agent
+releases prior to the root-level `additionalProperties` relaxation in
+`agent/internal/server/dispatch.schema.json` reject any dispatch payload carrying a
+field they don't recognize with `400 schema_violation` — the whole dispatch fails as
+INFRA, it does not degrade to ignoring the new field. The schema relaxation only
+protects Agents built from it onward; already-deployed older Agents are still exposed.
+See `docs/superpowers/specs/2026-07-29-on-demand-presign-design.md` §7 for the full
+compatibility matrix.
+
 Record the current image ID, update source, rebuild, and recreate only Runtime services
 (if the release adds database columns, apply the migration first — see Database
 migrations):
