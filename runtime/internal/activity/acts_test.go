@@ -50,3 +50,43 @@ func TestStoreActsPassConfigThrough(t *testing.T) {
 		t.Error("连续 3 次 INFRA 后设备应 QUARANTINED(§10)")
 	}
 }
+
+// 在途 workflow 重放会送来没有 FailScope 的旧载荷,活动必须按旧语义翻译,
+// 否则重放期间的记账与当初不一致(设计文档 §5)。
+func TestReleaseDeviceScopeTranslation(t *testing.T) {
+	cases := []struct {
+		name           string
+		req            wf.ReleaseRequest // DeviceID/TaskID 由用例填
+		wantDeviceFail int
+		wantClientFail int
+	}{
+		{"新载荷 client", wf.ReleaseRequest{FailScope: wf.FailScopeClient}, 0, 1},
+		{"新载荷 none 不被当成空", wf.ReleaseRequest{FailScope: wf.FailScopeNone}, 0, 0},
+		{"旧载荷 InfraFail=true → device", wf.ReleaseRequest{InfraFail: true}, 1, 0},
+		{"旧载荷 InfraFail=false → ok", wf.ReleaseRequest{InfraFail: false}, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := storeWithDevice(t)
+			a := &Acts{Store: s, Cfg: Config{LeaseSeconds: 120, QuarantineAfter: 3}}
+			l, err := a.AcquireDevice(ctx, wf.AcquireRequest{TaskID: "t1"})
+			if err != nil || l == nil {
+				t.Fatalf("acquire: %+v %v", l, err)
+			}
+			req := tc.req
+			req.DeviceID, req.TaskID = l.DeviceID, "t1"
+			if err := a.ReleaseDevice(ctx, req); err != nil {
+				t.Fatalf("ReleaseDevice: %v", err)
+			}
+			ov, err := s.FleetOverview(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := ov.Devices[0]
+			if d.FailStreak != tc.wantDeviceFail || d.ClientFailStreak != tc.wantClientFail {
+				t.Errorf("device=%d client=%d, want device=%d client=%d",
+					d.FailStreak, d.ClientFailStreak, tc.wantDeviceFail, tc.wantClientFail)
+			}
+		})
+	}
+}

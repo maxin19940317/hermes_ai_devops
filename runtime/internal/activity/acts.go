@@ -17,7 +17,7 @@ import (
 // both store.MemStore and (later) PGStore satisfy this interface.
 type Store interface {
 	AcquireDevice(ctx context.Context, sel wf.DeviceSelector, taskID string, leaseSeconds int) (*wf.Lease, error)
-	ReleaseDevice(ctx context.Context, deviceID, taskID string, infraFail bool, quarantineAfter int) error
+	ReleaseDevice(ctx context.Context, deviceID, taskID string, scope wf.FailScope, quarantineAfter int) error
 	CreateTask(ctx context.Context, row wf.TaskRow) error
 	FinishTask(ctx context.Context, req wf.FinishRequest) error
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
@@ -92,8 +92,17 @@ func (a *Acts) FinishTask(ctx context.Context, req wf.FinishRequest) error {
 	return a.Store.FinishTask(ctx, req)
 }
 
+// ReleaseDevice 归还设备并按归因记账。空 FailScope 表示载荷来自改动前的
+// workflow(重放场景,设计文档 §5):按旧语义翻译,保持当初的记账行为。
 func (a *Acts) ReleaseDevice(ctx context.Context, req wf.ReleaseRequest) error {
-	return a.Store.ReleaseDevice(ctx, req.DeviceID, req.TaskID, req.InfraFail, a.Cfg.QuarantineAfter)
+	scope := req.FailScope
+	if scope == "" {
+		scope = wf.FailScopeOK
+		if req.InfraFail {
+			scope = wf.FailScopeDevice
+		}
+	}
+	return a.Store.ReleaseDevice(ctx, req.DeviceID, req.TaskID, scope, a.Cfg.QuarantineAfter)
 }
 
 // SaveDecision 落 decisions 表(§11):规则引擎与 LLM 的每次裁决都落表,可回放。

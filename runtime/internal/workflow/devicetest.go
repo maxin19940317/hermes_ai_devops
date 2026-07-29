@@ -204,9 +204,13 @@ const (
 )
 
 type ReleaseRequest struct {
-	DeviceID  string `json:"device_id"`
-	TaskID    string `json:"task_id"`
-	InfraFail bool   `json:"infra_fail"` // true → fail_streak+1,连续 3 次隔离(§10)
+	DeviceID string `json:"device_id"`
+	TaskID   string `json:"task_id"`
+	// InfraFail 是改动前的归因字段。**保留不删**:它进过 workflow history,
+	// 在途 workflow 重放时会原样送回来(设计文档 §5)。
+	InfraFail bool `json:"infra_fail"`
+	// FailScope 是新的四值归因(差距 #10)。为空 = 旧载荷,活动按 InfraFail 翻译。
+	FailScope FailScope `json:"fail_scope,omitempty"`
 }
 
 // ---- 输出 ----
