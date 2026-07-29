@@ -3,11 +3,9 @@ package activity
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"time"
 
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
+	"hermes-devops/runtime/internal/presign"
 )
 
 // EvidenceFiles 是 dispatch 时按 §3.7 固定预签的证据键集;
@@ -22,32 +20,15 @@ type PresignedUpload struct {
 }
 
 // presignEnabled:endpoint 或凭据缺失即禁用(优雅降级,非错误,§3.7)。
-func (c Config) presignEnabled() bool {
-	return c.MinIOEndpoint != "" && c.MinIOAccessKey != "" && c.MinIOSecretKey != ""
-}
+func (c Config) presignEnabled() bool { return c.presignConfig().Enabled() }
 
-// presignClient 构造 minio client。AWS V4 签名覆盖 Host 头,因此 client 必须用
-// MINIO_PUBLIC_ENDPOINT 的 host 构造——预签名是纯离线操作(不发起网络请求),
-// 集群内不可达的 public host 不影响签名;事后改写 URL host 会使签名失效,不可取。
-// MINIO_PUBLIC_ENDPOINT 为空时退回 MINIO_ENDPOINT(仅同 host 可达时正确)。
-func presignClient(c Config) (*minio.Client, error) {
-	endpoint := c.MinIOPublicEndpoint
-	if endpoint == "" {
-		endpoint = c.MinIOEndpoint
+// presignConfig 把 activity 配置投影成签名包的配置。
+func (c Config) presignConfig() presign.Config {
+	return presign.Config{
+		Endpoint: c.MinIOEndpoint, PublicEndpoint: c.MinIOPublicEndpoint,
+		AccessKey: c.MinIOAccessKey, SecretKey: c.MinIOSecretKey,
+		Bucket: c.MinIOBucket, TTL: c.MinIOPresignTTL,
 	}
-	secure := false
-	host := endpoint
-	if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
-		host = u.Host
-		secure = u.Scheme == "https"
-	}
-	// Region 固定:不设则 minio-go 预签时会先发起 GetBucketLocation 网络请求,
-	// 而预签名必须是纯离线操作(dispatch 活动不应依赖 MinIO 可达性)。
-	return minio.New(host, &minio.Options{
-		Creds:  credentials.NewStaticV4(c.MinIOAccessKey, c.MinIOSecretKey, ""),
-		Secure: secure,
-		Region: "us-east-1",
-	})
 }
 
 // presignedUploads 对固定键集预签 PUT。任何失败降级为空集(附件缺失不构成
@@ -58,27 +39,21 @@ func (a *Acts) presignedUploads(ctx context.Context, taskID string) []PresignedU
 		a.warnf("minio presigning disabled (endpoint/credentials empty); presigned_uploads empty")
 		return uploads
 	}
-	cli, err := presignClient(a.Cfg)
+	signer, err := presign.NewSigner(a.Cfg.presignConfig())
 	if err != nil {
 		a.warnf("minio presign client init failed: %v; presigned_uploads empty", err)
 		return uploads
 	}
-	ttl := a.Cfg.MinIOPresignTTL
-	if ttl <= 0 {
-		ttl = time.Hour
-	}
-	bucket := a.Cfg.MinIOBucket
-	expires := time.Now().UTC().Add(ttl)
 	for _, f := range EvidenceFiles {
 		key := fmt.Sprintf("runs/%s/%s", taskID, f)
-		u, err := cli.PresignedPutObject(ctx, bucket, key, ttl)
+		u, expires, err := signer.PutURL(ctx, key)
 		if err != nil {
 			a.warnf("minio presign PUT failed for key %s: %v; presigned_uploads empty", key, err)
 			return []PresignedUpload{}
 		}
 		uploads = append(uploads, PresignedUpload{
 			ObjectKey: key,
-			URL:       u.String(),
+			URL:       u,
 			ExpiresAt: expires.Format(time.RFC3339),
 		})
 	}
