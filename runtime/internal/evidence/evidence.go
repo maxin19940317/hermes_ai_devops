@@ -322,7 +322,7 @@ func buildStreamExcerpts(scans map[string]*streamScan) []Excerpt {
 				}
 				content, truncated := headLines(scan.errorLines, limit)
 				out = append(out, Excerpt{File: "logcat.txt", Kind: "error_lines",
-					Content: content, Truncated: truncated || len(scan.errorLines) >= excerptLogcatMaxLines})
+					Content: content, Truncated: truncated || scan.errorLinesOverflow || scan.errorLinesTruncated})
 			}
 		}
 	}

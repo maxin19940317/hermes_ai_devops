@@ -423,6 +423,95 @@ func TestExtractFallbackUsesWholeLargeLog(t *testing.T) {
 	}
 }
 
+func TestExtractLogcatFallbackErrorLineBoundary(t *testing.T) {
+	tests := []struct {
+		name          string
+		errorCount    int
+		wantTruncated bool
+	}{
+		{name: "49 lines", errorCount: 49},
+		{name: "exactly 50 lines", errorCount: 50},
+		{name: "51 lines", errorCount: 51, wantTruncated: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var b strings.Builder
+			for i := 1; i <= tt.errorCount; i++ {
+				level := "E"
+				if i%2 == 0 {
+					level = "F"
+				}
+				fmt.Fprintf(&b, "07-01 01:25:47.2 1 1 %s tag: ERR-%03d\n", level, i)
+			}
+
+			in := baseInput()
+			in.Signatures = []Signature{{ID: "nomatch", Where: "logcat", Pattern: "NEVER-MATCH", Classify: "CODE"}}
+			in.Files["logcat"] = strings.NewReader(b.String())
+			ev := Extract(in)
+
+			if len(ev.Excerpts) != 1 {
+				t.Fatalf("excerpts = %+v, want one logcat error_lines excerpt", ev.Excerpts)
+			}
+			excerpt := ev.Excerpts[0]
+			if excerpt.File != "logcat.txt" || excerpt.Kind != "error_lines" {
+				t.Fatalf("excerpt = %+v, want one logcat error_lines excerpt", excerpt)
+			}
+			if excerpt.Truncated != tt.wantTruncated {
+				t.Errorf("truncated = %v, want %v", excerpt.Truncated, tt.wantTruncated)
+			}
+
+			lines := strings.Split(excerpt.Content, "\n")
+			wantLines := tt.errorCount
+			if wantLines > excerptLogcatMaxLines {
+				wantLines = excerptLogcatMaxLines
+			}
+			if len(lines) != wantLines {
+				t.Fatalf("retained lines = %d, want %d", len(lines), wantLines)
+			}
+			for i, line := range lines {
+				want := fmt.Sprintf("ERR-%03d", i+1)
+				if !strings.Contains(line, want) {
+					t.Errorf("line %d = %q, want %q in encounter order", i+1, line, want)
+				}
+			}
+			if strings.Contains(excerpt.Content, "ERR-051") {
+				t.Errorf("excerpt retained overflow line ERR-051: %q", excerpt.Content)
+			}
+		})
+	}
+}
+
+func TestExtractLogcatFallbackDetectsErrorMarkerOutsideClippedDisplay(t *testing.T) {
+	longLine := strings.Repeat("h", maxContextLineBytes) +
+		" E MIDDLE-ERROR " + strings.Repeat("t", maxContextLineBytes)
+
+	in := baseInput()
+	in.Signatures = []Signature{{ID: "nomatch", Where: "logcat", Pattern: "NEVER-MATCH", Classify: "CODE"}}
+	in.Files["logcat"] = strings.NewReader(longLine + "\n")
+	ev := Extract(in)
+
+	if len(ev.Excerpts) != 1 {
+		t.Fatalf("excerpts = %+v, want one logcat error_lines excerpt", ev.Excerpts)
+	}
+	excerpt := ev.Excerpts[0]
+	if excerpt.File != "logcat.txt" || excerpt.Kind != "error_lines" {
+		t.Fatalf("excerpt = %+v, want one logcat error_lines excerpt", excerpt)
+	}
+	if len(excerpt.Content) > maxContextLineBytes {
+		t.Errorf("excerpt content length = %d, want <= %d", len(excerpt.Content), maxContextLineBytes)
+	}
+	if !strings.Contains(excerpt.Content, clippedLineMarker) {
+		t.Errorf("excerpt content was not clipped: %q", excerpt.Content)
+	}
+	if strings.Contains(excerpt.Content, "MIDDLE-ERROR") {
+		t.Errorf("middle marker unexpectedly survived display clipping: %q", excerpt.Content)
+	}
+	if !excerpt.Truncated {
+		t.Errorf("excerpt truncated = false, want true")
+	}
+}
+
 func TestExtractLargeStdoutFallbackKeepsTail(t *testing.T) {
 	var b strings.Builder
 	padding := strings.Repeat("p", 199) + "\n"

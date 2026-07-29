@@ -43,14 +43,16 @@ func (c matchCandidate) context() string {
 }
 
 type streamScan struct {
-	size       int64
-	lineCount  int
-	candidates map[int][]matchCandidate
-	overflow   map[int]bool
-	tail       []string
-	errorLines []string
-	truncated  bool
-	readErr    error
+	size                int64
+	lineCount           int
+	candidates          map[int][]matchCandidate
+	overflow            map[int]bool
+	tail                []string
+	errorLines          []string
+	errorLinesOverflow  bool
+	errorLinesTruncated bool
+	truncated           bool
+	readErr             error
 }
 
 type lineAccumulator struct {
@@ -135,9 +137,14 @@ func scanStream(r io.Reader, matchers []streamMatcher, logcat bool) *streamScan 
 			out.truncated = true
 		}
 
-		if logcat && len(out.errorLines) < excerptLogcatMaxLines &&
-			logcatErrLine.MatchString(current.text) {
-			out.errorLines = append(out.errorLines, current.text)
+		matchText := string(line.prefix)
+		if logcat && logcatErrLine.MatchString(matchText) {
+			if len(out.errorLines) < excerptLogcatMaxLines {
+				out.errorLines = append(out.errorLines, current.text)
+				out.errorLinesTruncated = out.errorLinesTruncated || current.truncated
+			} else {
+				out.errorLinesOverflow = true
+			}
 		}
 
 		for index, candidates := range out.candidates {
@@ -152,7 +159,6 @@ func scanStream(r io.Reader, matchers []streamMatcher, logcat bool) *streamScan 
 			out.candidates[index] = candidates
 		}
 
-		matchText := string(line.prefix)
 		for _, matcher := range matchers {
 			if !matcher.re.MatchString(matchText) {
 				continue
