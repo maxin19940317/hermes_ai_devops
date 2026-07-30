@@ -137,37 +137,95 @@ func (s *MemStore) NextWorkflowAttemptAll(_ context.Context, commitSHA string, p
 
 // RecentRun 是快照里的一次运行(设计文档 §4.2)。Verdict 为空表示尚无终态结论。
 type RecentRun struct {
-	Project    string
-	Commit     string
-	PipelineID int
-	Variant    string
-	Verdict    string
-	EndedAt    time.Time
+	WorkflowID    string
+	Project       string
+	Commit        string
+	PipelineID    int
+	Version       string
+	RuleVersion   string
+	Variant       string
+	Verdict       string
+	EndedAt       time.Time
+	Authoritative bool
 }
 
-// RecentRuns 返回最近 limit 条产物及其最新一次运行结论(飞书指令层翻译上下文)。
-// 关联规则(设计文档 §3.2):同一 (commit,iid,variant) 的 task 可能挂在 bundle
-// workflow(ID = base)、变体 workflow(base-variant)或两者的 -r{N} 重跑下,
-// 且 bundle 下多个变体共享同一 workflow_id——必须同时按 test_id 过滤才不串变体。
+// RecentRuns 优先返回 workflow_runs 的权威运行记录，再补充尚未被 registry
+// 覆盖的旧 artifacts。权威记录只与完全相同 workflow_id/test_id 的 task 关联。
 func (s *MemStore) RecentRuns(_ context.Context, limit int) ([]RecentRun, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	type keyed struct {
+
+	type keyedRun struct {
+		run WorkflowRun
+		seq int64
+	}
+	runs := make([]keyedRun, 0, len(s.workflowRuns))
+	excluded := make(map[string]struct{})
+	for workflowID, run := range s.workflowRuns {
+		runs = append(runs, keyedRun{run: run, seq: s.runSeq[workflowID]})
+		for _, variant := range run.Variants {
+			excluded[artifactKey(run.Project, run.CommitSHA, run.PipelineID, variant)] = struct{}{}
+		}
+	}
+	sort.Slice(runs, func(i, j int) bool {
+		if runs[i].seq != runs[j].seq {
+			return runs[i].seq > runs[j].seq
+		}
+		return runs[i].run.WorkflowID > runs[j].run.WorkflowID
+	})
+
+	out := make([]RecentRun, 0, limit)
+	for _, keyed := range runs {
+		run := keyed.run
+		for _, variant := range run.Variants {
+			var best *taskRecord
+			for _, rec := range s.tasks {
+				if rec.row.WorkflowID != run.WorkflowID || rec.row.TestID != variant {
+					continue
+				}
+				if best == nil || rec.row.Attempt > best.row.Attempt ||
+					(rec.row.Attempt == best.row.Attempt && rec.seq > best.seq) ||
+					(rec.row.Attempt == best.row.Attempt && rec.seq == best.seq &&
+						rec.row.TaskID > best.row.TaskID) {
+					best = rec
+				}
+			}
+			recent := RecentRun{
+				WorkflowID: run.WorkflowID, Project: run.Project, Commit: run.CommitSHA,
+				PipelineID: run.PipelineID, Version: run.Version, RuleVersion: run.RuleVersion,
+				Variant: variant, Authoritative: true,
+			}
+			if best != nil {
+				recent.Verdict, recent.EndedAt = best.verdict, best.endedAt
+			}
+			out = append(out, recent)
+			if len(out) == limit {
+				return out, nil
+			}
+		}
+	}
+
+	type keyedArtifact struct {
 		art Artifact
 		seq int64
 	}
-	all := make([]keyed, 0, len(s.rows))
+	all := make([]keyedArtifact, 0, len(s.rows))
 	for k, a := range s.rows {
-		all = append(all, keyed{art: a, seq: s.rowSeq[k]})
+		if _, ok := excluded[artifactKey(a.Project, a.CommitSHA, a.PipelineID, a.Variant)]; ok {
+			continue
+		}
+		all = append(all, keyedArtifact{art: a, seq: s.rowSeq[k]})
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].seq > all[j].seq })
-	if len(all) > limit {
-		all = all[:limit]
-	}
-	out := make([]RecentRun, 0, len(all))
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].seq != all[j].seq {
+			return all[i].seq > all[j].seq
+		}
+		return artifactKey(all[i].art.Project, all[i].art.CommitSHA, all[i].art.PipelineID, all[i].art.Variant) >
+			artifactKey(all[j].art.Project, all[j].art.CommitSHA, all[j].art.PipelineID, all[j].art.Variant)
+	})
 	for _, k := range all {
 		a := k.art
 		run := RecentRun{
@@ -192,6 +250,9 @@ func (s *MemStore) RecentRuns(_ context.Context, limit int) ([]RecentRun, error)
 			run.Verdict, run.EndedAt = best.verdict, best.endedAt
 		}
 		out = append(out, run)
+		if len(out) == limit {
+			break
+		}
 	}
 	return out, nil
 }

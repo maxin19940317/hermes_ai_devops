@@ -1768,4 +1768,188 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			}
 		}
 	})
+
+	t.Run("RecentRunsAuthoritativeFirst", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.RegisterArtifacts(ctx, []Artifact{{
+			Project: "legacy/project", CommitSHA: "legacy", PipelineID: 1,
+			Variant: "legacy-v", URL: "u", SHA256: "s",
+		}}); err != nil {
+			t.Fatalf("RegisterArtifacts: %v", err)
+		}
+		run := WorkflowRun{
+			WorkflowID: "authoritative-run", Project: "grp/project",
+			CommitSHA: "abcd1234", PipelineID: 42, Version: "1.2.3",
+			RuleVersion: "rules-v7", Scope: "bundle", Attempt: 2,
+			Variants: []string{"v2", "v1"},
+		}
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+
+		got, err := s.RecentRuns(ctx, 3)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("runs = %#v, want 3", got)
+		}
+		for i, variant := range []string{"v1", "v2"} {
+			want := RecentRun{
+				WorkflowID: "authoritative-run", Project: "grp/project",
+				Commit: "abcd1234", PipelineID: 42, Version: "1.2.3",
+				RuleVersion: "rules-v7", Variant: variant, Authoritative: true,
+			}
+			if !reflect.DeepEqual(got[i], want) {
+				t.Errorf("runs[%d] = %#v, want %#v", i, got[i], want)
+			}
+		}
+		if got[2].Project != "legacy/project" || got[2].Variant != "legacy-v" ||
+			got[2].Authoritative || got[2].WorkflowID != "" || got[2].Version != "" ||
+			got[2].RuleVersion != "" {
+			t.Errorf("legacy fallback = %#v, want non-authoritative legacy row", got[2])
+		}
+	})
+
+	t.Run("RecentRunsExpandsVariantsBeforeLimit", func(t *testing.T) {
+		s := newStore(t)
+		old := WorkflowRun{
+			WorkflowID: "run-old", Project: "p", CommitSHA: "old", PipelineID: 1,
+			Version: "1", RuleVersion: "r", Variants: []string{"old-v"},
+		}
+		newest := WorkflowRun{
+			WorkflowID: "run-new", Project: "p", CommitSHA: "new", PipelineID: 2,
+			Version: "2", RuleVersion: "r2",
+			Variants: []string{"v4", "v2", "v1", "v3"},
+		}
+		for _, run := range []WorkflowRun{old, newest} {
+			if err := s.RecordWorkflowRun(ctx, run); err != nil {
+				t.Fatalf("RecordWorkflowRun %s: %v", run.WorkflowID, err)
+			}
+		}
+
+		got, err := s.RecentRuns(ctx, 3)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("runs = %#v, want 3", got)
+		}
+		for i, variant := range []string{"v1", "v2", "v3"} {
+			if got[i].WorkflowID != newest.WorkflowID || got[i].Variant != variant ||
+				!got[i].Authoritative {
+				t.Errorf("runs[%d] = %#v, want newest/%s authoritative", i, got[i], variant)
+			}
+		}
+	})
+
+	t.Run("RecentRunsExactTaskAssociation", func(t *testing.T) {
+		s := newStore(t)
+		run := WorkflowRun{
+			WorkflowID: "run-exact", Project: "p", CommitSHA: "sha", PipelineID: 7,
+			Version: "1", RuleVersion: "r", Variants: []string{"v1", "v2"},
+		}
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+		tasks := []wf.TaskRow{
+			{TaskID: "exact-v1-a0", WorkflowID: run.WorkflowID, TestID: "v1", Attempt: 0, IdempotencyKey: "exact-v1-a0", Status: "RUNNING"},
+			{TaskID: "exact-v1-a2", WorkflowID: run.WorkflowID, TestID: "v1", Attempt: 2, IdempotencyKey: "exact-v1-a2", Status: "RUNNING"},
+			{TaskID: "exact-v2", WorkflowID: run.WorkflowID, TestID: "v2", Attempt: 0, IdempotencyKey: "exact-v2", Status: "RUNNING"},
+			{TaskID: "prefix", WorkflowID: "prefix-" + run.WorkflowID, TestID: "v1", Attempt: 99, IdempotencyKey: "prefix", Status: "RUNNING"},
+			{TaskID: "suffix", WorkflowID: run.WorkflowID + "-suffix", TestID: "v1", Attempt: 100, IdempotencyKey: "suffix", Status: "RUNNING"},
+			{TaskID: "wrong-test", WorkflowID: run.WorkflowID, TestID: "v10", Attempt: 101, IdempotencyKey: "wrong-test", Status: "RUNNING"},
+		}
+		for _, row := range tasks {
+			if err := s.CreateTask(ctx, row); err != nil {
+				t.Fatalf("CreateTask %s: %v", row.TaskID, err)
+			}
+		}
+		for taskID, verdict := range map[string]string{
+			"exact-v1-a0": "TEST_FAILED",
+			"exact-v1-a2": "PASSED",
+			"prefix":      "INFRA_ERROR",
+			"suffix":      "INFRA_ERROR",
+			"wrong-test":  "INFRA_ERROR",
+		} {
+			if err := s.FinishTask(ctx, wf.FinishRequest{
+				TaskID: taskID, Status: "COMPLETED", Verdict: verdict,
+			}); err != nil {
+				t.Fatalf("FinishTask %s: %v", taskID, err)
+			}
+		}
+
+		got, err := s.RecentRuns(ctx, 10)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("runs = %#v, want 2", got)
+		}
+		if got[0].Variant != "v1" || got[0].Verdict != "PASSED" ||
+			got[0].EndedAt.IsZero() {
+			t.Errorf("v1 = %#v, want exact workflow/test latest attempt PASSED", got[0])
+		}
+		if got[1].Variant != "v2" || got[1].Verdict != "" ||
+			!got[1].EndedAt.IsZero() {
+			t.Errorf("v2 = %#v, want running task without verdict/end", got[1])
+		}
+	})
+
+	t.Run("RecentRunsLegacyFallbackAndGlobalDedup", func(t *testing.T) {
+		s := newStore(t)
+		run := WorkflowRun{
+			WorkflowID: "registered-run", Project: "p", CommitSHA: "same", PipelineID: 1,
+			Version: "1", RuleVersion: "r", Variants: []string{"v1"},
+		}
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+		// The duplicate is deliberately newer than the unique fallback. Deduplication
+		// must happen before the fallback LIMIT or it crowds the unique row out.
+		if err := s.RegisterArtifacts(ctx, []Artifact{
+			{Project: "legacy", CommitSHA: "unique", PipelineID: 2, Variant: "v2", URL: "u", SHA256: "s"},
+			{Project: "p", CommitSHA: "same", PipelineID: 1, Variant: "v1", URL: "u", SHA256: "s"},
+		}); err != nil {
+			t.Fatalf("RegisterArtifacts: %v", err)
+		}
+
+		got, err := s.RecentRuns(ctx, 2)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("runs = %#v, want authoritative plus unique fallback", got)
+		}
+		if !got[0].Authoritative || got[0].WorkflowID != run.WorkflowID {
+			t.Errorf("runs[0] = %#v, want authoritative run", got[0])
+		}
+		if got[1].Authoritative || got[1].Commit != "unique" || got[1].Variant != "v2" {
+			t.Errorf("runs[1] = %#v, want unique legacy fallback", got[1])
+		}
+	})
+
+	t.Run("RecentRunsReturnsDefensiveCopies", func(t *testing.T) {
+		s := newStore(t)
+		run := WorkflowRun{
+			WorkflowID: "defensive-run", Project: "p", CommitSHA: "sha", PipelineID: 1,
+			Version: "1", RuleVersion: "r", Variants: []string{"v1"},
+		}
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+		first, err := s.RecentRuns(ctx, 1)
+		if err != nil {
+			t.Fatalf("RecentRuns first: %v", err)
+		}
+		first[0].Project = "mutated"
+		first[0].Verdict = "mutated"
+		second, err := s.RecentRuns(ctx, 1)
+		if err != nil {
+			t.Fatalf("RecentRuns second: %v", err)
+		}
+		if second[0].Project != "p" || second[0].Verdict != "" {
+			t.Fatalf("stored result mutated through caller slice: %#v", second[0])
+		}
+	})
 }

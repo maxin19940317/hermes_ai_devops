@@ -122,41 +122,93 @@ func (s *PGStore) NextWorkflowAttemptAll(ctx context.Context, commitSHA string, 
 	return maxN, nil
 }
 
-// RecentRuns 见 MemStore 同名方法的语义说明(设计文档 §3.2)。
-// 实现为 1 + limit 次查询而非单条 SQL:baseID 的构造只在 Go 侧(wf.BaseWorkflowID)
-// 存在一份,不在 SQL 里重复拼接字符串——格式漂移在编译期即不可能。limit 为 10 量级,
-// 且只在人机交互路径上调用,查询次数可接受。
+// RecentRuns 见 MemStore 同名方法的语义说明。
 func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT project, commit_sha, pipeline_id, variant
-		FROM artifacts
-		ORDER BY created_at DESC, artifact_id DESC
-		LIMIT $1`, limit)
+		SELECT wr.workflow_id, wr.project, wr.commit_sha, wr.pipeline_id,
+		       wr.version, wr.rule_version, expanded.variant,
+		       COALESCE(task.verdict, ''), task.ended_at
+		FROM workflow_runs wr
+		CROSS JOIN LATERAL unnest(wr.variants) WITH ORDINALITY
+			AS expanded(variant, ord)
+		LEFT JOIN LATERAL (
+			SELECT verdict, ended_at
+			FROM tasks
+			WHERE workflow_id = wr.workflow_id
+			  AND test_id = expanded.variant
+			ORDER BY attempt DESC, created_at DESC, task_id DESC
+			LIMIT 1
+		) task ON true
+		ORDER BY wr.created_at DESC, wr.workflow_id DESC, expanded.ord
+		LIMIT $1`,
+		limit)
 	if err != nil {
-		return nil, fmt.Errorf("recent runs: %w", err)
+		return nil, fmt.Errorf("recent runs: authoritative: %w", err)
 	}
-	out := []RecentRun{}
+	out := make([]RecentRun, 0, limit)
+	for rows.Next() {
+		var r RecentRun
+		var endedAt sql.NullTime
+		if err := rows.Scan(
+			&r.WorkflowID, &r.Project, &r.Commit, &r.PipelineID,
+			&r.Version, &r.RuleVersion, &r.Variant, &r.Verdict, &endedAt,
+		); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("recent runs: authoritative scan: %w", err)
+		}
+		if endedAt.Valid {
+			r.EndedAt = endedAt.Time.UTC()
+		}
+		r.Authoritative = true
+		out = append(out, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("recent runs: authoritative: %w", err)
+	}
+	remaining := limit - len(out)
+	if remaining == 0 {
+		return out, nil
+	}
+
+	rows, err = s.DB.QueryContext(ctx, `
+		SELECT a.project, a.commit_sha, a.pipeline_id, a.variant
+		FROM artifacts a
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM workflow_runs wr
+			WHERE wr.project = a.project
+			  AND wr.commit_sha = a.commit_sha
+			  AND wr.pipeline_id = a.pipeline_id
+			  AND a.variant = ANY(wr.variants)
+		)
+		ORDER BY a.created_at DESC, a.artifact_id DESC
+		LIMIT $1`,
+		remaining)
+	if err != nil {
+		return nil, fmt.Errorf("recent runs: legacy: %w", err)
+	}
+	legacyStart := len(out)
 	for rows.Next() {
 		var r RecentRun
 		if err := rows.Scan(&r.Project, &r.Commit, &r.PipelineID, &r.Variant); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("recent runs: scan: %w", err)
+			return nil, fmt.Errorf("recent runs: legacy scan: %w", err)
 		}
 		out = append(out, r)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("recent runs: %w", err)
+		return nil, fmt.Errorf("recent runs: legacy: %w", err)
 	}
-	for i := range out {
+
+	for i := legacyStart; i < len(out); i++ {
 		base := wf.BaseWorkflowID(out[i].Project, out[i].Commit, out[i].PipelineID)
 		var verdict sql.NullString
 		var endedAt sql.NullTime
-		// starts_with 而非 LIKE:项目名可能含下划线(Algo_Super_SDK),
-		// 而 _ 是 LIKE 的单字符通配符,走 LIKE 就得加 ESCAPE。
 		err := s.DB.QueryRowContext(ctx, `
 			SELECT verdict, ended_at FROM tasks
 			WHERE test_id = $1
@@ -167,7 +219,7 @@ func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("recent runs: lookup %s: %w", out[i].Variant, err)
+			return nil, fmt.Errorf("recent runs: legacy lookup %s: %w", out[i].Variant, err)
 		}
 		out[i].Verdict = verdict.String
 		if endedAt.Valid {
