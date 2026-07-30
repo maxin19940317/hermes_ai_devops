@@ -252,28 +252,27 @@ func TestWebhookSendCardWireShape(t *testing.T) {
 }
 
 // app:content 是**序列化后的字符串**(与 SendText 同形),不是对象。
+// 复用 feishu_test.go 既有的 fakeOpenAPI 夹具(token + /im/v1/messages 双端点、
+// 自带计数与 lastMessage);**不要**自己起裸 httptest server 去凑 token 端点。
 func TestAppSendCardWireShape(t *testing.T) {
-	var got map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "tenant_access_token") {
-			_, _ = w.Write([]byte(`{"code":0,"tenant_access_token":"t","expire":7200}`))
-			return
-		}
-		_ = json.NewDecoder(r.Body).Decode(&got)
-		_, _ = w.Write([]byte(`{"code":0}`))
-	}))
-	defer srv.Close()
-	s := newAppSenderForTest(t, srv.URL) // 照既有测试构造 appSender 的写法
+	f := &fakeOpenAPI{}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+	cs, ok := s.(CardSender)
+	if !ok {
+		t.Fatal("appSender 应实现 CardSender")
+	}
 	card := map[string]any{"header": "x"}
-	if err := s.SendCard(context.Background(), card); err != nil {
+	if err := cs.SendCard(ctx, card); err != nil {
 		t.Fatal(err)
 	}
-	if got["msg_type"] != "interactive" {
-		t.Errorf("msg_type = %v, want interactive", got["msg_type"])
+	body, _ := f.lastMessage()
+	if body["msg_type"] != "interactive" {
+		t.Errorf("msg_type = %v, want interactive", body["msg_type"])
 	}
-	str, isStr := got["content"].(string)
+	str, isStr := body["content"].(string)
 	if !isStr {
-		t.Fatalf("app 的 content 应是序列化字符串, got %T", got["content"])
+		t.Fatalf("app 的 content 应是序列化字符串, got %T", body["content"])
 	}
 	var back map[string]any
 	if err := json.Unmarshal([]byte(str), &back); err != nil {
@@ -284,37 +283,29 @@ func TestAppSendCardWireShape(t *testing.T) {
 	}
 }
 
-// token 过期 → 强制刷新**并且只重试一次**(与 SendText 同款)。
+// token 过期 → 强制刷新**并且只重试一次**(与 TestAppSenderRefreshesExpiredToken 同款)。
 func TestAppSendCardRefreshesExpiredToken(t *testing.T) {
-	var tokenCalls, msgCalls int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "tenant_access_token") {
-			atomic.AddInt32(&tokenCalls, 1)
-			_, _ = w.Write([]byte(`{"code":0,"tenant_access_token":"t","expire":7200}`))
-			return
-		}
-		// 首个 messages 请求回 token 失效码,第二个成功
-		if atomic.AddInt32(&msgCalls, 1) == 1 {
-			_, _ = w.Write([]byte(`{"code":99991663,"msg":"token expired"}`)) // 按既有常量取真实码
-			return
-		}
-		_, _ = w.Write([]byte(`{"code":0}`))
-	}))
-	defer srv.Close()
-
-	s := newAppSenderForTest(t, srv.URL)
-	if err := s.SendCard(context.Background(), map[string]any{"h": "x"}); err != nil {
-		t.Fatalf("刷新后应成功: %v", err)
+	f := &fakeOpenAPI{messageReplies: []string{
+		`{"code":99991663,"msg":"token expired"}`,
+		`{"code":0,"msg":"ok"}`,
+	}}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+	cs := s.(CardSender)
+	if err := cs.SendCard(ctx, map[string]any{"h": "x"}); err != nil {
+		t.Fatalf("过期重试后应成功: %v", err)
 	}
 	// 两个计数都要断言:只断言 token==2 挡不住"消息被重试很多次"的实现。
-	if tc, mc := atomic.LoadInt32(&tokenCalls), atomic.LoadInt32(&msgCalls); tc != 2 || mc != 2 {
-		t.Fatalf("calls token/message = %d/%d, want 2/2", tc, mc)
+	tokenCalls, msgCalls := f.counts()
+	if tokenCalls != 2 || msgCalls != 2 {
+		t.Fatalf("calls token/message = %d/%d, want 2/2", tokenCalls, msgCalls)
 	}
 }
 ```
 
-`newAppSenderForTest` / token 失效码常量按 `feishu_test.go` 既有用例的写法来——先读文件
-（`99991663` 是占位，用文件里已有的那个常量）。计数用到 `sync/atomic`，记得补 import。
+`fakeOpenAPI` / `appCfg` / `ctx` 都是 `feishu_test.go` 里现成的（`ctx` 是包级变量，
+不要再声明）——先读该文件，尤其是 `TestAppSenderRefreshesExpiredToken`（`feishu_test.go:200`），
+本任务两条 app 用例就是它的卡片版。`reflect` 需要补 import。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -590,16 +581,17 @@ func dumpElements(es []CardElement) string {
 
 ```go
 // padTo 造一批变体:第 i 个的 Reason 带唯一标记 MARK-%03d,填充到 detailRunes 长
-// (< 500 rune,避免撞上截断逻辑,让本测试只考察裁剪)。变体数一路加到
-// "详情总量刚过预算"为止,再多加 extraOver 个,于是**必须**被丢掉的详情数落在
-// [1, extraOver+1] 区间——上界由此可断言,不必在测试里重算实现的预算账。
-// 返回:填好的 out、按顺序排列的标记表、以及允许的最大省略数。
-func padTo(out *DeviceTestOutput, budget int) (*DeviceTestOutput, []string, int) {
-	const detailRunes, extraOver = 400, 2
+// (< 500 rune,避免撞上截断逻辑,让本测试只考察裁剪)。总量顶到预算的数倍,
+// 保证正确实现**必须**丢掉一批详情。
+//
+// 注意:不要在这里预测"该丢几个"——JSON 骨架、主行、hr、header 都算进预算,
+// 测试里重算一遍就是把实现的账抄第二遍,抄错了就会稳定误杀正确实现。
+// 分界由下面从卡片内容**观测**得出,断言只压形状(连续后缀、精确数量、不过度裁剪)。
+func padTo(out *DeviceTestOutput) (*DeviceTestOutput, []string) {
+	const detailRunes, variants = 400, 60
 	var markers []string
 	add := func(variant string) {
-		i := len(markers)
-		m := fmt.Sprintf("MARK-%03d", i)
+		m := fmt.Sprintf("MARK-%03d", len(markers))
 		markers = append(markers, m)
 		out.Tasks = append(out.Tasks, TaskSummary{
 			Variant: variant, Verdict: "TEST_FAILED", Attempt: 1,
@@ -607,20 +599,17 @@ func padTo(out *DeviceTestOutput, budget int) (*DeviceTestOutput, []string, int)
 		})
 	}
 	add("v-first")
-	// 填充变体一律排在 v-first 与 v-last 之间,保证首尾两端的标记有确定序号
-	for est := 0; est < budget; est += detailRunes * 3 { // 3 ≈ UTF-8 每汉字字节数
-		add(fmt.Sprintf("v-fill-%03d", len(markers)))
-	}
-	for i := 0; i < extraOver; i++ {
+	// 填充变体一律排在 v-first 与 v-last 之间,保证首尾两端的标记序号确定
+	for i := 0; i < variants-2; i++ {
 		add(fmt.Sprintf("v-fill-%03d", len(markers)))
 	}
 	add("v-last")
-	return out, markers, extraOver + 1
+	return out, markers
 }
 
 // 裁剪必须保留前面变体的详情、只丢末尾的(设计 §4.5 第 1 步)。
 func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
-	out, markers, maxOmitted := padTo(&DeviceTestOutput{}, 30*1024)
+	out, markers := padTo(&DeviceTestOutput{})
 	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
 	body := allContent(card)
 
@@ -639,9 +628,8 @@ func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
 		t.Fatal("详情被删光了:至少要保住最前面几个变体的详情")
 	}
 	omitted := len(markers) - kept
-	if omitted < 1 || omitted > maxOmitted {
-		t.Fatalf("丢弃 %d 个详情,期望落在 [1,%d]:超出说明裁剪过度或根本没裁",
-			omitted, maxOmitted)
+	if omitted == 0 {
+		t.Fatal("这批输入远超预算,不该一个详情都没丢")
 	}
 
 	// 2) 变体主行一个都不许删——只删可选行
@@ -652,13 +640,19 @@ func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
 	}
 
 	// 3) 标注里的数字必须与实际丢弃数**逐字相符**,写死 999 或差一都要红
-	want := fmt.Sprintf("（%d 个变体的详情已省略）", omitted)
+	want := fmt.Sprintf("（%d 个变体的详情已省略）", omitted) // 全角括号,与实现逐字一致
 	if !strings.Contains(body, want) {
 		t.Errorf("缺少或写错省略标注,期望包含 %q", want)
 	}
 
-	if n := len(mustMarshal(t, card)); n > 30*1024 {
+	// 4) 不许过度裁剪。单个详情约占预算 4%,逐个丢到不超预算为止会停在 90% 以上;
+	//    "一超预算就把所有可选行删光"这类实现会掉到 10% 上下,被这条挡住。
+	n := len(mustMarshal(t, card))
+	if n > 30*1024 {
 		t.Errorf("裁剪后仍超预算: %d", n)
+	}
+	if n < 30*1024*3/4 {
+		t.Errorf("只剩 %d 字节(预算 %d):裁剪过度,应逐个丢到刚好装下为止", n, 30*1024)
 	}
 }
 ```
@@ -737,32 +731,67 @@ git commit -m "feat(workflow): build the notification card as a closed DTO"
 
 - [ ] **Step 1: 写失败的测试**
 
-fake 要能分别计数 `SendText` 与 `SendCard`。准备两个 fake：一个只实现 `SendText`
-（模拟旧 fake），一个实现 `CardSender`。
+`notify_test.go:13` 已有的 `fakeSender`（只实现 `SendText`，字段 `texts` / `err`）
+正好就是"旧实现"那一档，直接复用，不要另造同义 fake。卡片档新造一个嵌它的
+`cardFake`。`ctx` 是 `specs_test.go:13` 的包级变量，也不要重复声明。新文件自己的 import
+需要 `context` / `encoding/json` / `errors` / `strings` / `testing` 加 `feishu` 与 `wf` 两个内部包。
 
 ```go
+type cardFake struct {
+	fakeSender // 提供 SendText / texts / err
+	cards      []any
+	failCard   bool
+}
+
+func (f *cardFake) SendCard(ctx context.Context, card any) error {
+	f.cards = append(f.cards, card)
+	if f.failCard {
+		return errors.New("card rejected")
+	}
+	return nil
+}
+
 func TestNotifyCardOrder(t *testing.T) {
 	big := cardOfExactSize(t, 40*1024)
 	small := cardOfExactSize(t, 512)
 	cases := []struct {
-		name       string
-		sender     feishu.Sender
-		card       wf.NotificationCard
-		cardFails  bool
-		wantCards  int
-		wantTexts  int
+		name      string
+		sender    feishu.Sender // nil 表示未配置飞书
+		card      wf.NotificationCard
+		wantCards int
+		wantTexts int
 	}{
-		{"nil sender 静默", nil, small, false, 0, 0},
-		{"非 CardSender → 只发文本", &textOnlyFake{}, small, false, 0, 1},
-		{"超预算 → 只发文本,SendCard 零调用", &cardFake{}, big, false, 0, 1},
-		{"正常 → 只发卡片", &cardFake{}, small, false, 1, 0},
-		{"卡片失败 → 降级发文本", &cardFake{}, small, true, 1, 1},
+		{"nil sender 静默", nil, small, 0, 0},
+		{"非 CardSender → 只发文本", &fakeSender{}, small, 0, 1},
+		{"超预算 → 只发文本,SendCard 零调用", &cardFake{}, big, 0, 1},
+		{"正常 → 只发卡片", &cardFake{}, small, 1, 0},
+		{"卡片失败 → 降级发文本", &cardFake{failCard: true}, small, 1, 1},
 		// 边界必须精确锁定,否则把 > 写成 >= 不会被发现:
-		{"恰好 30*1024 → 发卡片", &cardFake{}, cardOfExactSize(t, 30*1024), false, 1, 0},
-		{"30*1024+1 → 零调用,降级", &cardFake{}, cardOfExactSize(t, 30*1024+1), false, 0, 1},
+		{"恰好 30*1024 → 发卡片", &cardFake{}, cardOfExactSize(t, 30*1024), 1, 0},
+		{"30*1024+1 → 零调用,降级", &cardFake{}, cardOfExactSize(t, 30*1024+1), 0, 1},
 	}
-	// 断言 wantCards / wantTexts 的**精确调用次数**;
-	// "超预算"那条的 wantCards=0 是设计 §5.2 第 3 步的机械判据。
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Acts{Feishu: tc.sender}
+			if err := a.NotifyCard(ctx, wf.NotifyCardRequest{
+				Card: tc.card, FallbackText: "fb"}); err != nil {
+				t.Fatalf("这些用例都应成功: %v", err)
+			}
+			var cards, texts int
+			switch f := tc.sender.(type) {
+			case *cardFake:
+				cards, texts = len(f.cards), len(f.texts)
+			case *fakeSender:
+				texts = len(f.texts)
+			}
+			// 断言**精确调用次数**;"超预算"那条的 wantCards=0
+			// 是设计 §5.2 第 3 步的机械判据(不是"试了卡片失败再降级")。
+			if cards != tc.wantCards || texts != tc.wantTexts {
+				t.Errorf("calls card/text = %d/%d, want %d/%d",
+					cards, texts, tc.wantCards, tc.wantTexts)
+			}
+		})
+	}
 }
 
 // 边界用例靠 cardOfExactSize——只有"正常小卡"和">30KB 大卡"两档时,把 `>` 写成 `>=`
@@ -804,6 +833,34 @@ func cardOfExactSize(t *testing.T, n int) wf.NotificationCard {
 	}
 	return c
 }
+
+// 降级发送本身失败时,错误必须保留 cause(便于排查是 token 还是网络)。
+func TestNotifyCardFallbackFailureWrapsCause(t *testing.T) {
+	sentinel := errors.New("boom")
+	f := &cardFake{fakeSender: fakeSender{err: sentinel}, failCard: true}
+	a := &Acts{Feishu: f}
+	err := a.NotifyCard(ctx, wf.NotifyCardRequest{FallbackText: "x"})
+	if err == nil {
+		t.Fatal("降级也失败时必须返回错误")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("错误应保留 cause, got %v", err)
+	}
+}
+
+// 降级文本必须原样来自载荷,activity 不得自己拼。
+func TestNotifyCardFallbackTextIsVerbatim(t *testing.T) {
+	f := &cardFake{failCard: true}
+	a := &Acts{Feishu: f}
+	const want = "任意文本 —— activity 不该改动它"
+	if err := a.NotifyCard(ctx, wf.NotifyCardRequest{FallbackText: want}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.texts) != 1 || f.texts[0] != want {
+		t.Errorf("降级文本 = %v, want 原样 %q", f.texts, want)
+	}
+}
+```
 
 - [ ] **Step 2: 跑测试确认失败**
 
