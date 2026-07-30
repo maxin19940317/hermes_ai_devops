@@ -104,6 +104,11 @@ commit/pipeline/variant 时必须能分别登记、查询和递增 attempt。
 旧唯一键曾经静默吞掉的跨项目产物无法由迁移恢复。它们继续视为历史缺失，rerun
 fail closed；需要时由原 webhook/kick 重新登记。
 
+新接收的 project 必须是最长 256 字符、无空白的 GitLab namespace path：
+`segment[/segment...]`，segment 只含 ASCII 字母、数字、下划线、点和连字符，且不接受
+`..`。加上现有 128 字符 variant 上限后，生成的 scoped retry workflow ID 仍小于命令参数
+的 512 字符上限。存量不符合该语法的 legacy workflow 继续只读。
+
 ## 3. Workflow 写入边界
 
 ### 3.1 输入契约
@@ -204,6 +209,9 @@ rerun 的失败集合来源。
 rerun <source_workflow_id> [variant]
 ```
 
+workflow ID 和 variant 都是无空白参数，单项最长 512 字符；真实 workflow ID 中的项目路径
+包含 `/`，命令契约必须允许该字符。
+
 旧的 `rerun <sha> <pipeline_iid> [variant]` 必须返回明确迁移提示：
 
 ```text
@@ -300,7 +308,9 @@ Authoritative bool
 
 NL snapshot 的 recent run 增加 `workflow_id` 与 `authoritative`。只有 authoritative 行可以被
 模型渲染为 rerun；Runtime 执行时仍重新 GetWorkflowRun 和检查 Temporal 终态，不能信任快照。
-prompt、command schema、示例和参数校验同步改成新语法。
+prompt、command schema、示例和参数校验同步改成新语法。该变化与旧 rerun 参数语义不兼容，
+因此当前 translation contract 与 prompt 一并升到 v2；保留 `cmd_translate_v1.md` 不改，
+确保历史 `prompt_version=cmd_translate_v1` 仍可解释。
 
 ## 7. 数据库迁移与部署
 
