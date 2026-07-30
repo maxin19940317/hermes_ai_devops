@@ -830,64 +830,111 @@ var allowedCardKeys = map[string]bool{
 	"template": true, "elements": true, "tag": true, "text": true, "content": true,
 }
 
-// walkCard 递归检查 key / tag / text 类型;返回全部违规项。
-// textCtx 区分当前 map 是"文本节点"(tag 恒为 plain_text)还是"元素节点"
-// (tag 只能是 div/hr):由父层的 key 决定——"text"/"title" 之下强制进入文本
-// 语境,"elements" 数组里的每一项都是元素语境。
+// walkCard 按 NotificationCard/CardConfig/CardHeader/CardElement/CardText
+// 五种 DTO 节点逐层校验允许键、必需键、值类型与 div/hr 的 Text 配对。
+// 只做全局九键白名单不够:它会放过合法 key 出现在错误节点、标量 text,
+// 以及缺 tag/content 的 CardText。
 func walkCard(t *testing.T, v any) []string {
 	t.Helper()
 	var bad []string
-	var walk func(node any, path string, textCtx bool)
-	walk = func(node any, path string, textCtx bool) {
-		switch n := node.(type) {
-		case map[string]any:
-			if !textCtx {
-				switch tag, _ := n["tag"].(string); tag {
-				case "div":
-					if text, ok := n["text"]; !ok || text == nil {
-						bad = append(bad, fmt.Sprintf("%s: div 的 text 必须非 nil", path))
-					}
-				case "hr":
-					if text, ok := n["text"]; ok && text != nil {
-						bad = append(bad, fmt.Sprintf("%s: hr 的 text 必须为 nil", path))
-					}
-				}
-			}
-			for k, val := range n {
-				childPath := path + "." + k
-				if !allowedCardKeys[k] {
-					bad = append(bad, fmt.Sprintf("%s: 集合外 key %q", childPath, k))
-					continue
-				}
-				switch k {
-				case "tag":
-					s, _ := val.(string)
-					if textCtx {
-						if s != "plain_text" {
-							bad = append(bad, fmt.Sprintf("%s: text tag=%q,want plain_text", childPath, s))
-						}
-					} else if s != "div" && s != "hr" {
-						bad = append(bad, fmt.Sprintf("%s: element tag=%q,want div|hr", childPath, s))
-					}
-				case "template":
-					s, _ := val.(string)
-					if s != "green" && s != "red" && s != "orange" {
-						bad = append(bad, fmt.Sprintf("%s: template=%q,want green|red|orange", childPath, s))
-					}
-				case "text", "title":
-					walk(val, childPath, true)
-				default:
-					walk(val, childPath, textCtx)
-				}
-			}
-		case []any:
-			for i, item := range n {
-				// elements 数组里的每一项都是元素节点,不是文本节点。
-				walk(item, fmt.Sprintf("%s[%d]", path, i), false)
+
+	checkObject := func(node any, path, kind string, allowed map[string]bool, required ...string) (map[string]any, bool) {
+		obj, ok := node.(map[string]any)
+		if !ok {
+			bad = append(bad, fmt.Sprintf("%s: %s 必须是 object, got %T", path, kind, node))
+			return nil, false
+		}
+		for _, key := range required {
+			if _, ok := obj[key]; !ok {
+				bad = append(bad, fmt.Sprintf("%s: %s 缺必需 key %q", path, kind, key))
 			}
 		}
+		for key := range obj {
+			switch {
+			case !allowedCardKeys[key]:
+				bad = append(bad, fmt.Sprintf("%s.%s: 集合外 key %q", path, key, key))
+			case !allowed[key]:
+				bad = append(bad, fmt.Sprintf("%s.%s: key %q 不属于 %s", path, key, key, kind))
+			}
+		}
+		return obj, true
 	}
-	walk(v, "$", false)
+
+	textKeys := map[string]bool{"tag": true, "content": true}
+	validateText := func(node any, path string) {
+		text, ok := checkObject(node, path, "CardText", textKeys, "tag", "content")
+		if !ok {
+			return
+		}
+		tag, ok := text["tag"].(string)
+		if !ok {
+			bad = append(bad, fmt.Sprintf("%s.tag: 必须是 string, got %T", path, text["tag"]))
+		} else if tag != "plain_text" {
+			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want plain_text", path, tag))
+		}
+		if _, ok := text["content"].(string); !ok {
+			bad = append(bad, fmt.Sprintf("%s.content: 必须是 string, got %T", path, text["content"]))
+		}
+	}
+
+	rootKeys := map[string]bool{"config": true, "header": true, "elements": true}
+	root, ok := checkObject(v, "$", "NotificationCard", rootKeys, "config", "header", "elements")
+	if !ok {
+		return bad
+	}
+
+	configKeys := map[string]bool{"wide_screen_mode": true}
+	if config, ok := checkObject(root["config"], "$.config", "CardConfig", configKeys, "wide_screen_mode"); ok {
+		if _, ok := config["wide_screen_mode"].(bool); !ok {
+			bad = append(bad, fmt.Sprintf("$.config.wide_screen_mode: 必须是 bool, got %T",
+				config["wide_screen_mode"]))
+		}
+	}
+
+	headerKeys := map[string]bool{"title": true, "template": true}
+	if header, ok := checkObject(root["header"], "$.header", "CardHeader", headerKeys, "title", "template"); ok {
+		validateText(header["title"], "$.header.title")
+		template, stringOK := header["template"].(string)
+		if !stringOK {
+			bad = append(bad, fmt.Sprintf("$.header.template: 必须是 string, got %T", header["template"]))
+		} else if template != "green" && template != "red" && template != "orange" {
+			bad = append(bad, fmt.Sprintf("$.header.template: got %q,want green|red|orange", template))
+		}
+	}
+
+	elements, ok := root["elements"].([]any)
+	if !ok {
+		bad = append(bad, fmt.Sprintf("$.elements: 必须是 array, got %T", root["elements"]))
+		return bad
+	}
+	elementKeys := map[string]bool{"tag": true, "text": true}
+	for i, node := range elements {
+		path := fmt.Sprintf("$.elements[%d]", i)
+		element, ok := checkObject(node, path, "CardElement", elementKeys, "tag")
+		if !ok {
+			continue
+		}
+		tag, stringOK := element["tag"].(string)
+		if !stringOK {
+			bad = append(bad, fmt.Sprintf("%s.tag: 必须是 string, got %T", path, element["tag"]))
+			continue
+		}
+		switch tag {
+		case "div":
+			text, exists := element["text"]
+			if !exists || text == nil {
+				bad = append(bad, fmt.Sprintf("%s: div 的 text 必须非 nil", path))
+				continue
+			}
+			validateText(text, path+".text")
+		case "hr":
+			if text, exists := element["text"]; exists && text != nil {
+				bad = append(bad, fmt.Sprintf("%s: hr 的 text 必须为 nil", path))
+			}
+		default:
+			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want div|hr", path, tag))
+		}
+	}
 	return bad
 }
 
@@ -926,11 +973,15 @@ func TestCardIsClosedStructure(t *testing.T) {
 // 反例:证明上面的遍历不是空转。
 func TestCardClosedStructureCatchesViolations(t *testing.T) {
 	cases := []struct{ name, payload string }{
-		{"带 actions", `{"header":{"title":{"tag":"plain_text","content":"x"}},"actions":[]}`},
-		{"带 behaviors", `{"elements":[{"tag":"div","behaviors":[{"type":"open_url"}]}]}`},
-		{"lark_md 文本", `{"elements":[{"tag":"div","text":{"tag":"lark_md","content":"x"}}]}`},
-		{"div 缺 text", `{"elements":[{"tag":"div"}]}`},
-		{"hr 带 text", `{"elements":[{"tag":"hr","text":{"tag":"plain_text","content":"x"}}]}`},
+		{"带 actions", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"}}],"actions":[]}`},
+		{"带 behaviors", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"behaviors":[]}]}`},
+		{"lark_md 文本", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"lark_md","content":"x"}}]}`},
+		{"div 缺 text", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div"}]}`},
+		{"hr 带 text", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"hr","text":{"tag":"plain_text","content":"x"}}]}`},
+		{"text 是标量", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":"x"}]}`},
+		{"text 缺 tag", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"content":"x"}}]}`},
+		{"text 缺 content", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text"}}]}`},
+		{"合法 key 放错节点", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"template":"red"}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

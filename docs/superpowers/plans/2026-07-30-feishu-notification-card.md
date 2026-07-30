@@ -431,7 +431,7 @@ func TestBuildNotificationCardEmptyTasks(t *testing.T) {
 
 文案必须与 `buildNotification` 里那句**逐字相同**（设计 §4.3 对照表最后一行）。
 
-**封闭结构**（设计 §4.4；含五份反例证明断言不空转）：
+**封闭结构**（设计 §4.4；含九份反例证明断言不空转）：
 
 ```go
 var allowedCardKeys = map[string]bool{
@@ -439,9 +439,11 @@ var allowedCardKeys = map[string]bool{
 	"template": true, "elements": true, "tag": true, "text": true, "content": true,
 }
 
-// walkCard 递归检查 key / tag / text 类型,并锁住 div=>Text 非 nil、
-// hr=>Text nil;返回全部违规项。
-func walkCard(t *testing.T, v any) []string { /* 递归 map/slice,收集违规 */ }
+// walkCard 按 NotificationCard/CardConfig/CardHeader/CardElement/CardText
+// 五种 DTO 节点逐层检查局部允许键、必需键、JSON 值类型,并锁住
+// div=>Text 非 nil、hr=>Text nil。只做全局九键白名单会放过合法 key
+// 出现在错误节点、标量 text,以及缺 tag/content 的 CardText。
+func walkCard(t *testing.T, v any) []string { /* 按 node kind 校验并收集违规 */ }
 
 func TestCardIsClosedStructure(t *testing.T) {
 	card := buildNotificationCard(sampleInput(), sampleOutput())
@@ -461,11 +463,15 @@ func TestCardIsClosedStructure(t *testing.T) {
 // 反例:证明上面的遍历不是空转。
 func TestCardClosedStructureCatchesViolations(t *testing.T) {
 	cases := []struct{ name string; payload string }{
-		{"带 actions", `{"header":{"title":{"tag":"plain_text","content":"x"}},"actions":[]}`},
-		{"带 behaviors", `{"elements":[{"tag":"div","behaviors":[{"type":"open_url"}]}]}`},
-		{"lark_md 文本", `{"elements":[{"tag":"div","text":{"tag":"lark_md","content":"x"}}]}`},
-		{"div 缺 text", `{"elements":[{"tag":"div"}]}`},
-		{"hr 带 text", `{"elements":[{"tag":"hr","text":{"tag":"plain_text","content":"x"}}]}`},
+		{"带 actions", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"}}],"actions":[]}`},
+		{"带 behaviors", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"behaviors":[]}]}`},
+		{"lark_md 文本", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"lark_md","content":"x"}}]}`},
+		{"div 缺 text", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div"}]}`},
+		{"hr 带 text", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"hr","text":{"tag":"plain_text","content":"x"}}]}`},
+		{"text 是标量", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":"x"}]}`},
+		{"text 缺 tag", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"content":"x"}}]}`},
+		{"text 缺 content", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text"}}]}`},
+		{"合法 key 放错节点", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"template":"red"}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -715,7 +721,7 @@ Expected: 编译失败 —— `buildNotificationCard` / `NotificationCard` 未�
 - [ ] **Step 5: 跑测试**
 
 Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/workflow/ -v -run 'NotificationCard|CardIsClosed|CardClosedStructure' 2>&1 | tail -30`
-Expected: 全部 PASS，含五份反例
+Expected: 全部 PASS，含九份反例
 
 - [ ] **Step 6: 验证中文截断用例真的会红**
 
