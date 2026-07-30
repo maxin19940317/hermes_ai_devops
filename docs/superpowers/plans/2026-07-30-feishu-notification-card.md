@@ -286,14 +286,35 @@ func TestAppSendCardWireShape(t *testing.T) {
 
 // token 过期 → 强制刷新**并且只重试一次**(与 SendText 同款)。
 func TestAppSendCardRefreshesExpiredToken(t *testing.T) {
-	var tokenCalls, msgCalls int
-	// 首个 messages 请求返回 token 失效码,第二个成功。
-	// 两个计数都要断言:只断言 token=2 挡不住"消息被重试很多次"的实现。
-	// 期望 tokenCalls == 2(首次 + 强制刷新)、msgCalls == 2(首次失败 + 重试一次)。
+	var tokenCalls, msgCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "tenant_access_token") {
+			atomic.AddInt32(&tokenCalls, 1)
+			_, _ = w.Write([]byte(`{"code":0,"tenant_access_token":"t","expire":7200}`))
+			return
+		}
+		// 首个 messages 请求回 token 失效码,第二个成功
+		if atomic.AddInt32(&msgCalls, 1) == 1 {
+			_, _ = w.Write([]byte(`{"code":99991663,"msg":"token expired"}`)) // 按既有常量取真实码
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	defer srv.Close()
+
+	s := newAppSenderForTest(t, srv.URL)
+	if err := s.SendCard(context.Background(), map[string]any{"h": "x"}); err != nil {
+		t.Fatalf("刷新后应成功: %v", err)
+	}
+	// 两个计数都要断言:只断言 token==2 挡不住"消息被重试很多次"的实现。
+	if tc, mc := atomic.LoadInt32(&tokenCalls), atomic.LoadInt32(&msgCalls); tc != 2 || mc != 2 {
+		t.Fatalf("calls token/message = %d/%d, want 2/2", tc, mc)
+	}
 }
 ```
 
-`newAppSenderForTest` / token 失效码常量按 `feishu_test.go` 既有用例的写法来——先读文件。
+`newAppSenderForTest` / token 失效码常量按 `feishu_test.go` 既有用例的写法来——先读文件
+（`99991663` 是占位，用文件里已有的那个常量）。计数用到 `sync/atomic`，记得补 import。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -568,43 +589,84 @@ func dumpElements(es []CardElement) string {
   的变体构造临界输入：
 
 ```go
+// padTo 造一批变体:第 i 个的 Reason 带唯一标记 MARK-%03d,填充到 detailRunes 长
+// (< 500 rune,避免撞上截断逻辑,让本测试只考察裁剪)。变体数一路加到
+// "详情总量刚过预算"为止,再多加 extraOver 个,于是**必须**被丢掉的详情数落在
+// [1, extraOver+1] 区间——上界由此可断言,不必在测试里重算实现的预算账。
+// 返回:填好的 out、按顺序排列的标记表、以及允许的最大省略数。
+func padTo(out *DeviceTestOutput, budget int) (*DeviceTestOutput, []string, int) {
+	const detailRunes, extraOver = 400, 2
+	var markers []string
+	add := func(variant string) {
+		i := len(markers)
+		m := fmt.Sprintf("MARK-%03d", i)
+		markers = append(markers, m)
+		out.Tasks = append(out.Tasks, TaskSummary{
+			Variant: variant, Verdict: "TEST_FAILED", Attempt: 1,
+			Reason: m + strings.Repeat("甲", detailRunes-len([]rune(m))),
+		})
+	}
+	add("v-first")
+	// 填充变体一律排在 v-first 与 v-last 之间,保证首尾两端的标记有确定序号
+	for est := 0; est < budget; est += detailRunes * 3 { // 3 ≈ UTF-8 每汉字字节数
+		add(fmt.Sprintf("v-fill-%03d", len(markers)))
+	}
+	for i := 0; i < extraOver; i++ {
+		add(fmt.Sprintf("v-fill-%03d", len(markers)))
+	}
+	add("v-last")
+	return out, markers, extraOver + 1
+}
+
 // 裁剪必须保留前面变体的详情、只丢末尾的(设计 §4.5 第 1 步)。
 func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
-	// 两个变体,reason 各带唯一标记,长度调到"两个都留会超预算、只留第一个不超"
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v-first", Verdict: "TEST_FAILED", Attempt: 1,
-			Reason: "FIRST-MARKER" + strings.Repeat("甲", 400)},
-		{Variant: "v-last", Verdict: "TEST_FAILED", Attempt: 1,
-			Reason: "LAST-MARKER" + strings.Repeat("乙", 400)},
-	}}
-	// 用足够多的变体把总量顶过预算(见下方 padTo 辅助),但两个带标记的排在最前与最后
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, padTo(out, 30*1024))
+	out, markers, maxOmitted := padTo(&DeviceTestOutput{}, 30*1024)
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
 	body := allContent(card)
 
-	if !strings.Contains(body, "FIRST-MARKER") {
-		t.Error("裁剪从头删了:前面变体的详情必须保留")
+	// 1) 保留的标记必须是**完整前缀**、丢弃的必须是**完整后缀**。
+	//    只搜"第一个在、最后一个不在"挡不住"中间也删了几个"。
+	kept := 0
+	for kept < len(markers) && strings.Contains(body, markers[kept]) {
+		kept++
 	}
-	if strings.Contains(body, "LAST-MARKER") {
-		t.Error("末尾变体的详情应被丢弃")
-	}
-	// 变体本身(主行)不许被删——只删可选行
-	for _, v := range []string{"v-first", "v-last"} {
-		if !strings.Contains(body, v) {
-			t.Errorf("变体 %s 的主行被删了,只应删可选行", v)
+	for i := kept; i < len(markers); i++ {
+		if strings.Contains(body, markers[i]) {
+			t.Fatalf("标记 %s 在断点 %d 之后仍存在:丢弃的不是连续后缀", markers[i], kept)
 		}
 	}
-	// 省略数量必须与实际丢弃的变体数一致,不能写死
-	if !strings.Contains(body, "个变体的详情已省略") {
-		t.Error("缺省略标注")
+	if kept == 0 {
+		t.Fatal("详情被删光了:至少要保住最前面几个变体的详情")
 	}
+	omitted := len(markers) - kept
+	if omitted < 1 || omitted > maxOmitted {
+		t.Fatalf("丢弃 %d 个详情,期望落在 [1,%d]:超出说明裁剪过度或根本没裁",
+			omitted, maxOmitted)
+	}
+
+	// 2) 变体主行一个都不许删——只删可选行
+	for i := range out.Tasks {
+		if !strings.Contains(body, out.Tasks[i].Variant) {
+			t.Errorf("变体 %s 的主行被删了,只应删可选行", out.Tasks[i].Variant)
+		}
+	}
+
+	// 3) 标注里的数字必须与实际丢弃数**逐字相符**,写死 999 或差一都要红
+	want := fmt.Sprintf("（%d 个变体的详情已省略）", omitted)
+	if !strings.Contains(body, want) {
+		t.Errorf("缺少或写错省略标注,期望包含 %q", want)
+	}
+
 	if n := len(mustMarshal(t, card)); n > 30*1024 {
 		t.Errorf("裁剪后仍超预算: %d", n)
 	}
 }
 ```
 
-  `padTo` / `allContent` / `mustMarshal` 是本测试文件里的小辅助，由你实现；
-  关键是**标记必须唯一且可搜索**，这样"删错了哪一端"能被区分出来。
+  `allContent`(把所有 `CardElement.Text.Content` 拼成一个串)与 `mustMarshal`
+  是本测试文件(workflow 包)里的小辅助，由你实现。省略标注的**确切措辞**
+  `（%d 个变体的详情已省略）` 是契约的一部分：实现里的格式串必须与此逐字一致
+  （全角括号），改措辞就得同步改这里。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -627,7 +689,10 @@ Expected: 编译失败 —— `buildNotificationCard` / `NotificationCard` 未�
   这一点必须与黄金测试的 `want` 完全一致——把四行塞进一个 `div` 会让黄金比对红
 - `Reason` / `Summary` 各自 `truncateRunes(s, 500)`
 - 全部文本节点 `Tag: "plain_text"`
-- 末尾按 §4.5 的两步裁剪：超预算 → 从末尾变体丢可选行 → 加标注 → **重新 Marshal 测量**
+- 末尾按 §4.5 的两步裁剪：超预算 → 从末尾变体丢可选行 → 加标注 → **重新 Marshal 测量**。
+  标注是独立的一个 `div`，内容格式串**逐字**为 `fmt.Sprintf("（%d 个变体的详情已省略）", n)`
+  （全角括号，`n` = 实际被丢掉可选行的变体数）——测试按这个串精确匹配，改措辞两边同步改。
+  丢弃顺序严格从**最后一个变体**往前，主行(`Variant`/`Verdict`)任何情况下都不删。
 
 `truncateRunes` 用 `[]rune` 切片，不要用 `s[:n]`。
 
@@ -677,8 +742,8 @@ fake 要能分别计数 `SendText` 与 `SendCard`。准备两个 fake：一个�
 
 ```go
 func TestNotifyCardOrder(t *testing.T) {
-	big := wf.NotificationCard{ /* 构造一个序列化后 > 30KB 的卡片 */ }
-	small := wf.NotificationCard{ /* 正常大小 */ }
+	big := cardOfExactSize(t, 40*1024)
+	small := cardOfExactSize(t, 512)
 	cases := []struct {
 		name       string
 		sender     feishu.Sender
@@ -700,56 +765,45 @@ func TestNotifyCardOrder(t *testing.T) {
 	// "超预算"那条的 wantCards=0 是设计 §5.2 第 3 步的机械判据。
 }
 
-// cardOfExactSize 造一个 json.Marshal 后**恰好** n 字节的卡片:
-// 先建骨架,再逐字符调整某个 Content 的填充长度直到命中 n。
-// 边界用例靠它——只有"正常小卡"和">30KB 大卡"两档时,把 `>` 写成 `>=`
+// 边界用例靠 cardOfExactSize——只有"正常小卡"和">30KB 大卡"两档时,把 `>` 写成 `>=`
 // (或反之)不会有任何测试变红。
+//
+// marshalCard 是**本文件(activity 包)内**的辅助。
+// 不要复用 workflow 测试里的同名 helper——那在另一个包,不可见,会编译失败。
+func marshalCard(t *testing.T, c wf.NotificationCard) []byte {
+	t.Helper()
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal card: %v", err)
+	}
+	return raw
+}
+
+// cardOfExactSize 造一个 json.Marshal 后**恰好** n 字节的卡片。
+// 常数次 Marshal:填充是纯 ASCII 且无需转义,所以每多 1 个字符长度就 +1,
+// 先量出骨架长度再一次性补足即可(不要对 n 做线性搜索,那是三万次 Marshal)。
 func cardOfExactSize(t *testing.T, n int) wf.NotificationCard {
 	t.Helper()
 	mk := func(pad int) wf.NotificationCard {
 		return wf.NotificationCard{
-			Header: wf.CardHeader{Title: wf.CardText{Tag: "plain_text", Content: "x"}, Template: "green"},
+			Header: wf.CardHeader{
+				Title:    wf.CardText{Tag: "plain_text", Content: "x"},
+				Template: "green",
+			},
 			Elements: []wf.CardElement{{Tag: "div", Text: &wf.CardText{
 				Tag: "plain_text", Content: strings.Repeat("a", pad)}}},
 		}
 	}
-	// 单调:pad 每 +1,序列化长度也 +1(全 ASCII 且无需转义),二分/线性都能命中。
-	for pad := 0; pad <= n; pad++ {
-		if len(mustMarshal(t, mk(pad))) == n {
-			return mk(pad)
-		}
+	base := len(marshalCard(t, mk(0)))
+	if n < base {
+		t.Fatalf("目标 %d 字节小于骨架 %d 字节", n, base)
 	}
-	t.Fatalf("造不出恰好 %d 字节的卡片", n)
-	return wf.NotificationCard{}
+	c := mk(n - base)
+	if got := len(marshalCard(t, c)); got != n {
+		t.Fatalf("造出 %d 字节,想要 %d(填充与长度不是 1:1?)", got, n)
+	}
+	return c
 }
-
-// 降级发送本身失败时,错误必须保留 cause(便于排查是 token 还是网络)。
-func TestNotifyCardFallbackFailureWrapsCause(t *testing.T) {
-	sentinel := errors.New("boom")
-	f := &cardFake{failCard: true, failText: sentinel}
-	a := &Acts{Feishu: f}
-	err := a.NotifyCard(ctx, wf.NotifyCardRequest{FallbackText: "x"})
-	if err == nil {
-		t.Fatal("降级也失败时必须返回错误")
-	}
-	if !errors.Is(err, sentinel) {
-		t.Errorf("错误应保留 cause, got %v", err)
-	}
-}
-
-// 降级文本必须原样来自载荷,activity 不得自己拼。
-func TestNotifyCardFallbackTextIsVerbatim(t *testing.T) {
-	f := &cardFake{failCard: true}
-	a := &Acts{Feishu: f}
-	const want = "任意文本 —— activity 不该改动它"
-	if err := a.NotifyCard(ctx, wf.NotifyCardRequest{FallbackText: want}); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.texts) != 1 || f.texts[0] != want {
-		t.Errorf("降级文本 = %v, want 原样 %q", f.texts, want)
-	}
-}
-```
 
 - [ ] **Step 2: 跑测试确认失败**
 
