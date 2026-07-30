@@ -412,9 +412,11 @@ Version/RuleVersion/Project 与 packages；不能因为翻译层见过该 ID 就
 
 按仓库现有 `examples/{valid,invalid}` 惯例，为 `command.schema.json` 建正反例：
 
-- valid：四个指令各一例、`none` 一例、`args` 为空数组、`confidence` 边界 0 与 1
-- invalid：未知 `command`、`args` 含空格（**关键用例**）、`args` 含换行、`args` 超 3 项、
-  `args` item 超 64 字符、`confidence` 越界、多余字段、缺 `translation_version`
+- valid：`translation_version=2`；四个指令与 `none` 各一例；`rerun` 分别带 1 项
+  source workflow ID、2 项 source workflow ID + variant；`confidence` 边界 0 与 1
+- invalid：`translation_version=1`、未知 `command`、`rerun` 为 0 项或超过 2 项、
+  任一 arg 含 Unicode 空白（空格、换行、NBSP、全角空格等，**关键用例**）、任一 arg
+  超过 512 字符、`confidence` 越界、多余字段、缺 `translation_version`
 
 ### 8.2 `feishucmd` 单测（fake Translator，不打网络）
 
@@ -428,8 +430,10 @@ Version/RuleVersion/Project 与 packages；不能因为翻译层见过该 ID 就
 - TTL 过期后 `y` 不执行
 - 新翻译覆盖旧待确认（旧的落 `expired`）
 - 待确认态检查先于 `Parse`：用户打 `y` 时不落到 usage
-- 逐条错误路径：schema 不过 / `none` / 回灌失败 / sha 非法 / iid 非法 / 变体不存在 /
-  设备不存在 / 低置信度 —— 各断言回复文本与 `outcome` 落库值
+- 权威成员校验：source workflow ID 必须来自快照中的 `authoritative=true` 行；可选
+  variant 必须属于同一个 source workflow，不能借用另一 source 的同名或异名 variant
+- 逐条错误路径：schema 不过 / `none` / 回灌失败 / 伪造或 non-authoritative workflow /
+  跨 source variant / 设备不存在 / 低置信度 —— 各断言回复文本与 `outcome` 落库值
 - 非白名单发自然语言：Translator **零调用**（断言 fake 计数为 0）
 - 翻译层禁用时 `help` 分支行为与今天逐字节一致
 

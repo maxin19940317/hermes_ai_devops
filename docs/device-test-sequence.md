@@ -290,9 +290,9 @@ sequenceDiagram
 `DeviceTestOutput` 仍从 Temporal 按精确 workflow ID 读取。`RecentRuns` 优先展示这些
 权威行，缺少 run 记录的 legacy 行只用于显示。
 
-显式重跑语法是 `rerun <source_workflow_id> [variant]`。无 variant 时只重跑源输出中
-未通过的变体；指定 variant 时只要求属于源 run（允许 PASSED/SKIPPED）。每条文本命令都会原子分配
-新的 attempt 和 workflow ID，所以重复发送命令会启动不同 attempt；Temporal
+显式重跑语法是 `rerun <source_workflow_id> [variant]`。无 variant 时只重跑源输出中满足
+`verdict != PASSED && verdict != SKIPPED` 的变体；显式 variant 只要属于源 run 就仍可重跑，包括 PASSED 或 SKIPPED。
+每条文本命令都会原子分配新的 attempt 和 workflow ID，所以重复发送命令会启动不同 attempt；Temporal
 `RejectDuplicate` 不提供命令级幂等。下一轮交互按钮必须另用持久化 claim 固定其 attempt
 和目标 workflow ID。
 

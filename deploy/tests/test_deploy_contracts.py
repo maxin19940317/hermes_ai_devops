@@ -384,6 +384,32 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
                     legacy_syntax,
                 )
 
+    def test_rerun_variant_selection_predicate_is_explicit(self):
+        deploy_readme = " ".join(
+            DEPLOY_README.read_text(encoding="utf-8").split()
+        )
+        sequence = " ".join((
+            ROOT / "docs" / "device-test-sequence.md"
+        ).read_text(encoding="utf-8").split())
+
+        self.assertIn(
+            "verdict != PASSED && verdict != SKIPPED",
+            deploy_readme,
+        )
+        self.assertIn(
+            "explicit variant remains allowed when it belongs to the source run, "
+            "including PASSED or SKIPPED",
+            deploy_readme,
+        )
+        self.assertIn(
+            "verdict != PASSED && verdict != SKIPPED",
+            sequence,
+        )
+        self.assertIn(
+            "显式 variant 只要属于源 run 就仍可重跑，包括 PASSED 或 SKIPPED",
+            sequence,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

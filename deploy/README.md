@@ -56,9 +56,11 @@ open_ids) is set, whitelisted users can send the bot DM commands (`status`,
 messages from anyone else are silently ignored.
 
 `rerun` accepts only an authoritative, closed source recorded in `workflow_runs`.
-Without a variant it retries the source output's failed variants; legacy rows returned
-by `RecentRuns` are display-only and cannot be rerun. Each direct text command allocates
-a fresh attempt and workflow ID. Temporal duplicate rejection is therefore not an
+Without a variant it retries only source-output entries satisfying
+`verdict != PASSED && verdict != SKIPPED`; an explicit variant remains allowed when it
+belongs to the source run, including PASSED or SKIPPED. Legacy rows returned by
+`RecentRuns` are display-only and cannot be rerun. Each direct text command allocates a
+fresh attempt and workflow ID. Temporal duplicate rejection is therefore not an
 idempotency mechanism for repeated commands; persistent action claims belong to the
 subsequent interactive-button round.
 
