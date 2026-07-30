@@ -333,7 +333,7 @@ missing parent must satisfy `errors.Is(err, ErrWorkflowRunPermanent)`.
 ```bash
 cd /home/maxin/Code/hermes_ai_devops/.worktrees/workflow-runs/runtime
 PATH=/home/maxin/.local/go/bin:$PATH go test ./internal/store \
-  -run 'WorkflowRun' -count=1 -v
+  -run 'Test(Mem|PG)StoreConformance/WorkflowRun' -count=1 -v
 ```
 
 Expected: undefined WorkflowRun APIs.
@@ -400,7 +400,8 @@ cd /home/maxin/Code/hermes_ai_devops/.worktrees/workflow-runs/runtime
 PATH=/home/maxin/.local/go/bin:$PATH gofmt -w \
   internal/store/workflow_runs.go internal/store/postgres_workflow_runs.go \
   internal/store/store.go internal/store/conformance_test.go
-PATH=/home/maxin/.local/go/bin:$PATH go test ./internal/store -run 'WorkflowRun' -count=1 -v
+PATH=/home/maxin/.local/go/bin:$PATH go test ./internal/store \
+  -run 'Test(Mem|PG)StoreConformance/WorkflowRun' -count=1 -v
 PATH=/home/maxin/.local/go/bin:$PATH go test ./internal/store -count=1
 ```
 
