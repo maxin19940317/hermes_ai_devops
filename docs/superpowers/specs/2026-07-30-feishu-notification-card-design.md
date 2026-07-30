@@ -2,7 +2,7 @@
 
 日期：2026-07-30
 
-状态：待批准（v5，2026-07-30 第四轮评审后修订：CardSender 而非扩展 Sender、全量动态文本、节点白名单、边界精确化）
+状态：待批准（v6，2026-07-30 第五轮评审后修订：封闭 DTO 作范围门禁、超预算路径唯一、删除残留分叉）
 
 ## 1. 背景
 
@@ -27,7 +27,7 @@ verdict 与 category 要逐行读，看不出"这次该查代码还是查环境"
 4. **header 颜色：业务失败优先于基础设施失败**（见 §4.1）。
 5. **卡片字段与纯文本严格对齐，仅一处有意偏离并显式列出**（见 §4.3）。
 6. **卡片里**所有**动态文本节点一律 `plain_text` 渲染**，并有 UTF-8 安全的裁剪与总体积
-   预算（见 §4.4）。
+   预算（见 §4.5）。范围门禁靠 §4.4 的封闭 DTO，不靠测试白名单。
 7. **不扩展 `feishu.Sender`，另加 `CardSender`**（见 §5.4）。往 `Sender` 上加方法会让
    `notify_test.go` 与 `feishucmd/executor_test.go` 里两个只实现 `SendText` 的 fake
    直接编译失败——而"既有测试一条未改"正是本轮的验收判据，那样就自相矛盾了。
@@ -37,7 +37,7 @@ verdict 与 category 要逐行读，看不出"这次该查代码还是查环境"
 - 改 `Notify` 的签名而不新增活动：会打断在途活动的解码。
 - activity 侧重新拼降级文本：两处实现同一格式必然漂移，而"逐字节相同"是本轮的验收项。
 - 动态字段用 `lark_md`：`Reason` 与 Analyzer summary 都是不可信文本（后者是 **LLM 输出**），
-  markdown 渲染会让链接、@ 提及、标签被解释。见 §4.4。
+  markdown 渲染会让链接、@ 提及、标签被解释。见 §4.5。
 - 一个变体一张卡片：8 个变体会刷 8 条消息。
 
 ## 3. 范围
@@ -116,7 +116,62 @@ verdict 与 category 要逐行读，看不出"这次该查代码还是查环境"
 这处偏离只作用于卡片。**降级文本是 `buildNotification` 的逐字节原样输出**（§5.1），
 不受此影响——所以"逐字节相同"这个验收项与本偏离不冲突。
 
-### 4.4 渲染安全与体积边界
+### 4.4 封闭 DTO：范围门禁靠类型，不靠测试白名单
+
+"卡片里不许有交互组件"若只靠测试里的白名单守，是守不住的：实现者加一个交互节点、
+同步把白名单扩大，测试照样绿。而且只查 `tag` 也挡不住在允许的节点上挂
+`behaviors` / `open-url` 属性。
+
+**所以允许的结构固定在本 spec 里，用一个没有任何交互字段的封闭 DTO 表达。**
+实现必须逐字采用；要扩集合，先改 spec。
+
+```go
+// NotificationCard 是终态通知卡片的封闭结构(本轮范围门禁)。
+// 它不含任何可表达交互的字段——没有 actions、没有 behaviors、没有 value——
+// 因此按钮不可能在不修改本类型(进而不修改 spec)的前提下漏进展示卡片。
+type NotificationCard struct {
+	Config   CardConfig    `json:"config"`
+	Header   CardHeader    `json:"header"`
+	Elements []CardElement `json:"elements"`
+}
+
+type CardConfig struct {
+	WideScreenMode bool `json:"wide_screen_mode"`
+}
+
+type CardHeader struct {
+	Title    CardText `json:"title"`
+	Template string   `json:"template"` // 只允许 green | red | orange(§4.1)
+}
+
+// CardElement 只有两种形态:文本块(tag=div,Text 非空)与分隔线(tag=hr,Text 为 nil)。
+type CardElement struct {
+	Tag  string    `json:"tag"`            // 只允许 div | hr
+	Text *CardText `json:"text,omitempty"` // tag=hr 时必须为 nil
+}
+
+// CardText 的 Tag 恒为 plain_text(§4.5),没有 lark_md 这个选项。
+type CardText struct {
+	Tag     string `json:"tag"`     // 恒为 "plain_text"
+	Content string `json:"content"`
+}
+```
+
+**固定集合**（测试按此断言，越界即红）：
+
+| 位置 | 允许值 |
+|---|---|
+| `CardElement.Tag` | `div`、`hr` |
+| `CardText.Tag` | `plain_text`（唯一值） |
+| `CardHeader.Template` | `green`、`red`、`orange` |
+| 序列化后出现的 JSON key | `config`、`wide_screen_mode`、`header`、`title`、`template`、`elements`、`tag`、`text`、`content` —— **仅此九个** |
+
+测试把卡片 `json.Marshal` 后解析成 `map[string]any` 递归遍历：出现集合外的 key
+（如 `actions`、`behaviors`、`value`、`url`）、集合外的 tag、或 `CardText.Tag != "plain_text"`
+一律失败。这样"未知字段"和"允许节点上挂交互属性"两种漏法都被堵住，且不需要穷举飞书的
+组件目录。
+
+### 4.5 渲染安全与体积边界
 
 **卡片里的每一处动态文本都是不可信输入，不只是 `Reason` 与 `Analysis.Summary`。**
 完整清单：
@@ -136,7 +191,7 @@ markdown 渲染会让 `[text](url)`、`<at user_id="...">`、标签语法被解�
 是模型产物，用 markdown 渲染等于允许模型在通知里插链接和 @ 提及；而 `Project` 连字符
 白名单都没有。若将来某处确需 markdown，必须显式转义后再放。
 
-验证方式是**递归断言整张卡片的每个文本节点类型**（§8），而不是逐字段列举——列举会随
+验证方式是 §4.4 的封闭 DTO 加 §8 的递归断言，而不是逐字段列举——列举会随
 字段增加而漏。
 
 **裁剪与预算**（超出即截断并加省略标记）：
@@ -147,13 +202,22 @@ markdown 渲染会让 `[text](url)`、`<at user_id="...">`、标签语法被解�
 | 单个 `Analysis.Summary` | 500 rune |
 | 卡片总大小 | `len(json.Marshal(card)) <= 30*1024` |
 
-总大小的处置顺序，必须按此执行：
+总大小的处置分两处，**执行路径唯一**：
+
+**workflow 侧（`buildNotificationCard`）**尽力裁到预算内：
 
 1. 超限 → 按变体顺序从末尾丢弃可选行（reason 行、hermes 行）
 2. 加上"（N 个变体的详情已省略）"标注后**重新测量**——标注本身也占字节
-3. 仍超限 → 直接走降级纯文本（§5.2）
 
 第 2 步是容易漏的一环：加标注后不重测，等于把一个刚裁到边界的卡片又推回超限。
+
+**activity 侧（`NotifyCard`）在调 Sender 之前把关**（见 §5.2 的固定顺序）：
+重新 `json.Marshal(req.Card)`，若仍超 `30*1024` → **直接** `SendText(req.FallbackText)`，
+**不调用 `SendCard`**。
+
+这样"超预算"只有一条执行路径，可机械断言（`SendCard` 零调用）；而不是"要么没调、要么调了
+但失败"两种都算对。activity 侧重新测量而不信任 workflow 的裁剪结果，也顺带覆盖了
+"workflow 版本比 activity 老、裁剪逻辑不一致"的情形。
 
 裁剪必须**按 rune 边界**，不能按字节——中文在 UTF-8 里是 3 字节，按字节切会产生半个字符，
 飞书侧渲染成乱码甚至拒收。
@@ -189,11 +253,19 @@ req := NotifyCardRequest{
 
 `buildNotification` 因此**保留且仍在主路径上被调用**，不是死代码。
 
-### 5.2 降级顺序
+### 5.2 降级顺序（固定，无分支歧义）
 
-1. `NotifyCard` → `Feishu.SendCard(req.Card)`
-2. 失败（接口变更 / 渲染错误 / 限流 / 超体积）→ 记日志 → `Feishu.SendText(req.FallbackText)`
-3. 降级也失败 → 记 error 并返回错误（与今天 `Notify` 失败一致：workflow 记日志、不改结论）
+`NotifyCard` 严格按此执行：
+
+1. `Feishu` 为 nil → 静默成功（与今天一致，开发模式）
+2. 类型断言拿不到 `CardSender` → `SendText(req.FallbackText)`，**不调 `SendCard`**（§5.4）
+3. `json.Marshal(req.Card)` 超 `30*1024` → `SendText(req.FallbackText)`，**不调 `SendCard`**（§4.5）
+4. 否则 → `SendCard(req.Card)`
+5. `SendCard` 失败（接口变更 / 渲染错误 / 限流）→ 记日志 → `SendText(req.FallbackText)`
+6. 降级发送也失败 → 记 error 并返回错误（与今天 `Notify` 失败一致：workflow 记日志、不改结论）
+
+第 2、3 步的"不调 `SendCard`"是可机械断言的（fake 上的调用计数为 0），第 5 步是"调过且失败"。
+三者互不重叠——不存在"要么没调、要么调了但失败都算对"的模糊地带。
 
 降级不是可选项：它保证"通知不会因为卡片这层新东西而整体消失"。
 
@@ -280,7 +352,7 @@ workflow 的先例。
 | `SendCard` 失败 | 记日志 → `SendText(req.FallbackText)`（§5.2） |
 | 降级发送也失败 | 记 error 日志，返回错误 |
 | 两种 Sender 都未配置（`Acts.Feishu == nil`） | 静默成功，与今天一致（开发模式） |
-| 卡片超总预算 | 按 §4.4 丢弃末尾变体的可选行并标注；仍超则直接走降级 |
+| 卡片超总预算 | workflow 侧按 §4.5 丢弃末尾变体的可选行并标注；activity 侧重测仍超 → 直接降级、`SendCard` 零调用（§5.2 第 3 步）|
 | `Reason` / `Summary` 超单项上限 | 按 rune 边界截断并加省略标记 |
 | `out.Tasks` 为空 | 发卡片，正文是"无可测变体"提示 |
 
@@ -325,13 +397,18 @@ workflow 的先例。
   **且标注计入后重新测量仍在预算内**
 - 裁到极限仍超预算 → 走降级纯文本（断言 `SendCard` 未被调用或其失败被降级接住）
 
-节点类型白名单（而非黑名单）：
+封闭结构断言（对齐 §4.4 的固定集合，不是"以实现为准"的白名单）：
 
-- 递归遍历卡片树，断言每个节点的类型都在**本轮实际使用的白名单**内
-  （如 `header` / `div` / `plain_text` / `hr` —— 以实现为准）。
-- 用白名单而不是禁 `button`/`action`/`callback`/`value`：黑名单挡不住 `select`、
-  `overflow`、`picker`、带 `open-url` behavior 的节点等等。白名单守的是"本轮不做按钮"
-  这个范围边界，且不需要穷举飞书的全部交互组件类型。
+- 卡片 `json.Marshal` 后解析成 `map[string]any` 递归遍历，断言：
+  - 出现的 JSON key **全部**属于 §4.4 那九个（`config`/`wide_screen_mode`/`header`/`title`/
+    `template`/`elements`/`tag`/`text`/`content`）——多一个即红
+  - `elements[].tag ∈ {div, hr}`
+  - 每个 `text.tag == "plain_text"`
+  - `header.template ∈ {green, red, orange}`
+- 显式反例：手工构造一份带 `actions` key、一份带 `behaviors` key、一份
+  `text.tag = "lark_md"` 的卡片，断言上述遍历**会红**（证明这套断言不是空转）
+- 这样堵住两种漏法：未知字段（`actions`/`value`/`url`），以及在允许节点上挂交互属性
+  （`behaviors`/`open-url`）。不需要穷举飞书的组件目录，也不允许"加节点顺手扩白名单"。
 
 **Sender（两种实现，精确断言）**
 
@@ -347,7 +424,7 @@ workflow 的先例。
 - `NotifyCard` 是独立注册的活动名
 - `NotifyCardRequest.FallbackText` 等于同一输入下 `buildNotification` 的输出
 
-**重放**：§6 的 `WorkflowReplayer` 测试；若不可行，按 §6 收窄验收表述。
+**重放**：§6 的 `WorkflowReplayer` 测试，喂改动前录制的 history fixture。
 
 ## 9. 验收标准
 
@@ -358,8 +435,9 @@ workflow 的先例。
 - **递归断言**整张卡片每个文本节点均为 `plain_text`；`Project` / `Variant` / `Reason` / `Summary` 各有含 markdown、`<at>` 语法的用例（有测试）
 - 超长中文 `Reason` 截断后仍是合法 UTF-8（按 rune 切，有测试）
 - 卡片总大小判据是 `len(json.Marshal(card)) <= 30*1024`，且省略标注计入后重新测量（有测试）
-- 卡片树每个节点类型都在本轮的白名单内（而非黑名单排除，有测试）
+- 卡片序列化后的 JSON key 全部属于 §4.4 固定的九个，tag 与 template 取值受限；带 `actions`/`behaviors`/`lark_md` 的反例会让断言变红（有测试）
 - `SendCard` 失败时降级文本与 `buildNotification` 输出逐字节相同（有测试）
+- 超 `30*1024` 时 `SendCard` **零调用**、直接发降级文本（有测试；§5.2 第 3 步）
 - `Notify(ctx, string)` 未改签名；`feishu.Sender` 未扩展；`notify_test.go` 与 `feishucmd/executor_test.go` 的既有 fake 一行未改即编译通过
 - 在途 workflow 重放不失败——由改动前录制的 history fixture + `WorkflowReplayer` 测试证明（§6 已选定此项，不留二选一）
 - CLAUDE.md §4/§12 的 signal 描述已更正，并注明按钮未实现及其前置
