@@ -537,21 +537,25 @@ func TestExtractLargeStdoutFallbackKeepsTail(t *testing.T) {
 	}
 }
 
-func TestExtractFallbackMarksClippedStreamTailTruncated(t *testing.T) {
+func TestExtractFallbackSeparatesDisplayAndScanTruncation(t *testing.T) {
 	tests := []struct {
-		name string
-		key  string
-		file string
+		name              string
+		key               string
+		file              string
+		lineBytes         int
+		wantFileTruncated bool
 	}{
-		{name: "stdout", key: "stdout", file: "stdout.log"},
-		{name: "stderr", key: "stderr", file: "stderr.log"},
+		{name: "stdout display clipped", key: "stdout", file: "stdout.log", lineBytes: maxContextLineBytes + 1},
+		{name: "stdout scan truncated", key: "stdout", file: "stdout.log", lineBytes: maxScanLineBytes + 1, wantFileTruncated: true},
+		{name: "stderr display clipped", key: "stderr", file: "stderr.log", lineBytes: maxContextLineBytes + 1},
+		{name: "stderr scan truncated", key: "stderr", file: "stderr.log", lineBytes: maxScanLineBytes + 1, wantFileTruncated: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			in := baseInput()
 			in.Signatures = []Signature{{ID: "nomatch", Where: tt.key, Pattern: "NEVER-MATCH", Classify: "CODE"}}
-			in.Files[tt.key] = strings.NewReader(strings.Repeat("x", maxContextLineBytes+1) + "\n")
+			in.Files[tt.key] = strings.NewReader(strings.Repeat("x", tt.lineBytes) + "\n")
 			ev := Extract(in)
 
 			if len(ev.Excerpts) != 1 {
@@ -567,11 +571,15 @@ func TestExtractFallbackMarksClippedStreamTailTruncated(t *testing.T) {
 			if !excerpt.Truncated {
 				t.Error("excerpt truncated = false, want true")
 			}
-			if !ev.Truncated {
-				t.Error("evidence truncated = false, want true")
+			if ev.Truncated != tt.wantFileTruncated {
+				t.Errorf("evidence truncated = %v, want %v", ev.Truncated, tt.wantFileTruncated)
 			}
-			if len(ev.Inputs.TruncatedFiles) != 1 || ev.Inputs.TruncatedFiles[0] != tt.file {
-				t.Errorf("truncated_files = %v, want [%s]", ev.Inputs.TruncatedFiles, tt.file)
+			if tt.wantFileTruncated {
+				if len(ev.Inputs.TruncatedFiles) != 1 || ev.Inputs.TruncatedFiles[0] != tt.file {
+					t.Errorf("truncated_files = %v, want [%s]", ev.Inputs.TruncatedFiles, tt.file)
+				}
+			} else if len(ev.Inputs.TruncatedFiles) != 0 {
+				t.Errorf("truncated_files = %v, want empty", ev.Inputs.TruncatedFiles)
 			}
 		})
 	}

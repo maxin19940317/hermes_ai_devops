@@ -133,7 +133,7 @@ func scanStream(r io.Reader, matchers []streamMatcher, logcat bool) *streamScan 
 		line.stripTrailingCR()
 		out.lineCount++
 		current := line.contextLine()
-		if current.truncated {
+		if line.length > maxScanLineBytes {
 			out.truncated = true
 		}
 
