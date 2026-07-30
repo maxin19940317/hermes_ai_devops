@@ -176,12 +176,6 @@ type WorkflowRun struct {
     CreatedAt        time.Time
 }
 
-type RunVariantState struct {
-    Variant string
-    Status  string
-    Verdict string
-    EndedAt time.Time
-}
 ```
 
 新增方法：
@@ -189,15 +183,14 @@ type RunVariantState struct {
 ```go
 RecordWorkflowRun(ctx context.Context, run WorkflowRun) error
 GetWorkflowRun(ctx context.Context, workflowID string) (*WorkflowRun, error)
-ListWorkflowRunVariantStates(ctx context.Context, workflowID string) ([]RunVariantState, error)
 ```
 
 `GetWorkflowRun` 不存在时返回可由 `errors.Is` 判断的 `ErrWorkflowRunNotFound`。
-`ListWorkflowRunVariantStates` 只做 `tasks.workflow_id = workflowID` 精确匹配；每个 test_id
-取最大的 task attempt，禁止 workflow ID 前缀匹配。该方法只服务 RecentRuns 展示，不作为
-rerun 的失败集合来源。
+变体状态读取 API 本轮不提供：当前生产路径没有消费者。RecentRuns 直接在自己的权威查询中
+按精确 `workflow_id/test_id` 关联 tasks；rerun 的失败集合来自 Temporal output。若后续出现
+独立消费者，再按实际调用契约新增该 API。
 
-活动层的 Store 子接口只增加 `RecordWorkflowRun`。飞书命令层增加 Get/List 状态方法。
+活动层的 Store 子接口只增加 `RecordWorkflowRun`。飞书命令层增加 `GetWorkflowRun`。
 
 ## 5. 精确 rerun
 
@@ -280,8 +273,9 @@ running、closed、not found、无可读结果和查询失败。
 - 指定 variant：调用带 project 的 `NextWorkflowAttempt`；
 - 未指定 variant：调用带 project 的 `NextWorkflowAttemptAll`。
 
-`NextWorkflowAttemptAll` 仍递增该项目/commit/pipeline 下全部 artifact 计数，但新 workflow
-只携带失败 variants。递增全部计数保证 bundle 级 `-r{N}` 总能超过历史最大值，不会与已有
+`NextWorkflowAttemptAll` 在锁定该项目/commit/pipeline 下全部 artifact 行后计算
+`MAX(workflow_attempt)+1`，并把每一行都设置到这个相同水位；新 workflow 仍只携带失败
+variants。统一水位保证 bundle 级和后续变体级 `-r{N}` 共用单一单调序列，不会与已有
 workflow ID 碰撞。Temporal start 失败可以留下未使用的 attempt，不回退计数器。
 
 ## 6. RecentRuns 与 NL 快照

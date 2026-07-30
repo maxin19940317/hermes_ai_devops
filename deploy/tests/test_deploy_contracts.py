@@ -445,8 +445,16 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
         deploy_readme = DEPLOY_README.read_text(encoding="utf-8")
 
         self.assertIn(
-            "prior batch stable -> stop writers -> migrate -> "
-            "deploy all new binaries -> resume",
+            "prior batch stable -> stop writers -> migrate -> update and restart "
+            "analyze_bridge on every hermes-agent host -> deploy all new binaries -> resume",
+            deploy_readme,
+        )
+        self.assertIn(
+            "command.schema.json v2",
+            deploy_readme,
+        )
+        self.assertIn(
+            "all natural-language commands",
             deploy_readme,
         )
         self.assertIn(

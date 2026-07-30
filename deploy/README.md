@@ -189,13 +189,16 @@ Stop all old artifact writers before removing the old unique constraint.
 The mandatory production order is:
 
 ```text
-prior batch stable -> stop writers -> migrate -> deploy all new binaries -> resume
+prior batch stable -> stop writers -> migrate -> update and restart analyze_bridge on every hermes-agent host -> deploy all new binaries -> resume
 ```
 
 During the stopped-writer window, stop every old Trigger/Runtime process that can insert
-artifacts, apply `deploy/postgres/migrations/2026-07-30-workflow-runs.sql`, deploy all new
-Trigger/Worker/Relay binaries as one release, and only then resume ingress. Do not combine
-this window with deployment of the prerequisite batch.
+artifacts, apply `deploy/postgres/migrations/2026-07-30-workflow-runs.sql`, synchronize
+`hermes/analyze_bridge` including `command.schema.json v2` to every hermes-agent host and
+restart each `analyze_bridge`, then deploy all new Trigger/Worker/Relay binaries as one
+release. Only resume ingress after both sides are on v2. A forward or reverse version
+mismatch makes the bridge reject the other side's translation payload and breaks all natural-language commands.
+Do not combine this window with deployment of the prerequisite batch.
 
 ## Verify
 
