@@ -25,6 +25,7 @@ type Store interface {
 	GetResult(ctx context.Context, taskID string) (*wf.ResultRecord, error)
 	GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error)
 	SaveEvidenceSnapshot(ctx context.Context, snap store.EvidenceSnapshot) error
+	RecordWorkflowRun(ctx context.Context, run store.WorkflowRun) error
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).
@@ -46,8 +47,8 @@ type Config struct {
 	// 空 = listener 不启动。
 	FeishuCmdWhitelist string
 	// MinIO 预签名直传(§3.7);Endpoint 或凭据为空即禁用,优雅降级为空 presigned_uploads。
-	MinIOEndpoint       string        // 集群内 endpoint(如 minio:9000);兼作启用开关
-	MinIOPublicEndpoint string        // 预签名 URL 的 host,须 Client 可达(签名覆盖 Host)
+	MinIOEndpoint       string // 集群内 endpoint(如 minio:9000);兼作启用开关
+	MinIOPublicEndpoint string // 预签名 URL 的 host,须 Client 可达(签名覆盖 Host)
 	MinIOAccessKey      string
 	MinIOSecretKey      string
 	MinIOBucket         string        // 缺省 hermes-evidence

@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 
 	"hermes-devops/runtime/internal/hermesclient"
@@ -28,8 +29,13 @@ type fakeActs struct {
 	skipped      []SkippedSpec // SelectTestSpecs 透传:fleet 无匹配设备/OS 未接入
 	acquires     []*Lease      // 每次 AcquireDevice 依次弹出;耗尽后返回 defaultLease
 	dispatchErrs []error       // 依次弹出;耗尽后 nil
+	recordErrs   []error
+	selectErr    error
 
 	acquireCalls  int
+	selectCalls   int
+	recordCalls   []RecordWorkflowRunRequest
+	callOrder     []string
 	created       []TaskRow
 	dispatched    []DispatchRequest
 	canceled      []CancelRequest
@@ -55,8 +61,24 @@ type fakeActs struct {
 
 var defaultLease = &Lease{DeviceID: "dev1", Serial: "513cd3de", ClientID: "c1", ClientBaseURL: "https://client:8443"}
 
+func (f *fakeActs) RecordWorkflowRun(_ context.Context, req RecordWorkflowRunRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recordCalls = append(f.recordCalls, req)
+	f.callOrder = append(f.callOrder, "record")
+	if len(f.recordErrs) == 0 {
+		return nil
+	}
+	err := f.recordErrs[0]
+	f.recordErrs = f.recordErrs[1:]
+	return err
+}
 func (f *fakeActs) SelectTestSpecs(_ context.Context, _ DeviceTestInput) (*SpecSelection, error) {
-	return &SpecSelection{Specs: f.specs, Skipped: f.skipped}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.selectCalls++
+	f.callOrder = append(f.callOrder, "select")
+	return &SpecSelection{Specs: f.specs, Skipped: f.skipped}, f.selectErr
 }
 func (f *fakeActs) AcquireDevice(_ context.Context, _ AcquireRequest) (*Lease, error) {
 	f.mu.Lock()
@@ -269,6 +291,105 @@ func TestHappyPathPassed(t *testing.T) {
 	}
 	if f.released[0].InfraFail {
 		t.Error("新版本分支不该再填 InfraFail")
+	}
+}
+
+func TestWorkflowRecordsRunBeforeSelect(t *testing.T) {
+	f := &fakeActs{}
+	env := newEnv(t, f)
+	in := input()
+	in.RuleVersion = rules.DefaultVersion
+	in.Scope = "v2"
+	in.Attempt = 2
+	in.SourceWorkflowID = "device-test-grp/p-gabcd1234-p42"
+	in.Packages = []PackageRef{{Variant: "v2"}, {Variant: "v1"}, {Variant: "v2"}}
+
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: in.WorkflowID()})
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.callOrder) < 2 ||
+		!reflect.DeepEqual(f.callOrder[:2], []string{"record", "select"}) {
+		t.Fatalf("call order = %v", f.callOrder)
+	}
+	if len(f.recordCalls) != 1 {
+		t.Fatalf("record calls = %d", len(f.recordCalls))
+	}
+	want := RecordWorkflowRunRequest{
+		WorkflowID: in.WorkflowID(), Project: in.Project, CommitSHA: in.Commit,
+		PipelineID: in.PipelineID, Version: in.Version, RuleVersion: rules.DefaultVersion,
+		Scope: in.Scope, Attempt: in.Attempt, Variants: []string{"v1", "v2"},
+		SourceWorkflowID: in.SourceWorkflowID,
+	}
+	if !reflect.DeepEqual(f.recordCalls[0], want) {
+		t.Fatalf("record request = %+v, want %+v", f.recordCalls[0], want)
+	}
+	if got := []string{in.Packages[0].Variant, in.Packages[1].Variant, in.Packages[2].Variant}; !reflect.DeepEqual(got, []string{"v2", "v1", "v2"}) {
+		t.Fatalf("input package order mutated: %v", got)
+	}
+}
+
+func TestWorkflowRecordRetriesPastDefaultMaximum(t *testing.T) {
+	f := &fakeActs{recordErrs: []error{errBoom, errBoom, errBoom, errBoom}}
+	env := newEnv(t, f)
+	env.SetTestTimeout(2 * time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.recordCalls) != 5 {
+		t.Fatalf("record calls = %d, want 5", len(f.recordCalls))
+	}
+	if f.selectCalls != 1 {
+		t.Fatalf("select calls = %d, want 1", f.selectCalls)
+	}
+}
+
+func TestWorkflowRecordPermanentFailureBlocksSelect(t *testing.T) {
+	permanent := temporal.NewNonRetryableApplicationError(
+		"immutable conflict", "WorkflowRunPermanent", errBoom)
+	f := &fakeActs{recordErrs: []error{permanent}}
+	env := newEnv(t, f)
+	env.SetTestTimeout(2 * time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if env.GetWorkflowError() == nil {
+		t.Fatal("workflow succeeded")
+	}
+	if len(f.recordCalls) != 1 || f.selectCalls != 0 {
+		t.Fatalf("record=%d select=%d, want 1/0", len(f.recordCalls), f.selectCalls)
+	}
+}
+
+func TestWorkflowRecordRetryPolicyDoesNotLeakToSelect(t *testing.T) {
+	f := &fakeActs{selectErr: errBoom}
+	env := newEnv(t, f)
+	env.SetTestTimeout(2 * time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if env.GetWorkflowError() == nil {
+		t.Fatal("workflow succeeded")
+	}
+	if len(f.recordCalls) != 1 || f.selectCalls != 3 {
+		t.Fatalf("record=%d select=%d, want 1/3", len(f.recordCalls), f.selectCalls)
+	}
+}
+
+func TestWorkflowRecordUsesActualExecutionID(t *testing.T) {
+	f := &fakeActs{}
+	env := newEnv(t, f)
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "unexpected-execution-id"})
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	err := env.GetWorkflowError()
+	if err == nil || !strings.Contains(err.Error(),
+		`workflow execution id "unexpected-execution-id" does not match input id "`+wfID+`"`) {
+		t.Fatalf("workflow error = %v", err)
+	}
+	if len(f.recordCalls) != 0 || f.selectCalls != 0 {
+		t.Fatalf("record=%d select=%d, want 0/0", len(f.recordCalls), f.selectCalls)
 	}
 }
 

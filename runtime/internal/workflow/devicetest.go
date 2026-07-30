@@ -3,6 +3,7 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -264,6 +265,33 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 		return nil, fmt.Errorf("device test %s: %w", in.WorkflowID(), err)
 	}
 
+	if workflow.GetVersion(
+		ctx, "record-workflow-run-v1", workflow.DefaultVersion, 1,
+	) != workflow.DefaultVersion {
+		actualID := workflow.GetInfo(ctx).WorkflowExecution.ID
+		if actualID != in.WorkflowID() {
+			return nil, fmt.Errorf(
+				"workflow execution id %q does not match input id %q",
+				actualID, in.WorkflowID(),
+			)
+		}
+		recordCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			StartToCloseTimeout: 30 * time.Second,
+			RetryPolicy: &temporal.RetryPolicy{
+				InitialInterval:    2 * time.Second,
+				BackoffCoefficient: 2,
+				MaximumInterval:    time.Minute,
+				MaximumAttempts:    0,
+			},
+		})
+		req := newRecordWorkflowRunRequest(actualID, in, ruleVersion)
+		if err := workflow.ExecuteActivity(
+			recordCtx, "RecordWorkflowRun", req,
+		).Get(recordCtx, nil); err != nil {
+			return nil, fmt.Errorf("record workflow run: %w", err)
+		}
+	}
+
 	var sel SpecSelection
 	if err := workflow.ExecuteActivity(ctx, "SelectTestSpecs", in).Get(ctx, &sel); err != nil {
 		return nil, fmt.Errorf("select test specs: %w", err)
@@ -300,6 +328,38 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 		}
 	}
 	return out, nil
+}
+
+func newRecordWorkflowRunRequest(
+	workflowID string,
+	in DeviceTestInput,
+	ruleVersion string,
+) RecordWorkflowRunRequest {
+	variants := make([]string, 0, len(in.Packages))
+	for _, pkg := range in.Packages {
+		if pkg.Variant != "" {
+			variants = append(variants, pkg.Variant)
+		}
+	}
+	sort.Strings(variants)
+	canonical := variants[:0]
+	for _, variant := range variants {
+		if len(canonical) == 0 || canonical[len(canonical)-1] != variant {
+			canonical = append(canonical, variant)
+		}
+	}
+	return RecordWorkflowRunRequest{
+		WorkflowID:       workflowID,
+		Project:          in.Project,
+		CommitSHA:        in.Commit,
+		PipelineID:       in.PipelineID,
+		Version:          in.Version,
+		RuleVersion:      ruleVersion,
+		Scope:            in.Scope,
+		Attempt:          in.Attempt,
+		Variants:         canonical,
+		SourceWorkflowID: in.SourceWorkflowID,
+	}
 }
 
 // runTest 执行一个测试(含 INFRA 机械重试,§10 缺省 ≤2 次)。

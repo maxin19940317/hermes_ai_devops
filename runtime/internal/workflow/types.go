@@ -34,6 +34,22 @@ type DeviceTestInput struct {
 	// Attempt 显式 retry 序号(差距 #11):>0 时 workflow ID 加 -r{N} 后缀,
 	// N 取自 artifacts.workflow_attempt 原子递增;0 = 普通触发。
 	Attempt int `json:"attempt,omitempty"`
+	// SourceWorkflowID 指向触发本次重跑的权威 workflow run;普通触发为空。
+	SourceWorkflowID string `json:"source_workflow_id,omitempty"`
+}
+
+// RecordWorkflowRunRequest 是 workflow 与持久化活动之间的稳定载荷。
+type RecordWorkflowRunRequest struct {
+	WorkflowID       string   `json:"workflow_id"`
+	Project          string   `json:"project"`
+	CommitSHA        string   `json:"commit_sha"`
+	PipelineID       int      `json:"pipeline_id"`
+	Version          string   `json:"version"`
+	RuleVersion      string   `json:"rule_version"`
+	Scope            string   `json:"scope"`
+	Attempt          int      `json:"attempt"`
+	Variants         []string `json:"variants"`
+	SourceWorkflowID string   `json:"source_workflow_id,omitempty"`
 }
 
 // BaseWorkflowID 是 workflow ID 去掉 scope/attempt 后缀的公共前缀。
