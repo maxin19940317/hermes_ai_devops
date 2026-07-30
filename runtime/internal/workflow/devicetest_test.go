@@ -302,6 +302,11 @@ func TestWorkflowSendsCardWithVerbatimFallback(t *testing.T) {
 	if got := f.notifyCards[0].FallbackText; got != want {
 		t.Errorf("FallbackText = %q, want 与 buildNotification 逐字节相同 %q", got, want)
 	}
+	// 只查 FallbackText 查不出 workflow 是否真把卡片本体传下去了——
+	// Card 字段单独断言,确保"接线"这条线真的被覆盖。
+	if got, wantCard := f.notifyCards[0].Card, buildNotificationCard(input(), &out); !reflect.DeepEqual(got, wantCard) {
+		t.Errorf("Card = %+v, want 与 buildNotificationCard 同源 %+v", got, wantCard)
+	}
 }
 
 func TestLeaseExpiryRetriesThenInfraError(t *testing.T) {
