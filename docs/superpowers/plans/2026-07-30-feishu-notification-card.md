@@ -92,11 +92,27 @@ workflow 代码，就再也录不到这份历史了，而设计 §6 把"旧 hist
 ```go
 	const fixture = "testdata/history-pre-notify-card.json"
 
-	data := serializeHistory(t, c, wfID, runID) // 步骤 1
-	if !bytes.Contains(data, []byte("WorkflowExecutionStarted")) ||
-		!bytes.Contains(data, []byte("WorkflowExecutionCompleted")) {
-		t.Fatalf("history 不完整,拒绝落盘(%d 字节)", len(data)) // 步骤 2
+	hist := fetchHistory(t, c, wfID, runID) // 步骤 1a:*historypb.History
+
+	// 步骤 2:按 EventType **结构化**校验,不要字节搜索序列化结果。
+	// protojson 把 enum 写成 proto 名(EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+	// 见 go.temporal.io/api enums/v1/event_type.pb.go),搜 "WorkflowExecutionStarted"
+	// 会拒掉每一份**合法**的 history。
+	var started, completed bool
+	for _, ev := range hist.GetEvents() {
+		switch ev.GetEventType() {
+		case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED:
+			started = true
+		case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED:
+			completed = true
+		}
 	}
+	if !started || !completed {
+		t.Fatalf("history 不完整(started=%v completed=%v, %d 事件),拒绝落盘",
+			started, completed, len(hist.GetEvents()))
+	}
+
+	data := serializeHistory(t, hist) // 步骤 1b
 	if err := os.MkdirAll(filepath.Dir(fixture), 0o755); err != nil {
 		t.Fatalf("创建 testdata 目录失败: %v", err) // 步骤 3
 	}
@@ -113,11 +129,16 @@ workflow 代码，就再也录不到这份历史了，而设计 §6 把"旧 hist
 	ok := false
 	defer func() {
 		cerr := f.Close()
-		if !ok || cerr != nil {
-			_ = os.Remove(fixture)
-			if cerr != nil {
-				t.Errorf("关闭 %s 失败,已删除: %v", fixture, cerr)
-			}
+		if ok && cerr == nil {
+			return
+		}
+		// 删不掉半成品是硬问题:它会被 O_EXCL 永久占住,从此录不了新 fixture。
+		if rerr := os.Remove(fixture); rerr != nil && !os.IsNotExist(rerr) {
+			t.Errorf("删除半成品 %s 失败,后续录制会被 O_EXCL 永久挡住,请手工删除: %v",
+				fixture, rerr)
+		}
+		if cerr != nil {
+			t.Errorf("关闭 %s 失败: %v", fixture, cerr)
 		}
 	}()
 	if _, err := f.Write(data); err != nil { // 步骤 5
@@ -263,9 +284,12 @@ func TestAppSendCardWireShape(t *testing.T) {
 	}
 }
 
-// token 过期 → 强制刷新重试一次(与 SendText 同款)。
+// token 过期 → 强制刷新**并且只重试一次**(与 SendText 同款)。
 func TestAppSendCardRefreshesExpiredToken(t *testing.T) {
-	// 首个 messages 请求返回 token 失效码,第二个成功;断言整体成功且 token 端点被请求两次
+	var tokenCalls, msgCalls int
+	// 首个 messages 请求返回 token 失效码,第二个成功。
+	// 两个计数都要断言:只断言 token=2 挡不住"消息被重试很多次"的实现。
+	// 期望 tokenCalls == 2(首次 + 强制刷新)、msgCalls == 2(首次失败 + 重试一次)。
 }
 ```
 
@@ -539,6 +563,48 @@ func dumpElements(es []CardElement) string {
 - `Project = "a[x](http://evil)b"`、`Variant = "v<at user_id=\"all\">"`、
   `Reason`、`Summary` 各含 markdown/`<at>` → 卡片里是字面文本，节点 `tag == "plain_text"`
 - 构造超预算输入 → `len(json.Marshal(card)) <= 30*1024`，且带"详情已省略"标注
+- **裁剪必须从末尾删，且有会红的断言**。只检查"最终大小 + 有标注"是不够的：
+  从头删、随机删、把所有详情都删光，三种错误实现都能通过。用两个各带**唯一可识别详情**
+  的变体构造临界输入：
+
+```go
+// 裁剪必须保留前面变体的详情、只丢末尾的(设计 §4.5 第 1 步)。
+func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
+	// 两个变体,reason 各带唯一标记,长度调到"两个都留会超预算、只留第一个不超"
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v-first", Verdict: "TEST_FAILED", Attempt: 1,
+			Reason: "FIRST-MARKER" + strings.Repeat("甲", 400)},
+		{Variant: "v-last", Verdict: "TEST_FAILED", Attempt: 1,
+			Reason: "LAST-MARKER" + strings.Repeat("乙", 400)},
+	}}
+	// 用足够多的变体把总量顶过预算(见下方 padTo 辅助),但两个带标记的排在最前与最后
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, padTo(out, 30*1024))
+	body := allContent(card)
+
+	if !strings.Contains(body, "FIRST-MARKER") {
+		t.Error("裁剪从头删了:前面变体的详情必须保留")
+	}
+	if strings.Contains(body, "LAST-MARKER") {
+		t.Error("末尾变体的详情应被丢弃")
+	}
+	// 变体本身(主行)不许被删——只删可选行
+	for _, v := range []string{"v-first", "v-last"} {
+		if !strings.Contains(body, v) {
+			t.Errorf("变体 %s 的主行被删了,只应删可选行", v)
+		}
+	}
+	// 省略数量必须与实际丢弃的变体数一致,不能写死
+	if !strings.Contains(body, "个变体的详情已省略") {
+		t.Error("缺省略标注")
+	}
+	if n := len(mustMarshal(t, card)); n > 30*1024 {
+		t.Errorf("裁剪后仍超预算: %d", n)
+	}
+}
+```
+
+  `padTo` / `allContent` / `mustMarshal` 是本测试文件里的小辅助，由你实现；
+  关键是**标记必须唯一且可搜索**，这样"删错了哪一端"能被区分出来。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -626,9 +692,35 @@ func TestNotifyCardOrder(t *testing.T) {
 		{"超预算 → 只发文本,SendCard 零调用", &cardFake{}, big, false, 0, 1},
 		{"正常 → 只发卡片", &cardFake{}, small, false, 1, 0},
 		{"卡片失败 → 降级发文本", &cardFake{}, small, true, 1, 1},
+		// 边界必须精确锁定,否则把 > 写成 >= 不会被发现:
+		{"恰好 30*1024 → 发卡片", &cardFake{}, cardOfExactSize(t, 30*1024), false, 1, 0},
+		{"30*1024+1 → 零调用,降级", &cardFake{}, cardOfExactSize(t, 30*1024+1), false, 0, 1},
 	}
 	// 断言 wantCards / wantTexts 的**精确调用次数**;
 	// "超预算"那条的 wantCards=0 是设计 §5.2 第 3 步的机械判据。
+}
+
+// cardOfExactSize 造一个 json.Marshal 后**恰好** n 字节的卡片:
+// 先建骨架,再逐字符调整某个 Content 的填充长度直到命中 n。
+// 边界用例靠它——只有"正常小卡"和">30KB 大卡"两档时,把 `>` 写成 `>=`
+// (或反之)不会有任何测试变红。
+func cardOfExactSize(t *testing.T, n int) wf.NotificationCard {
+	t.Helper()
+	mk := func(pad int) wf.NotificationCard {
+		return wf.NotificationCard{
+			Header: wf.CardHeader{Title: wf.CardText{Tag: "plain_text", Content: "x"}, Template: "green"},
+			Elements: []wf.CardElement{{Tag: "div", Text: &wf.CardText{
+				Tag: "plain_text", Content: strings.Repeat("a", pad)}}},
+		}
+	}
+	// 单调:pad 每 +1,序列化长度也 +1(全 ASCII 且无需转义),二分/线性都能命中。
+	for pad := 0; pad <= n; pad++ {
+		if len(mustMarshal(t, mk(pad))) == n {
+			return mk(pad)
+		}
+	}
+	t.Fatalf("造不出恰好 %d 字节的卡片", n)
+	return wf.NotificationCard{}
 }
 
 // 降级发送本身失败时,错误必须保留 cause(便于排查是 token 还是网络)。
@@ -698,7 +790,8 @@ func (a *Acts) NotifyCard(ctx context.Context, req wf.NotifyCardRequest) error {
 	return nil
 }
 
-// cardSizeBudget 见设计 §4.5。
+// cardSizeBudget 见设计 §4.5。判据是 `len(raw) > cardSizeBudget` 才降级——
+// **恰好等于**预算是允许发卡片的(边界由 cardOfExactSize 的两条用例锁定)。
 const cardSizeBudget = 30 * 1024
 
 func (a *Acts) sendFallback(ctx context.Context, text string) error {
