@@ -722,6 +722,15 @@ type CardText struct {
 	Content string `json:"content"`
 }
 
+// NotifyCardRequest 是 NotifyCard 活动的输入(进 workflow history)。
+// FallbackText 由 workflow 调既有的 buildNotification 生成并随载荷下发:
+// activity 侧**绝不自行拼文本**——两处实现同一格式必然漂移,而"降级内容与改动前
+// 逐字节相同"是本轮的验收项。
+type NotifyCardRequest struct {
+	Card         NotificationCard `json:"card"`
+	FallbackText string           `json:"fallback_text"`
+}
+
 // cardByteBudget 是卡片序列化后的总大小上限(设计 §4.5)。
 const cardByteBudget = 30 * 1024
 
