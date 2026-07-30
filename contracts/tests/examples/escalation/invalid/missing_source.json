@@ -1,0 +1,9 @@
+{
+  "escalation_version": 1,
+  "idempotency_key": "devops-escalation:aios/algo_super_sdk:def41bec:aarch64_Android_SNPE_2.21:CODE",
+  "rule": {
+    "verdict": "TEST_FAILED",
+    "category": "CODE",
+    "reason": "test cases failed"
+  }
+}

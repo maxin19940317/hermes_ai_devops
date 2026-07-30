@@ -2,10 +2,27 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	wf "hermes-devops/runtime/internal/workflow"
 )
+
+// HasDecision 报告某任务是否已有指定 actor 的裁决(升级判重,
+// 设计 §5 门槛 3)。
+func (s *PGStore) HasDecision(ctx context.Context, taskID, actor string) (bool, error) {
+	var one int
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT 1 FROM decisions WHERE task_id = $1 AND actor = $2 LIMIT 1`,
+		taskID, actor).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("has decision %s/%s: %w", taskID, actor, err)
+	}
+	return true, nil
+}
 
 // SaveDecision 落 decisions 表(§11):规则引擎与 LLM 的每次裁决都落表,可回放。
 // output 已是 JSON,原样存入 JSONB;task_id 不存在时外键报错。

@@ -1,0 +1,31 @@
+{
+  "escalation_version": 1,
+  "idempotency_key": "devops-escalation:aios/algo_super_sdk:def41bec:aarch64_Android_SNPE_2.21:dsp_unavailable",
+  "source": {
+    "project": "aios/algo_super_sdk",
+    "commit": "def41bec",
+    "pipeline_iid": 53,
+    "variant": "aarch64_Android_SNPE_2.21",
+    "task_id": "device-test-aios/algo_super_sdk-gdef41bec-p53:aarch64_Android_SNPE_2.21:a1"
+  },
+  "rule": {
+    "verdict": "TEST_FAILED",
+    "category": "DELEGATE",
+    "reason": "signature hit: dsp_unavailable"
+  },
+  "hermes": {
+    "summary": "gesture DSP 不支持 unsigned PD",
+    "root_cause": "SNPE 2.21 DSP 委派失败,回退 CPU 路径缺失",
+    "suggested_category": "DELEGATE",
+    "confidence": 0.92,
+    "next_actions": ["检查 delegate 分区配置"]
+  },
+  "evidence": {
+    "snapshot_id": "device-test-aios/algo_super_sdk-gdef41bec-p53:aarch64_Android_SNPE_2.21:a1",
+    "object_key": "evidence/device-test-aios/algo_super_sdk-gdef41bec-p53:aarch64_Android_SNPE_2.21:a1/evidence.json",
+    "sha256": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "extractor_version": "1"
+  },
+  "ruled_out": ["测试链路 INFRA(outbox/租约/设备调度验证正常)"],
+  "reproduce": "push 任意 master commit 触发 pipeline,该变体必现"
+}

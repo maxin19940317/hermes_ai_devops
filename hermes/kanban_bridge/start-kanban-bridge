@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# start-kanban-bridge — 在 q-uat 宿主(tobias 账号,docker 组)启动 kanban_bridge。
+# 形态与 start-analyze-bridge 一致:env 文件 + pidfile + nohup uvicorn,
+# 重复执行幂等(健康则直接返回)。本服务跑在宿主,不在任何容器内
+# (需要 docker exec 权限,worker 容器不持 docker socket,设计 §6)。
+set -euo pipefail
+ENV_FILE=${KANBAN_BRIDGE_ENV:-/home/tobias/kanban_bridge.env}
+PID_FILE=${KANBAN_BRIDGE_PID:-/home/tobias/logs/kanban-bridge-8644.pid}
+LOG_FILE=${KANBAN_BRIDGE_LOG:-/home/tobias/logs/kanban-bridge-8644.log}
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_MODULE=kanban_bridge:app
+PORT=8644
+UVICORN_BIN=${UVICORN_BIN:-uvicorn}
+
+if [ ! -f "$ENV_FILE" ]; then
+  echo "missing $ENV_FILE (需要 KANBAN_BRIDGE_TOKEN=...)" >&2
+  exit 2
+fi
+# shellcheck disable=SC1090
+set -a
+. "$ENV_FILE"
+set +a
+
+mkdir -p "$(dirname "$PID_FILE")"
+if [ -f "$PID_FILE" ]; then
+  old_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  if [ -n "${old_pid:-}" ] && kill -0 "$old_pid" 2>/dev/null; then
+    if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+      echo "kanban bridge already running: $old_pid"
+      exit 0
+    fi
+    kill "$old_pid" 2>/dev/null || true
+    sleep 1
+  fi
+fi
+
+cd "$APP_DIR"
+nohup "$UVICORN_BIN" "$APP_MODULE" --host 0.0.0.0 --port "$PORT" \
+  >>"$LOG_FILE" 2>&1 &
+echo $! >"$PID_FILE"
+sleep 1
+curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
+echo "kanban bridge started: $(cat "$PID_FILE") (port $PORT)"

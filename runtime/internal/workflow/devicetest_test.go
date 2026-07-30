@@ -42,6 +42,11 @@ type fakeActs struct {
 	evidenceErr   error    // 非 nil 模拟提取失败(降级路径)
 	snapshotID    string   // ExtractEvidence 返回的快照 id(空 = 降级未持久化)
 
+	gate      EscalationGateResponse // EscalationGate 返回值(Enabled 缺省 false = 升级禁用)
+	gateCalls []EscalationGateRequest
+	escCalls  []EscalationRequest
+	escErr    error // 非 nil 模拟 Escalate 活动失败
+
 	results   map[string]ResultRecord // LoadResult 的权威数据源(模拟 results 表)
 	loadCalls []string
 
@@ -148,6 +153,22 @@ func (f *fakeActs) CheckLease(_ context.Context, r CheckLeaseRequest) (*time.Tim
 	defer f.mu.Unlock()
 	f.checkLeaseCalls = append(f.checkLeaseCalls, r.TaskID)
 	return f.leaseExpiry, nil
+}
+func (f *fakeActs) EscalationGate(_ context.Context, r EscalationGateRequest) (*EscalationGateResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gateCalls = append(f.gateCalls, r)
+	g := f.gate
+	return &g, nil
+}
+func (f *fakeActs) Escalate(_ context.Context, r EscalationRequest) (*EscalationResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.escCalls = append(f.escCalls, r)
+	if f.escErr != nil {
+		return nil, f.escErr
+	}
+	return &EscalationResponse{KanbanTaskID: "t_1", IdempotencyKey: "k", Result: "created"}, nil
 }
 
 // seedResult 把 sig 登记为 results 表的权威行:事务性 Outbox 链路下
@@ -712,5 +733,118 @@ func TestFailScope(t *testing.T) {
 					tc.site, tc.category, tc.status, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestEscalationGateMatrix:升级门槛矩阵(docs/superpowers/specs/2026-07-30 §5)——
+// category ∈ {CODE,MODEL,DELEGATE,DEVICE} × 启用 × 判重 × 置信度 × 分析缺失。
+// 幂等键尾段:有签名命中取首个签名 id(自报优先),否则 category。
+func TestEscalationGateMatrix(t *testing.T) {
+	cases := []struct {
+		name         string
+		reported     []string
+		matched      []string
+		extraSigCat  map[string]rules.Category
+		gateEnabled  bool
+		already      bool
+		analysisNil  bool
+		confidence   float64
+		wantEscalate bool
+		wantSigOrCat string
+	}{
+		{"CODE 升级(无签名取 category)", nil, nil, nil, true, false, false, 0.9, true, "CODE"},
+		{"MODEL 升级(自报签名)", []string{"cpu_fallback"}, nil, nil, true, false, false, 0.9, true, "cpu_fallback"},
+		{"DELEGATE 升级(runtime 提取命中)", nil, []string{"dsp_unavailable"}, nil, true, false, false, 0.9, true, "dsp_unavailable"},
+		{"DEVICE 升级", []string{"sig_dev"}, nil, map[string]rules.Category{"sig_dev": "DEVICE"}, true, false, false, 0.9, true, "sig_dev"},
+		{"INFRA 不升级(类别门槛)", []string{"sig_infra"}, nil, map[string]rules.Category{"sig_infra": "INFRA"}, true, false, false, 0.9, false, ""},
+		{"endpoint 未配置不升级", nil, nil, nil, false, false, false, 0.9, false, ""},
+		{"已升级判重不重复", nil, nil, nil, true, true, false, 0.9, false, ""},
+		{"低置信不升级", nil, nil, nil, true, false, false, 0.5, false, ""},
+		{"分析缺失不升级", nil, nil, nil, true, false, true, 0, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := spec1()
+			for k, v := range tc.extraSigCat {
+				spec.SignatureCategory[k] = v
+			}
+			f := &fakeActs{
+				specs:       []TestSpec{spec},
+				matchedSigs: tc.matched,
+				gate:        EscalationGateResponse{Enabled: tc.gateEnabled, MinConfidence: 0.7, AlreadyEscalated: tc.already},
+			}
+			if !tc.analysisNil {
+				f.analysis = &hermesclient.Analysis{AnalysisVersion: 1, Summary: "s", Confidence: tc.confidence}
+			}
+			env := newEnv(t, f)
+			sig := TaskResultSignal{
+				TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 1, CasesTotal: 10,
+				CasesFailed: 2, SignaturesHit: tc.reported,
+			}
+			seedResult(f, sig)
+			env.RegisterDelayedCallback(func() {
+				env.SignalWorkflow(SignalTaskResult, sig)
+			}, 10*time.Second)
+
+			env.ExecuteWorkflow(DeviceTestWorkflow, input())
+			var out DeviceTestOutput
+			if err := env.GetWorkflowResult(&out); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantEscalate {
+				if len(f.escCalls) != 1 {
+					t.Fatalf("escCalls = %d, want 1", len(f.escCalls))
+				}
+				req := f.escCalls[0]
+				if req.SignatureOrCategory != tc.wantSigOrCat ||
+					req.Project != "grp/p" || req.Commit != "abcd1234" || req.PipelineID != 42 ||
+					req.TaskID != taskID("a1") || req.Verdict != "TEST_FAILED" ||
+					req.Analysis == nil {
+					t.Errorf("escalation req = %+v", req)
+				}
+			} else if len(f.escCalls) != 0 {
+				t.Errorf("不应升级: escCalls = %+v", f.escCalls)
+			}
+			// 主链路不受影响:verdict 恒为规则判定
+			if out.Tasks[0].Verdict != "TEST_FAILED" {
+				t.Errorf("verdict = %s, want TEST_FAILED", out.Tasks[0].Verdict)
+			}
+		})
+	}
+}
+
+// TestEscalateFailureKeepsMainFlow:bridge/活动失败(故障注入)只记日志——
+// verdict、通知、hermes 分析全部不受影响(§7:升级失败不阻断、不重试)。
+func TestEscalateFailureKeepsMainFlow(t *testing.T) {
+	f := &fakeActs{
+		specs:       []TestSpec{spec1()},
+		matchedSigs: []string{"dsp_unavailable"},
+		gate:        EscalationGateResponse{Enabled: true, MinConfidence: 0.7},
+		analysis:    &hermesclient.Analysis{AnalysisVersion: 1, Summary: "s", Confidence: 0.9},
+		escErr:      errBoom,
+	}
+	env := newEnv(t, f)
+	sig := TaskResultSignal{
+		TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 0,
+		SignaturesHit: []string{"dsp_unavailable"},
+	}
+	seedResult(f, sig)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, sig)
+	}, 10*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Tasks[0].Verdict != "TEST_FAILED" || out.Tasks[0].Category != "DELEGATE" {
+		t.Errorf("summary = %+v, want TEST_FAILED/DELEGATE(升级失败不改判定)", out.Tasks[0])
+	}
+	if out.Tasks[0].Analysis == nil {
+		t.Error("升级失败不得影响 hermes 分析结论")
+	}
+	if len(f.notifications) != 1 || !strings.Contains(f.notifications[0], "TEST_FAILED") {
+		t.Errorf("通知应照常发送: %v", f.notifications)
 	}
 }

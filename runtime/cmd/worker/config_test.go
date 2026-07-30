@@ -68,24 +68,27 @@ func TestLoadConfigAppliesDefaults(t *testing.T) {
 
 func TestLoadConfigOverridesFromEnv(t *testing.T) {
 	cfg, err := loadConfig(lookup(map[string]string{
-		"VARIANTS_CONFIG":        "v.yaml",
-		"CALLBACK_BASE_URL":      "https://runtime.example",
-		"TEMPORAL_ADDRESS":       "temporal.internal:7233",
-		"TEMPORAL_TASK_QUEUE":    "custom-queue",
-		"DATABASE_URL":           "postgres://x/y",
-		"WORKER_CALLBACKS_ADDR":  ":9999",
-		"LEASE_SECONDS":          "60",
-		"QUARANTINE_AFTER":       "5",
-		"MAX_INFRA_RETRIES":      "1",
-		"ARTIFACT_AUTH_TYPE":     "basic",
-		"ARTIFACT_AUTH_TOKEN":    "secret-tok",
-		"ARTIFACT_AUTH_USERNAME": "deploy-user",
-		"FEISHU_WEBHOOK_URL":     "https://open.feishu.cn/hook/x",
-		"FEISHU_APP_ID":          "cli_a1",
-		"FEISHU_APP_SECRET":      "app-sec",
-		"FEISHU_RECEIVE_ID":      "ou_user1",
-		"FEISHU_RECEIVE_ID_TYPE": "open_id",
-		"FEISHU_CMD_WHITELIST":   "ou_a,ou_b",
+		"VARIANTS_CONFIG":           "v.yaml",
+		"CALLBACK_BASE_URL":         "https://runtime.example",
+		"TEMPORAL_ADDRESS":          "temporal.internal:7233",
+		"TEMPORAL_TASK_QUEUE":       "custom-queue",
+		"DATABASE_URL":              "postgres://x/y",
+		"WORKER_CALLBACKS_ADDR":     ":9999",
+		"LEASE_SECONDS":             "60",
+		"QUARANTINE_AFTER":          "5",
+		"MAX_INFRA_RETRIES":         "1",
+		"ARTIFACT_AUTH_TYPE":        "basic",
+		"ARTIFACT_AUTH_TOKEN":       "secret-tok",
+		"ARTIFACT_AUTH_USERNAME":    "deploy-user",
+		"FEISHU_WEBHOOK_URL":        "https://open.feishu.cn/hook/x",
+		"FEISHU_APP_ID":             "cli_a1",
+		"FEISHU_APP_SECRET":         "app-sec",
+		"FEISHU_RECEIVE_ID":         "ou_user1",
+		"FEISHU_RECEIVE_ID_TYPE":    "open_id",
+		"FEISHU_CMD_WHITELIST":      "ou_a,ou_b",
+		"ESCALATION_ENDPOINT":       "http://bridge:8644",
+		"ESCALATION_TOKEN":          "esc-tok",
+		"ESCALATION_MIN_CONFIDENCE": "0.85",
 	}))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
@@ -124,6 +127,11 @@ func TestLoadConfigOverridesFromEnv(t *testing.T) {
 		cfg.Activity.FeishuReceiveID != "ou_user1" || cfg.Activity.FeishuReceiveIDType != "open_id" ||
 		cfg.Activity.FeishuCmdWhitelist != "ou_a,ou_b" {
 		t.Errorf("feishu app creds = %+v", cfg.Activity)
+	}
+	if cfg.Activity.EscalationEndpoint != "http://bridge:8644" ||
+		cfg.Activity.EscalationToken != "esc-tok" ||
+		cfg.Activity.EscalationMinConfidence != 0.85 {
+		t.Errorf("escalation cfg = %+v", cfg.Activity)
 	}
 }
 

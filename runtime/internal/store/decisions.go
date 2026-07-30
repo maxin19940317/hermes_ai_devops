@@ -27,3 +27,16 @@ func (s *MemStore) ListDecisions(_ context.Context, taskID string) ([]wf.Decisio
 	}
 	return out, nil
 }
+
+// HasDecision 报告某任务是否已有指定 actor 的裁决(升级判重:
+// decisions actor='escalation' 存在即已升级过,设计 §5 门槛 3)。
+func (s *MemStore) HasDecision(_ context.Context, taskID, actor string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range s.decisions {
+		if d.TaskID == taskID && d.Actor == actor {
+			return true, nil
+		}
+	}
+	return false, nil
+}

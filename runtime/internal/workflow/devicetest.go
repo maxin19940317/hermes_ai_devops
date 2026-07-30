@@ -157,6 +157,48 @@ type DecisionRow struct {
 	EvidenceSnapshotID string `json:"evidence_snapshot_id,omitempty"`
 }
 
+// EscalationGateRequest 是 EscalationGate 活动的入参(升级门槛评估,
+// 设计 §5):阈值与判重等配置/存储状态经活动进入 workflow,保持确定性。
+type EscalationGateRequest struct {
+	TaskID   string `json:"task_id"`
+	Category string `json:"category"`
+}
+
+// EscalationGateResponse 是升级门槛的配置侧输入:Enabled=false(未配置
+// ESCALATION_ENDPOINT)时 workflow 完全跳过升级旁路。
+type EscalationGateResponse struct {
+	Enabled          bool    `json:"enabled"`
+	MinConfidence    float64 `json:"min_confidence"`
+	AlreadyEscalated bool    `json:"already_escalated"` // decisions 已有 actor='escalation'
+}
+
+// EscalationRequest 是 Escalate 活动的入参:组信封所需的全部事实
+// (信封结构 contracts/escalation.schema.json)。
+type EscalationRequest struct {
+	TaskID     string `json:"task_id"`
+	Project    string `json:"project"`
+	Commit     string `json:"commit"`
+	PipelineID int    `json:"pipeline_iid"`
+	Variant    string `json:"variant"`
+	Verdict    string `json:"verdict"`
+	Category   string `json:"category"`
+	Reason     string `json:"reason"`
+	// SignatureOrCategory 幂等键尾段(设计 §4):有签名命中取首个签名 id,
+	// 否则取 rule category。
+	SignatureOrCategory string                 `json:"signature_or_category"`
+	Analysis            *hermesclient.Analysis `json:"analysis,omitempty"`
+	// EvidenceSnapshotID 引用已持久化快照;空 = 快照降级未持久化,
+	// 信封 evidence 段省略,不阻断升级。
+	EvidenceSnapshotID string `json:"evidence_snapshot_id,omitempty"`
+}
+
+// EscalationResponse 是 Escalate 活动的结果(落 decisions 的 output 同源)。
+type EscalationResponse struct {
+	KanbanTaskID   string `json:"kanban_task_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+	Result         string `json:"result"` // created | existing
+}
+
 // ExtractEvidenceRequest 是 ExtractEvidence 活动的入参(§12 Phase 2)。
 type ExtractEvidenceRequest struct {
 	TaskID  string           `json:"task_id"`
@@ -280,7 +322,7 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 	resultCh := workflow.GetSignalChannel(ctx, SignalTaskResult)
 
 	for _, spec := range sel.Specs {
-		out.Tasks = append(out.Tasks, runTest(ctx, spec, ruleVersion, resultCh))
+		out.Tasks = append(out.Tasks, runTest(ctx, in, spec, ruleVersion, resultCh))
 	}
 
 	text := buildNotification(in, out)
@@ -291,11 +333,11 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 }
 
 // runTest 执行一个测试(含 INFRA 机械重试,§10 缺省 ≤2 次)。
-func runTest(ctx workflow.Context, spec TestSpec, ruleVersion string, resultCh workflow.ReceiveChannel) TaskSummary {
+func runTest(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVersion string, resultCh workflow.ReceiveChannel) TaskSummary {
 	maxAttempts := spec.MaxInfraRetries + 1
 	var sum TaskSummary
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		sum = runAttempt(ctx, spec, ruleVersion, attempt, resultCh)
+		sum = runAttempt(ctx, in, spec, ruleVersion, attempt, resultCh)
 		if !sum.retryable || attempt == maxAttempts {
 			break
 		}
@@ -359,7 +401,7 @@ func failScope(site releaseSite, category rules.Category, resultStatus string) F
 	return FailScopeNone // 未覆盖组合保守处理:不加不减
 }
 
-func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt int, resultCh workflow.ReceiveChannel) TaskSummary {
+func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVersion string, attempt int, resultCh workflow.ReceiveChannel) TaskSummary {
 	wfID := workflow.GetInfo(ctx).WorkflowExecution.ID
 	// 幂等键 = {workflow_id}:{test_id}:{attempt}(§12.6),task_id 同值
 	taskID := fmt.Sprintf("%s:%s:a%d", wfID, spec.TestID, attempt)
@@ -515,6 +557,9 @@ func runAttempt(ctx workflow.Context, spec TestSpec, ruleVersion string, attempt
 	// Phase 2:非 PASSED 交 Analyzer 补充分析(降级设计,不影响主链路)
 	if d.Verdict != rules.VerdictPassed {
 		sum.Analysis = runAnalysis(ctx, dctx, taskID, d, ev)
+		// 升级旁路(设计 §5):有稳定诊断的非 INFRA 失败派给 PM;
+		// 全程 fire-and-forget,失败只记日志
+		maybeEscalate(ctx, in, taskID, spec, res, d, ev, sum.Analysis)
 	}
 	finish(res.Status, sum.Verdict, sum.Category, sum.Reason)
 	release(d.Category == rules.CategoryInfra, failScope(siteTerminal, d.Category, res.Status))
@@ -552,6 +597,61 @@ func mergeSignatureHits(reported, extracted []string) ([]string, bool) {
 		}
 	}
 	return merged, added
+}
+
+// escalatableCategories:有稳定诊断的非 INFRA 失败才升级(设计 §5);
+// INFRA 类由机械重试与归因计数负责,不打扰 PM。
+func escalatableCategory(c rules.Category) bool {
+	switch c {
+	case rules.CategoryCode, rules.CategoryModel, rules.CategoryDelegate, rules.CategoryDevice:
+		return true
+	}
+	return false
+}
+
+// maybeEscalate 升级旁路(docs/superpowers/specs/2026-07-30 §2/§5):
+// Hermes 分析后按门槛评估(category ∈ {CODE,MODEL,DELEGATE,DEVICE} +
+// 启用 + 未升级过 + analysis 非空 + confidence ≥ 阈值),满足则组信封经
+// Escalate 活动派给 PM。全程 fire-and-forget:任何失败只记日志,
+// verdict/通知/审计主链路不变(§3:agent 不在执行关键路径)。
+func maybeEscalate(ctx workflow.Context, in DeviceTestInput, taskID string, spec TestSpec, res *TaskResultSignal, d rules.Decision, ev *ExtractEvidenceResponse, analysis *hermesclient.Analysis) {
+	logger := workflow.GetLogger(ctx)
+	if !escalatableCategory(d.Category) {
+		return
+	}
+	var gate EscalationGateResponse
+	if err := workflow.ExecuteActivity(ctx, "EscalationGate",
+		EscalationGateRequest{TaskID: taskID, Category: string(d.Category)}).Get(ctx, &gate); err != nil {
+		logger.Error("escalation gate failed, skip escalation", "task", taskID, "error", err)
+		return
+	}
+	if !gate.Enabled || gate.AlreadyEscalated || analysis == nil ||
+		analysis.Confidence < gate.MinConfidence {
+		return
+	}
+	// 幂等键尾段(设计 §4):有签名命中取首个签名 id(设备自报优先),否则 category
+	sigOrCat := string(d.Category)
+	var evSigs []string
+	if ev != nil {
+		evSigs = ev.MatchedSignatures
+	}
+	if merged, _ := mergeSignatureHits(res.SignaturesHit, evSigs); len(merged) > 0 {
+		sigOrCat = merged[0]
+	}
+	var snapID string
+	if ev != nil {
+		snapID = ev.SnapshotID
+	}
+	var escResp EscalationResponse
+	if err := workflow.ExecuteActivity(ctx, "Escalate", EscalationRequest{
+		TaskID: taskID, Project: in.Project, Commit: in.Commit, PipelineID: in.PipelineID,
+		Variant: spec.Variant, Verdict: string(d.Verdict), Category: string(d.Category),
+		Reason: d.Reason, SignatureOrCategory: sigOrCat, Analysis: analysis,
+		EvidenceSnapshotID: snapID,
+	}).Get(ctx, &escResp); err != nil {
+		// activity 内部已落 error 审计行(§7);此处只记日志,不影响主链路
+		logger.Error("escalate failed", "task", taskID, "error", err)
+	}
 }
 
 // saveRuleDecision 把规则引擎裁决落 decisions 表;失败只记日志(用 disconnected

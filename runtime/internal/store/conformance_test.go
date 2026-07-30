@@ -44,6 +44,7 @@ type fullStore interface {
 	OutboxBacklog(ctx context.Context, stuckAttempts int) (*OutboxBacklog, error)
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
 	ListDecisions(ctx context.Context, taskID string) ([]wf.DecisionRow, error)
+	HasDecision(ctx context.Context, taskID, actor string) (bool, error)
 	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
 	SaveEvidenceSnapshot(ctx context.Context, snap EvidenceSnapshot) error
 	GetEvidenceSnapshot(ctx context.Context, evidenceID string) (*EvidenceSnapshot, error)
@@ -1263,6 +1264,23 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		assertJSONEqual(llm.Output, got[1].Output)
 		if none, err := s.ListDecisions(ctx, "no-such"); err != nil || len(none) != 0 {
 			t.Errorf("未知任务应返回空: %v %v", none, err)
+		}
+		// HasDecision(升级判重,设计 §5 门槛 3):按 task_id+actor 精确匹配
+		if has, err := s.HasDecision(ctx, "w:t1:a1", "escalation"); err != nil || has {
+			t.Errorf("未升级时应为 false: %v %v", has, err)
+		}
+		if err := s.SaveDecision(ctx, wf.DecisionRow{TaskID: "w:t1:a1", Actor: "escalation",
+			Output: json.RawMessage(`{"kanban_task_id":"t_1","result":"created"}`)}); err != nil {
+			t.Fatal(err)
+		}
+		if has, _ := s.HasDecision(ctx, "w:t1:a1", "escalation"); !has {
+			t.Error("升级后应为 true")
+		}
+		if has, _ := s.HasDecision(ctx, "w:t1:a1", "human"); has {
+			t.Error("不同 actor 不得误判")
+		}
+		if has, _ := s.HasDecision(ctx, "other-task", "escalation"); has {
+			t.Error("不同 task 不得误判")
 		}
 	})
 

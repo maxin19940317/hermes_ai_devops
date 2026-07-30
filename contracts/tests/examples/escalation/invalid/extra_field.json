@@ -1,0 +1,17 @@
+{
+  "escalation_version": 1,
+  "idempotency_key": "devops-escalation:aios/algo_super_sdk:def41bec:aarch64_Android_SNPE_2.21:CODE",
+  "source": {
+    "project": "aios/algo_super_sdk",
+    "commit": "def41bec",
+    "pipeline_iid": 53,
+    "variant": "aarch64_Android_SNPE_2.21",
+    "task_id": "device-test-aios/algo_super_sdk-gdef41bec-p53:aarch64_Android_SNPE_2.21:a1"
+  },
+  "rule": {
+    "verdict": "TEST_FAILED",
+    "category": "CODE",
+    "reason": "test cases failed"
+  },
+  "bogus": 1
+}

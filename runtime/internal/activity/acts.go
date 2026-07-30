@@ -25,6 +25,8 @@ type Store interface {
 	GetResult(ctx context.Context, taskID string) (*wf.ResultRecord, error)
 	GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error)
 	SaveEvidenceSnapshot(ctx context.Context, snap store.EvidenceSnapshot) error
+	GetEvidenceSnapshot(ctx context.Context, evidenceID string) (*store.EvidenceSnapshot, error)
+	HasDecision(ctx context.Context, taskID, actor string) (bool, error)
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).
@@ -45,6 +47,11 @@ type Config struct {
 	// FeishuCmdWhitelist 指令 listener 白名单(逗号分隔 open_id);
 	// 空 = listener 不启动。
 	FeishuCmdWhitelist string
+	// DevOps → PM 升级通道(docs/superpowers/specs/2026-07-30 §8):
+	// Endpoint 空 = 升级禁用(现状)。
+	EscalationEndpoint      string
+	EscalationToken         string
+	EscalationMinConfidence float64 // 缺省 0.7
 	// MinIO 预签名直传(§3.7);Endpoint 或凭据为空即禁用,优雅降级为空 presigned_uploads。
 	MinIOEndpoint       string        // 集群内 endpoint(如 minio:9000);兼作启用开关
 	MinIOPublicEndpoint string        // 预签名 URL 的 host,须 Client 可达(签名覆盖 Host)

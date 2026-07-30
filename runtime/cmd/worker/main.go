@@ -25,6 +25,9 @@
 //	FEISHU_RECEIVE_ID       可选;接收方 open_id(个人单聊)或 chat_id(群)
 //	FEISHU_RECEIVE_ID_TYPE  可选;chat_id|open_id,缺省 chat_id
 //	FEISHU_CMD_WHITELIST    可选;指令 listener 白名单(逗号分隔 open_id),空 = 不启动
+//	ESCALATION_ENDPOINT     可选;kanban_bridge URL,空 = 升级禁用(现状)
+//	ESCALATION_TOKEN        可选;bridge Bearer 共享密钥
+//	ESCALATION_MIN_CONFIDENCE 可选;hermes 置信度门槛,缺省 0.7
 //	FEISHU_CMD_NL           可选;飞书指令自然语言翻译旁路总开关,缺省 false(灰度)。
 //	                        启用需三者合取:=true && HERMES_ENDPOINT 非空 && FEISHU_CMD_WHITELIST 非空
 //	FEISHU_CMD_NL_TIMEOUT_SEC 可选;/translate 调用超时,缺省 60(不复用 HERMES_TIMEOUT_SEC)

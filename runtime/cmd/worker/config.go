@@ -51,6 +51,17 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		}
 		return d, nil
 	}
+	envFloat := func(key string, def float64) (float64, error) {
+		v := getenv(key)
+		if v == "" {
+			return def, nil
+		}
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%s: 非法浮点数 %q: %w", key, v, err)
+		}
+		return f, nil
+	}
 
 	variantsPath := getenv("VARIANTS_CONFIG")
 	if variantsPath == "" {
@@ -104,6 +115,10 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	escMinConf, err := envFloat("ESCALATION_MIN_CONFIDENCE", 0.7)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		TemporalAddress:    env("TEMPORAL_ADDRESS", "127.0.0.1:7233"),
@@ -126,6 +141,10 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			FeishuReceiveIDType: getenv("FEISHU_RECEIVE_ID_TYPE"), // 空 → chat_id
 			// 飞书指令 listener 白名单(逗号分隔 open_id;空 = listener 不启动)
 			FeishuCmdWhitelist: getenv("FEISHU_CMD_WHITELIST"),
+			// DevOps → PM 升级通道(设计 §8):空 = 升级禁用(现状)
+			EscalationEndpoint:      getenv("ESCALATION_ENDPOINT"),
+			EscalationToken:         getenv("ESCALATION_TOKEN"),
+			EscalationMinConfidence: escMinConf,
 			// §12 Phase 2:自然语言翻译旁路总开关(缺省关,灰度)。
 			FeishuCmdNL:        getenv("FEISHU_CMD_NL") == "true",
 			FeishuCmdNLTimeout: time.Duration(nlTimeoutSec) * time.Second,

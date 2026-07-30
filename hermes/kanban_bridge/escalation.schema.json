@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-devops/contracts/escalation.schema.json",
+  "title": "DevOps → PM 升级信封 v1",
+  "description": "DevOps → PM 升级通道(docs/superpowers/specs/2026-07-30-devops-pm-escalation-design.md §3)的任务信封:Runtime Escalate 活动组信,kanban_bridge 校验后渲染 title/body 投递 kanban。结构化自包含(PM 侧够不到 devops 的 DB/MinIO);title ≤200 / body ≤8KB 的截断在 bridge 侧执行,契约不限制长度。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["escalation_version", "idempotency_key", "source", "rule"],
+  "properties": {
+    "escalation_version": { "const": 1 },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "幂等键(设计 §4):devops-escalation:{project}:{commit}:{variant}:{signature_or_category};由 devops 派生,bridge 不推导"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project", "commit", "pipeline_iid", "variant", "task_id"],
+      "properties": {
+        "project": { "type": "string", "minLength": 1 },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "pipeline_iid": { "type": "integer", "minimum": 1 },
+        "variant": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "category", "reason"],
+      "properties": {
+        "verdict": { "type": "string", "minLength": 1 },
+        "category": {
+          "description": "错误分类(CLAUDE.md §9,与 runtime rules.Category 枚举一致)",
+          "enum": ["INFRA", "BUILD", "CODE", "MODEL", "DELEGATE", "DEVICE", "PERF", "UNKNOWN"]
+        },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "hermes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "confidence"],
+      "description": "Hermes 分析结论;分析降级时整个字段缺省(门槛 §5:无分析不升级)",
+      "properties": {
+        "summary": { "type": "string", "minLength": 1 },
+        "root_cause": { "type": "string" },
+        "suggested_category": {
+          "enum": ["INFRA", "BUILD", "CODE", "MODEL", "DELEGATE", "DEVICE", "PERF", "UNKNOWN"]
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "next_actions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_id", "object_key", "sha256", "extractor_version"],
+      "description": "evidence 快照引用(差距 #6);快照未持久化(降级)时整个字段缺省,不阻断升级",
+      "properties": {
+        "snapshot_id": { "type": "string", "minLength": 1 },
+        "object_key": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "extractor_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ruled_out": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "已排除方向的陈述(可选)"
+    },
+    "reproduce": { "type": "string", "description": "复现路径(可选)" }
+  }
+}
