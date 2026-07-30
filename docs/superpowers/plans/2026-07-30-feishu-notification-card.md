@@ -75,13 +75,21 @@ workflow 代码，就再也录不到这份历史了，而设计 §6 把"旧 hist
 
 **录制器必须拒绝覆盖已存在的 fixture**：
 
+用 `O_CREATE|O_EXCL` **原子**取得首次写入权，而不是 `os.Stat` 预检查——
+后者是"检查后写入"竞态，且没处理 `Stat` 返回非 `NotExist` 错误的情形：
+
 ```go
 	const fixture = "testdata/history-pre-notify-card.json"
-	if _, err := os.Stat(fixture); err == nil {
+	f, err := os.OpenFile(fixture, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if errors.Is(err, os.ErrExist) {
 		t.Fatalf("%s 已存在,拒绝覆盖。这份 history 必须是**改动前**录的;"+
 			"Task 5 之后再跑本录制器会把它替换成改动后的历史,"+
-			"重放测试就再也发现不了版本分支的问题。要重录先手工删除。", fixture)
+			"重放测试就再也发现不了版本分支的问题。要重录请先手工删除。", fixture)
 	}
+	if err != nil {
+		t.Fatalf("创建 %s 失败: %v", fixture, err)
+	}
+	defer f.Close()
 ```
 
 这不是防呆，是防一种**会静默毁掉回归判据**的操作：文件被覆盖后重放测试照样绿，
@@ -97,7 +105,16 @@ API 决定序列化方式**，不要凭记忆写。若 `FromJSONFile` 期望的�
 
 - [ ] **Step 2: 跑录制，产出 fixture**
 
-Run: 录制测试（按你的门控方式启用）
+```bash
+cd /home/maxin/Code/hermes_ai_devops/runtime && \
+  PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache \
+  go test -tags record_history ./internal/workflow \
+    -run '^TestRecordPreNotifyCardHistory$' -count=1 -v
+```
+
+`-count=1` 不是可选的：录制器一旦被测试缓存命中就会被跳过，而它有写文件的副作用，
+"跳过"看起来像成功但什么都没产出。
+
 Expected: 生成 `runtime/internal/workflow/testdata/history-pre-notify-card.json`，
 非空且包含 `WorkflowExecutionStarted` 与 `WorkflowExecutionCompleted` 事件
 
@@ -125,9 +142,11 @@ func TestReplayPreNotifyCardHistory(t *testing.T) {
 Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/workflow/ -run TestReplayPreNotifyCardHistory -v`
 Expected: PASS —— **在生产代码尚未改动的情况下通过**，证明 fixture 与 harness 都可用
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: 格式化并 Commit**
 
 ```bash
+/home/maxin/.local/go/bin/gofmt -w \
+  runtime/internal/workflow/replay_test.go runtime/internal/workflow/record_history_test.go
 git add runtime/internal/workflow/testdata/ \
         runtime/internal/workflow/replay_test.go \
         runtime/internal/workflow/record_history_test.go
@@ -264,6 +283,7 @@ Expected: 新用例全 PASS，**既有 `SendText` 用例一条未改即通过**
 - [ ] **Step 6: Commit**
 
 ```bash
+/home/maxin/.local/go/bin/gofmt -w runtime/internal/feishu/
 git add runtime/internal/feishu/
 git commit -m "feat(feishu): add CardSender with per-mode wire shapes"
 ```
@@ -365,50 +385,88 @@ func TestCardClosedStructureCatchesViolations(t *testing.T) {
 }
 ```
 
-**字段精确值**（设计 §4.3）——**一份黄金卡片，逐元素比对，不是只看"某行在不在"**：
+**字段精确值**（设计 §4.3）——**逐元素比对整个 `Elements` 切片**：
 
-只检查出现条件挡不住这几类真实错误：header 漏了 commit 或 pipeline、cases 写成
-`failed/total` 而不是 `passed/total`、duration 不是 `%.1f`、attempt 取错值。所以主用例是：
+`strings.Contains` 挡不住子串误通过：`380.14` 会通过对 `"380.1"` 的检查，
+`attempt 20` 会通过对 `"attempt 2"` 的检查。所以必须构造完整的 `want []CardElement`
+并整体比对（`Tag`、`Text.Tag`、`Content`、**顺序**）。
+
+**先把正文格式钉死**，否则黄金测试写不出来：
+
+| 行 | 格式 | 出现条件 |
+|---|---|---|
+| 主行 | `{variant}  {verdict}`，非 PASSED 且 `Category != ""` 时追加 `({category})` | 每个变体总有 |
+| 指标行 | 由存在的部分用 ` · ` 连接：`{duration:%.1f}s`、`cases {passed}/{total}`（两者同受 `CasesTotal > 0` 门控）、`attempt {n}`（`SKIPPED` 时省略） | 至少一部分存在时才有该行 |
+| reason 行 | `{reason}` | `Reason != ""` |
+| hermes 行 | `hermes: {summary}` | `Analysis != nil && Summary != ""` |
+
+变体之间用 `{Tag: "hr"}` 分隔（首个变体前不加）。
 
 ```go
 func TestBuildNotificationCardGolden(t *testing.T) {
 	in := DeviceTestInput{Project: "algo-super-sdk", Commit: "9da3b9d9",
 		PipelineID: 56, Version: "1.4.2"}
-	out := &DeviceTestOutput{Tasks: []TaskSummary{{
-		Variant: "aarch64_Android_SNPE_1.68", Verdict: "TEST_FAILED", Category: "CODE",
-		DurationSec: 380.14, CasesTotal: 38, CasesFailed: 3, Attempt: 2,
-		Reason: "three cases crashed",
-		Analysis: &hermesclient.Analysis{Summary: "DSP 初始化崩溃"},
-	}}}
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "PASSED",
+			DurationSec: 412.3, CasesTotal: 38, CasesFailed: 0, Attempt: 1},
+		{Variant: "aarch64_Android_SNPE_1.68", Verdict: "TEST_FAILED", Category: "CODE",
+			DurationSec: 380.14, CasesTotal: 38, CasesFailed: 3, Attempt: 2,
+			Reason:   "three cases crashed",
+			Analysis: &hermesclient.Analysis{Summary: "DSP 初始化崩溃"}},
+		{Variant: "aarch64_Linux_RKNN_2.3.2", Verdict: "SKIPPED",
+			Reason: "fleet 无匹配设备"},
+	}}
+
 	card := buildNotificationCard(in, out)
 
-	// header 必须含全部四项(project/commit/pipeline/version),逐字比对
-	wantTitle := "[hermes-devops] algo-super-sdk g9da3b9d9 p56 (v1.4.2)"
-	if card.Header.Title.Content != wantTitle {
-		t.Errorf("header = %q, want %q", card.Header.Title.Content, wantTitle)
+	if want := "[hermes-devops] algo-super-sdk g9da3b9d9 p56 (v1.4.2)"; card.Header.Title.Content != want {
+		t.Errorf("header content = %q, want %q", card.Header.Title.Content, want)
+	}
+	if card.Header.Title.Tag != "plain_text" {
+		t.Errorf("header tag = %q, want plain_text", card.Header.Title.Tag)
+	}
+	if card.Header.Template != "red" { // INFRA 不在场,存在 TEST_FAILED → red
+		t.Errorf("template = %q, want red", card.Header.Template)
 	}
 
-	body := cardText(card) // 把所有 element 的 content 拼起来的测试辅助
-	for _, want := range []string{
-		"aarch64_Android_SNPE_1.68",
-		"TEST_FAILED",
-		"(CODE)",
-		"380.1",       // %.1f,不是 380.14 也不是 380
-		"cases 35/38", // passed/total = (38-3)/38,不是 failed/total
-		"attempt 2",   // 取 Attempt 的值,不是写死 1
-		"three cases crashed",
-		"DSP 初始化崩溃",
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("卡片正文缺 %q\n实际:\n%s", want, body)
-		}
+	txt := func(c string) *CardText { return &CardText{Tag: "plain_text", Content: c} }
+	want := []CardElement{
+		{Tag: "div", Text: txt("aarch64_Android_SNPE_2.21  PASSED")},
+		{Tag: "div", Text: txt("412.3s · cases 38/38 · attempt 1")},
+		{Tag: "hr"},
+		{Tag: "div", Text: txt("aarch64_Android_SNPE_1.68  TEST_FAILED(CODE)")},
+		{Tag: "div", Text: txt("380.1s · cases 35/38 · attempt 2")}, // %.1f;passed=38-3
+		{Tag: "div", Text: txt("three cases crashed")},
+		{Tag: "div", Text: txt("hermes: DSP 初始化崩溃")},
+		{Tag: "hr"},
+		{Tag: "div", Text: txt("aarch64_Linux_RKNN_2.3.2  SKIPPED")}, // SKIPPED 无 category
+		{Tag: "div", Text: txt("fleet 无匹配设备")},                     // 无指标行:CasesTotal=0 且 SKIPPED 省 attempt
 	}
-	// 反向:不该出现的
-	if strings.Contains(body, "cases 3/38") {
-		t.Error("cases 用了 failed/total,应为 passed/total")
+	if !reflect.DeepEqual(card.Elements, want) {
+		t.Errorf("elements 不匹配\ngot  (%d):\n%s\nwant (%d):\n%s",
+			len(card.Elements), dumpElements(card.Elements), len(want), dumpElements(want))
 	}
 }
+
+// dumpElements 把切片逐行打出来,便于看出是哪一行/哪个字符不同。
+func dumpElements(es []CardElement) string {
+	var b strings.Builder
+	for i, e := range es {
+		if e.Text == nil {
+			fmt.Fprintf(&b, "  [%d] tag=%s\n", i, e.Tag)
+			continue
+		}
+		fmt.Fprintf(&b, "  [%d] tag=%s texttag=%s content=%q\n", i, e.Tag, e.Text.Tag, e.Text.Content)
+	}
+	return b.String()
+}
 ```
+
+用 `reflect.DeepEqual` 而非 `cmp.Diff`：`go-cmp` 只在 `go.sum`（间接依赖），
+直接用它要动 `go.mod`；`dumpElements` 已经能给出可读的差异定位。
+
+这条断言同时覆盖了顺序、`hr` 的位置、`%.1f` 舍入（`380.14` → `380.1`）、
+`passed = CasesTotal - CasesFailed`（35 而非 3）、以及 SKIPPED 那两处省略。
 
 **出现条件**（在黄金卡片之外，各一条最小用例）：
 
@@ -468,6 +526,7 @@ Expected: **FAIL**（`utf8.ValidString` 为假）。改回来确认恢复 PASS�
 - [ ] **Step 7: Commit**
 
 ```bash
+/home/maxin/.local/go/bin/gofmt -w runtime/internal/workflow/
 git add runtime/internal/workflow/
 git commit -m "feat(workflow): build the notification card as a closed DTO"
 ```
@@ -600,6 +659,10 @@ func (a *Acts) sendFallback(ctx context.Context, text string) error {
 Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache sh -c 'go vet ./... && go test ./internal/activity/ -v -run NotifyCard' 2>&1 | tail -20`
 Expected: 全部 PASS；**既有 `notify_test.go` 一条未改即通过**
 
+**为什么降级路径不做手工验收**：卡片与降级文本走**同一个** Sender、同一个 URL，
+真实端点造不出"卡片失败但文本可达"。只有这里的 `cardFake`（`SendCard` 失败、
+`SendText` 成功）能精确构造该条件，所以降级完全由本任务的自动化测试覆盖。
+
 - [ ] **Step 6: 验证"超预算零调用"真的会红**
 
 把超预算分支临时改成"照常调 `SendCard`，失败再降级"，跑：
@@ -611,6 +674,7 @@ Expected: **FAIL** —— "超预算"那条的 `wantCards=0` 不满足。改回�
 - [ ] **Step 7: Commit**
 
 ```bash
+/home/maxin/.local/go/bin/gofmt -w runtime/internal/activity/ runtime/internal/workflow/
 git add runtime/internal/activity/ runtime/internal/workflow/devicetest.go
 git commit -m "feat(activity): add NotifyCard with a single over-budget path"
 ```
@@ -682,6 +746,7 @@ Expected: 全部 PASS
 - [ ] **Step 6: Commit**
 
 ```bash
+/home/maxin/.local/go/bin/gofmt -w runtime/internal/workflow/
 git add runtime/internal/workflow/
 git commit -m "feat(workflow): send notification cards behind a version gate"
 ```
@@ -746,7 +811,4 @@ git commit -m "docs: notification cards shipped; correct the signal description"
 2. 触发一次含 `TEST_FAILED` 的 → **红色**；含 `INFRA_ERROR` 且无其他失败的 → **橙色**
 3. 一次同时含 `INFRA_ERROR` 与 `TEST_FAILED` 的 → **红色**（不是橙）
 4. 卡片上**没有任何按钮**
-5. ~~把 webhook 指向必然失败的地址验证降级~~ —— **这一项不成立，已删除**：卡片与降级
-   文本走的是**同一个** URL，指向失败地址会让两次发送都失败，验证不出降级。降级路径由
-   Task 4 的活动测试覆盖（`cardFake` 对 `SendCard` 失败、对 `SendText` 成功），
-   那里能精确造出"卡片失败但文本可达"的条件，而真实端点造不出来。
+
