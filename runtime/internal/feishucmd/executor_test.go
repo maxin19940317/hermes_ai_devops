@@ -309,7 +309,7 @@ func TestRerunExactAuthoritativeContract(t *testing.T) {
 
 	t.Run("LegacyThreeArgsShowsMigration", func(t *testing.T) {
 		st, starter, e := newRerunFixture(t)
-		got := runRerun(t, e, "not-even-a-sha", "x", "v1")
+		got := runRerun(t, e, strings.Repeat("x", 513), "not-an-iid", "v1")
 		want := "旧 rerun 语法已停用，请使用 rerun <source_workflow_id> [variant]"
 		if got != want {
 			t.Fatalf("reply = %q, want %q", got, want)
@@ -332,6 +332,71 @@ func TestRerunExactAuthoritativeContract(t *testing.T) {
 					st.calls, starter.calls)
 			}
 		}
+	})
+
+	t.Run("ArgumentLengthBoundary", func(t *testing.T) {
+		const validationReply = "rerun 参数必须无空白且单项不超过 512 字符"
+
+		t.Run("512CharacterWorkflowIDPassesGate", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			got := runRerun(t, e, strings.Repeat("w", 512))
+			if !strings.Contains(got, "查无权威") {
+				t.Fatalf("reply = %q, 512-character ID should reach store lookup", got)
+			}
+			if len(st.calls) != 1 || len(starter.calls) != 0 {
+				t.Fatalf("calls store=%v starter=%v, want GetWorkflowRun only",
+					st.calls, starter.calls)
+			}
+		})
+
+		t.Run("513CharacterWorkflowIDRejectedBeforeDependencies", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			got := runRerun(t, e, strings.Repeat("w", 513))
+			if got != validationReply {
+				t.Fatalf("reply = %q, want %q", got, validationReply)
+			}
+			if len(st.calls) != 0 || len(starter.calls) != 0 {
+				t.Fatalf("overlong ID touched dependencies: store=%v starter=%v",
+					st.calls, starter.calls)
+			}
+		})
+
+		t.Run("512CharacterVariantPassesGate", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			variant := strings.Repeat("v", 512)
+			got := runRerun(t, e, sourceWorkflowID, variant)
+			if !strings.Contains(got, "不属于源 workflow") {
+				t.Fatalf("reply = %q, 512-character variant should reach membership validation", got)
+			}
+			if len(st.calls) != 2 || len(starter.calls) != 1 {
+				t.Fatalf("calls store=%v starter=%v, want Get/Closed/List path",
+					st.calls, starter.calls)
+			}
+		})
+
+		t.Run("513CharacterVariantRejectedBeforeDependencies", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			got := runRerun(t, e, sourceWorkflowID, strings.Repeat("v", 513))
+			if got != validationReply {
+				t.Fatalf("reply = %q, want %q", got, validationReply)
+			}
+			if len(st.calls) != 0 || len(starter.calls) != 0 {
+				t.Fatalf("overlong variant touched dependencies: store=%v starter=%v",
+					st.calls, starter.calls)
+			}
+		})
+
+		t.Run("WhitespaceArgRejectedBeforeDependencies", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			got := runRerun(t, e, sourceWorkflowID, "bad variant")
+			if got != validationReply {
+				t.Fatalf("reply = %q, want %q", got, validationReply)
+			}
+			if len(st.calls) != 0 || len(starter.calls) != 0 {
+				t.Fatalf("whitespace variant touched dependencies: store=%v starter=%v",
+					st.calls, starter.calls)
+			}
+		})
 	})
 
 	t.Run("NewOneArgRerunsFailedOutputOnly", func(t *testing.T) {

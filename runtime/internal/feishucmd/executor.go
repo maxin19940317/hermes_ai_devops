@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 
@@ -327,6 +329,11 @@ func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
 	if len(args) < 1 || len(args) > 2 {
 		return "用法: rerun <source_workflow_id> [variant]", nil
 	}
+	for _, arg := range args {
+		if !validRerunArg(arg) {
+			return "rerun 参数必须无空白且单项不超过 512 字符", nil
+		}
+	}
 
 	workflowID := args[0]
 	source, err := e.Store.GetWorkflowRun(ctx, workflowID)
@@ -432,6 +439,11 @@ func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
 func isPositiveInt(s string) bool {
 	n, err := strconv.Atoi(s)
 	return err == nil && n > 0
+}
+
+func validRerunArg(s string) bool {
+	return s != "" && utf8.ValidString(s) && utf8.RuneCountInString(s) <= 512 &&
+		strings.IndexFunc(s, unicode.IsSpace) < 0
 }
 
 func pkgRef(a store.Artifact) wf.PackageRef {
