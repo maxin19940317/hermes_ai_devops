@@ -611,8 +611,8 @@ RecentRunsReturnsDefensiveCopies
 ```
 
 The limit case must create one newest run with more variants than the limit and another older run; assert
-the first run alone fills the result. The fallback test must create a workflow_run excluded by the current
-authoritative page and prove its artifact tuple is still excluded from fallback.
+the first run alone fills the result. The fallback test must create a duplicate artifact newer than the
+only true legacy artifact and prove authoritative-tuple exclusion happens before the fallback limit.
 
 - [ ] **Step 2: Run RED**
 
