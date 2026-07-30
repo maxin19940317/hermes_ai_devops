@@ -1538,6 +1538,58 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 	})
 
+	t.Run("NextWorkflowAttemptMixedConcurrentNamespace", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.RegisterArtifacts(ctx, []Artifact{
+			{Project: "grp/p", CommitSHA: "face1234", PipelineID: 8, Variant: "v1",
+				BuildType: "Release", URL: "u1", SHA256: "s1"},
+			{Project: "grp/p", CommitSHA: "face1234", PipelineID: 8, Variant: "v2",
+				BuildType: "Release", URL: "u2", SHA256: "s2"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		const callsPerKind = 8
+		results := make(chan int, callsPerKind*2)
+		errs := make(chan error, callsPerKind*2)
+		var wg sync.WaitGroup
+		for range callsPerKind {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				n, err := s.NextWorkflowAttemptAll(ctx, "grp/p", "face1234", 8)
+				results <- n
+				errs <- err
+			}()
+			go func() {
+				defer wg.Done()
+				n, err := s.NextWorkflowAttempt(ctx, "grp/p", "face1234", 8, "v1")
+				results <- n
+				errs <- err
+			}()
+		}
+		wg.Wait()
+		close(results)
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("mixed concurrent attempt: %v", err)
+			}
+		}
+		got := make([]int, 0, callsPerKind*2)
+		for n := range results {
+			got = append(got, n)
+		}
+		sort.Ints(got)
+		want := make([]int, callsPerKind*2)
+		for i := range want {
+			want[i] = i + 1
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("mixed shared-namespace attempts = %v, want %v", got, want)
+		}
+	})
+
 	t.Run("DecisionsRoundTripInOrder", func(t *testing.T) {
 		s := newStore(t)
 		_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w:t1:a1", IdempotencyKey: "w:t1:a1"})
