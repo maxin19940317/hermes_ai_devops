@@ -1,5 +1,8 @@
 # 飞书终态通知卡片化 实施计划（展示部分）
 
+> **实施状态（2026-07-30）：** 展示卡片已完成于 `d7d6c3b`。下方 checkbox
+> 保留原实施脚本的未回填状态，不代表任务尚未执行；这里不虚假补勾历史步骤。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把终态通知从纯文本换成结构化卡片，颜色一眼区分"查代码"与"查环境"，且不引入任何交互组件。
@@ -428,7 +431,7 @@ func TestBuildNotificationCardEmptyTasks(t *testing.T) {
 
 文案必须与 `buildNotification` 里那句**逐字相同**（设计 §4.3 对照表最后一行）。
 
-**封闭结构**（设计 §4.4；含三份反例证明断言不空转）：
+**封闭结构**（设计 §4.4；含五份反例证明断言不空转）：
 
 ```go
 var allowedCardKeys = map[string]bool{
@@ -436,7 +439,8 @@ var allowedCardKeys = map[string]bool{
 	"template": true, "elements": true, "tag": true, "text": true, "content": true,
 }
 
-// walkCard 递归检查 key / tag / text 类型;返回全部违规项。
+// walkCard 递归检查 key / tag / text 类型,并锁住 div=>Text 非 nil、
+// hr=>Text nil;返回全部违规项。
 func walkCard(t *testing.T, v any) []string { /* 递归 map/slice,收集违规 */ }
 
 func TestCardIsClosedStructure(t *testing.T) {
@@ -460,6 +464,8 @@ func TestCardClosedStructureCatchesViolations(t *testing.T) {
 		{"带 actions", `{"header":{"title":{"tag":"plain_text","content":"x"}},"actions":[]}`},
 		{"带 behaviors", `{"elements":[{"tag":"div","behaviors":[{"type":"open_url"}]}]}`},
 		{"lark_md 文本", `{"elements":[{"tag":"div","text":{"tag":"lark_md","content":"x"}}]}`},
+		{"div 缺 text", `{"elements":[{"tag":"div"}]}`},
+		{"hr 带 text", `{"elements":[{"tag":"hr","text":{"tag":"plain_text","content":"x"}}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -576,8 +582,8 @@ func dumpElements(es []CardElement) string {
   `Reason`、`Summary` 各含 markdown/`<at>` → 卡片里是字面文本，节点 `tag == "plain_text"`
 - 构造超预算输入 → `len(json.Marshal(card)) <= 30*1024`，且带"详情已省略"标注
 - **裁剪必须从末尾删，且有会红的断言**。只检查"最终大小 + 有标注"是不够的：
-  从头删、随机删、把所有详情都删光，三种错误实现都能通过。用两个各带**唯一可识别详情**
-  的变体构造临界输入：
+  从头删、随机删、把所有详情都删光，三种错误实现都能通过。用一批各带**唯一可识别详情**
+  的变体构造超预算输入：
 
 ```go
 // padTo 造一批变体:第 i 个的 Reason 带唯一标记 MARK-%03d,填充到 detailRunes 长
@@ -645,14 +651,30 @@ func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
 		t.Errorf("缺少或写错省略标注,期望包含 %q", want)
 	}
 
-	// 4) 不许过度裁剪。单个详情约占预算 4%,逐个丢到不超预算为止会停在 90% 以上;
-	//    "一超预算就把所有可选行删光"这类实现会掉到 10% 上下,被这条挡住。
+	// 4) 当前结果必须在预算内。
 	n := len(mustMarshal(t, card))
-	if n > 30*1024 {
+	if n > cardByteBudget {
 		t.Errorf("裁剪后仍超预算: %d", n)
 	}
-	if n < 30*1024*3/4 {
-		t.Errorf("只剩 %d 字节(预算 %d):裁剪过度,应逐个丢到刚好装下为止", n, 30*1024)
+
+	// 5) 裁剪必须是最小的:恢复第一个被省略变体的详情,保持其余后缀详情
+	//    清除,并把省略数减一;这个候选必须重新超预算。相比 75% 经验阈值,
+	//    这里直接证明生产实现停在"再少删一个就放不下"的机械边界。
+	blocks := make([]cardVariantBlock, len(out.Tasks))
+	for i, task := range out.Tasks {
+		blocks[i] = buildCardVariantBlock(task)
+		if i > kept {
+			blocks[i].clearDetail()
+		}
+	}
+	candidate := card
+	candidate.Elements = flattenCardBlocks(blocks)
+	if omittedAfterRestore := omitted - 1; omittedAfterRestore > 0 {
+		candidate.Elements = append(candidate.Elements, cardOmittedNotice(omittedAfterRestore))
+	}
+	if got := len(mustMarshal(t, candidate)); got <= cardByteBudget {
+		t.Errorf("恢复第一个被省略详情后仍只有 %d 字节(预算 %d):生产结果裁剪过度",
+			got, cardByteBudget)
 	}
 }
 ```
@@ -693,7 +715,7 @@ Expected: 编译失败 —— `buildNotificationCard` / `NotificationCard` 未�
 - [ ] **Step 5: 跑测试**
 
 Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/workflow/ -v -run 'NotificationCard|CardIsClosed|CardClosedStructure' 2>&1 | tail -30`
-Expected: 全部 PASS，含三份反例
+Expected: 全部 PASS，含五份反例
 
 - [ ] **Step 6: 验证中文截断用例真的会红**
 

@@ -803,8 +803,8 @@ func cardHeaderTemplate(tasks []TaskSummary) string {
 }
 
 // cardVariantBlock 是单个变体在卡片里的行分组:主行(main)恒存在且不可裁剪,
-// 其余三行(metric/reason/hermes)按格式表条件出现,裁剪时作为"该变体的详情"
-// 整体丢弃(设计 §4.5 第 1 步只丢 reason/hermes,metric 保留)。
+// metric 按格式表条件出现但始终保留;reason/hermes 是"该变体的详情",
+// 裁剪时按变体整体丢弃(设计 §4.5 第 1 步)。
 type cardVariantBlock struct {
 	main   CardElement
 	metric *CardElement

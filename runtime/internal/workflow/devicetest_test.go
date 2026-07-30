@@ -841,6 +841,18 @@ func walkCard(t *testing.T, v any) []string {
 	walk = func(node any, path string, textCtx bool) {
 		switch n := node.(type) {
 		case map[string]any:
+			if !textCtx {
+				switch tag, _ := n["tag"].(string); tag {
+				case "div":
+					if text, ok := n["text"]; !ok || text == nil {
+						bad = append(bad, fmt.Sprintf("%s: div 的 text 必须非 nil", path))
+					}
+				case "hr":
+					if text, ok := n["text"]; ok && text != nil {
+						bad = append(bad, fmt.Sprintf("%s: hr 的 text 必须为 nil", path))
+					}
+				}
+			}
 			for k, val := range n {
 				childPath := path + "." + k
 				if !allowedCardKeys[k] {
@@ -917,6 +929,8 @@ func TestCardClosedStructureCatchesViolations(t *testing.T) {
 		{"带 actions", `{"header":{"title":{"tag":"plain_text","content":"x"}},"actions":[]}`},
 		{"带 behaviors", `{"elements":[{"tag":"div","behaviors":[{"type":"open_url"}]}]}`},
 		{"lark_md 文本", `{"elements":[{"tag":"div","text":{"tag":"lark_md","content":"x"}}]}`},
+		{"div 缺 text", `{"elements":[{"tag":"div"}]}`},
+		{"hr 带 text", `{"elements":[{"tag":"hr","text":{"tag":"plain_text","content":"x"}}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1291,13 +1305,29 @@ func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
 		t.Errorf("缺少或写错省略标注,期望包含 %q", want)
 	}
 
-	// 4) 不许过度裁剪。单个详情约占预算 4%,逐个丢到不超预算为止会停在 90% 以上;
-	//    "一超预算就把所有可选行删光"这类实现会掉到 10% 上下,被这条挡住。
+	// 4) 当前结果必须在预算内。
 	n := len(mustMarshal(t, card))
-	if n > 30*1024 {
+	if n > cardByteBudget {
 		t.Errorf("裁剪后仍超预算: %d", n)
 	}
-	if n < 30*1024*3/4 {
-		t.Errorf("只剩 %d 字节(预算 %d):裁剪过度,应逐个丢到刚好装下为止", n, 30*1024)
+
+	// 5) 裁剪必须是最小的:恢复第一个被省略变体的详情,保持其余后缀详情
+	//    清除,并把省略数减一;这个候选必须重新超预算。相比 75% 经验阈值,
+	//    这里直接证明生产实现停在"再少删一个就放不下"的机械边界。
+	blocks := make([]cardVariantBlock, len(out.Tasks))
+	for i, task := range out.Tasks {
+		blocks[i] = buildCardVariantBlock(task)
+		if i > kept {
+			blocks[i].clearDetail()
+		}
+	}
+	candidate := card
+	candidate.Elements = flattenCardBlocks(blocks)
+	if omittedAfterRestore := omitted - 1; omittedAfterRestore > 0 {
+		candidate.Elements = append(candidate.Elements, cardOmittedNotice(omittedAfterRestore))
+	}
+	if got := len(mustMarshal(t, candidate)); got <= cardByteBudget {
+		t.Errorf("恢复第一个被省略详情后仍只有 %d 字节(预算 %d):生产结果裁剪过度",
+			got, cardByteBudget)
 	}
 }

@@ -1,5 +1,5 @@
 // 本文件无 build tag,永远进普通 CI(与 record_history_test.go 严格分离,
-// 后者带 //go:build record_history,只在显式录制时编译——见 task-1-brief.md)。
+// 后者带 //go:build record_history,只在显式录制时编译)。
 package workflow
 
 import (
@@ -29,8 +29,8 @@ const fixtureWorkflowID = wfID
 // 重放时这些入参会因为 wfID 变成 "ReplayId" 而与 history 里记录的不一致,
 // SDK 的确定性校验随即在毫不相关的位置(LoadResult 的 ActivityTaskScheduled)
 // 报 "TMPRL1100 lookup failed for scheduledEventID to activityID"。
-// 定位过程见 task-1-report.md;修复是显式传 OriginalExecution.ID=录制时的
-// workflow ID(RunID 留空即可,生产代码不消费它)。这也是选择 in-memory 路径
+// 修复是显式传 OriginalExecution.ID=录制时的 workflow ID(RunID 留空即可,
+// 生产代码不消费它)。这也是选择 in-memory 路径
 // (protojson 反序列化 + ReplayWorkflowHistoryWithOptions)而非
 // ReplayWorkflowHistoryFromJSONFile 的唯一原因——后者没有带 Options 的变体,
 // 无法设置 OriginalExecution。
