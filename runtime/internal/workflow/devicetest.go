@@ -728,6 +728,11 @@ const cardByteBudget = 30 * 1024
 // cardReasonSummaryLimit 是单个 Reason / Analysis.Summary 的 rune 上限(设计 §4.5)。
 const cardReasonSummaryLimit = 500
 
+// cardTruncationMarker 是超长文本被截断后追加的省略标记(设计 §4.5:"截断并带省略标记")。
+// 提到包级是为了让测试直接引用这个真实值断言"标记确实出现",而不是在测试里
+// 另造一份字面量、悄悄漂离实现。
+const cardTruncationMarker = "…(已截断)"
+
 // truncateRunes 按 rune 边界截断超长文本并加省略标记(设计 §4.5)。
 // 用 []rune 切片而非 s[:n] 字节切片:中文在 UTF-8 下是多字节,按字节切会切出
 // 半个字符,导致 utf8.ValidString 为假,飞书侧可能渲染乱码甚至拒收。
@@ -736,13 +741,12 @@ func truncateRunes(s string, max int) string {
 	if len(r) <= max {
 		return s
 	}
-	const marker = "…(已截断)"
-	markerRunes := []rune(marker)
+	markerRunes := []rune(cardTruncationMarker)
 	keep := max - len(markerRunes)
 	if keep < 0 {
 		keep = 0
 	}
-	return string(r[:keep]) + marker
+	return string(r[:keep]) + cardTruncationMarker
 }
 
 // plainCardDiv 构造一个 tag=div、text.tag=plain_text 的卡片行(设计 §4.5:

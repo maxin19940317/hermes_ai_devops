@@ -1052,6 +1052,18 @@ func TestBuildNotificationCardTruncatesReason(t *testing.T) {
 	if strings.Contains(reason, long) {
 		t.Error("截断后仍包含完整原文")
 	}
+	if !strings.HasSuffix(reason, cardTruncationMarker) {
+		t.Errorf("截断后应带省略标记 %q,got %q", cardTruncationMarker, reason)
+	}
+
+	// 边界:恰好等于上限不截断,上限+1 必须截断到恰好上限个 rune——
+	// 挡住"实际上限比 500 松/紧"(比如误把 max 写成 400)的实现。
+	if got := truncateRunes(strings.Repeat("甲", cardReasonSummaryLimit), cardReasonSummaryLimit); got != strings.Repeat("甲", cardReasonSummaryLimit) {
+		t.Error("恰好 500 rune 不应被截断")
+	}
+	if n := utf8.RuneCountInString(truncateRunes(strings.Repeat("甲", cardReasonSummaryLimit+1), cardReasonSummaryLimit)); n != cardReasonSummaryLimit {
+		t.Errorf("501 rune 截断后应恰为 %d,got %d", cardReasonSummaryLimit, n)
+	}
 }
 
 func TestBuildNotificationCardTruncatesSummary(t *testing.T) {
@@ -1069,6 +1081,9 @@ func TestBuildNotificationCardTruncatesSummary(t *testing.T) {
 	content := strings.TrimPrefix(hermes, "hermes: ")
 	if utf8.RuneCountInString(content) > cardReasonSummaryLimit {
 		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(content))
+	}
+	if !strings.HasSuffix(content, cardTruncationMarker) {
+		t.Errorf("截断后应带省略标记 %q,got %q", cardTruncationMarker, content)
 	}
 }
 
@@ -1097,6 +1112,12 @@ func TestBuildNotificationCardTruncatesChineseSummaryValidUTF8(t *testing.T) {
 	hermes := card.Elements[len(card.Elements)-1].Text.Content
 	if !utf8.ValidString(hermes) {
 		t.Error("纯中文 Summary 截断后不是合法 UTF-8")
+	}
+	// 与 TestBuildNotificationCardTruncatesChineseReasonValidUTF8 对称:去掉
+	// "hermes: " 前缀后按上限校验 rune 数,不放过"截断没生效"这种回归。
+	content := strings.TrimPrefix(hermes, "hermes: ")
+	if utf8.RuneCountInString(content) > cardReasonSummaryLimit {
+		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(content))
 	}
 }
 
@@ -1191,6 +1212,15 @@ func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
 		if !strings.Contains(body, out.Tasks[i].Variant) {
 			t.Errorf("变体 %s 的主行被删了,只应删可选行", out.Tasks[i].Variant)
 		}
+	}
+
+	// 2b) 指标行也不许删:设计 §4.5 第 1 步只丢 reason/hermes,metric 保留。
+	// padTo 里每个变体的 Attempt 都是 1、CasesTotal 都是 0,所以指标行内容
+	// 逐变体相同(都是 "attempt 1"),没法按变体区分——改用出现次数:
+	// 只要有一个变体的指标行被连带丢了,计数就会少于变体总数。
+	if got := strings.Count(body, "attempt 1"); got != len(out.Tasks) {
+		t.Errorf("指标行出现次数 = %d,want %d(应逐变体保留,只丢 reason/hermes)",
+			got, len(out.Tasks))
 	}
 
 	// 3) 标注里的数字必须与实际丢弃数**逐字相符**,写死 999 或差一都要红
