@@ -120,7 +120,7 @@
     "truncated": {
       "type": "boolean",
       "default": false,
-      "description": "提取发生降级:签名上下文与兜底摘录的共享内容预算耗尽、日志读取错误或不完整、或超长单行导致扫描/展示截断"
+      "description": "提取发生降级:签名上下文与兜底摘录的共享内容预算耗尽、日志读取错误或不完整、或单行超过 1MiB 扫描上限而发生扫描截断"
     },
     "excerpts": {
       "type": "array",
