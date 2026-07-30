@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -54,6 +55,9 @@ type fullStore interface {
 	SaveCommandTranslation(ctx context.Context, row CommandTranslation) error
 	ListCommandTranslations(ctx context.Context, openID string, limit int) ([]CommandTranslation, error)
 	RecentRuns(ctx context.Context, limit int) ([]RecentRun, error)
+	RecordWorkflowRun(ctx context.Context, run WorkflowRun) error
+	GetWorkflowRun(ctx context.Context, workflowID string) (*WorkflowRun, error)
+	ListWorkflowRunVariantStates(ctx context.Context, workflowID string) ([]RunVariantState, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -112,6 +116,218 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatal(err)
 		}
 	}
+
+	workflowRunBase := func() WorkflowRun {
+		return WorkflowRun{
+			WorkflowID: "device-test-grp/p-gabcd1234-p42",
+			Project:    "grp/p", CommitSHA: "abcd1234", PipelineID: 42,
+			Version: "1.2.3", RuleVersion: "verdict-rules-v1",
+			Variants: []string{"v2", "", "v1", "v2"},
+		}
+	}
+
+	t.Run("WorkflowRunRecordGetCanonical", func(t *testing.T) {
+		s := newStore(t)
+		run := workflowRunBase()
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+		got, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatalf("GetWorkflowRun: %v", err)
+		}
+		if got == nil {
+			t.Fatal("GetWorkflowRun returned nil")
+		}
+		want := run
+		want.Variants = []string{"v1", "v2"}
+		want.CreatedAt = got.CreatedAt
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("run = %#v, want %#v", *got, want)
+		}
+		if got.CreatedAt.IsZero() {
+			t.Fatal("CreatedAt must be populated")
+		}
+		if _, err := s.GetWorkflowRun(ctx, "missing"); !errors.Is(err, ErrWorkflowRunNotFound) {
+			t.Fatalf("missing error = %v, want ErrWorkflowRunNotFound", err)
+		}
+	})
+
+	t.Run("WorkflowRunIdempotent", func(t *testing.T) {
+		s := newStore(t)
+		run := workflowRunBase()
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+		first, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replay := run
+		replay.Variants = []string{"v2", "v1", "v1"}
+		replay.CreatedAt = first.CreatedAt.Add(24 * time.Hour)
+		if err := s.RecordWorkflowRun(ctx, replay); err != nil {
+			t.Fatalf("canonical replay: %v", err)
+		}
+		got, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, first) {
+			t.Fatalf("idempotent replay changed row: got %#v, first %#v", got, first)
+		}
+
+		empty := workflowRunBase()
+		empty.WorkflowID = "empty-variants"
+		empty.Variants = nil
+		if err := s.RecordWorkflowRun(ctx, empty); err != nil {
+			t.Fatalf("record empty variants: %v", err)
+		}
+		if err := s.RecordWorkflowRun(ctx, empty); err != nil {
+			t.Fatalf("replay empty variants: %v", err)
+		}
+	})
+
+	t.Run("WorkflowRunConflictEveryField", func(t *testing.T) {
+		s := newStore(t)
+		parentA := workflowRunBase()
+		parentA.WorkflowID = "parent-a"
+		parentA.Variants = []string{"parent"}
+		parentB := parentA
+		parentB.WorkflowID = "parent-b"
+		for _, parent := range []WorkflowRun{parentA, parentB} {
+			if err := s.RecordWorkflowRun(ctx, parent); err != nil {
+				t.Fatalf("record %s: %v", parent.WorkflowID, err)
+			}
+		}
+		base := workflowRunBase()
+		base.SourceWorkflowID = parentA.WorkflowID
+		if err := s.RecordWorkflowRun(ctx, base); err != nil {
+			t.Fatalf("record base: %v", err)
+		}
+		cases := []struct {
+			name   string
+			change func(*WorkflowRun)
+		}{
+			{"Project", func(r *WorkflowRun) { r.Project = "grp/other" }},
+			{"CommitSHA", func(r *WorkflowRun) { r.CommitSHA = "deadbeef" }},
+			{"PipelineID", func(r *WorkflowRun) { r.PipelineID++ }},
+			{"Version", func(r *WorkflowRun) { r.Version = "2.0.0" }},
+			{"RuleVersion", func(r *WorkflowRun) { r.RuleVersion = "rules-v2" }},
+			{"Scope", func(r *WorkflowRun) { r.Scope = "nightly" }},
+			{"Attempt", func(r *WorkflowRun) { r.Attempt++ }},
+			{"Variants", func(r *WorkflowRun) { r.Variants = []string{"v1", "v3"} }},
+			{"SourceWorkflowID", func(r *WorkflowRun) { r.SourceWorkflowID = parentB.WorkflowID }},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				changed := base
+				changed.Variants = append([]string(nil), base.Variants...)
+				tc.change(&changed)
+				if err := s.RecordWorkflowRun(ctx, changed); !errors.Is(err, ErrWorkflowRunConflict) {
+					t.Fatalf("error = %v, want ErrWorkflowRunConflict", err)
+				}
+			})
+		}
+	})
+
+	t.Run("WorkflowRunRejectsMissingSource", func(t *testing.T) {
+		s := newStore(t)
+		run := workflowRunBase()
+		run.SourceWorkflowID = "does-not-exist"
+		if err := s.RecordWorkflowRun(ctx, run); !errors.Is(err, ErrWorkflowRunPermanent) {
+			t.Fatalf("missing source error = %v, want ErrWorkflowRunPermanent", err)
+		}
+		run.SourceWorkflowID = run.WorkflowID
+		if err := s.RecordWorkflowRun(ctx, run); !errors.Is(err, ErrWorkflowRunPermanent) {
+			t.Fatalf("self source error = %v, want ErrWorkflowRunPermanent", err)
+		}
+
+		invalid := []struct {
+			name   string
+			change func(*WorkflowRun)
+		}{
+			{"WorkflowID", func(r *WorkflowRun) { r.WorkflowID = "" }},
+			{"Project", func(r *WorkflowRun) { r.Project = "" }},
+			{"CommitSHA", func(r *WorkflowRun) { r.CommitSHA = "" }},
+			{"PipelineID", func(r *WorkflowRun) { r.PipelineID = 0 }},
+			{"Version", func(r *WorkflowRun) { r.Version = "" }},
+			{"RuleVersion", func(r *WorkflowRun) { r.RuleVersion = "" }},
+			{"Attempt", func(r *WorkflowRun) { r.Attempt = -1 }},
+		}
+		for _, tc := range invalid {
+			t.Run(tc.name, func(t *testing.T) {
+				bad := workflowRunBase()
+				tc.change(&bad)
+				if err := s.RecordWorkflowRun(ctx, bad); !errors.Is(err, ErrWorkflowRunPermanent) {
+					t.Fatalf("error = %v, want ErrWorkflowRunPermanent", err)
+				}
+			})
+		}
+	})
+
+	t.Run("WorkflowRunDefensiveCopy", func(t *testing.T) {
+		s := newStore(t)
+		run := workflowRunBase()
+		callerVariants := append([]string(nil), run.Variants...)
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(run.Variants, callerVariants) {
+			t.Fatalf("caller variants mutated: got %v, want %v", run.Variants, callerVariants)
+		}
+		first, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first.Variants[0] = "mutated"
+		second, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(second.Variants, []string{"v1", "v2"}) {
+			t.Fatalf("stored variants mutated through result: %v", second.Variants)
+		}
+	})
+
+	t.Run("WorkflowRunVariantStatesAreExact", func(t *testing.T) {
+		s := newStore(t)
+		const workflowID = "run-exact"
+		for _, row := range []wf.TaskRow{
+			{TaskID: "v1-a0", WorkflowID: workflowID, TestID: "v1", Attempt: 0, IdempotencyKey: "v1-a0", Status: "RUNNING"},
+			{TaskID: "v1-a1", WorkflowID: workflowID, TestID: "v1", Attempt: 1, IdempotencyKey: "v1-a1", Status: "RUNNING"},
+			{TaskID: "v2-a1", WorkflowID: workflowID, TestID: "v2", Attempt: 1, IdempotencyKey: "v2-a1", Status: "RUNNING"},
+			{TaskID: "adversary", WorkflowID: workflowID + "-suffix", TestID: "v1", Attempt: 99, IdempotencyKey: "adversary", Status: "RUNNING"},
+		} {
+			if err := s.CreateTask(ctx, row); err != nil {
+				t.Fatalf("CreateTask %s: %v", row.TaskID, err)
+			}
+		}
+		for _, finish := range []wf.FinishRequest{
+			{TaskID: "v1-a0", Status: "COMPLETED", Verdict: "TEST_FAILED"},
+			{TaskID: "v2-a1", Status: "COMPLETED", Verdict: "PASSED"},
+			{TaskID: "adversary", Status: "COMPLETED", Verdict: "INFRA_ERROR"},
+		} {
+			if err := s.FinishTask(ctx, finish); err != nil {
+				t.Fatalf("FinishTask %s: %v", finish.TaskID, err)
+			}
+		}
+		got, err := s.ListWorkflowRunVariantStates(ctx, workflowID)
+		if err != nil {
+			t.Fatalf("ListWorkflowRunVariantStates: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("states = %#v, want two exact-workflow variants", got)
+		}
+		if got[0].Variant != "v1" || got[0].Status != "RUNNING" ||
+			got[0].Verdict != "" || !got[0].EndedAt.IsZero() {
+			t.Errorf("v1 latest state = %#v, want running attempt 1", got[0])
+		}
+		if got[1].Variant != "v2" || got[1].Status != "COMPLETED" ||
+			got[1].Verdict != "PASSED" || got[1].EndedAt.IsZero() {
+			t.Errorf("v2 latest state = %#v, want completed PASSED", got[1])
+		}
+	})
 
 	t.Run("HasCapableDeviceIgnoresStatus", func(t *testing.T) {
 		s := newStore(t)

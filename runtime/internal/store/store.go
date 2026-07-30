@@ -41,18 +41,20 @@ type ArtifactStore interface {
 
 // MemStore 是进程内实现,供单测与无数据库的开发模式使用。
 type MemStore struct {
-	mu          sync.Mutex
-	rows        map[string]Artifact
-	clients     map[string]Client
-	devices     map[string]*deviceRow
-	tasks       map[string]*taskRecord
-	events      map[string]TaskEvent
-	results     map[string]wf.ResultRecord
-	decisions   []wf.DecisionRow
-	outbox      []*outboxRow
-	outboxByKey map[string]*outboxRow
-	outboxByID  map[int64]*outboxRow
-	outboxSeq   int64
+	mu           sync.Mutex
+	rows         map[string]Artifact
+	clients      map[string]Client
+	devices      map[string]*deviceRow
+	tasks        map[string]*taskRecord
+	events       map[string]TaskEvent
+	results      map[string]wf.ResultRecord
+	decisions    []wf.DecisionRow
+	outbox       []*outboxRow
+	outboxByKey  map[string]*outboxRow
+	outboxByID   map[int64]*outboxRow
+	outboxSeq    int64
+	workflowRuns map[string]WorkflowRun
+	runSeq       map[string]int64
 	// evidenceSnaps 是 evidence_snapshots 表(差距 #6)的内存视图。
 	evidenceSnaps map[string]EvidenceSnapshot
 	// translations 是 command_translations 表(设计文档 §4.3)的内存视图。
@@ -77,6 +79,8 @@ func NewMemStore() *MemStore {
 		results:          map[string]wf.ResultRecord{},
 		outboxByKey:      map[string]*outboxRow{},
 		outboxByID:       map[int64]*outboxRow{},
+		workflowRuns:     map[string]WorkflowRun{},
+		runSeq:           map[string]int64{},
 		evidenceSnaps:    map[string]EvidenceSnapshot{},
 		rowSeq:           map[string]int64{},
 		clientFailStreak: map[string]int{},
