@@ -2,7 +2,8 @@
 // 企业自建应用机器人(app_id/app_secret/chat_id 三件套齐全时优先,
 // tenant_access_token 缓存 + 过期强制刷新重试一次);
 // 群自定义机器人 webhook(未配置应用凭据时兜底,行为与历史完全一致)。
-// 本版消息体保持纯文本(msg_type=text);交互卡片/消息更新属后续版本。
+// 纯文本走 Sender.SendText;交互卡片走可选的 CardSender.SendCard
+// (两种模式各自实现,wire 形态不对称,见 CardSender 注释)。消息更新属后续版本。
 package feishu
 
 import (
@@ -31,6 +32,14 @@ var tokenExpiredCodes = map[int]bool{99991663: true, 99991661: true}
 // Sender 发送纯文本消息。
 type Sender interface {
 	SendText(ctx context.Context, text string) error
+}
+
+// CardSender 是能发交互卡片的 Sender(终态通知卡片化)。
+// 单独成接口而非往 Sender 上加方法:后者会让 activity/notify_test.go 与
+// feishucmd/executor_test.go 里只实现 SendText 的既有 fake 直接编译失败。
+type CardSender interface {
+	Sender
+	SendCard(ctx context.Context, card any) error
 }
 
 // Config 是发送方配置;Mode 由 NewSender 按凭据齐全度判定。
@@ -155,6 +164,14 @@ func (s *webhookSender) SendText(ctx context.Context, text string) error {
 	})
 }
 
+// SendCard 发交互卡片。webhook 自定义机器人的卡片走顶层 card 字段。
+func (s *webhookSender) SendCard(ctx context.Context, card any) error {
+	return post(ctx, s.cfg, s.cfg.WebhookURL, nil, map[string]any{
+		"msg_type": "interactive",
+		"card":     card,
+	})
+}
+
 // ---- app 模式(企业自建应用机器人) ----
 
 type appSender struct {
@@ -175,11 +192,31 @@ func newAppSender(c Config) *appSender {
 
 // SendText 发纯文本;token 过期错误码 → 强制刷新重试一次。
 func (s *appSender) SendText(ctx context.Context, text string) error {
+	content, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return fmt.Errorf("feishu: encode message content: %w", err)
+	}
+	return s.send(ctx, "text", string(content))
+}
+
+// SendCard 发交互卡片;content 与 SendText 同形——序列化后的字符串,
+// 而非对象(app 消息端点对所有 msg_type 的 content 字段一律要求字符串)。
+func (s *appSender) SendCard(ctx context.Context, card any) error {
+	content, err := json.Marshal(card)
+	if err != nil {
+		return fmt.Errorf("feishu: encode card content: %w", err)
+	}
+	return s.send(ctx, "interactive", string(content))
+}
+
+// send 是 SendText/SendCard 共用的发送逻辑:取 token(缓存)→ 发消息;
+// token 过期错误码 → 强制刷新重试一次。
+func (s *appSender) send(ctx context.Context, msgType, content string) error {
 	tok, err := s.tenantToken(ctx, false)
 	if err != nil {
 		return err
 	}
-	if err := s.sendMessage(ctx, tok, text); err != nil {
+	if err := s.sendMessage(ctx, tok, msgType, content); err != nil {
 		if !isTokenExpired(err) {
 			return err
 		}
@@ -188,7 +225,7 @@ func (s *appSender) SendText(ctx context.Context, text string) error {
 		if err != nil {
 			return err
 		}
-		return s.sendMessage(ctx, tok, text)
+		return s.sendMessage(ctx, tok, msgType, content)
 	}
 	return nil
 }
@@ -244,11 +281,8 @@ func (s *appSender) tenantToken(ctx context.Context, force bool) (string, error)
 	return s.token, nil
 }
 
-func (s *appSender) sendMessage(ctx context.Context, token, text string) error {
-	content, err := json.Marshal(map[string]string{"text": text})
-	if err != nil {
-		return fmt.Errorf("feishu: encode message content: %w", err)
-	}
+// sendMessage 向 im/v1/messages 发送已序列化的 content(text/interactive 通用)。
+func (s *appSender) sendMessage(ctx context.Context, token, msgType, content string) error {
 	idType := s.cfg.ReceiveIDType
 	if idType == "" {
 		idType = "chat_id" // 缺省群聊;个人单聊配 open_id
@@ -258,7 +292,7 @@ func (s *appSender) sendMessage(ctx context.Context, token, text string) error {
 		map[string]string{"Authorization": "Bearer " + token},
 		map[string]any{
 			"receive_id": s.cfg.ReceiveID,
-			"msg_type":   "text",
-			"content":    string(content),
+			"msg_type":   msgType,
+			"content":    content,
 		})
 }

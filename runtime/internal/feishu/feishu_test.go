@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -237,5 +238,80 @@ func TestWebhookSenderBusinessError(t *testing.T) {
 	s, _ := NewSender(Config{WebhookURL: srv.URL})
 	if err := s.SendText(ctx, "hello"); err == nil || !strings.Contains(err.Error(), "19001") {
 		t.Errorf("got %v", err)
+	}
+}
+
+// webhook:content 是对象,卡片走顶层 card 字段。
+func TestWebhookSendCardWireShape(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	defer srv.Close()
+	s, _ := NewSender(Config{WebhookURL: srv.URL})
+	cs, ok := s.(CardSender)
+	if !ok {
+		t.Fatal("webhookSender 应实现 CardSender")
+	}
+	if err := cs.SendCard(context.Background(), map[string]any{"header": "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if got["msg_type"] != "interactive" {
+		t.Errorf("msg_type = %v, want interactive", got["msg_type"])
+	}
+	if _, isObj := got["card"].(map[string]any); !isObj {
+		t.Errorf("webhook 的 card 应是对象, got %T", got["card"])
+	}
+}
+
+// app:content 是**序列化后的字符串**(与 SendText 同形),不是对象。
+// 复用 feishu_test.go 既有的 fakeOpenAPI 夹具(token + /im/v1/messages 双端点、
+// 自带计数与 lastMessage);不自己起裸 httptest server 去凑 token 端点。
+func TestAppSendCardWireShape(t *testing.T) {
+	f := &fakeOpenAPI{}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+	cs, ok := s.(CardSender)
+	if !ok {
+		t.Fatal("appSender 应实现 CardSender")
+	}
+	card := map[string]any{"header": "x"}
+	if err := cs.SendCard(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := f.lastMessage()
+	if body["msg_type"] != "interactive" {
+		t.Errorf("msg_type = %v, want interactive", body["msg_type"])
+	}
+	str, isStr := body["content"].(string)
+	if !isStr {
+		t.Fatalf("app 的 content 应是序列化字符串, got %T", body["content"])
+	}
+	var back map[string]any
+	if err := json.Unmarshal([]byte(str), &back); err != nil {
+		t.Fatalf("content 不是合法 JSON: %v", err)
+	}
+	if !reflect.DeepEqual(back, card) {
+		t.Errorf("content 解析回来应等于原卡片, got %v", back)
+	}
+}
+
+// token 过期 → 强制刷新并且只重试一次(与 TestAppSenderRefreshesExpiredToken 同款)。
+func TestAppSendCardRefreshesExpiredToken(t *testing.T) {
+	f := &fakeOpenAPI{messageReplies: []string{
+		`{"code":99991663,"msg":"token expired"}`,
+		`{"code":0,"msg":"ok"}`,
+	}}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+	cs := s.(CardSender)
+	if err := cs.SendCard(ctx, map[string]any{"h": "x"}); err != nil {
+		t.Fatalf("过期重试后应成功: %v", err)
+	}
+	// 两个计数都要断言:只断言 token==2 挡不住"消息被重试很多次"的实现。
+	tokenCalls, msgCalls := f.counts()
+	if tokenCalls != 2 || msgCalls != 2 {
+		t.Fatalf("calls token/message = %d/%d, want 2/2", tokenCalls, msgCalls)
 	}
 }
