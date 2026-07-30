@@ -40,22 +40,19 @@ func newTranslator(f *fakeTranslator, st Store) *Translator {
 // TestRenderParseRoundTrip 是方案 1 封闭性的核心断言:schema 允许的任何输出
 // 渲染成一行文本后,Parse 必须无损切回同一条指令。
 func TestRenderParseRoundTrip(t *testing.T) {
+	const workflowPrefix = "device-test-grp/algo-super-sdk-"
 	cases := []struct {
 		cmd  string
 		args []string
 	}{
 		{"status", nil},
 		{"devices", []string{}},
-		{"rerun", []string{"9da3b9d9", "56"}},
-		{"rerun", []string{"9da3b9d9", "56", "aarch64_Android_SNPE_1.68"}},
+		{"rerun", []string{"device-test-grp/algo-super-sdk-g9da3b9d9-p56"}},
+		{"rerun", []string{"device-test-grp/algo-super-sdk-g9da3b9d9-p56", "aarch64_Android_SNPE_1.68"}},
 		{"unquarantine", []string{"dev-1"}},
 		{"unquarantine", []string{"a.b_c-d"}},
-		// schema 对任意指令的 args 都允许 maxItems: 3,不止 rerun。
-		{"unquarantine", []string{"dev-1", "dev-2", "dev-3"}},
-		// 大写字母在 pattern 值域内。
-		{"rerun", []string{"ABCDEF12", "56", "AARCH64_ANDROID_SNPE_1.68"}},
-		// pattern 上界 {1,64}。
-		{"unquarantine", []string{strings.Repeat("a", 64)}},
+		// workflow ID 可含项目路径分隔符,且契约上限为 512 字符。
+		{"rerun", []string{workflowPrefix + strings.Repeat("a", 512-len(workflowPrefix))}},
 	}
 	for _, c := range cases {
 		line := render(c.cmd, c.args)
@@ -74,7 +71,7 @@ func TestRenderParseRoundTrip(t *testing.T) {
 
 func TestTranslateReadOnlyCommandExecutesDirectly(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "devices", Confidence: 0.95, Reason: "询问设备状态",
+		TranslationVersion: 2, Command: "devices", Confidence: 0.95, Reason: "询问设备状态",
 	}}
 	st := store.NewMemStore()
 	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "看下设备状态")
@@ -87,11 +84,13 @@ func TestTranslateReadOnlyCommandExecutesDirectly(t *testing.T) {
 }
 
 func TestTranslateSideEffectCommandNeedsConfirm(t *testing.T) {
+	st := store.NewMemStore()
+	run := recordTranslationWorkflowRun(t, st)
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "rerun",
-		Args: []string{"9da3b9d9", "56", "aarch64_Android_SNPE_1.68"}, Confidence: 0.92,
+		TranslationVersion: 2, Command: "rerun",
+		Args: []string{run.WorkflowID, run.Variants[0]}, Confidence: 0.92,
 	}}
-	res := newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "重跑昨天那个")
+	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑昨天那个")
 	if !res.OK || !res.NeedsConfirm {
 		t.Fatalf("res = %+v, want OK 且需确认", res)
 	}
@@ -101,39 +100,21 @@ func TestTranslateSideEffectCommandNeedsConfirm(t *testing.T) {
 }
 
 func TestTranslateRejectsUnknownVariant(t *testing.T) {
+	st := store.NewMemStore()
+	run := recordTranslationWorkflowRun(t, st)
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "rerun",
-		Args: []string{"9da3b9d9", "56", "aarch64_Android_RKNN_9.9"}, Confidence: 0.95,
+		TranslationVersion: 2, Command: "rerun",
+		Args: []string{run.WorkflowID, "aarch64_Android_RKNN_9.9"}, Confidence: 0.95,
 	}}
-	res := newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "重跑那个")
+	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑那个")
 	if res.OK || res.Outcome != store.OutcomeRejectedArgs {
 		t.Fatalf("res = %+v, want 拒绝且 rejected_args", res)
 	}
 }
 
-func TestTranslateRejectsBadSHA(t *testing.T) {
-	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "rerun", Args: []string{"zzz", "56"}, Confidence: 0.95,
-	}}
-	res := newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "重跑")
-	if res.OK || res.Outcome != store.OutcomeRejectedArgs {
-		t.Fatalf("res = %+v", res)
-	}
-}
-
-func TestTranslateRejectsBadIID(t *testing.T) {
-	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "rerun", Args: []string{"9da3b9d9", "0"}, Confidence: 0.95,
-	}}
-	res := newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "重跑")
-	if res.OK || res.Outcome != store.OutcomeRejectedArgs {
-		t.Fatalf("res = %+v", res)
-	}
-}
-
 func TestTranslateRejectsLowConfidence(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "devices", Confidence: 0.5,
+		TranslationVersion: 2, Command: "devices", Confidence: 0.5,
 	}}
 	res := newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "嗯")
 	if res.OK || res.Outcome != store.OutcomeRejectedLowConfidence {
@@ -146,7 +127,7 @@ func TestTranslateRejectsLowConfidence(t *testing.T) {
 
 func TestTranslateNone(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "none", Confidence: 0.9, Reason: "与设备测试无关",
+		TranslationVersion: 2, Command: "none", Confidence: 0.9, Reason: "与设备测试无关",
 	}}
 	res := newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "今天天气怎么样")
 	if res.OK || res.Outcome != store.OutcomeRejectedNone {
@@ -183,7 +164,7 @@ func TestTranslateSchemaInvalidError(t *testing.T) {
 // 按快照 devices 成员判定(设计文档 §5.3),而不只是校验参数个数。
 func TestTranslateRejectsUnknownDevice(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "unquarantine", Args: []string{"dev-ghost"}, Confidence: 0.95,
+		TranslationVersion: 2, Command: "unquarantine", Args: []string{"dev-ghost"}, Confidence: 0.95,
 	}}
 	st := store.NewMemStore()
 	if err := st.UpsertClientDevices(context.Background(), store.Client{ClientID: "c1"},
@@ -198,7 +179,7 @@ func TestTranslateRejectsUnknownDevice(t *testing.T) {
 
 func TestTranslateSnapshotCarriesNow(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "devices", Confidence: 0.9,
+		TranslationVersion: 2, Command: "devices", Confidence: 0.9,
 	}}
 	newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "设备")
 	var snap map[string]any
@@ -212,6 +193,126 @@ func TestTranslateSnapshotCarriesNow(t *testing.T) {
 		if _, ok := snap[k]; !ok {
 			t.Errorf("snapshot 缺字段 %q", k)
 		}
+	}
+}
+
+func recordTranslationWorkflowRun(t *testing.T, st *store.MemStore) store.WorkflowRun {
+	t.Helper()
+	run := store.WorkflowRun{
+		WorkflowID:  "device-test-grp/algo-super-sdk-g9da3b9d9-p56",
+		Project:     "grp/algo-super-sdk",
+		CommitSHA:   "9da3b9d9",
+		PipelineID:  56,
+		Version:     "1.2.3",
+		RuleVersion: "rules-v4",
+		Scope:       "all",
+		Variants:    []string{"aarch64_Android_SNPE_1.68", "aarch64_Android_SNPE_2.21"},
+	}
+	if err := st.RecordWorkflowRun(context.Background(), run); err != nil {
+		t.Fatalf("RecordWorkflowRun: %v", err)
+	}
+	return run
+}
+
+func TestTranslateSnapshotCarriesAuthoritativeWorkflowIdentity(t *testing.T) {
+	st := store.NewMemStore()
+	run := recordTranslationWorkflowRun(t, st)
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 2, Command: "devices", Confidence: 0.9,
+	}}
+	newTranslator(f, st).Translate(context.Background(), "ou_1", "设备")
+
+	var snap snapshot
+	if err := json.Unmarshal([]byte(f.gotCtxJSON), &snap); err != nil {
+		t.Fatalf("snapshot 不是合法 JSON: %v", err)
+	}
+	if len(snap.RecentRuns) != 2 {
+		t.Fatalf("recent_runs = %+v, want 2 variants", snap.RecentRuns)
+	}
+	for _, got := range snap.RecentRuns {
+		if got.WorkflowID != run.WorkflowID || got.Version != run.Version ||
+			got.RuleVersion != run.RuleVersion || !got.Authoritative {
+			t.Errorf("snapshot run = %+v, want authoritative identity from %+v", got, run)
+		}
+	}
+}
+
+func TestTranslateAcceptsAuthoritativeWorkflowRerun(t *testing.T) {
+	st := store.NewMemStore()
+	run := recordTranslationWorkflowRun(t, st)
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 2, Command: "rerun",
+		Args: []string{run.WorkflowID, run.Variants[0]}, Confidence: 0.95,
+	}}
+	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑上次失败的 SNPE")
+	if !res.OK || !res.NeedsConfirm || res.Outcome != store.OutcomePendingConfirm {
+		t.Fatalf("res = %+v, want authoritative rerun pending confirmation", res)
+	}
+}
+
+func TestTranslateRejectsFabricatedWorkflowID(t *testing.T) {
+	st := store.NewMemStore()
+	recordTranslationWorkflowRun(t, st)
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 2, Command: "rerun",
+		Args: []string{"device-test-grp/fabricated-gdeadbeef-p99"}, Confidence: 0.95,
+	}}
+	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑")
+	if res.OK || res.Outcome != store.OutcomeRejectedArgs {
+		t.Fatalf("res = %+v, want fabricated workflow rejected", res)
+	}
+}
+
+type recentRunsStore struct {
+	*store.MemStore
+	runs []store.RecentRun
+}
+
+func (s recentRunsStore) RecentRuns(context.Context, int) ([]store.RecentRun, error) {
+	return s.runs, nil
+}
+
+func TestTranslateRejectsLegacyFallbackRerun(t *testing.T) {
+	const workflowID = "device-test-grp/legacy-g9da3b9d9-p56"
+	st := recentRunsStore{
+		MemStore: store.NewMemStore(),
+		runs: []store.RecentRun{{
+			Commit: "9da3b9d9", PipelineID: 56, Variant: "aarch64_Android_SNPE_1.68",
+		}},
+	}
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 2, Command: "rerun", Args: []string{workflowID}, Confidence: 0.95,
+	}}
+	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑")
+	if res.OK || res.Outcome != store.OutcomeRejectedArgs {
+		t.Fatalf("res = %+v, want legacy fallback rerun rejected", res)
+	}
+	var snap map[string]any
+	if err := json.Unmarshal([]byte(f.gotCtxJSON), &snap); err != nil {
+		t.Fatalf("snapshot 不是合法 JSON: %v", err)
+	}
+	rows := snap["recent_runs"].([]any)
+	legacy := rows[0].(map[string]any)
+	if legacy["authoritative"] != false {
+		t.Fatalf("legacy authoritative = %v, want false", legacy["authoritative"])
+	}
+	for _, field := range []string{"workflow_id", "version", "rule_version"} {
+		if _, ok := legacy[field]; ok {
+			t.Errorf("legacy fallback 不应携带空身份字段 %q: %v", field, legacy)
+		}
+	}
+}
+
+func TestTranslateRejectsVariantOutsideSourceRun(t *testing.T) {
+	st := store.NewMemStore()
+	run := recordTranslationWorkflowRun(t, st)
+	f := &fakeTranslator{out: &hermesclient.Translation{
+		TranslationVersion: 2, Command: "rerun",
+		Args: []string{run.WorkflowID, "aarch64_Android_RKNN_9.9"}, Confidence: 0.95,
+	}}
+	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑 RKNN")
+	if res.OK || res.Outcome != store.OutcomeRejectedArgs {
+		t.Fatalf("res = %+v, want variant outside source run rejected", res)
 	}
 }
 
@@ -232,7 +333,7 @@ func (erroringSnapshotStore) RecentRuns(context.Context, int) ([]store.RecentRun
 
 func TestTranslateDegradesWhenStoreErrors(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "devices", Confidence: 0.9,
+		TranslationVersion: 2, Command: "devices", Confidence: 0.9,
 	}}
 	st := erroringSnapshotStore{MemStore: store.NewMemStore()}
 	tr := newTranslator(f, st)
@@ -262,7 +363,7 @@ func TestTranslateDegradesWhenStoreErrors(t *testing.T) {
 
 func TestTranslateAuditsEveryOutcome(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 1, Command: "none", Confidence: 0.2,
+		TranslationVersion: 2, Command: "none", Confidence: 0.2,
 	}}
 	st := store.NewMemStore()
 	newTranslator(f, st).Translate(context.Background(), "ou_1", "什么鬼")

@@ -42,7 +42,7 @@ type Client interface {
 // Command 是封闭枚举(status|devices|rerun|unquarantine|none);none 表示信息不足
 // 或输入根本不是指令。
 type Translation struct {
-	TranslationVersion int      `json:"translation_version"` // 契约固定为 1
+	TranslationVersion int      `json:"translation_version"` // 当前契约固定为 2
 	Command            string   `json:"command"`
 	Args               []string `json:"args,omitempty"`
 	Confidence         float64  `json:"confidence"`
