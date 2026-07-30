@@ -446,10 +446,13 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
                     self.assertNotRegex(stripped, pattern)
 
     def test_documented_rollout_order_and_prerequisites_are_explicit(self):
-        deploy_readme = DEPLOY_README.read_text(encoding="utf-8")
+        deploy_readme = " ".join(
+            DEPLOY_README.read_text(encoding="utf-8").split()
+        )
 
         rollout_order = (
-            "prior batch stable -> stop writers -> migrate -> update and restart "
+            "prior batch stable -> stop all old artifact writers and Feishu command "
+            "listeners -> migrate -> update and restart "
             "analyze_bridge on every hermes-agent host -> deploy all new binaries -> resume"
         )
         mismatch_warning = (
@@ -462,7 +465,8 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
                 self.assertIn("command.schema.json v2", documented)
                 self.assertIn(mismatch_warning, documented)
                 self.assertIn(
-                    "Only resume ingress after both sides are on v2.",
+                    "Only resume command and artifact ingress after analyze_bridge "
+                    "and all new binaries are on v2.",
                     documented,
                 )
         self.assertIn(
@@ -476,8 +480,8 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
             deploy_readme,
         )
         self.assertIn(
-            "Stop all old artifact writers before removing the old unique "
-            "constraint.",
+            "Stop all old artifact writers and Feishu command listeners before "
+            "removing the old unique constraint",
             deploy_readme,
         )
 

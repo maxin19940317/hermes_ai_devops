@@ -184,21 +184,25 @@ artifact writers.
 
 The already-merged presign/evidence-v3/attribution batch must be deployed and observed stable first.
 Merging the workflow_runs branch does not authorize the production migration.
-Stop all old artifact writers before removing the old unique constraint.
+Stop all old artifact writers and Feishu command listeners before removing the old
+unique constraint or restarting `analyze_bridge` on v2.
 
 The mandatory production order is:
 
 ```text
-prior batch stable -> stop writers -> migrate -> update and restart analyze_bridge on every hermes-agent host -> deploy all new binaries -> resume
+prior batch stable -> stop all old artifact writers and Feishu command listeners -> migrate -> update and restart analyze_bridge on every hermes-agent host -> deploy all new binaries -> resume
 ```
 
-During the stopped-writer window, stop every old Trigger/Runtime process that can insert
-artifacts, apply `deploy/postgres/migrations/2026-07-30-workflow-runs.sql`, synchronize
+During the stopped-ingress window, stop every old Trigger process that can insert
+artifacts and every old Worker process that hosts a Feishu command listener. This stops
+both artifact writes and command ingress before any v2 component starts. Then apply
+`deploy/postgres/migrations/2026-07-30-workflow-runs.sql`, synchronize
 `hermes/analyze_bridge` including `command.schema.json v2` to every hermes-agent host and
 restart each `analyze_bridge`, then deploy all new Trigger/Worker/Relay binaries as one
-release. Only resume ingress after both sides are on v2. A forward or reverse version
-mismatch makes the bridge reject the other side's translation payload.
+release. A forward or reverse version mismatch makes the bridge reject the other side's
+translation payload.
 A forward or reverse v1/v2 mismatch breaks all natural-language commands.
+Only resume command and artifact ingress after analyze_bridge and all new binaries are on v2.
 Do not combine this window with deployment of the prerequisite batch.
 
 ## Verify
