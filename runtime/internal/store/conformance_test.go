@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -574,6 +575,46 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if exp, err := s.GetLeaseExpiry(ctx, "w:t1:a1"); err != nil || exp != nil {
 			t.Errorf("释放后: exp=%v err=%v, want (nil, nil)", exp, err)
+		}
+	})
+
+	// lease_id 必须含不可猜的秘密材料(差距 #8 final-review)。它是 upload-requests
+	// 端点唯一的鉴权依据,而该端点签发往证据桶写入的 URL、callbacks 又无其他鉴权。
+	// 若 lease_id 等于 task_id(旧实现),凭据的全部成分都可猜:task_id 有规律、
+	// client_id 可猜、device_id 就是 serial、attempt 编码在 task_id 里、
+	// lease_generation 是每设备小计数——同网段主机试几次就能换到写入 URL。
+	t.Run("LeaseIDCarriesEntropy", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		const taskID = "w:t1:a1"
+		lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, taskID, 120)
+		if err != nil || lease == nil {
+			t.Fatalf("acquire: %+v %v", lease, err)
+		}
+		if lease.LeaseID == taskID {
+			t.Fatal("lease_id 等于 task_id:凭据没有任何秘密材料,端点鉴权形同虚设")
+		}
+		// 前缀保留 task_id 便于排查;后缀是随机十六进制。
+		suffix, ok := strings.CutPrefix(lease.LeaseID, taskID+":")
+		if !ok {
+			t.Fatalf("lease_id = %q, want %q 前缀", lease.LeaseID, taskID+":")
+		}
+		if len(suffix) != 32 { // 16 字节 hex
+			t.Errorf("随机后缀长度 = %d, want 32(16 字节 hex)", len(suffix))
+		}
+		if _, err := hex.DecodeString(suffix); err != nil {
+			t.Errorf("随机后缀不是十六进制: %q", suffix)
+		}
+		// 同一 task 重新获取(懒回收/重试)必须换新值,否则旧凭据仍然有效。
+		if err := s.ReleaseDevice(ctx, lease.DeviceID, taskID, wf.FailScopeOK, 3); err != nil {
+			t.Fatal(err)
+		}
+		again, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, taskID, 120)
+		if err != nil || again == nil {
+			t.Fatalf("re-acquire: %+v %v", again, err)
+		}
+		if again.LeaseID == lease.LeaseID {
+			t.Error("同一 task 重新获取应生成新 lease_id,否则旧凭据不失效")
 		}
 	})
 

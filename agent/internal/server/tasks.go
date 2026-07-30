@@ -298,7 +298,15 @@ const onDemandRetryDelay = 3 * time.Second
 
 // uploadAttachments 上传收集到的附件。优先按需签发(差距 #8):用本次实际收集到
 // 的文件换 URL,glob 命中的文件(logs/*.log、dumps/**)因此第一次能被上传。
-// 端点不可达时回退到派单时的固定键集;401(租约已非己有)不回退。
+// 任何失败(含 401 租约失效)都回退到派单时的固定键集。
+//
+// 401 也回退,是 2026-07-29 final-review 的更正。原设计写的是"401 不回退,
+// 继续上传会污染别人的证据",但那个理由不成立:回退用的派单期 URL 同样限定在
+// runs/{task_id}/ 前缀内,而 task_id 编码了 attempt(:a{N}),所以迟到的上传只能
+// 写进自己的目录——重试拿到的是不同的 task_id、不同的前缀。而不回退的代价是
+// 实打实的:硬超时、租约过期、AcquireDevice 懒回收都会让 VerifyLease 判否,
+// 于是跑完但迟到的任务一个附件都不传,包括 logcat——恰好是最需要 INFRA 排查
+// 证据的场合把证据丢了。
 //
 // collected 是 executor.Summary.Collected(设备侧按 manifest collect 列表拉取
 // 的、相对于 out_dir/device/ 的路径清单)。CRITICAL:不能改回遍历 out_dir——
@@ -316,10 +324,12 @@ func (s *Server) uploadAttachments(ctx context.Context, d Dispatch, outDir strin
 			return atts
 		}
 		if errors.Is(err, reporter.ErrLeaseNotOwned) {
-			s.logf("task %s: 租约已非己有,放弃上传(不回退)", d.TaskID)
-			return nil
+			// 租约失效值得单独记一条:它意味着任务已易主/被回收,附件虽仍会经固定
+			// 键集上传(同样限定在本 task 自己的前缀内),但结果回流大概率已无人接收。
+			s.logf("task %s: 租约已非己有,按需签发被拒;仍回退固定键集上传附件", d.TaskID)
+		} else {
+			s.logf("task %s: 按需签发失败(%v),回退固定键集", d.TaskID, err)
 		}
-		s.logf("task %s: 按需签发失败(%v),回退固定键集", d.TaskID, err)
 	}
 	return s.uploadFixedSet(ctx, d, outDir)
 }

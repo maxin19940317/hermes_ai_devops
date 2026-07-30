@@ -2,12 +2,37 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	wf "hermes-devops/runtime/internal/workflow"
 )
+
+// leaseIDEntropyBytes 是 lease_id 后缀的随机字节数(差距 #8 final-review)。
+const leaseIDEntropyBytes = 16
+
+// newLeaseID 生成租约所有权凭据(§10/差距 #15)。
+//
+// 形态是 {task_id}:{32 位十六进制随机}。前半段保留 task_id 便于人工排查与日志关联;
+// 后半段是真正的秘密材料——**这一点是必需的,不是加固**:凭据的用途是给
+// callbacks 的 upload-requests 端点(差距 #8)做鉴权,而该端点签发的是往证据桶
+// 写入的预签名 URL,callbacks 整体又没有其他鉴权(mTLS 属 Phase 3)。
+// 若 lease_id 仍等于 task_id(2026-07-29 之前的实现),那么凭据的全部成分
+// ——task_id、client_id、device_id(= serial)、attempt(编码在 task_id 里)、
+// lease_generation(每设备小计数)——都是可猜的,同网段主机试几次就能换到写入 URL。
+//
+// 对所有消费方都不透明:Agent 原样回传,两套 store 只做相等比较,故加随机不影响任何调用方。
+func newLeaseID(taskID string) (string, error) {
+	b := make([]byte, leaseIDEntropyBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("new lease id for %s: %w", taskID, err)
+	}
+	return taskID + ":" + hex.EncodeToString(b), nil
+}
 
 // Client 对应 clients 表一行(§11)。
 type Client struct {
@@ -100,7 +125,11 @@ func (s *MemStore) AcquireDevice(_ context.Context, sel wf.DeviceSelector, taskI
 		}
 		row.Status = DeviceBusy
 		row.LeaseTaskID = taskID
-		row.LeaseID = taskID // lease_id 每次授予唯一;取 task_id(本身含 attempt,全链路唯一)
+		leaseID, err := newLeaseID(taskID)
+		if err != nil {
+			return nil, err
+		}
+		row.LeaseID = leaseID
 		row.LeaseGeneration++
 		row.Released = false
 		row.LeaseExpiresAt = time.Now().Add(time.Duration(leaseSeconds) * time.Second)

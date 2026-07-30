@@ -74,9 +74,13 @@ func (s *PGStore) AcquireDevice(ctx context.Context, sel wf.DeviceSelector, task
 		return nil, fmt.Errorf("acquire device: mark busy: %w", err)
 	}
 	expiresAt := time.Now().Add(time.Duration(leaseSeconds) * time.Second)
-	// 每次授予(含懒回收)生成新 lease_id(取 task_id,本身含 attempt,全链路唯一)
+	// 每次授予(含懒回收)生成新 lease_id(见 newLeaseID:task_id 前缀 + 随机后缀)
 	// 并递增 generation,旧持有者的续租凭据立即失效(§10/差距 #15);
 	// released_at 复位(行保留作审计)。
+	leaseID, err := newLeaseID(taskID)
+	if err != nil {
+		return nil, err
+	}
 	var generation int
 	if err := tx.QueryRowContext(ctx, `
 		INSERT INTO device_leases (device_id, task_id, lease_id, lease_generation, lease_expires_at)
@@ -87,7 +91,7 @@ func (s *PGStore) AcquireDevice(ctx context.Context, sel wf.DeviceSelector, task
 			lease_expires_at = EXCLUDED.lease_expires_at,
 			released_at = NULL
 		RETURNING lease_generation`,
-		chosen.DeviceID, taskID, taskID, expiresAt).Scan(&generation); err != nil {
+		chosen.DeviceID, taskID, leaseID, expiresAt).Scan(&generation); err != nil {
 		return nil, fmt.Errorf("acquire device: write lease: %w", err)
 	}
 	var baseURL string
@@ -101,7 +105,7 @@ func (s *PGStore) AcquireDevice(ctx context.Context, sel wf.DeviceSelector, task
 	return &wf.Lease{
 		DeviceID: chosen.DeviceID, Serial: chosen.Serial,
 		ClientID: chosen.ClientID, ClientBaseURL: baseURL,
-		LeaseID: taskID, Generation: generation,
+		LeaseID: leaseID, Generation: generation,
 	}, nil
 }
 

@@ -1116,7 +1116,12 @@ func TestUploadOnDemandRetrySleepRespectsCancellation(t *testing.T) {
 }
 
 // 401 不回退:租约已非己有,继续上传会污染别人的证据。
-func TestUploadAttachmentsDoesNotFallBackOnUnauthorized(t *testing.T) {
+// 401(租约已非己有)也要回退(2026-07-29 final-review 更正)。
+// 原来的行为是"401 不上传",理由是"继续上传会污染别人的证据"——但回退用的派单期
+// URL 同样限定在 runs/{task_id}/ 内,而 task_id 编码了 attempt,迟到的上传只能写进
+// 自己的目录。不回退的真实代价是:硬超时/租约过期/懒回收都会让 VerifyLease 判否,
+// 于是跑完但迟到的任务连 logcat 都丢——恰好是最需要 INFRA 排查证据的场合。
+func TestUploadAttachmentsFallsBackOnUnauthorized(t *testing.T) {
 	outDir, collected := seedOutDir(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -1130,8 +1135,18 @@ func TestUploadAttachmentsDoesNotFallBackOnUnauthorized(t *testing.T) {
 		PresignedUploads: fixedSetFor("t1")}
 	s.uploadAttachments(context.Background(), d, outDir, collected)
 
-	if len(up.gotKeys) != 0 {
-		t.Errorf("401 时不得上传任何东西, got %v", up.gotKeys)
+	if len(up.gotKeys) != 1 {
+		t.Fatalf("401 应回退并上传一次, Upload 调用 = %d", len(up.gotKeys))
+	}
+	// 回退走的是派单时的固定键集,键仍在本 task 自己的前缀内。
+	joined := strings.Join(up.gotKeys[0], ",")
+	if !strings.Contains(joined, "runs/t1/result.json") {
+		t.Errorf("回退应走固定键集, got %v", up.gotKeys[0])
+	}
+	for _, k := range up.gotKeys[0] {
+		if !strings.HasPrefix(k, "runs/t1/") {
+			t.Errorf("回退的 key %q 越出本 task 前缀", k)
+		}
 	}
 }
 

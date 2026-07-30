@@ -37,7 +37,16 @@ PUT URL，TTL 取 `MINIO_PRESIGN_TTL`（缺省 1h），随 dispatch 载荷下发
    task_id 换取写入能力，而 task_id 是有规律的
    （`device-test-{project}-g{sha}-p{iid}:{variant}:a{n}`）。
    复用差距 #15 引入的租约所有权凭据（`lease_id` + `lease_generation`，派单时下发、
-   心跳续租时已在校验），不新增任何秘密。
+   心跳续租时已在校验）。
+
+   > **final-review 更正（2026-07-29）**：本条原文写的是"不新增任何秘密"，那是错的——
+   > 按当时的实现 `lease_id` **就等于 `task_id`**，于是凭据的全部成分都是可猜的：
+   > `task_id` 有规律、`client_id` 可猜、`device_id` 就是 serial、`attempt` 编码在
+   > `task_id` 里、`lease_generation` 是每设备的小计数。没有速率限制，同网段主机试几次
+   > 就能换到写入 URL。也就是说"比共享密钥粒度更细"这个论证在当时的实现下并不成立。
+   > 现已把 `lease_id` 改为 `{task_id}:{16 字节随机 hex}`（`store.newLeaseID`）：
+   > 前缀保留 `task_id` 便于排查，后缀是真正的秘密材料。对所有消费方都不透明
+   > （Agent 原样回传，两套 store 只做相等比较），故不影响任何调用方。
 2. **顺带修掉 glob 洞**（已确认）。Agent 在收集时已经知道 `collect` 实际匹配到了哪些文件，
    把相对路径清单报给 Runtime 换 URL 即可。这是按需签发的自然结果，不做反而浪费。
 3. **派单载荷保留 `presigned_uploads[]`，新增 `upload_request_url`**。契约只加不删；
@@ -179,8 +188,18 @@ Agent 请求 upload-requests 失败（连接失败 / 5xx / 超时）时：
 2. 回退到派单时的 `presigned_uploads[]`，按今天的固定键集逻辑上传
 3. 回退路径下 glob 文件依旧传不了——这是降级，不是新缺陷
 
-`401`（租约失效）**不回退**：租约都不是自己的了，说明这个任务已经易主或被回收，
-继续上传只会污染别人的证据。记日志并跳过上传。
+`401`（租约失效）**也回退**（final-review 更正，2026-07-29）。
+
+原文写的是"不回退：继续上传只会污染别人的证据"。那个理由不成立：回退用的派单期 URL
+同样限定在 `runs/{task_id}/` 前缀内，而 `task_id` 编码了 attempt（`:a{N}`），所以迟到的
+上传只能写进**自己**的目录——重试拿到的是不同的 `task_id`、不同的前缀。唯一会撞的是
+同 `workflow_id` 重启重新生成 `:a1` 这一种窄情形。
+
+而不回退的代价是实打实的：硬超时、租约过期、`AcquireDevice` 懒回收都会让 `VerifyLease`
+判否，于是**跑完但迟到的任务一个附件都不传，包括 logcat**——恰好是最需要 INFRA 排查
+证据的场合把证据丢了。
+
+401 仍单独记一条日志（任务已易主/被回收，结果回流大概率已无人接收），但附件照传。
 
 ### 5.3 Agent 侧的路径映射
 
@@ -196,7 +215,7 @@ Agent 请求 upload-requests 失败（连接失败 / 5xx / 超时）时：
 |---|---|
 | `upload_request_url` 为空（旧 Runtime） | Agent 直接走 `presigned_uploads[]`，与今天一致 |
 | 端点连接失败 / 5xx / 超时 | 重试 ≤2 次后回退固定键集（§5.2） |
-| 端点返回 401 | 不回退，不上传，记日志 —— 租约已非己有 |
+| 端点返回 401 | 回退固定键集并上传；单独记日志 —— 租约已非己有（§5.2 更正）|
 | 部分 key 被 `rejected` | 已签发的照传；被拒的记日志，不影响其余 |
 | MinIO 未配置（Runtime 侧） | 端点返回 503；Agent 回退，而 `presigned_uploads[]` 此时也是空的 → 无附件，与今天的降级一致 |
 | Agent 收集到 0 个文件 | 不发请求（空 `files` 会被 400） |
@@ -258,7 +277,7 @@ Agent,或 Runtime/Agent 同批发布**;不得让新 Runtime 单独先于所有 A
 **Agent（fake Runtime）**：
 - 正常路径：按实际收集到的文件请求，上传数量与之匹配
 - 端点 5xx → 重试 2 次后回退固定键集，且回退确实上传了
-- 端点 401 → 不回退、不上传
+- 端点 401 → 回退固定键集并上传，且回退的 key 仍在本 task 前缀内
 - `upload_request_url` 为空 → 直接走固定键集（旧 Runtime 兼容）
 - glob 文件（如 `dumps/0001.bin`）在新路径下确实被上传——这是关闭 CONTRACT-ISSUE 的证据
 
