@@ -619,7 +619,7 @@ authoritative page and prove its artifact tuple is still excluded from fallback.
 ```bash
 cd /home/maxin/Code/hermes_ai_devops/.worktrees/workflow-runs/runtime
 PATH=/home/maxin/.local/go/bin:$PATH go test ./internal/store \
-  -run 'RecentRuns' -count=1 -v
+  -run 'Test(Mem|PG)StoreConformance/RecentRuns' -count=1 -v
 ```
 
 Expected: fields are absent and prefix-associated legacy results violate exact matching/order.
@@ -675,7 +675,8 @@ cd /home/maxin/Code/hermes_ai_devops/.worktrees/workflow-runs/runtime
 PATH=/home/maxin/.local/go/bin:$PATH gofmt -w \
   internal/store/fleet.go internal/store/postgres_fleet.go \
   internal/store/conformance_test.go
-PATH=/home/maxin/.local/go/bin:$PATH go test ./internal/store -run 'RecentRuns' -count=1 -v
+PATH=/home/maxin/.local/go/bin:$PATH go test ./internal/store \
+  -run 'Test(Mem|PG)StoreConformance/RecentRuns' -count=1 -v
 PATH=/home/maxin/.local/go/bin:$PATH go test ./internal/store -count=1
 git add internal/store/fleet.go internal/store/postgres_fleet.go \
   internal/store/conformance_test.go
