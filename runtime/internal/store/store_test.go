@@ -19,19 +19,20 @@ func TestMemStoreArtifactKeyIncludesProject(t *testing.T) {
 	}
 }
 
-func TestMemStoreLegacyArtifactLookupTreatsEmptyProjectAsIdentity(t *testing.T) {
+func TestMemStoreArtifactLookupIsProjectAware(t *testing.T) {
 	s := NewMemStore()
 	arts := []Artifact{
-		{Project: "", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1"},
+		{Project: "grp/a", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1"},
 		{Project: "grp/b", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1"},
 	}
 	if err := s.RegisterArtifacts(ctx, arts); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := s.ListArtifacts(ctx, "abcd1234", 42); err == nil || len(got) != 0 {
-		t.Fatalf("ambiguous list = %+v err=%v, want fail closed", got, err)
+	got, err := s.ListArtifacts(ctx, "grp/a", "abcd1234", 42)
+	if err != nil || len(got) != 1 || got[0].Project != "grp/a" {
+		t.Fatalf("project list = %+v err=%v, want grp/a only", got, err)
 	}
-	if _, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "v1"); err == nil {
-		t.Fatal("ambiguous retry should fail closed")
+	if n, err := s.NextWorkflowAttempt(ctx, "grp/a", "abcd1234", 42, "v1"); err != nil || n != 1 {
+		t.Fatalf("project retry = %d err=%v, want 1", n, err)
 	}
 }

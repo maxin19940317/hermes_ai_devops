@@ -30,12 +30,11 @@ type Artifact struct {
 }
 
 // ArtifactStore 登记产物;实现必须幂等(同一 (project,commit,pipeline,variant)
-// 重复登记无效果)。NextWorkflowAttempt 是 Task 6 前的无 project 兼容入口,
-// 供显式 retry 派生 -r{N} 序号(差距 #11);
+// 重复登记无效果)。NextWorkflowAttempt 供显式 retry 派生 -r{N} 序号(差距 #11);
 // ConclusiveWorkflowIDs 供 bundle webhook 跳过已测变体。
 type ArtifactStore interface {
 	RegisterArtifacts(ctx context.Context, arts []Artifact) error
-	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
+	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	ConclusiveWorkflowIDs(ctx context.Context, workflowIDs []string) (map[string]bool, error)
 }
 
@@ -116,31 +115,19 @@ func artifactKey(project, commit string, pipelineID int, variant string) string 
 	return project + "|" + commit + "|" + strconv.Itoa(pipelineID) + "|" + variant
 }
 
-// NextWorkflowAttempt 是 Task 6 前的无 project 兼容入口。匹配唯一 project 时
-// 原子递增 workflow_attempt;跨 project 歧义时 fail closed,不递增任何行。
-func (s *MemStore) NextWorkflowAttempt(_ context.Context, commitSHA string, pipelineID int, variant string) (int, error) {
+// NextWorkflowAttempt 原子递增指定 project 的 workflow_attempt。
+func (s *MemStore) NextWorkflowAttempt(
+	_ context.Context, project, commitSHA string, pipelineID int, variant string,
+) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	project := ""
-	found := false
-	var matched Artifact
-	for _, a := range s.rows {
-		if a.CommitSHA != commitSHA || a.PipelineID != pipelineID || a.Variant != variant {
-			continue
-		}
-		if found && a.Project != project {
-			return 0, fmt.Errorf("next workflow attempt: artifact identity spans multiple projects: %s/%d/%s",
-				commitSHA, pipelineID, variant)
-		}
-		project = a.Project
-		found = true
-		matched = a
-	}
+	key := artifactKey(project, commitSHA, pipelineID, variant)
+	matched, found := s.rows[key]
 	if !found {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d/%s",
-			commitSHA, pipelineID, variant)
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d/%s",
+			project, commitSHA, pipelineID, variant)
 	}
 	matched.WorkflowAttempt++
-	s.rows[artifactKey(project, commitSHA, pipelineID, variant)] = matched
+	s.rows[key] = matched
 	return matched.WorkflowAttempt, nil
 }

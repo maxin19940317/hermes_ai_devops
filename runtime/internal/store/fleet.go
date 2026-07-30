@@ -78,49 +78,38 @@ func (s *MemStore) UnquarantineDevice(_ context.Context, deviceID string) (bool,
 	return true, nil
 }
 
-// ListArtifacts 是 Task 6 前的无 project 兼容入口。匹配唯一 project 时返回
-// 全部产物;跨 project 歧义时 fail closed。
-func (s *MemStore) ListArtifacts(_ context.Context, commitSHA string, pipelineID int) ([]Artifact, error) {
+// ListArtifacts 返回指定 project/commit/pipeline 的全部产物。
+func (s *MemStore) ListArtifacts(
+	_ context.Context, project, commitSHA string, pipelineID int,
+) ([]Artifact, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := []Artifact{}
-	project := ""
-	found := false
 	for _, a := range s.rows {
-		if a.CommitSHA != commitSHA || a.PipelineID != pipelineID {
-			continue
+		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
+			out = append(out, a)
 		}
-		if found && a.Project != project {
-			return nil, fmt.Errorf("list artifacts: artifact identity spans multiple projects: %s/%d",
-				commitSHA, pipelineID)
-		}
-		project = a.Project
-		found = true
-		out = append(out, a)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Variant < out[j].Variant })
 	return out, nil
 }
 
-// NextWorkflowAttemptAll 是 Task 6 前的无 project 兼容入口。匹配唯一 project
-// 时递增全部变体并返回最大值;跨 project 歧义时 fail closed。
-func (s *MemStore) NextWorkflowAttemptAll(_ context.Context, commitSHA string, pipelineID int) (int, error) {
+// NextWorkflowAttemptAll 递增指定 project/commit/pipeline 的全部变体并返回最大值。
+func (s *MemStore) NextWorkflowAttemptAll(
+	_ context.Context, project, commitSHA string, pipelineID int,
+) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	project := ""
 	found := false
 	for _, a := range s.rows {
-		if a.CommitSHA != commitSHA || a.PipelineID != pipelineID {
-			continue
+		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
+			found = true
+			break
 		}
-		if found && a.Project != project {
-			return 0, fmt.Errorf("next workflow attempt: artifact identity spans multiple projects: %s/%d",
-				commitSHA, pipelineID)
-		}
-		project = a.Project
-		found = true
 	}
 	if !found {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d", commitSHA, pipelineID)
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d",
+			project, commitSHA, pipelineID)
 	}
 	maxN := 0
 	for k, a := range s.rows {

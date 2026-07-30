@@ -45,13 +45,13 @@ type fullStore interface {
 	OutboxBacklog(ctx context.Context, stuckAttempts int) (*OutboxBacklog, error)
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
 	ListDecisions(ctx context.Context, taskID string) ([]wf.DecisionRow, error)
-	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
+	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	SaveEvidenceSnapshot(ctx context.Context, snap EvidenceSnapshot) error
 	GetEvidenceSnapshot(ctx context.Context, evidenceID string) (*EvidenceSnapshot, error)
 	FleetOverview(ctx context.Context) (*FleetOverview, error)
 	UnquarantineDevice(ctx context.Context, deviceID string) (bool, error)
-	ListArtifacts(ctx context.Context, commitSHA string, pipelineID int) ([]Artifact, error)
-	NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error)
+	ListArtifacts(ctx context.Context, project, commitSHA string, pipelineID int) ([]Artifact, error)
+	NextWorkflowAttemptAll(ctx context.Context, project, commitSHA string, pipelineID int) (int, error)
 	SaveCommandTranslation(ctx context.Context, row CommandTranslation) error
 	ListCommandTranslations(ctx context.Context, openID string, limit int) ([]CommandTranslation, error)
 	RecentRuns(ctx context.Context, limit int) ([]RecentRun, error)
@@ -104,7 +104,9 @@ func artifactAttempts(t *testing.T, s fullStore) map[string]int {
 	switch st := s.(type) {
 	case *MemStore:
 		for _, row := range st.Artifacts() {
-			out[row.Project] = row.WorkflowAttempt
+			if row.CommitSHA == "abcd1234" && row.PipelineID == 42 && row.Variant == "v1" {
+				out[row.Project] = row.WorkflowAttempt
+			}
 		}
 	case *PGStore:
 		rows, err := st.DB.QueryContext(ctx, `
@@ -1040,12 +1042,12 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatal(err)
 		}
 		for want := 1; want <= 3; want++ {
-			n, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "v1")
+			n, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1")
 			if err != nil || n != want {
 				t.Fatalf("attempt = %d err=%v, want %d", n, err, want)
 			}
 		}
-		if _, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "ghost"); err == nil {
+		if _, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "ghost"); err == nil {
 			t.Error("未登记的键应报错")
 		}
 	})
@@ -1464,58 +1466,52 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 				BuildType: "Release", URL: "u2", SHA256: "s2", Size: 2, ManifestDigest: "m2"},
 			{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 43, Variant: "v1",
 				BuildType: "Release", URL: "u3", SHA256: "s3", Size: 3, ManifestDigest: "m3"},
+			{Project: "grp/other", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1",
+				BuildType: "Release", URL: "other1", SHA256: "so1", Size: 4, ManifestDigest: "mo1"},
+			{Project: "grp/other", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v2",
+				BuildType: "Release", URL: "other2", SHA256: "so2", Size: 5, ManifestDigest: "mo2"},
 		}
 		if err := s.RegisterArtifacts(ctx, arts); err != nil {
 			t.Fatal(err)
 		}
-		got, err := s.ListArtifacts(ctx, "abcd1234", 42)
+		got, err := s.ListArtifacts(ctx, "grp/p", "abcd1234", 42)
 		if err != nil || len(got) != 2 {
 			t.Fatalf("list = %+v err=%v, want 2 行", got, err)
 		}
 		if got[0].Project != "grp/p" || got[0].URL == "" || got[0].ManifestDigest == "" {
 			t.Errorf("artifact 字段不全: %+v", got[0])
 		}
-		if none, _ := s.ListArtifacts(ctx, "abcd1234", 99); len(none) != 0 {
+		if none, _ := s.ListArtifacts(ctx, "grp/p", "abcd1234", 99); len(none) != 0 {
 			t.Errorf("无记录键应返回空: %+v", none)
 		}
+		other, err := s.ListArtifacts(ctx, "grp/other", "abcd1234", 42)
+		if err != nil || len(other) != 2 || other[0].Project != "grp/other" {
+			t.Fatalf("other project list = %+v err=%v, want isolated rows", other, err)
+		}
 		// 变体级 retry 使 v1 行先发散到 1;bundle 级递增后应取 max=2
-		if n, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "v1"); err != nil || n != 1 {
+		if n, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1"); err != nil || n != 1 {
 			t.Fatalf("variant attempt = %d err=%v", n, err)
 		}
-		n, err := s.NextWorkflowAttemptAll(ctx, "abcd1234", 42)
+		n, err := s.NextWorkflowAttemptAll(ctx, "grp/p", "abcd1234", 42)
 		if err != nil || n != 2 {
 			t.Fatalf("attempt all = %d err=%v, want 2(max 发散值+1)", n, err)
 		}
-		if _, err := s.NextWorkflowAttemptAll(ctx, "abcd1234", 99); err == nil {
+		if n, err := s.NextWorkflowAttempt(ctx, "grp/other", "abcd1234", 42, "v1"); err != nil || n != 1 {
+			t.Fatalf("other variant attempt = %d err=%v, want 1", n, err)
+		}
+		if n, err := s.NextWorkflowAttemptAll(ctx, "grp/other", "abcd1234", 42); err != nil || n != 2 {
+			t.Fatalf("other attempt all = %d err=%v, want 2", n, err)
+		}
+		if _, err := s.NextWorkflowAttemptAll(ctx, "grp/p", "abcd1234", 99); err == nil {
 			t.Error("无记录键应报错")
 		}
-	})
-
-	t.Run("LegacyProjectAgnosticArtifactMethodsFailClosed", func(t *testing.T) {
-		s := newStore(t)
-		arts := []Artifact{
-			{Project: "grp/a", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1",
-				BuildType: "Release", URL: "a", SHA256: "sa", Size: 1, ManifestDigest: "ma"},
-			{Project: "grp/b", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1",
-				BuildType: "Release", URL: "b", SHA256: "sb", Size: 1, ManifestDigest: "mb"},
-		}
-		if err := s.RegisterArtifacts(ctx, arts); err != nil {
-			t.Fatal(err)
-		}
-		if got, err := s.ListArtifacts(ctx, "abcd1234", 42); err == nil || len(got) != 0 {
-			t.Fatalf("ambiguous legacy list = %+v err=%v, want fail closed", got, err)
-		}
-		if _, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "v1"); err == nil {
-			t.Fatal("ambiguous legacy variant retry should fail closed")
-		}
-		if _, err := s.NextWorkflowAttemptAll(ctx, "abcd1234", 42); err == nil {
-			t.Fatal("ambiguous legacy bundle retry should fail closed")
-		}
 		attempts := artifactAttempts(t, s)
-		for _, project := range []string{"grp/a", "grp/b"} {
-			if attempts[project] != 0 {
-				t.Errorf("%s workflow attempt = %d, ambiguous retry must not increment", project, attempts[project])
-			}
+		if attempts["grp/p"] != 2 {
+			t.Errorf("grp/p v1 workflow attempt = %d, want 2", attempts["grp/p"])
+		}
+		if attempts["grp/other"] != 2 {
+			t.Errorf("grp/other v1 workflow attempt = %d, want independently incremented to 2",
+				attempts["grp/other"])
 		}
 	})
 

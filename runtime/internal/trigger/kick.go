@@ -160,7 +160,9 @@ func (h *Handler) HandleKick(w http.ResponseWriter, r *http.Request) {
 	if p.Retry {
 		// 显式 retry(差距 #11):同一逻辑键(commit,pipeline,variant)原子递增
 		// workflow_attempt 得 N,workflow ID 加 -r{N} 起新 run;普通重放永不走这里。
-		n, err := h.store.NextWorkflowAttempt(r.Context(), p.Commit, p.PipelineID, p.Variant)
+		n, err := h.store.NextWorkflowAttempt(
+			r.Context(), p.Project, p.Commit, p.PipelineID, p.Variant,
+		)
 		if err != nil {
 			log.Error().Err(err).Msg("next workflow attempt")
 			http.Error(w, "retry attempt failed", http.StatusInternalServerError)

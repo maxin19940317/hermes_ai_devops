@@ -13,14 +13,14 @@ import (
 // Command 是一条解析后的指令(封闭枚举;Name 未知时恒为 help)。
 type Command struct {
 	Name string   // status | devices | rerun | unquarantine | help
-	Args []string // rerun: <sha8> <pipeline_iid> [variant];unquarantine: [device_id]
+	Args []string // rerun: <source_workflow_id> [variant];unquarantine: [device_id]
 }
 
 // usage 是帮助文本(空/未知指令的应答)。
 const usage = `可用指令:
   status                        运行中 workflow / 设备状态 / 活跃租约
   devices                       设备列表(serial/soc/status/fail_streak)
-  rerun <sha8> <pipeline_iid> [variant]  重跑(无 variant 跑全部变体,包不齐报错)
+  rerun <source_workflow_id> [variant]  重跑权威终态运行的失败变体(可指定一个变体)
   unquarantine [device_id]      解除设备隔离(多台时需指定 id)`
 
 // Parse 解析一条消息文本:trim 后按空白切分,命令名大小写不敏感;

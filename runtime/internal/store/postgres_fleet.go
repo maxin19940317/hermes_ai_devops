@@ -61,22 +61,16 @@ func (s *PGStore) UnquarantineDevice(ctx context.Context, deviceID string) (bool
 	return n > 0, nil
 }
 
-// ListArtifacts 是 Task 6 前的无 project 兼容入口。匹配唯一 project 时返回
-// 全部产物;跨 project 歧义时 fail closed。
-func (s *PGStore) ListArtifacts(ctx context.Context, commitSHA string, pipelineID int) ([]Artifact, error) {
-	project, found, err := s.legacyArtifactProject(ctx, commitSHA, pipelineID, nil)
-	if err != nil {
-		return nil, fmt.Errorf("list artifacts %s/%d: %w", commitSHA, pipelineID, err)
-	}
-	if !found {
-		return []Artifact{}, nil
-	}
+// ListArtifacts 返回指定 project/commit/pipeline 的全部产物。
+func (s *PGStore) ListArtifacts(
+	ctx context.Context, project, commitSHA string, pipelineID int,
+) ([]Artifact, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT project, commit_sha, pipeline_id, variant, build_type, url, sha256, size, manifest_digest
 		FROM artifacts WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3 ORDER BY variant`,
 		project, commitSHA, pipelineID)
 	if err != nil {
-		return nil, fmt.Errorf("list artifacts %s/%d: %w", commitSHA, pipelineID, err)
+		return nil, fmt.Errorf("list artifacts %s/%s/%d: %w", project, commitSHA, pipelineID, err)
 	}
 	defer rows.Close()
 	out := []Artifact{}
@@ -84,28 +78,23 @@ func (s *PGStore) ListArtifacts(ctx context.Context, commitSHA string, pipelineI
 		var a Artifact
 		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
 			&a.BuildType, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest); err != nil {
-			return nil, fmt.Errorf("list artifacts %s/%d: scan: %w", commitSHA, pipelineID, err)
+			return nil, fmt.Errorf("list artifacts %s/%s/%d: scan: %w",
+				project, commitSHA, pipelineID, err)
 		}
 		out = append(out, a)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list artifacts %s/%d: %w", commitSHA, pipelineID, err)
+		return nil, fmt.Errorf("list artifacts %s/%s/%d: %w", project, commitSHA, pipelineID, err)
 	}
 	return out, nil
 }
 
-// NextWorkflowAttemptAll 是 Task 6 前的无 project 兼容入口。匹配唯一 project
-// 时原子递增全部变体并返回最大值;跨 project 歧义时 fail closed。
-func (s *PGStore) NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error) {
-	project, found, err := s.legacyArtifactProject(ctx, commitSHA, pipelineID, nil)
-	if err != nil {
-		return 0, fmt.Errorf("next workflow attempt %s/%d: %w", commitSHA, pipelineID, err)
-	}
-	if !found {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d", commitSHA, pipelineID)
-	}
+// NextWorkflowAttemptAll 原子递增指定 project/commit/pipeline 的全部变体并返回最大值。
+func (s *PGStore) NextWorkflowAttemptAll(
+	ctx context.Context, project, commitSHA string, pipelineID int,
+) (int, error) {
 	var maxN int
-	err = s.DB.QueryRowContext(ctx, `
+	err := s.DB.QueryRowContext(ctx, `
 		WITH bumped AS (
 			UPDATE artifacts SET workflow_attempt = workflow_attempt + 1
 			WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3
@@ -114,10 +103,12 @@ func (s *PGStore) NextWorkflowAttemptAll(ctx context.Context, commitSHA string, 
 		SELECT COALESCE(MAX(workflow_attempt), 0) FROM bumped`,
 		project, commitSHA, pipelineID).Scan(&maxN)
 	if err != nil {
-		return 0, fmt.Errorf("next workflow attempt %s/%d: %w", commitSHA, pipelineID, err)
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: %w",
+			project, commitSHA, pipelineID, err)
 	}
 	if maxN == 0 {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d", commitSHA, pipelineID)
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d",
+			project, commitSHA, pipelineID)
 	}
 	return maxN, nil
 }

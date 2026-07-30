@@ -2,7 +2,9 @@ package feishucmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,9 +21,10 @@ import (
 type Store interface {
 	FleetOverview(ctx context.Context) (*store.FleetOverview, error)
 	UnquarantineDevice(ctx context.Context, deviceID string) (bool, error)
-	ListArtifacts(ctx context.Context, commitSHA string, pipelineID int) ([]store.Artifact, error)
-	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
-	NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error)
+	ListArtifacts(ctx context.Context, project, commitSHA string, pipelineID int) ([]store.Artifact, error)
+	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
+	NextWorkflowAttemptAll(ctx context.Context, project, commitSHA string, pipelineID int) (int, error)
+	GetWorkflowRun(ctx context.Context, workflowID string) (*store.WorkflowRun, error)
 	// 以下三个供意图翻译层使用(设计文档 §3.1)
 	RecentRuns(ctx context.Context, limit int) ([]store.RecentRun, error)
 	SaveCommandTranslation(ctx context.Context, row store.CommandTranslation) error
@@ -31,6 +34,8 @@ type Store interface {
 // WorkflowStarter 启动 DeviceTestWorkflow(trigger.TemporalStarter 满足)。
 type WorkflowStarter interface {
 	StartDeviceTest(ctx context.Context, in wf.DeviceTestInput) (workflowID string, started bool, err error)
+	WorkflowClosed(ctx context.Context, workflowID string) (bool, error)
+	WorkflowResult(ctx context.Context, workflowID string) (*wf.DeviceTestOutput, error)
 }
 
 // Executor 是指令执行体:鉴权(白名单)→ 解析 → 执行 → 文本回复。
@@ -41,9 +46,6 @@ type Executor struct {
 	Sender    feishu.Sender   // 回复通道;nil = 只执行不回复(测试)
 	Log       *zerolog.Logger // 可选;nil 用 Nop
 	Whitelist map[string]bool
-	// ExpectedVariants 是 bundle 全量变体数(variants.yaml 声明数),
-	// rerun 无 variant 时的包齐整性判据;0 = 不校验齐整性。
-	ExpectedVariants int
 
 	// Translator 非 nil 时启用自然语言翻译旁路(设计文档 §3.1);
 	// nil = 未启用,未知输入回 usage(改动前的行为)。
@@ -314,78 +316,122 @@ func (e *Executor) devices(ctx context.Context) (string, error) {
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
-// rerun <sha8> <pipeline_iid> [variant]:用 artifacts 表重建 DeviceTestInput
-// 显式启动(-r{N} 后缀来自 workflow_attempt 递增,差距 #11)。
-// 查无记录/包不齐/参数非法 → 明确报错文本(不返回 error,不算执行失败)。
+// rerun <source_workflow_id> [variant] 从 workflow_runs 与 Temporal 终态输出
+// 重建精确输入。无 variant 时只重试该次运行输出里的失败变体。
 func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
-	if len(args) < 2 || len(args) > 3 {
-		return "用法: rerun <sha8> <pipeline_iid> [variant]", nil
+	if len(args) == 3 ||
+		(len(args) == 2 && validateSHA(strings.ToLower(args[0])) == nil &&
+			isPositiveInt(args[1])) {
+		return "旧 rerun 语法已停用，请使用 rerun <source_workflow_id> [variant]", nil
 	}
-	sha := strings.ToLower(args[0])
-	if err := validateSHA(sha); err != nil {
-		return fmt.Sprintf("非法 sha: %v", err), nil
+	if len(args) < 1 || len(args) > 2 {
+		return "用法: rerun <source_workflow_id> [variant]", nil
 	}
-	iid, err := strconv.Atoi(args[1])
-	if err != nil || iid <= 0 {
-		return fmt.Sprintf("非法 pipeline_iid %q(正整数)", args[1]), nil
+
+	workflowID := args[0]
+	source, err := e.Store.GetWorkflowRun(ctx, workflowID)
+	if errors.Is(err, store.ErrWorkflowRunNotFound) {
+		return fmt.Sprintf("查无权威 workflow 运行记录: %s", workflowID), nil
 	}
-	arts, err := e.Store.ListArtifacts(ctx, sha, iid)
+	if err != nil {
+		return "", fmt.Errorf("get workflow run %s: %w", workflowID, err)
+	}
+	closed, err := e.Starter.WorkflowClosed(ctx, workflowID)
+	if err != nil {
+		return fmt.Sprintf("检查 workflow 状态失败: %v", err), nil
+	}
+	if !closed {
+		return fmt.Sprintf("workflow 尚未结束: %s", workflowID), nil
+	}
+
+	explicit := len(args) == 2
+	targets := []string{}
+	if explicit {
+		targets = append(targets, args[1])
+	} else {
+		out, err := e.Starter.WorkflowResult(ctx, workflowID)
+		if err != nil {
+			return fmt.Sprintf("读取 workflow 结果失败: %v", err), nil
+		}
+		seen := make(map[string]struct{})
+		for _, summary := range out.Tasks {
+			if summary.Verdict == "PASSED" || summary.Verdict == wf.VerdictSkipped ||
+				summary.Variant == "" {
+				continue
+			}
+			seen[summary.Variant] = struct{}{}
+		}
+		for variant := range seen {
+			targets = append(targets, variant)
+		}
+		sort.Strings(targets)
+		if len(targets) == 0 {
+			return fmt.Sprintf("workflow 没有失败变体: %s", workflowID), nil
+		}
+	}
+
+	arts, err := e.Store.ListArtifacts(ctx, source.Project, source.CommitSHA, source.PipelineID)
 	if err != nil {
 		return "", err
 	}
-	if len(arts) == 0 {
-		return fmt.Sprintf("查无记录: g%s p%d 未登记任何 artifact", sha, iid), nil
+	sourceVariants := make(map[string]struct{}, len(source.Variants))
+	for _, variant := range source.Variants {
+		sourceVariants[variant] = struct{}{}
 	}
+	byVariant := make(map[string][]store.Artifact, len(arts))
+	for _, art := range arts {
+		byVariant[art.Variant] = append(byVariant[art.Variant], art)
+	}
+	packages := make([]wf.PackageRef, 0, len(targets))
+	for _, variant := range targets {
+		if _, ok := sourceVariants[variant]; !ok {
+			return fmt.Sprintf("变体 %s 不属于源 workflow %s", variant, workflowID), nil
+		}
+		matches := byVariant[variant]
+		if len(matches) != 1 {
+			return fmt.Sprintf("变体 %s 的 artifact 数量为 %d，要求恰好 1 个", variant, len(matches)), nil
+		}
+		packages = append(packages, pkgRef(matches[0]))
+	}
+
 	in := wf.DeviceTestInput{
-		Project: arts[0].Project, Commit: sha, PipelineID: iid,
+		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
+		Version: source.Version, RuleVersion: source.RuleVersion,
+		SourceWorkflowID: source.WorkflowID, Packages: packages,
 	}
-	if len(args) == 3 {
-		// 单变体重跑:Scope=variant,ID 含变体后缀
-		variant := args[2]
-		var art *store.Artifact
-		for i := range arts {
-			if arts[i].Variant == variant {
-				art = &arts[i]
-				break
-			}
-		}
-		if art == nil {
-			avail := make([]string, 0, len(arts))
-			for _, a := range arts {
-				avail = append(avail, a.Variant)
-			}
-			return fmt.Sprintf("变体 %s 无记录;已登记: %s", variant, strings.Join(avail, ", ")), nil
-		}
-		n, err := e.Store.NextWorkflowAttempt(ctx, sha, iid, variant)
+	if explicit {
+		variant := targets[0]
+		n, err := e.Store.NextWorkflowAttempt(
+			ctx, source.Project, source.CommitSHA, source.PipelineID, variant,
+		)
 		if err != nil {
 			return "", err
 		}
 		in.Scope = variant
 		in.Attempt = n
-		in.Packages = []wf.PackageRef{pkgRef(*art)}
 	} else {
-		// 全量重跑:包不齐拒绝(被 interruptible 打断的残缺构建不得重跑)
-		if e.ExpectedVariants > 0 && len(arts) < e.ExpectedVariants {
-			return fmt.Sprintf("包不齐: g%s p%d 仅 %d/%d 个变体有 artifact,请补齐后重试",
-				sha, iid, len(arts), e.ExpectedVariants), nil
-		}
-		n, err := e.Store.NextWorkflowAttemptAll(ctx, sha, iid)
+		n, err := e.Store.NextWorkflowAttemptAll(
+			ctx, source.Project, source.CommitSHA, source.PipelineID,
+		)
 		if err != nil {
 			return "", err
 		}
+		in.Scope = source.Scope
 		in.Attempt = n
-		for _, a := range arts {
-			in.Packages = append(in.Packages, pkgRef(a))
-		}
 	}
 	id, started, err := e.Starter.StartDeviceTest(ctx, in)
 	if err != nil {
 		return "", fmt.Errorf("start workflow: %w", err)
 	}
 	if !started {
-		return fmt.Sprintf("workflow 已存在(幂等,未重启): %s", id), nil
+		return fmt.Sprintf("workflow 已存在，本次 attempt 未启动: %s", id), nil
 	}
 	return fmt.Sprintf("已启动: %s(%d 个变体)", id, len(in.Packages)), nil
+}
+
+func isPositiveInt(s string) bool {
+	n, err := strconv.Atoi(s)
+	return err == nil && n > 0
 }
 
 func pkgRef(a store.Artifact) wf.PackageRef {
