@@ -68,6 +68,36 @@ func TestPGStoreConformance(t *testing.T) {
 	runConformance(t, func(t *testing.T) fullStore { return openTestPG(t) })
 }
 
+func TestPGRecentRunsUsesOneSnapshot(t *testing.T) {
+	s := openTestPG(t)
+	artifact := Artifact{
+		Project: "snapshot/project", CommitSHA: "abcd1234", PipelineID: 42,
+		Variant: "v1", URL: "u", SHA256: "s",
+	}
+	if err := s.RegisterArtifacts(ctx, []Artifact{artifact}); err != nil {
+		t.Fatalf("RegisterArtifacts: %v", err)
+	}
+
+	got, err := s.recentRuns(ctx, 1, func() error {
+		return s.RecordWorkflowRun(ctx, WorkflowRun{
+			WorkflowID: "inserted-between-recent-run-queries",
+			Project:    artifact.Project, CommitSHA: artifact.CommitSHA,
+			PipelineID: artifact.PipelineID, Version: "1.0.0",
+			RuleVersion: "rules-v1", Variants: []string{artifact.Variant},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RecentRuns: %v", err)
+	}
+	if len(got) != 1 || got[0].Authoritative ||
+		got[0].Project != artifact.Project || got[0].Variant != artifact.Variant {
+		t.Fatalf("runs = %#v, want legacy row from the call's initial snapshot", got)
+	}
+	if _, err := s.GetWorkflowRun(ctx, "inserted-between-recent-run-queries"); err != nil {
+		t.Fatalf("concurrent workflow run was not committed: %v", err)
+	}
+}
+
 func artifactAttempts(t *testing.T, s fullStore) map[string]int {
 	t.Helper()
 	out := map[string]int{}

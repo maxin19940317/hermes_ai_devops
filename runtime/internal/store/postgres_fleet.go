@@ -127,7 +127,22 @@ func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error
 	if limit <= 0 {
 		return nil, nil
 	}
-	rows, err := s.DB.QueryContext(ctx, `
+	return s.recentRuns(ctx, limit, nil)
+}
+
+func (s *PGStore) recentRuns(
+	ctx context.Context, limit int, afterAuthoritative func() error,
+) ([]RecentRun, error) {
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("recent runs: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
 		SELECT wr.workflow_id, wr.project, wr.commit_sha, wr.pipeline_id,
 		       wr.version, wr.rule_version, expanded.variant,
 		       COALESCE(task.verdict, ''), task.ended_at
@@ -169,12 +184,20 @@ func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("recent runs: authoritative: %w", err)
 	}
+	if afterAuthoritative != nil {
+		if err := afterAuthoritative(); err != nil {
+			return nil, fmt.Errorf("recent runs: after authoritative: %w", err)
+		}
+	}
 	remaining := limit - len(out)
 	if remaining == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("recent runs: commit: %w", err)
+		}
 		return out, nil
 	}
 
-	rows, err = s.DB.QueryContext(ctx, `
+	rows, err = tx.QueryContext(ctx, `
 		SELECT a.project, a.commit_sha, a.pipeline_id, a.variant
 		FROM artifacts a
 		WHERE NOT EXISTS (
@@ -209,7 +232,7 @@ func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error
 		base := wf.BaseWorkflowID(out[i].Project, out[i].Commit, out[i].PipelineID)
 		var verdict sql.NullString
 		var endedAt sql.NullTime
-		err := s.DB.QueryRowContext(ctx, `
+		err := tx.QueryRowContext(ctx, `
 			SELECT verdict, ended_at FROM tasks
 			WHERE test_id = $1
 			  AND (workflow_id = $2 OR starts_with(workflow_id, $2 || '-'))
@@ -225,6 +248,9 @@ func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error
 		if endedAt.Valid {
 			out[i].EndedAt = endedAt.Time.UTC()
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("recent runs: commit: %w", err)
 	}
 	return out, nil
 }
