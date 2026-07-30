@@ -39,7 +39,7 @@ LEGACY_RERUN_SYNTAX = re.compile(
     r"<(?:sha(?:8|[0-9]*)?|commit_sha)>\s+"
     r"<(?:pipeline_iid|pipeline_id)>"
     r"|[0-9a-fA-F]{7,40}\s+[1-9][0-9]*"
-    r")(?=\s|$)"
+    r")(?=[\s`)\]}>.,;:!?，。；：！？*_~]|$)"
 )
 WORKFLOW_RUNS_MIGRATION_PATTERNS = {
     "workflow_runs table": re.compile(
@@ -69,8 +69,40 @@ WORKFLOW_RUNS_MIGRATION_PATTERNS = {
 
 
 def strip_sql_comments(text):
-    without_blocks = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    return re.sub(r"--[^\r\n]*", "", without_blocks)
+    out = []
+    i = 0
+    block_depth = 0
+    in_line_comment = False
+    while i < len(text):
+        pair = text[i:i + 2]
+        if in_line_comment:
+            if text[i] in "\r\n":
+                in_line_comment = False
+                out.append(text[i])
+            i += 1
+            continue
+        if block_depth:
+            if pair == "/*":
+                block_depth += 1
+                i += 2
+            elif pair == "*/":
+                block_depth -= 1
+                i += 2
+            else:
+                if text[i] in "\r\n":
+                    out.append(text[i])
+                i += 1
+            continue
+        if pair == "--":
+            in_line_comment = True
+            i += 2
+        elif pair == "/*":
+            block_depth = 1
+            i += 2
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
 
 class SecretExclusionContracts(unittest.TestCase):
@@ -398,6 +430,9 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
                 f"-- {line}" for line in migration.splitlines()
             ),
             "block comment": f"/*\n{migration}\n*/",
+            "nested block comment": (
+                f"/* outer\n/* nested marker */\n{migration}\n*/"
+            ),
         }
 
         for name, mutation in mutations.items():
@@ -446,11 +481,20 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
             "rerun <commit_sha> <pipeline_id>",
             "rerun 9da3b9d9 56",
             "rerun abcdef1234567890 1 variant",
+            "`rerun <commit_sha> <pipeline_id>`",
+            "`rerun 9da3b9d9 56`",
         )
 
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 self.assertRegex(mutation, LEGACY_RERUN_SYNTAX)
+
+        for current in (
+            "`rerun device-test-grp/project-g9da3b9d9-p56`",
+            "rerun device-test-grp/project-g9da3b9d9-p56 variant",
+        ):
+            with self.subTest(current=current):
+                self.assertNotRegex(current, LEGACY_RERUN_SYNTAX)
 
     def test_rerun_variant_selection_predicate_is_explicit(self):
         deploy_readme = " ".join(
