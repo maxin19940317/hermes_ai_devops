@@ -1,18 +1,93 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 type workflowRunsSchemaShape struct {
 	Columns     []string
 	Constraints []string
 	Indexes     []string
+}
+
+func openIsolatedMigrationPG(t *testing.T) *PGStore {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL 未设置且 embedded postgres 不可用,跳过 PG 集成测试")
+	}
+	admin, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open migration test admin connection: %v", err)
+	}
+	if err := admin.PingContext(ctx); err != nil {
+		admin.Close()
+		t.Fatalf("ping migration test database: %v", err)
+	}
+
+	random := make([]byte, 12)
+	if _, err := rand.Read(random); err != nil {
+		admin.Close()
+		t.Fatalf("generate migration test schema name: %v", err)
+	}
+	schema := "workflow_runs_test_" + hex.EncodeToString(random)
+	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		admin.Close()
+		t.Fatalf("create migration test schema: %v", err)
+	}
+
+	var isolatedDB *sql.DB
+	var registeredDSN string
+	t.Cleanup(func() {
+		if isolatedDB != nil {
+			if err := isolatedDB.Close(); err != nil {
+				t.Errorf("close isolated migration database: %v", err)
+			}
+		}
+		if registeredDSN != "" {
+			stdlib.UnregisterConnConfig(registeredDSN)
+		}
+		if _, err := admin.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`); err != nil {
+			t.Errorf("drop migration test schema %s: %v", schema, err)
+		}
+		if err := admin.Close(); err != nil {
+			t.Errorf("close migration test admin database: %v", err)
+		}
+	})
+
+	config, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse migration test DSN: %v", err)
+	}
+	if config.RuntimeParams == nil {
+		config.RuntimeParams = map[string]string{}
+	}
+	config.RuntimeParams["search_path"] = schema
+	registeredDSN = stdlib.RegisterConnConfig(config)
+
+	s, err := OpenPG(ctx, registeredDSN)
+	if err != nil {
+		t.Fatalf("open isolated migration store: %v", err)
+	}
+	isolatedDB = s.DB
+	var currentSchema string
+	if err := s.DB.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&currentSchema); err != nil {
+		t.Fatalf("read isolated current_schema: %v", err)
+	}
+	if currentSchema != schema {
+		t.Fatalf("current_schema = %q, want isolated %q", currentSchema, schema)
+	}
+	return s
 }
 
 func captureWorkflowRunsSchemaShape(t *testing.T, db *sql.DB) workflowRunsSchemaShape {
@@ -138,7 +213,14 @@ func assertFreshWorkflowRunsShape(t *testing.T, shape workflowRunsSchemaShape) {
 }
 
 func TestWorkflowRunsMigrationUpgradesLegacyArtifactKey(t *testing.T) {
-	s := openTestPG(t)
+	s := openIsolatedMigrationPG(t)
+	var schema string
+	if err := s.DB.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	if schema == "public" {
+		t.Fatal("migration test must not mutate the shared public schema")
+	}
 	fresh := captureWorkflowRunsSchemaShape(t, s.DB)
 	assertFreshWorkflowRunsShape(t, fresh)
 
