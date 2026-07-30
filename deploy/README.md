@@ -41,8 +41,15 @@ forced refresh on expiry errors); otherwise it falls back to the group custom
 bot webhook (`FEISHU_WEBHOOK_URL`). `FEISHU_RECEIVE_ID` accepts an `open_id`
 (personal DM, set `FEISHU_RECEIVE_ID_TYPE=open_id`) or a `chat_id` (group chat,
 the default when the type is unset). All empty means notifications are silently
-skipped (dev mode). Messages are plain text in this version; interactive cards
-are a later milestone. The worker also runs an optional command listener over the
+skipped (dev mode). Terminal-state notifications render as an interactive card
+(2026-07-30): the header background is green/red/orange by verdict — red whenever
+any task has a non-`INFRA_ERROR` failure (business failure takes priority even if
+`INFRA_ERROR` is also present), orange when every failure is `INFRA_ERROR`, green
+when nothing is judged a failure. If the card send fails, or the configured sender
+doesn't support cards, the worker falls back to the same plain-text message this
+version used to send unconditionally. This milestone ships display only — the
+card has no buttons or other interactive components. The worker also runs an
+optional command listener over the
 app's WebSocket event subscription: when `FEISHU_CMD_WHITELIST` (comma-separated
 open_ids) is set, whitelisted users can send the bot DM commands (`status`,
 `devices`, `rerun <sha8> <pipeline_iid> [variant]`, `unquarantine [device_id]`);

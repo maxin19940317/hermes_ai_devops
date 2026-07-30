@@ -49,7 +49,7 @@
 | 数据库 | PostgreSQL 15+(与 Temporal 共实例分库) | Client 本地用 SQLite(WAL) |
 | 附件/日志存储 | MinIO(S3 兼容),预签名 URL 直传 | 大文件不过 Runtime |
 | 产物仓库 | GitLab Generic Package Registry(现状沿用) | |
-| 通知 | 飞书机器人 + 交互卡片(按钮回调 → Runtime signal) | |
+| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 按钮尚未实现,见 §12 Phase 2 |
 | 部署 | Docker Compose(服务器全套);Client 手动安装 MSI/exe | |
 | 日志 | 结构化日志(zerolog),UTC + 毫秒,全组件 NTP | |
 
@@ -278,7 +278,7 @@ Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, star
    目的:Windows+USB+ADB 是最大不确定段,用 CLI 手动踩完所有坑再套服务壳。
 4. Temporal spike(1 周内 go/no-go):signal 接收、Activity 重试、杀进程后重放恢复,三个最小示例。
 5. Trigger 服务:GitLab pipeline webhook(验签、去重)→ 拉 bundle-g{sha}.json → 登记 artifacts 表 → 启动 DeviceTestWorkflow。
-6. DeviceTestWorkflow 主干:resolve_artifact → acquire_device → dispatch(POST Client,幂等键={workflow_id}:{task_id}:{attempt})→ await_result(signal,租约由心跳续期,过期按 on_infra_error)→ extract_evidence → **规则引擎**判 verdict(不接 LLM)→ release_device → 飞书纯文本通知。
+6. DeviceTestWorkflow 主干:resolve_artifact → acquire_device → dispatch(POST Client,幂等键={workflow_id}:{task_id}:{attempt})→ await_result(signal,租约由心跳续期,过期按 on_infra_error)→ extract_evidence → **规则引擎**判 verdict(不接 LLM)→ release_device → 飞书通知(2026-07-30 起为展示卡片,失败降级纯文本)。
 7. agent-cli 套 RPC 壳(§8.1 API)+ 心跳/事件/结果回调 + MinIO 预签名直传 + Windows Service 化。
 
 **Phase 1 DoD**:push 一次代码 → 15 分钟内飞书收到含 verdict 与日志链接的通知;三项故障注入(拔 USB / 杀 Agent 进程 / 重启 Runtime)均收敛到正确终态,零重复执行。
@@ -290,7 +290,8 @@ Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, star
 > 为个人实例,宜另起专用实例)、工具白名单与 Schema 输出校验在该平台上的落地方式。
 > §3 硬性边界(Hermes 只经 Runtime、结构化输入、不在执行关键路径)不因复用而放宽。
 
-Evidence Extractor 完整化(签名匹配 + 匹配处 ±50 行上下文 + junit 失败 + 指标差值 → evidence.json,几十 KB 级);Analyzer(LLM 分析 evidence → 结构化结论 → decisions 落库;Hermes 超时/不可用 → 规则引擎保底);飞书交互卡片(重试/忽略/隔离按钮 → Runtime signal);Planner v1(自然语言 → Plan DSL,服务端 Schema 校验不过打回重试 ≤3 次)。
+Evidence Extractor 完整化(签名匹配 + 匹配处 ±50 行上下文 + junit 失败 + 指标差值 → evidence.json,几十 KB 级);Analyzer(LLM 分析 evidence → 结构化结论 → decisions 落库;Hermes 超时/不可用 → 规则引擎保底);飞书交互卡片(2026-07-30:**展示卡片已实现**;重试/忽略按钮待 `workflow_runs` 落地后单独一轮,
+按钮回调经 WS listener 执行而非 workflow signal;隔离按钮因无设备级信号源暂不做,见差距 #10);Planner v1(自然语言 → Plan DSL,服务端 Schema 校验不过打回重试 ≤3 次)。
 **严禁把原始日志全量灌入 LLM;Hermes 按需通过 `fetch_log_range(attachment, start, end)` 工具取片段。**
 
 ### Phase 3 — 硬化
