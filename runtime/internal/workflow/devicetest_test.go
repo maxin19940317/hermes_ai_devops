@@ -36,6 +36,7 @@ type fakeActs struct {
 	finished      []FinishRequest
 	released      []ReleaseRequest
 	notifications []string
+	notifyCards   []NotifyCardRequest
 
 	analysis      *hermesclient.Analysis // 非 nil 模拟 Analyzer 已启用
 	evidenceCalls []ExtractEvidenceRequest
@@ -107,6 +108,12 @@ func (f *fakeActs) Notify(_ context.Context, msg string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.notifications = append(f.notifications, msg)
+	return nil
+}
+func (f *fakeActs) NotifyCard(_ context.Context, req NotifyCardRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notifyCards = append(f.notifyCards, req)
 	return nil
 }
 func (f *fakeActs) ExtractEvidence(_ context.Context, r ExtractEvidenceRequest) (*ExtractEvidenceResponse, error) {
@@ -230,11 +237,19 @@ func TestHappyPathPassed(t *testing.T) {
 	if len(f.finished) != 1 || f.finished[0].Verdict != "PASSED" {
 		t.Errorf("finished=%+v", f.finished)
 	}
-	if len(f.notifications) != 1 ||
-		!strings.Contains(f.notifications[0], "PASSED") ||
-		!strings.Contains(f.notifications[0], "12.0s cases=10/10") ||
-		strings.Contains(f.notifications[0], "runs/x/") {
-		t.Errorf("notification = %q(需含 verdict 与耗时/用例,不含附件对象键)", f.notifications)
+	// 新 workflow 走 notify-card 版本分支(设计文档 §5):Notify 零调用,
+	// 断言改落在 NotifyCard 的 FallbackText 上。
+	if len(f.notifications) != 0 {
+		t.Errorf("notifications = %v, want 零调用(新 workflow 应走 NotifyCard)", f.notifications)
+	}
+	if len(f.notifyCards) != 1 {
+		t.Fatalf("notifyCards = %+v, want 1 次", f.notifyCards)
+	}
+	fallback := f.notifyCards[0].FallbackText
+	if !strings.Contains(fallback, "PASSED") ||
+		!strings.Contains(fallback, "12.0s cases=10/10") ||
+		strings.Contains(fallback, "runs/x/") {
+		t.Errorf("fallback text = %q(需含 verdict 与耗时/用例,不含附件对象键)", fallback)
 	}
 	// §11:PASSED 落规则裁决;不触发证据提取/分析(Phase 2 只对非 PASSED)
 	if len(f.decisions) != 1 || f.decisions[0].Actor != "rule" {
@@ -254,6 +269,38 @@ func TestHappyPathPassed(t *testing.T) {
 	}
 	if f.released[0].InfraFail {
 		t.Error("新版本分支不该再填 InfraFail")
+	}
+}
+
+// TestWorkflowSendsCardWithVerbatimFallback 验证 notify-card 版本分支(设计文档 §5):
+// 新 workflow 一律走 NotifyCard,且载荷的 FallbackText 必须与 buildNotification
+// 对同一输入的输出逐字节相同——降级文本只能有一个真源,不许 activity 侧另拼一份。
+func TestWorkflowSendsCardWithVerbatimFallback(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}}
+	env := newEnv(t, f)
+	seedResult(f, passResult(taskID("a1")))
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
+	}, 30*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow err: %v", env.GetWorkflowError())
+	}
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	want := buildNotification(input(), &out)
+
+	if len(f.notifications) != 0 {
+		t.Errorf("Notify 调用次数 = %d, want 0(新 workflow 不应再走纯文本分支): %v", len(f.notifications), f.notifications)
+	}
+	if len(f.notifyCards) != 1 {
+		t.Fatalf("notifyCards = %+v, want 1 次", f.notifyCards)
+	}
+	if got := f.notifyCards[0].FallbackText; got != want {
+		t.Errorf("FallbackText = %q, want 与 buildNotification 逐字节相同 %q", got, want)
 	}
 }
 
@@ -481,10 +528,15 @@ func TestSkippedVariantInOutputAndNotification(t *testing.T) {
 	if len(f.dispatched) != 1 {
 		t.Errorf("dispatched = %d, want 1(跳过变体不派单)", len(f.dispatched))
 	}
-	if len(f.notifications) != 1 ||
-		!strings.Contains(f.notifications[0], "SKIPPED") ||
-		!strings.Contains(f.notifications[0], "no capable device") {
-		t.Errorf("notification = %q(需含 SKIPPED 及原因)", f.notifications)
+	if len(f.notifications) != 0 {
+		t.Errorf("notifications = %v, want 零调用(新 workflow 应走 NotifyCard)", f.notifications)
+	}
+	if len(f.notifyCards) != 1 {
+		t.Fatalf("notifyCards = %+v, want 1 次", f.notifyCards)
+	}
+	if fallback := f.notifyCards[0].FallbackText; !strings.Contains(fallback, "SKIPPED") ||
+		!strings.Contains(fallback, "no capable device") {
+		t.Errorf("fallback text = %q(需含 SKIPPED 及原因)", fallback)
 	}
 }
 
@@ -544,9 +596,14 @@ func TestAnalysisSavedOnFailure(t *testing.T) {
 		out.Tasks[0].Analysis.Summary != "delegate fell back to CPU" {
 		t.Errorf("task summary 应携带 analysis: %+v", out.Tasks)
 	}
-	if len(f.notifications) != 1 ||
-		!strings.Contains(f.notifications[0], "hermes: delegate fell back to CPU") {
-		t.Errorf("notification = %q(需含 hermes summary 行)", f.notifications)
+	if len(f.notifications) != 0 {
+		t.Errorf("notifications = %v, want 零调用(新 workflow 应走 NotifyCard)", f.notifications)
+	}
+	if len(f.notifyCards) != 1 {
+		t.Fatalf("notifyCards = %+v, want 1 次", f.notifyCards)
+	}
+	if fallback := f.notifyCards[0].FallbackText; !strings.Contains(fallback, "hermes: delegate fell back to CPU") {
+		t.Errorf("fallback text = %q(需含 hermes summary 行)", fallback)
 	}
 }
 

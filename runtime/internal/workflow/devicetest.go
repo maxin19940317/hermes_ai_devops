@@ -283,9 +283,21 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 		out.Tasks = append(out.Tasks, runTest(ctx, spec, ruleVersion, resultCh))
 	}
 
-	text := buildNotification(in, out)
-	if err := workflow.ExecuteActivity(ctx, "Notify", text).Get(ctx, nil); err != nil {
-		workflow.GetLogger(ctx).Error("notify failed", "error", err)
+	// notify-card 版本分支(设计文档 §5):在途 workflow(重放旧 history)必须原样
+	// 发纯文本,新 workflow 一律发交互卡片。buildNotification 两个分支都要调用——
+	// 旧分支直接发送,新分支作为卡片的降级文本随载荷下发,因此不是死代码。
+	if workflow.GetVersion(ctx, "notify-card", workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+		if err := workflow.ExecuteActivity(ctx, "Notify", buildNotification(in, out)).Get(ctx, nil); err != nil {
+			workflow.GetLogger(ctx).Error("notify failed", "error", err)
+		}
+	} else {
+		req := NotifyCardRequest{
+			Card:         buildNotificationCard(in, out),
+			FallbackText: buildNotification(in, out), // 原函数,原样调用
+		}
+		if err := workflow.ExecuteActivity(ctx, "NotifyCard", req).Get(ctx, nil); err != nil {
+			workflow.GetLogger(ctx).Error("notify card failed", "error", err)
+		}
 	}
 	return out, nil
 }
