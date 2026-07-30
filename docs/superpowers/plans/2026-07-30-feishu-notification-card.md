@@ -30,18 +30,20 @@
   **`SendCard` 零调用**；超预算 → 发文本且 **`SendCard` 零调用**；否则发卡片；卡片失败 → 发文本。
 - Go 错误用 wrapped errors；注释中文；提交信息英文。
 
-**命令速查：**
+**Go 工具链：`/home/maxin/.local/go/bin/go`（go1.26.5）。**
+不要下载临时工具链——本机已装。`export` 不跨 subagent 或独立 shell 保留，
+所以**每条命令都要自带环境**，形如：
 
 ```bash
-export PATH=/tmp/claude-1000/-home-maxin-Code-hermes-ai-devops/c707bee6-56a7-42a6-9968-1c133ec47341/scratchpad/go/bin:$PATH
-export GOMODCACHE=/tmp/claude-1000/-home-maxin-Code-hermes-ai-devops/c707bee6-56a7-42a6-9968-1c133ec47341/scratchpad/gomodcache
-export GOCACHE=/tmp/claude-1000/-home-maxin-Code-hermes-ai-devops/c707bee6-56a7-42a6-9968-1c133ec47341/scratchpad/gocache
-cd runtime && go build ./... && go vet ./... && go test ./...
+cd /home/maxin/Code/hermes_ai_devops/runtime && \
+  PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache \
+  go test ./...
 ```
 
-**工具链注意：** 这套 scratchpad 的 `gofmt -w` 在 CJK 注释旁会损坏 ASCII 引号——
-**不要对含中文注释的文件跑 `gofmt -w`**，用 `gofmt -l` 检查。验证用 `go vet ./...`
-（`go build` 不编译测试文件）。
+`runtime/` 与 `agent/` 是**两个独立 module**，各自 `cd` 后再跑。
+
+验证用 `go vet ./...` 而非只 `go build`（后者不编译测试文件，看不见测试包的编译错误）。
+格式化用同一套工具链的 `gofmt -w`——它对中文注释与 ASCII 引号是安全的（已实测）。
 
 ---
 
@@ -49,7 +51,12 @@ cd runtime && go build ./... && go vet ./... && go test ./...
 
 **Files:**
 - Create: `runtime/internal/workflow/testdata/history-pre-notify-card.json`
-- Create: `runtime/internal/workflow/replay_test.go`
+- Create: `runtime/internal/workflow/record_history_test.go`（**带 build tag**，只负责录制）
+- Create: `runtime/internal/workflow/replay_test.go`（**无 tag**，永远进 CI）
+
+**两个文件必须分开。** build tag 作用于**整个文件**——把录制器和重放测试放同一个文件、
+再给文件加 tag，会让那条永久的 `TestReplayPreNotifyCardHistory` 也不进普通 CI，
+本轮最重要的 DoD 就此空转。
 
 **Interfaces:**
 - Consumes: 无
@@ -61,10 +68,24 @@ workflow 代码，就再也录不到这份历史了，而设计 §6 把"旧 hist
 
 - [ ] **Step 1: 写录制器**
 
-在 `replay_test.go` 里写一个**带 build tag 或环境变量门控**的录制测试（避免每次 CI 都起
-dev server）。用 `testtemporal.StartDevServer(t)` 起服务，注册 `DeviceTestWorkflow` 与
+在 `record_history_test.go`（文件首行 `//go:build record_history`）里写录制测试，
+避免每次 CI 都起 dev server。用 `testtemporal.StartDevServer(t)` 起服务，注册 `DeviceTestWorkflow` 与
 一组 fake activity（照 `devicetest_test.go` 既有的 `fakeActs` 写法），跑一个能走完
 "选变体 → 一个变体 PASSED → Notify" 的最小输入，然后用 client 拉取 history 并写文件。
+
+**录制器必须拒绝覆盖已存在的 fixture**：
+
+```go
+	const fixture = "testdata/history-pre-notify-card.json"
+	if _, err := os.Stat(fixture); err == nil {
+		t.Fatalf("%s 已存在,拒绝覆盖。这份 history 必须是**改动前**录的;"+
+			"Task 5 之后再跑本录制器会把它替换成改动后的历史,"+
+			"重放测试就再也发现不了版本分支的问题。要重录先手工删除。", fixture)
+	}
+```
+
+这不是防呆，是防一种**会静默毁掉回归判据**的操作：文件被覆盖后重放测试照样绿，
+但它验证的已经不是"在途 workflow 能否重放"了。
 
 关键：**history 必须能被 `worker.WorkflowReplayer` 读回**。先读 vendored SDK 确认
 replayer 提供哪些入口（`ReplayWorkflowHistory(logger, *historypb.History)` 与
@@ -101,13 +122,15 @@ func TestReplayPreNotifyCardHistory(t *testing.T) {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd runtime && go test ./internal/workflow/ -run TestReplayPreNotifyCardHistory -v`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/workflow/ -run TestReplayPreNotifyCardHistory -v`
 Expected: PASS —— **在生产代码尚未改动的情况下通过**，证明 fixture 与 harness 都可用
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add runtime/internal/workflow/testdata/ runtime/internal/workflow/replay_test.go
+git add runtime/internal/workflow/testdata/ \
+        runtime/internal/workflow/replay_test.go \
+        runtime/internal/workflow/record_history_test.go
 git commit -m "test(workflow): record pre-change history fixture for replay"
 ```
 
@@ -197,7 +220,7 @@ func TestAppSendCardRefreshesExpiredToken(t *testing.T) {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd runtime && go test ./internal/feishu/ -run SendCard`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/feishu/ -run SendCard`
 Expected: 编译失败 —— `CardSender` / `SendCard` 未定义
 
 - [ ] **Step 3: 加接口**
@@ -235,7 +258,7 @@ token 过期重试那段逻辑同样复用，不要复制粘贴出第二份。
 
 - [ ] **Step 5: 跑测试**
 
-Run: `cd runtime && go vet ./... && go test ./internal/feishu/ -v 2>&1 | tail -20`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache sh -c 'go vet ./... && go test ./internal/feishu/ -v' 2>&1 | tail -20`
 Expected: 新用例全 PASS，**既有 `SendText` 用例一条未改即通过**
 
 - [ ] **Step 6: Commit**
@@ -342,22 +365,72 @@ func TestCardClosedStructureCatchesViolations(t *testing.T) {
 }
 ```
 
-**字段一致性与安全**（设计 §4.3 / §4.5），逐条：
+**字段精确值**（设计 §4.3）——**一份黄金卡片，逐元素比对，不是只看"某行在不在"**：
+
+只检查出现条件挡不住这几类真实错误：header 漏了 commit 或 pipeline、cases 写成
+`failed/total` 而不是 `passed/total`、duration 不是 `%.1f`、attempt 取错值。所以主用例是：
+
+```go
+func TestBuildNotificationCardGolden(t *testing.T) {
+	in := DeviceTestInput{Project: "algo-super-sdk", Commit: "9da3b9d9",
+		PipelineID: 56, Version: "1.4.2"}
+	out := &DeviceTestOutput{Tasks: []TaskSummary{{
+		Variant: "aarch64_Android_SNPE_1.68", Verdict: "TEST_FAILED", Category: "CODE",
+		DurationSec: 380.14, CasesTotal: 38, CasesFailed: 3, Attempt: 2,
+		Reason: "three cases crashed",
+		Analysis: &hermesclient.Analysis{Summary: "DSP 初始化崩溃"},
+	}}}
+	card := buildNotificationCard(in, out)
+
+	// header 必须含全部四项(project/commit/pipeline/version),逐字比对
+	wantTitle := "[hermes-devops] algo-super-sdk g9da3b9d9 p56 (v1.4.2)"
+	if card.Header.Title.Content != wantTitle {
+		t.Errorf("header = %q, want %q", card.Header.Title.Content, wantTitle)
+	}
+
+	body := cardText(card) // 把所有 element 的 content 拼起来的测试辅助
+	for _, want := range []string{
+		"aarch64_Android_SNPE_1.68",
+		"TEST_FAILED",
+		"(CODE)",
+		"380.1",       // %.1f,不是 380.14 也不是 380
+		"cases 35/38", // passed/total = (38-3)/38,不是 failed/total
+		"attempt 2",   // 取 Attempt 的值,不是写死 1
+		"three cases crashed",
+		"DSP 初始化崩溃",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("卡片正文缺 %q\n实际:\n%s", want, body)
+		}
+	}
+	// 反向:不该出现的
+	if strings.Contains(body, "cases 3/38") {
+		t.Error("cases 用了 failed/total,应为 passed/total")
+	}
+}
+```
+
+**出现条件**（在黄金卡片之外，各一条最小用例）：
 
 - `CasesTotal == 0` → 指标行**既无 duration 也无 cases**（同一门控）；`> 0` → 两者都有
 - `Category == ""` 或 `Verdict == PASSED` → 无 category
 - `Reason == ""` → 无 reason 行；`Analysis == nil || Summary == ""` → 无 hermes 行
 - `Verdict == SKIPPED` → **无 attempt**；其余 verdict → 有 attempt
-- header 含 `Version`
+
+**渲染安全与截断**（设计 §4.5）：
+
 - 超 500 rune 的 `Reason` 被截断并带省略标记
+- **超 500 rune 的 `Analysis.Summary` 同样被截断并带省略标记**（与 `Reason` 对称，
+  两者都要有；只测 `Reason` 会漏掉 Summary 这条路径）
 - **纯中文超长 `Reason` 截断后 `utf8.ValidString` 为真**（按 rune 切的判据）
+- **纯中文超长 `Summary` 同上**
 - `Project = "a[x](http://evil)b"`、`Variant = "v<at user_id=\"all\">"`、
   `Reason`、`Summary` 各含 markdown/`<at>` → 卡片里是字面文本，节点 `tag == "plain_text"`
 - 构造超预算输入 → `len(json.Marshal(card)) <= 30*1024`，且带"详情已省略"标注
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd runtime && go test ./internal/workflow/ -run NotificationCard`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/workflow/ -run NotificationCard`
 Expected: 编译失败 —— `buildNotificationCard` / `NotificationCard` 未定义
 
 - [ ] **Step 3: 加 DTO**
@@ -382,14 +455,14 @@ Expected: 编译失败 —— `buildNotificationCard` / `NotificationCard` 未�
 
 - [ ] **Step 5: 跑测试**
 
-Run: `cd runtime && go test ./internal/workflow/ -v -run 'NotificationCard|CardIsClosed|CardClosedStructure' 2>&1 | tail -30`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/workflow/ -v -run 'NotificationCard|CardIsClosed|CardClosedStructure' 2>&1 | tail -30`
 Expected: 全部 PASS，含三份反例
 
 - [ ] **Step 6: 验证中文截断用例真的会红**
 
 把 `truncateRunes` 临时改成按字节切（`s[:n]`），跑纯中文超长那条：
 
-Run: `cd runtime && go test ./internal/workflow/ -run 'Truncat'`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/workflow/ -run 'Truncat'`
 Expected: **FAIL**（`utf8.ValidString` 为假）。改回来确认恢复 PASS，两次输出记进报告。
 
 - [ ] **Step 7: Commit**
@@ -444,6 +517,20 @@ func TestNotifyCardOrder(t *testing.T) {
 	// "超预算"那条的 wantCards=0 是设计 §5.2 第 3 步的机械判据。
 }
 
+// 降级发送本身失败时,错误必须保留 cause(便于排查是 token 还是网络)。
+func TestNotifyCardFallbackFailureWrapsCause(t *testing.T) {
+	sentinel := errors.New("boom")
+	f := &cardFake{failCard: true, failText: sentinel}
+	a := &Acts{Feishu: f}
+	err := a.NotifyCard(ctx, wf.NotifyCardRequest{FallbackText: "x"})
+	if err == nil {
+		t.Fatal("降级也失败时必须返回错误")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("错误应保留 cause, got %v", err)
+	}
+}
+
 // 降级文本必须原样来自载荷,activity 不得自己拼。
 func TestNotifyCardFallbackTextIsVerbatim(t *testing.T) {
 	f := &cardFake{failCard: true}
@@ -460,7 +547,7 @@ func TestNotifyCardFallbackTextIsVerbatim(t *testing.T) {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd runtime && go test ./internal/activity/ -run NotifyCard`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/activity/ -run NotifyCard`
 Expected: 编译失败 —— `NotifyCard` / `NotifyCardRequest` 未定义
 
 - [ ] **Step 3: 加载荷类型**
@@ -510,14 +597,14 @@ func (a *Acts) sendFallback(ctx context.Context, text string) error {
 
 - [ ] **Step 5: 跑测试**
 
-Run: `cd runtime && go vet ./... && go test ./internal/activity/ -v -run NotifyCard 2>&1 | tail -20`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache sh -c 'go vet ./... && go test ./internal/activity/ -v -run NotifyCard' 2>&1 | tail -20`
 Expected: 全部 PASS；**既有 `notify_test.go` 一条未改即通过**
 
 - [ ] **Step 6: 验证"超预算零调用"真的会红**
 
 把超预算分支临时改成"照常调 `SendCard`，失败再降级"，跑：
 
-Run: `cd runtime && go test ./internal/activity/ -run NotifyCardOrder`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/activity/ -run NotifyCardOrder`
 Expected: **FAIL** —— "超预算"那条的 `wantCards=0` 不满足。改回来确认恢复 PASS，
 两次输出记进报告。
 
@@ -554,7 +641,7 @@ func TestWorkflowSendsCardWithVerbatimFallback(t *testing.T) {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd runtime && go test ./internal/workflow/ -run SendsCardWithVerbatim`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/workflow/ -run SendsCardWithVerbatim`
 Expected: FAIL —— workflow 仍在调 `Notify`
 
 - [ ] **Step 3: 加版本分支**
@@ -582,14 +669,14 @@ Expected: FAIL —— workflow 仍在调 `Notify`
 
 - [ ] **Step 4: 跑测试 + 重放回归**
 
-Run: `cd runtime && go test ./internal/workflow/ -v 2>&1 | tail -25`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache go test ./internal/workflow/ -v 2>&1 | tail -25`
 Expected: 新用例 PASS，**且 Task 1 的 `TestReplayPreNotifyCardHistory` 仍然 PASS**——
 这是版本分支没有破坏在途 workflow 的证据。若它红了，说明 version marker 的位置有问题，
 **不要改 fixture 迁就**，改代码。
 
 - [ ] **Step 5: 全量回归**
 
-Run: `cd runtime && go build ./... && go vet ./... && go test ./...`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache sh -c 'go build ./... && go vet ./... && go test ./...'`
 Expected: 全部 PASS
 
 - [ ] **Step 6: Commit**
@@ -626,6 +713,12 @@ git commit -m "feat(workflow): send notification cards behind a version gate"
 按钮回调经 WS listener 执行而非 workflow signal;隔离按钮因无设备级信号源暂不做,见差距 #10)
 ```
 
+- [ ] **Step 1b: 更正 CLAUDE.md §12 Phase 1 第 6 条**
+
+`CLAUDE.md:281` 描述 DeviceTestWorkflow 主干时仍以"→ 飞书**纯文本**通知"结尾。
+把"纯文本通知"改为"飞书通知(2026-07-30 起为展示卡片,失败降级纯文本)"。
+这是本轮之后第三处过时描述，一并改掉——漏了它，读 Phase 1 主干的人拿到的仍是旧结论。
+
 - [ ] **Step 2: 更新 deploy/README.md 的通知一节**
 
 现有那句"Messages are plain text in this version; interactive cards are a later milestone"
@@ -634,7 +727,7 @@ git commit -m "feat(workflow): send notification cards behind a version gate"
 
 - [ ] **Step 3: 全量回归**
 
-Run: `cd runtime && go build ./... && go vet ./... && go test ./...`
+Run: `cd runtime && PATH=/home/maxin/.local/go/bin:$PATH GOCACHE=/tmp/hermes-runtime-go-cache sh -c 'go build ./... && go vet ./... && go test ./...'`
 Run: `cd /home/maxin/Code/hermes_ai_devops && .venv/bin/python -m pytest contracts/tests deploy/tests -q`
 Expected: 全部 PASS
 
@@ -653,4 +746,7 @@ git commit -m "docs: notification cards shipped; correct the signal description"
 2. 触发一次含 `TEST_FAILED` 的 → **红色**；含 `INFRA_ERROR` 且无其他失败的 → **橙色**
 3. 一次同时含 `INFRA_ERROR` 与 `TEST_FAILED` 的 → **红色**（不是橙）
 4. 卡片上**没有任何按钮**
-5. 把 `FEISHU_WEBHOOK_URL` 指向一个必然失败的地址 → 确认降级纯文本仍能发出（换回 app 模式验证）
+5. ~~把 webhook 指向必然失败的地址验证降级~~ —— **这一项不成立，已删除**：卡片与降级
+   文本走的是**同一个** URL，指向失败地址会让两次发送都失败，验证不出降级。降级路径由
+   Task 4 的活动测试覆盖（`cardFake` 对 `SendCard` 失败、对 `SendText` 成功），
+   那里能精确造出"卡片失败但文本可达"的条件，而真实端点造不出来。
