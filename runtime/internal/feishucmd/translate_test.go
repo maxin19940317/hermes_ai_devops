@@ -305,14 +305,27 @@ func TestTranslateRejectsLegacyFallbackRerun(t *testing.T) {
 
 func TestTranslateRejectsVariantOutsideSourceRun(t *testing.T) {
 	st := store.NewMemStore()
-	run := recordTranslationWorkflowRun(t, st)
+	runA := recordTranslationWorkflowRun(t, st)
+	runB := store.WorkflowRun{
+		WorkflowID:  "device-test-grp/algo-super-sdk-gcafebabe-p57",
+		Project:     "grp/algo-super-sdk",
+		CommitSHA:   "cafebabe",
+		PipelineID:  57,
+		Version:     "1.2.4",
+		RuleVersion: "rules-v4",
+		Scope:       "all",
+		Variants:    []string{"aarch64_Android_RKNN_9.9"},
+	}
+	if err := st.RecordWorkflowRun(context.Background(), runB); err != nil {
+		t.Fatalf("RecordWorkflowRun B: %v", err)
+	}
 	f := &fakeTranslator{out: &hermesclient.Translation{
 		TranslationVersion: 2, Command: "rerun",
-		Args: []string{run.WorkflowID, "aarch64_Android_RKNN_9.9"}, Confidence: 0.95,
+		Args: []string{runA.WorkflowID, runB.Variants[0]}, Confidence: 0.95,
 	}}
 	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑 RKNN")
 	if res.OK || res.Outcome != store.OutcomeRejectedArgs {
-		t.Fatalf("res = %+v, want variant outside source run rejected", res)
+		t.Fatalf("res = %+v, want workflow A paired with workflow B variant rejected", res)
 	}
 }
 
