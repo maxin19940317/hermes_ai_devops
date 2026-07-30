@@ -87,6 +87,12 @@ type fakeADB struct {
 	runExit       int
 	runBlocks     bool
 	deviceMissing bool // 模拟 -s 寻址不到设备:所有命令 exit=1 + stderr
+
+	// 寻址解析(2026-07-30 USB gadget serial 丢失场景)支持:
+	// devicesList 缺省返回仅含 serial 的列表(快路径);serialnoByTransport
+	// 用于慢路径探测(transport -> ro.serialno)。
+	devicesList         string
+	serialnoByTransport map[string]string
 }
 
 func defaultProps() map[string]string {
@@ -106,9 +112,24 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 		return adb.Result{ExitCode: 1, Stderr: "adb: device '" + serial + "' not found\n"}, nil
 	}
 
+	// devices -l 不带 -s,必须在按位取 cmd 之前处理。
+	// 缺省只报告 serial(快路径,既有用例无感知)。
+	if args[0] == "devices" {
+		out := f.devicesList
+		if out == "" {
+			out = "List of devices attached\n" + serial + "\tdevice\n"
+		}
+		return adb.Result{Stdout: out}, nil
+	}
+
 	cmd := args[2]
 	switch {
 	case cmd == "shell" && len(args) == 5 && args[3] == "getprop":
+		if args[4] == "ro.serialno" {
+			if v, ok := f.serialnoByTransport[args[1]]; ok {
+				return adb.Result{Stdout: v + "\n"}, nil
+			}
+		}
 		return adb.Result{Stdout: f.props[args[4]] + "\n"}, nil
 	case cmd == "shell" && len(args) == 6 && args[3] == "df":
 		out := fmt.Sprintf("Filesystem 1K-blocks Used Available Use%% Mounted on\n/dev/block/dm-0 10000000 100 %d 1%% /data\n", f.dfAvailKB)
@@ -505,5 +526,49 @@ func TestCancelDuringCollectingEndsCanceled(t *testing.T) {
 	}
 	if len(sum.Collected) == 0 {
 		t.Error("取消不应跳过收集")
+	}
+}
+
+// TestExecuteResolvesQuestionMarkTransport:USB gadget serial 丢失时 adb 只显示 "?",
+// 寻址解析应探测 ro.serialno 并用 "?" 作为 transport 完成整条流水线
+// (2026-07-30 实机:设备在线但 `adb -s 513cd3de` 全部 not found)。
+func TestExecuteResolvesQuestionMarkTransport(t *testing.T) {
+	f := &fakeADB{
+		props:               defaultProps(),
+		dfAvailKB:           1 << 20,
+		devicesList:         "List of devices attached\n?\tdevice product:trinket\n",
+		serialnoByTransport: map[string]string{"?": serial},
+	}
+	sum, err, _ := run(t, f, Options{PackagePath: buildPackage(t, 900), Serial: serial, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if sum.Status != StatusCompleted {
+		t.Errorf("status = %v, want COMPLETED", sum.Status)
+	}
+	// 解析后设备交互必须走 "?" transport(push 在流水线中必然出现)
+	if idx := f.find("-s ? push"); idx < 0 {
+		t.Errorf("push 应使用解析出的 transport '?',calls = %v", f.calls)
+	}
+}
+
+// TestExecuteDeviceNotFoundNoTransport:全部 transport 的 ro.serialno 都不匹配时,
+// 必须快速失败并报可见 transport 列表,不得带病进入下载/预检。
+func TestExecuteDeviceNotFoundNoTransport(t *testing.T) {
+	f := &fakeADB{
+		props:               defaultProps(),
+		dfAvailKB:           1 << 20,
+		devicesList:         "List of devices attached\n?\tdevice product:occam\n",
+		serialnoByTransport: map[string]string{"?": "some-other-device"},
+	}
+	sum, err, _ := run(t, f, Options{PackagePath: buildPackage(t, 900), Serial: serial, OutDir: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "not found via adb") {
+		t.Fatalf("err = %v, want not found via adb", err)
+	}
+	if sum.Status != StatusFailed {
+		t.Errorf("status = %v, want FAILED", sum.Status)
+	}
+	if idx := f.find("push"); idx >= 0 {
+		t.Error("寻址失败不得发生 push")
 	}
 }

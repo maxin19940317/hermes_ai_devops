@@ -106,6 +106,22 @@ func ParseDevices(out string) []string {
 	return serials
 }
 
+// ParseTransports 与 ParseDevices 同构,但保留 "?" 条目:解析寻址
+// (ResolveTransport)需要把它们作为候选 transport 逐个探测 ro.serialno——
+// "?" 不能被直接寻址,但 `adb -s "?"` 在仅有一个此类设备时可用
+// (agent/dist/README.md 的 ConfigFS 修复即依赖这一点)。
+func ParseTransports(out string) []string {
+	serials := []string{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[1] != "device" {
+			continue
+		}
+		serials = append(serials, fields[0])
+	}
+	return serials
+}
+
 // ShellListGlob 在 workdir 内展开 glob。pattern 来自 Manifest collect 字段,
 // 已由 Schema 限定字符集([A-Za-z0-9._*/-],无 ..),不加引号以保留 glob 展开。
 func ShellListGlob(serial, workdir, pattern string) []string {

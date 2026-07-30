@@ -184,6 +184,17 @@ func (e *Executor) Execute(ctx context.Context, opts Options) (*Summary, error) 
 			return fail(fmt.Errorf("deploy file integrity: %w", err))
 		}
 	}
+	// 寻址解析(放在包校验之后:校验不过不得触碰设备):USB gadget serial 丢失时
+	// adb 只显示 "?",`adb -s <ro.serialno>` 全部 not found(2026-07-30 实机踩坑)。
+	// 此时逐个 transport 探测 ro.serialno,找到后用真实 transport 替换逻辑 serial。
+	transport, err := e.resolveTransport(ctx, opts.Serial)
+	if err != nil {
+		return fail(err)
+	}
+	if transport != opts.Serial {
+		e.logf("serial resolve: %s -> transport %s", opts.Serial, transport)
+		opts.Serial = transport
+	}
 	if err := e.precheck(ctx, opts.Serial, m, sum); err != nil {
 		return fail(fmt.Errorf("device precheck: %w", err))
 	}
@@ -248,6 +259,34 @@ func (e *Executor) finishCanceled(sum *Summary) (*Summary, error) {
 	e.transition(sum, StatusCanceled)
 	e.writeSummary(sum)
 	return sum, nil
+}
+
+// resolveTransport 把逻辑 serial(ro.serialno)解析为可寻址的 transport。
+// 快路径:serial 本身就在 devices 列表中,原样返回,零额外调用。
+// 慢路径:USB gadget serial 丢失(列表只有 "?" 或陌生 serial)时,逐个
+// transport 探测 ro.serialno,返回匹配者;全部不匹配报可见列表便于排查。
+func (e *Executor) resolveTransport(ctx context.Context, logical string) (string, error) {
+	res, err := e.Runner.Run(ctx, adb.Devices())
+	if err != nil {
+		return "", fmt.Errorf("resolve serial: adb devices: %w", err)
+	}
+	transports := adb.ParseTransports(res.Stdout)
+	for _, t := range transports {
+		if t == logical {
+			return logical, nil
+		}
+	}
+	for _, t := range transports {
+		res, err := e.Runner.Run(ctx, adb.GetProp(t, "ro.serialno"))
+		if err != nil {
+			continue // 该 transport 探测失败,试下一个
+		}
+		if strings.TrimSpace(res.Stdout) == logical {
+			return t, nil
+		}
+	}
+	return "", fmt.Errorf("device %q not found via adb (visible transports: %s)",
+		logical, strings.Join(transports, ", "))
 }
 
 // precheck 校验设备属性与空间(§12: getprop 属性 / df 空间)。

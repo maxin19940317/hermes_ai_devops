@@ -155,3 +155,18 @@ func TestExecRunnerUsesPrivatePort(t *testing.T) {
 		}
 	}
 }
+
+func TestParseTransports(t *testing.T) {
+	out := "List of devices attached\n" +
+		"513cd3de\tdevice product:trinket\n" +
+		"?\tdevice product:occam\n" +
+		"deadbeef\tunauthorized\n" +
+		"offline01\toffline\n"
+	got := ParseTransports(out)
+	if len(got) != 2 || got[0] != "513cd3de" || got[1] != "?" {
+		t.Errorf("ParseTransports = %v, want [513cd3de ?](device 状态全保留,含 '?')", got)
+	}
+	if d := ParseDevices(out); len(d) != 1 || d[0] != "513cd3de" {
+		t.Errorf("ParseDevices = %v, want [513cd3de]('?' 仍被排除)", d)
+	}
+}
