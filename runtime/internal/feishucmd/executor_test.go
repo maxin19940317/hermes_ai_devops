@@ -438,6 +438,48 @@ func TestRerunExactAuthoritativeContract(t *testing.T) {
 		}
 	})
 
+	t.Run("VariantScopedAllThenExplicitNeverReusesWorkflowID", func(t *testing.T) {
+		mem := store.NewMemStore()
+		if err := mem.RecordWorkflowRun(ctx, store.WorkflowRun{
+			WorkflowID: sourceWorkflowID, Project: "grp/p", CommitSHA: "abcd1234",
+			PipelineID: 42, Version: "1.2.3", RuleVersion: "verdict-rules-v7",
+			Scope: "v1", Variants: []string{"v1", "v2"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		seedArtifacts(t, mem, "v1", "v2")
+		for want := 1; want <= 3; want++ {
+			if n, err := mem.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v2"); err != nil || n != want {
+				t.Fatalf("skew v2 = %d err=%v, want %d", n, err, want)
+			}
+		}
+		st := &rerunStore{MemStore: mem}
+		starter := &fakeStarter{
+			started: true, closed: true,
+			result: &wf.DeviceTestOutput{Tasks: []wf.TaskSummary{
+				{Variant: "v1", Verdict: "TEST_FAILED"},
+			}},
+		}
+		e := newExec(st, starter, nil)
+
+		runRerun(t, e, sourceWorkflowID)
+		for range 3 {
+			runRerun(t, e, sourceWorkflowID, "v1")
+		}
+		seen := make(map[string]struct{}, len(starter.inputs))
+		for _, in := range starter.inputs {
+			id := in.WorkflowID()
+			if _, exists := seen[id]; exists {
+				t.Fatalf("workflow ID reused after mixed reruns: %s; inputs=%+v", id, starter.inputs)
+			}
+			seen[id] = struct{}{}
+		}
+		if got := starter.inputs[1].Attempt; got != starter.inputs[0].Attempt+1 {
+			t.Fatalf("first explicit attempt = %d, want all waterline %d + 1",
+				got, starter.inputs[0].Attempt)
+		}
+	})
+
 	t.Run("NewTwoArgsRerunsExplicitPassedVariant", func(t *testing.T) {
 		_, starter, e := newRerunFixture(t)
 		starter.resultErr = errors.New("must not read result")

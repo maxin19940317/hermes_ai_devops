@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -57,7 +58,6 @@ type fullStore interface {
 	RecentRuns(ctx context.Context, limit int) ([]RecentRun, error)
 	RecordWorkflowRun(ctx context.Context, run WorkflowRun) error
 	GetWorkflowRun(ctx context.Context, workflowID string) (*WorkflowRun, error)
-	ListWorkflowRunVariantStates(ctx context.Context, workflowID string) ([]RunVariantState, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -319,45 +319,6 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if !reflect.DeepEqual(second.Variants, []string{"v1", "v2"}) {
 			t.Fatalf("stored variants mutated through result: %v", second.Variants)
-		}
-	})
-
-	t.Run("WorkflowRunVariantStatesAreExact", func(t *testing.T) {
-		s := newStore(t)
-		const workflowID = "run-exact"
-		for _, row := range []wf.TaskRow{
-			{TaskID: "v1-a0", WorkflowID: workflowID, TestID: "v1", Attempt: 0, IdempotencyKey: "v1-a0", Status: "RUNNING"},
-			{TaskID: "v1-a1", WorkflowID: workflowID, TestID: "v1", Attempt: 1, IdempotencyKey: "v1-a1", Status: "RUNNING"},
-			{TaskID: "v2-a1", WorkflowID: workflowID, TestID: "v2", Attempt: 1, IdempotencyKey: "v2-a1", Status: "RUNNING"},
-			{TaskID: "adversary", WorkflowID: workflowID + "-suffix", TestID: "v1", Attempt: 99, IdempotencyKey: "adversary", Status: "RUNNING"},
-		} {
-			if err := s.CreateTask(ctx, row); err != nil {
-				t.Fatalf("CreateTask %s: %v", row.TaskID, err)
-			}
-		}
-		for _, finish := range []wf.FinishRequest{
-			{TaskID: "v1-a0", Status: "COMPLETED", Verdict: "TEST_FAILED"},
-			{TaskID: "v2-a1", Status: "COMPLETED", Verdict: "PASSED"},
-			{TaskID: "adversary", Status: "COMPLETED", Verdict: "INFRA_ERROR"},
-		} {
-			if err := s.FinishTask(ctx, finish); err != nil {
-				t.Fatalf("FinishTask %s: %v", finish.TaskID, err)
-			}
-		}
-		got, err := s.ListWorkflowRunVariantStates(ctx, workflowID)
-		if err != nil {
-			t.Fatalf("ListWorkflowRunVariantStates: %v", err)
-		}
-		if len(got) != 2 {
-			t.Fatalf("states = %#v, want two exact-workflow variants", got)
-		}
-		if got[0].Variant != "v1" || got[0].Status != "RUNNING" ||
-			got[0].Verdict != "" || !got[0].EndedAt.IsZero() {
-			t.Errorf("v1 latest state = %#v, want running attempt 1", got[0])
-		}
-		if got[1].Variant != "v2" || got[1].Status != "COMPLETED" ||
-			got[1].Verdict != "PASSED" || got[1].EndedAt.IsZero() {
-			t.Errorf("v2 latest state = %#v, want completed PASSED", got[1])
 		}
 	})
 
@@ -1456,7 +1417,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 	})
 
 	// 飞书指令 rerun 的数据面:ListArtifacts 按逻辑键取包,
-	// NextWorkflowAttemptAll 全键递增取 max(变体行可能因 kick retry 发散)。
+	// NextWorkflowAttemptAll 把全键推进到同一个新水位(变体行可能因 kick retry 发散)。
 	t.Run("ListArtifactsAndAttemptAll", func(t *testing.T) {
 		s := newStore(t)
 		arts := []Artifact{
@@ -1488,13 +1449,21 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if err != nil || len(other) != 2 || other[0].Project != "grp/other" {
 			t.Fatalf("other project list = %+v err=%v, want isolated rows", other, err)
 		}
-		// 变体级 retry 使 v1 行先发散到 1;bundle 级递增后应取 max=2
-		if n, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1"); err != nil || n != 1 {
-			t.Fatalf("variant attempt = %d err=%v", n, err)
+		// 变体级 retry 使 v2 行先发散到 3;全组分配必须把两行都对齐到 4。
+		for want := 1; want <= 3; want++ {
+			if n, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v2"); err != nil || n != want {
+				t.Fatalf("variant attempt = %d err=%v, want %d", n, err, want)
+			}
 		}
 		n, err := s.NextWorkflowAttemptAll(ctx, "grp/p", "abcd1234", 42)
-		if err != nil || n != 2 {
-			t.Fatalf("attempt all = %d err=%v, want 2(max 发散值+1)", n, err)
+		if err != nil || n != 4 {
+			t.Fatalf("attempt all = %d err=%v, want 4(max 发散值+1)", n, err)
+		}
+		for _, variant := range []string{"v1", "v2"} {
+			n, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, variant)
+			if err != nil || n != 5 {
+				t.Fatalf("%s attempt after all = %d err=%v, want 5", variant, n, err)
+			}
 		}
 		if n, err := s.NextWorkflowAttempt(ctx, "grp/other", "abcd1234", 42, "v1"); err != nil || n != 1 {
 			t.Fatalf("other variant attempt = %d err=%v, want 1", n, err)
@@ -1506,12 +1475,66 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Error("无记录键应报错")
 		}
 		attempts := artifactAttempts(t, s)
-		if attempts["grp/p"] != 2 {
-			t.Errorf("grp/p v1 workflow attempt = %d, want 2", attempts["grp/p"])
+		if attempts["grp/p"] != 5 {
+			t.Errorf("grp/p v1 workflow attempt = %d, want 5", attempts["grp/p"])
 		}
 		if attempts["grp/other"] != 2 {
 			t.Errorf("grp/other v1 workflow attempt = %d, want independently incremented to 2",
 				attempts["grp/other"])
+		}
+	})
+
+	t.Run("NextWorkflowAttemptAllConcurrentWaterlines", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.RegisterArtifacts(ctx, []Artifact{
+			{Project: "grp/p", CommitSHA: "feed1234", PipelineID: 7, Variant: "v1",
+				BuildType: "Release", URL: "u1", SHA256: "s1"},
+			{Project: "grp/p", CommitSHA: "feed1234", PipelineID: 7, Variant: "v2",
+				BuildType: "Release", URL: "u2", SHA256: "s2"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for want := 1; want <= 3; want++ {
+			if n, err := s.NextWorkflowAttempt(ctx, "grp/p", "feed1234", 7, "v2"); err != nil || n != want {
+				t.Fatalf("skew v2 = %d err=%v, want %d", n, err, want)
+			}
+		}
+
+		const calls = 8
+		results := make(chan int, calls)
+		errs := make(chan error, calls)
+		var wg sync.WaitGroup
+		for range calls {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				n, err := s.NextWorkflowAttemptAll(ctx, "grp/p", "feed1234", 7)
+				results <- n
+				errs <- err
+			}()
+		}
+		wg.Wait()
+		close(results)
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent attempt all: %v", err)
+			}
+		}
+		got := make([]int, 0, calls)
+		for n := range results {
+			got = append(got, n)
+		}
+		sort.Ints(got)
+		want := []int{4, 5, 6, 7, 8, 9, 10, 11}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("concurrent waterlines = %v, want %v", got, want)
+		}
+		for _, variant := range []string{"v1", "v2"} {
+			n, err := s.NextWorkflowAttempt(ctx, "grp/p", "feed1234", 7, variant)
+			if err != nil || n != 12 {
+				t.Fatalf("%s after concurrent all = %d err=%v, want 12", variant, n, err)
+			}
 		}
 	})
 

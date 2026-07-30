@@ -89,28 +89,63 @@ func (s *PGStore) ListArtifacts(
 	return out, nil
 }
 
-// NextWorkflowAttemptAll 原子递增指定 project/commit/pipeline 的全部变体并返回最大值。
+// NextWorkflowAttemptAll 锁定指定 project/commit/pipeline 的全部变体，把它们
+// 原子推进到当前最大值的下一水位，确保并发分配不会复用序号。
 func (s *PGStore) NextWorkflowAttemptAll(
 	ctx context.Context, project, commitSHA string, pipelineID int,
 ) (int, error) {
-	var maxN int
-	err := s.DB.QueryRowContext(ctx, `
-		WITH bumped AS (
-			UPDATE artifacts SET workflow_attempt = workflow_attempt + 1
-			WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3
-			RETURNING workflow_attempt
-		)
-		SELECT COALESCE(MAX(workflow_attempt), 0) FROM bumped`,
-		project, commitSHA, pipelineID).Scan(&maxN)
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: %w",
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: begin: %w",
 			project, commitSHA, pipelineID, err)
 	}
-	if maxN == 0 {
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT workflow_attempt
+		FROM artifacts
+		WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3
+		ORDER BY variant
+		FOR UPDATE`,
+		project, commitSHA, pipelineID)
+	if err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: lock: %w",
+			project, commitSHA, pipelineID, err)
+	}
+	maxN := -1
+	for rows.Next() {
+		var n int
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("next workflow attempt %s/%s/%d: scan: %w",
+				project, commitSHA, pipelineID, err)
+		}
+		if n > maxN {
+			maxN = n
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: lock: %w",
+			project, commitSHA, pipelineID, err)
+	}
+	if maxN < 0 {
 		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d",
 			project, commitSHA, pipelineID)
 	}
-	return maxN, nil
+	target := maxN + 1
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE artifacts SET workflow_attempt = $4
+		WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3`,
+		project, commitSHA, pipelineID, target); err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: update: %w",
+			project, commitSHA, pipelineID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: commit: %w",
+			project, commitSHA, pipelineID, err)
+	}
+	return target, nil
 }
 
 // RecentRuns 见 MemStore 同名方法的语义说明。

@@ -72,15 +72,6 @@ func LoadSpecConfig(path string, d SpecDefaults) (*SpecConfig, error) {
 	return &SpecConfig{file: f, defaults: d}, nil
 }
 
-// VariantCount 返回 variants.yaml 声明的变体数(飞书 rerun 指令的
-// 包齐整性判据:全量重跑要求 artifacts 行数达到该数)。
-func (c *SpecConfig) VariantCount() int {
-	if c == nil {
-		return 0
-	}
-	return len(c.file.Variants)
-}
-
 // VariantNames 返回全部已声明变体名(排序后顺序稳定),供翻译层的上下文快照与
 // 变体存在性校验使用。
 func (c *SpecConfig) VariantNames() []string {

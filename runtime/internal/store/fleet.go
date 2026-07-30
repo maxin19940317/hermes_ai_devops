@@ -94,34 +94,33 @@ func (s *MemStore) ListArtifacts(
 	return out, nil
 }
 
-// NextWorkflowAttemptAll 递增指定 project/commit/pipeline 的全部变体并返回最大值。
+// NextWorkflowAttemptAll 把指定 project/commit/pipeline 的全部变体推进到
+// 当前最大值的下一水位，确保 bundle 与变体级 retry 共用单调序号空间。
 func (s *MemStore) NextWorkflowAttemptAll(
 	_ context.Context, project, commitSHA string, pipelineID int,
 ) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	found := false
+	maxN := -1
 	for _, a := range s.rows {
 		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d",
-			project, commitSHA, pipelineID)
-	}
-	maxN := 0
-	for k, a := range s.rows {
-		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
-			a.WorkflowAttempt++
-			s.rows[k] = a
 			if a.WorkflowAttempt > maxN {
 				maxN = a.WorkflowAttempt
 			}
 		}
 	}
-	return maxN, nil
+	if maxN < 0 {
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d",
+			project, commitSHA, pipelineID)
+	}
+	target := maxN + 1
+	for k, a := range s.rows {
+		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
+			a.WorkflowAttempt = target
+			s.rows[k] = a
+		}
+	}
+	return target, nil
 }
 
 // RecentRun 是快照里的一次运行(设计文档 §4.2)。Verdict 为空表示尚无终态结论。

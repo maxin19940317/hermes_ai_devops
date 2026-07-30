@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"hermes-devops/runtime/internal/feishu"
+	"hermes-devops/runtime/internal/rules"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -362,7 +363,7 @@ func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
 		}
 		seen := make(map[string]struct{})
 		for _, summary := range out.Tasks {
-			if summary.Verdict == "PASSED" || summary.Verdict == wf.VerdictSkipped ||
+			if summary.Verdict == string(rules.VerdictPassed) || summary.Verdict == wf.VerdictSkipped ||
 				summary.Variant == "" {
 				continue
 			}

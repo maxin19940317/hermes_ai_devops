@@ -29,13 +29,6 @@ type WorkflowRun struct {
 	CreatedAt        time.Time
 }
 
-type RunVariantState struct {
-	Variant string
-	Status  string
-	Verdict string
-	EndedAt time.Time
-}
-
 func canonicalWorkflowRun(run WorkflowRun) (WorkflowRun, error) {
 	if run.WorkflowID == "" || run.Project == "" || run.CommitSHA == "" ||
 		run.Version == "" || run.RuleVersion == "" {
@@ -114,39 +107,4 @@ func (s *MemStore) GetWorkflowRun(_ context.Context, workflowID string) (*Workfl
 	}
 	out := cloneWorkflowRun(run)
 	return &out, nil
-}
-
-func (s *MemStore) ListWorkflowRunVariantStates(_ context.Context, workflowID string) ([]RunVariantState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	latest := make(map[string]*taskRecord)
-	for _, rec := range s.tasks {
-		if rec.row.WorkflowID != workflowID {
-			continue
-		}
-		current := latest[rec.row.TestID]
-		if current == nil || rec.row.Attempt > current.row.Attempt ||
-			(rec.row.Attempt == current.row.Attempt && rec.seq > current.seq) ||
-			(rec.row.Attempt == current.row.Attempt && rec.seq == current.seq &&
-				rec.row.TaskID > current.row.TaskID) {
-			latest[rec.row.TestID] = rec
-		}
-	}
-	variants := make([]string, 0, len(latest))
-	for variant := range latest {
-		variants = append(variants, variant)
-	}
-	sort.Strings(variants)
-	out := make([]RunVariantState, 0, len(variants))
-	for _, variant := range variants {
-		rec := latest[variant]
-		out = append(out, RunVariantState{
-			Variant: variant,
-			Status:  rec.row.Status,
-			Verdict: rec.verdict,
-			EndedAt: rec.endedAt,
-		})
-	}
-	return out, nil
 }

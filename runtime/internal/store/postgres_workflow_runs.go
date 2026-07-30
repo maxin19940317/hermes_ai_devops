@@ -107,36 +107,3 @@ func (s *PGStore) GetWorkflowRun(ctx context.Context, workflowID string) (*Workf
 	run = cloneWorkflowRun(run)
 	return &run, nil
 }
-
-func (s *PGStore) ListWorkflowRunVariantStates(
-	ctx context.Context, workflowID string,
-) ([]RunVariantState, error) {
-	rows, err := s.DB.QueryContext(ctx, `
-		SELECT DISTINCT ON (test_id)
-		       test_id, status, verdict, ended_at
-		FROM tasks
-		WHERE workflow_id = $1
-		ORDER BY test_id, attempt DESC, created_at DESC, task_id DESC`,
-		workflowID)
-	if err != nil {
-		return nil, fmt.Errorf("list workflow run variant states %s: %w", workflowID, err)
-	}
-	defer rows.Close()
-
-	var out []RunVariantState
-	for rows.Next() {
-		var state RunVariantState
-		var endedAt sql.NullTime
-		if err := rows.Scan(&state.Variant, &state.Status, &state.Verdict, &endedAt); err != nil {
-			return nil, fmt.Errorf("list workflow run variant states %s: scan: %w", workflowID, err)
-		}
-		if endedAt.Valid {
-			state.EndedAt = endedAt.Time
-		}
-		out = append(out, state)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list workflow run variant states %s: %w", workflowID, err)
-	}
-	return out, nil
-}
