@@ -330,11 +330,11 @@ func buildStreamExcerpts(scans map[string]*streamScan) []Excerpt {
 }
 
 // tailLines 取行切片尾部,不超过 budget 字节;截断时丢弃开头半行。
-func tailLines(lines []string, budget int) (string, bool) {
+func tailLines(lines []contextLine, budget int) (string, bool) {
 	total := 0
 	lo := len(lines)
 	for i := len(lines) - 1; i >= 0; i-- {
-		n := len(lines[i]) + 1
+		n := len(lines[i].text) + 1
 		if total+n > budget {
 			break
 		}
@@ -344,7 +344,13 @@ func tailLines(lines []string, budget int) (string, bool) {
 	if lo == len(lines) {
 		return "", false
 	}
-	return strings.Join(lines[lo:], "\n"), lo > 0
+	text := make([]string, 0, len(lines)-lo)
+	truncated := lo > 0
+	for _, line := range lines[lo:] {
+		text = append(text, line.text)
+		truncated = truncated || line.truncated
+	}
+	return strings.Join(text, "\n"), truncated
 }
 
 // headLines 取行切片头部,不超过 budget 字节。

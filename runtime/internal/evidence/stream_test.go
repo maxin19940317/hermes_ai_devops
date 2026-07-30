@@ -85,7 +85,7 @@ func TestScanStreamRetainsOnlyBoundedOutputState(t *testing.T) {
 	}
 	retainedTailBytes := 0
 	for _, line := range got.tail {
-		retainedTailBytes += len(line) + 1
+		retainedTailBytes += len(line.text) + 1
 	}
 	if retainedTailBytes > excerptFileBytes {
 		t.Errorf("retained tail = %d bytes, want <= %d", retainedTailBytes, excerptFileBytes)

@@ -47,7 +47,7 @@ type streamScan struct {
 	lineCount           int
 	candidates          map[int][]matchCandidate
 	overflow            map[int]bool
-	tail                []string
+	tail                []contextLine
 	errorLines          []string
 	errorLinesOverflow  bool
 	errorLinesTruncated bool
@@ -133,7 +133,7 @@ func scanStream(r io.Reader, matchers []streamMatcher, logcat bool) *streamScan 
 		line.stripTrailingCR()
 		out.lineCount++
 		current := line.contextLine()
-		if line.length > maxScanLineBytes {
+		if current.truncated {
 			out.truncated = true
 		}
 
@@ -192,10 +192,10 @@ func scanStream(r io.Reader, matchers []streamMatcher, logcat bool) *streamScan 
 		}
 
 		lineBytes := len(current.text) + 1
-		out.tail = append(out.tail, current.text)
+		out.tail = append(out.tail, current)
 		tailBytes += lineBytes
 		for tailBytes > excerptFileBytes && len(out.tail) > 0 {
-			tailBytes -= len(out.tail[0]) + 1
+			tailBytes -= len(out.tail[0].text) + 1
 			out.tail = out.tail[1:]
 		}
 

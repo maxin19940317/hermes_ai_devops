@@ -537,6 +537,46 @@ func TestExtractLargeStdoutFallbackKeepsTail(t *testing.T) {
 	}
 }
 
+func TestExtractFallbackMarksClippedStreamTailTruncated(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		file string
+	}{
+		{name: "stdout", key: "stdout", file: "stdout.log"},
+		{name: "stderr", key: "stderr", file: "stderr.log"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := baseInput()
+			in.Signatures = []Signature{{ID: "nomatch", Where: tt.key, Pattern: "NEVER-MATCH", Classify: "CODE"}}
+			in.Files[tt.key] = strings.NewReader(strings.Repeat("x", maxContextLineBytes+1) + "\n")
+			ev := Extract(in)
+
+			if len(ev.Excerpts) != 1 {
+				t.Fatalf("excerpts = %+v, want one %s tail excerpt", ev.Excerpts, tt.key)
+			}
+			excerpt := ev.Excerpts[0]
+			if excerpt.File != tt.file || excerpt.Kind != "tail" {
+				t.Fatalf("excerpt = %+v, want %s tail excerpt", excerpt, tt.file)
+			}
+			if !strings.Contains(excerpt.Content, clippedLineMarker) {
+				t.Errorf("excerpt content was not clipped: %q", excerpt.Content)
+			}
+			if !excerpt.Truncated {
+				t.Error("excerpt truncated = false, want true")
+			}
+			if !ev.Truncated {
+				t.Error("evidence truncated = false, want true")
+			}
+			if len(ev.Inputs.TruncatedFiles) != 1 || ev.Inputs.TruncatedFiles[0] != tt.file {
+				t.Errorf("truncated_files = %v, want [%s]", ev.Inputs.TruncatedFiles, tt.file)
+			}
+		})
+	}
+}
+
 func TestExtractStreamingContextAcrossReadBoundaries(t *testing.T) {
 	var b strings.Builder
 	for i := 1; i <= 140; i++ {
