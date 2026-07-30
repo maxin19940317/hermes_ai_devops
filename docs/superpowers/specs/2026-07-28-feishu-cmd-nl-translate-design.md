@@ -3,7 +3,8 @@
 日期：2026-07-28
 
 状态：**已批准**（2026-07-28 评审通过；修订含 §3.3 bridge 适配、§3.2 查询语义、
-§5.2 应答闭集与待确认期输入处理、§6 超时基线）
+§5.2 应答闭集与待确认期输入处理、§6 超时基线；2026-07-30 随
+`workflow_runs` 升级到 translation contract/prompt v2）
 
 ## 1. 背景与决策
 
@@ -22,10 +23,11 @@
 1. **翻译只在 `help` 分支触发**。能被现有语法解析的输入原样走老路，解析不了才问
    Hermes。省 token，且对既有指令零回归风险——LLM 不在任何一条已能工作的指令的路径上。
 2. **翻译输出是一行指令文本，重走 `Parse`**。LLM 返回 `{command, args}`，Runtime 渲染成
-   `rerun 9da3b9d9 56 aarch64_Android_SNPE_1.68`，原样喂回 `Parse()`。翻译层的值域因此
+   `rerun device-test-grp/project-g9da3b9d9-p56 aarch64_Android_SNPE_1.68`，原样喂回
+   `Parse()`。翻译层的值域因此
    等于用户手打的值域，封闭性是结构上的保证，不依赖 prompt 措辞。
 3. **副作用指令二次确认，只读指令直接执行**。`rerun` / `unquarantine` 翻译成功后先回执
-   待确认，用户回 `y` 才执行；`status` / `devices` 直接执行。LLM 把 `pipeline_iid` 猜错的
+   待确认，用户回 `y` 才执行；`status` / `devices` 直接执行。LLM 把源 workflow 猜错的
    代价是白跑一轮设备测试。
 4. **待确认态存内存**（`Executor` 内 `map[open_id]pending` + TTL 120s，单槽覆盖）。worker
    重启丢失待确认项，代价只是用户重说一遍，绝不会误执行一个跨重启的陈旧 `rerun`。
@@ -56,8 +58,9 @@
 
 交付：
 
-- `contracts/command.schema.json`（v1）+ 正反例测试
-- `hermesclient.Translate` + `prompts/cmd_translate_v1.md` + 内嵌 Schema 校验
+- `contracts/command.schema.json`（当前 v2）+ 正反例测试；v1 输出作为 invalid 回归样例
+- `hermesclient.Translate` + `prompts/cmd_translate_v2.md` + 内嵌 Schema 校验；
+  `cmd_translate_v1.md` 原样保留作历史版本
 - `feishucmd/translate.go`：快照组装、渲染、回灌 `Parse`、参数复校、置信度门限
 - `feishucmd/executor.go`：`help` 分支旁路 + 待确认态
 - `store`：`RecentRuns` / `SaveCommandTranslation` 双实现 + `command_translations` 表
@@ -92,14 +95,14 @@ Listener（不变）──► Executor.HandleMessage
                       │    └─ 其他  ──► 清槽 + 落 declined ──► 继续往下当新消息处理
                       │
                       ├─ Parse(text)
-                      │    ├─ 命中四指令 ──────────────────► execute（完全不变）
+                      │    ├─ 命中四指令 ──────────────────► execute
                       │    └─ help ──► Translator.Translate
                       │                   │
                       │                   ├─ 组装上下文快照（store.RecentRuns + specCfg + FleetOverview）
                       │                   ├─ hermesclient.Translate（HTTP + command.schema.json 校验）
                       │                   ├─ 渲染 "cmd arg1 arg2 ..." 
                       │                   ├─ 回灌 Parse → 必须命中四指令，否则拒绝
-                      │                   ├─ 参数复校（validateSHA / iid / 变体存在性 / 设备存在性）
+                      │                   ├─ 参数复校（权威 workflow / 变体 / 设备存在性）
                       │                   └─ 置信度门限
                       │                        ├─ 只读指令 ──► execute ──► 回复（附"已按 X 执行"）
                       │                        ├─ 副作用指令 ──► 存待确认 ──► 回执确认提示
@@ -124,40 +127,16 @@ Listener（不变）──► Executor.HandleMessage
 
 ### 3.2 `RecentRuns` 的已知耦合与查询语义
 
-仓库里**没有 `workflows` 表**（CLAUDE.md §11 列了，`schema.sql` 里不存在）。verdict 只在
-`tasks` 上，而 tasks 与 `(commit, pipeline_iid, variant)` 的关联只经由两个字段：
+2026-07-30 起，`workflow_runs` 是新运行输入的权威、不可变索引。`RecentRuns` 以
+`workflow_runs.workflow_id = tasks.workflow_id` 精确关联新数据，不再用 workflow ID
+前缀推断身份。每行快照携带 `workflow_id` 和 `authoritative=true`，使翻译器能输出
+`rerun <source_workflow_id> [variant]`。
 
-- `tasks.workflow_id` = `WorkflowID()` 的输出（`workflow/types.go:42`）：
-  `device-test-{project}-g{sha}-p{iid}[-{scope}][-r{N}]`
-- `tasks.test_id` = 变体名（`activity/specs.go:141`：`TestID: p.Variant`）
-
-同一个 `(commit, iid, variant)` 的 task 可能挂在三种 workflow 下：变体级 kick 起的
-`baseID-{variant}`、bundle 级起的 `baseID`（`Scope=""`）、以及两者各自的 `-r{N}` 重跑。
-**bundle workflow 下 8 个变体的 task 全挂在同一个 `workflow_id` 上**（task_id 靠
-`{wfID}:{test_id}:a{attempt}` 区分，`devicetest.go:289`），所以查询必须同时按
-`test_id` 过滤，否则会串变体。
-
-正确语义：
-
-```sql
--- baseID := 'device-test-' || project || '-g' || commit_sha || '-p' || pipeline_id
-WHERE test_id = $variant
-  AND (workflow_id = $baseID OR starts_with(workflow_id, $baseID || '-'))
-ORDER BY created_at DESC
-LIMIT 1
-```
-
-用 `starts_with()` 而非 `LIKE`：项目名可能含下划线（业务仓库存在 `Algo_Super_SDK`
-这种写法），而 `_` 是 `LIKE` 的单字符通配符，走 `LIKE` 就得加 `ESCAPE` 子句。
-`starts_with()`（Postgres 11+）没有通配符语义，从根上免掉转义，也更易读。
-
-这仍是对 `WorkflowID()` 字符串格式的隐式依赖，必须有测试钉住，且测试内容是**完整
-语义**而非仅前缀：构造 bundle workflow（多变体同 `workflow_id`）、变体 workflow、
-`-r{N}` 重跑三种行，断言 `RecentRuns` 各自取到正确变体的最新 verdict；再断言前缀
-构造函数与 `WorkflowID()` 对同一输入产出一致的 baseID——格式一改测试就红。
-
-本设计不新建 `workflows` 表：那是 §11 的独立欠账，牵动 trigger/workflow 多处写入，
-不应搭车进这一轮。
+迁移不从历史 `artifacts` 或 `tasks` 回填 `workflow_runs`，因为缺失的 Version、
+RuleVersion 和项目归属无法可靠恢复。旧查询只作为 `authoritative=false` 的 display-only
+fallback；它可以帮助用户看历史，但不携带可执行 workflow 身份，翻译器必须拒绝把它
+渲染成 rerun。源 workflow 是否关闭和终态 `DeviceTestOutput` 由执行器向 Temporal 精确
+读取，不能从 task 行或 ID 形状推断。
 
 ### 3.3 `analyze_bridge` 适配（对岸改造）
 
@@ -200,13 +179,13 @@ schema，等于把契约选择权交给请求方，与"平台输出永远不可�
 
 ## 4. 契约
 
-### 4.1 `contracts/command.schema.json`（LLM 输出，v1）
+### 4.1 `contracts/command.schema.json`（LLM 输出，v2）
 
 ```json
 {
-  "translation_version": 1,
+  "translation_version": 2,
   "command": "rerun",
-  "args": ["9da3b9d9", "56", "aarch64_Android_SNPE_1.68"],
+  "args": ["device-test-grp/project-g9da3b9d9-p56", "aarch64_Android_SNPE_1.68"],
   "confidence": 0.92,
   "reason": "指代最近一次 SNPE 1.68 的失败运行"
 }
@@ -217,11 +196,13 @@ schema，等于把契约选择权交给请求方，与"平台输出永远不可�
 - `additionalProperties: false`；`translation_version`、`command`、`confidence` 必填
 - `command`：闭枚举 `status | devices | rerun | unquarantine | none`
   （`none` = 信息不足或根本不是指令）
-- `args`：`maxItems: 3`，item pattern **`^[A-Za-z0-9._-]{1,64}$`**
+- `rerun.args`：1 到 2 项，依次为最多 512 字符且不含任何 Unicode 空白的
+  `source_workflow_id` 与可选 variant；workflow ID 允许 `/`
+- `status/devices/none` 不接受参数；`unquarantine` 最多 1 项
 - `confidence`：`number`，`0 ≤ x ≤ 1`
 - `reason`：`string`，`maxLength: 200`，回执时展示给用户
 
-`args` 的 pattern 是全设计最吃重的一条：**禁掉全部空白字符**，使"渲染成文本再
+`args` 的 `not: {"pattern":"\\s"}` 是全设计最吃重的一条：**禁掉全部空白字符**，使"渲染成文本再
 `strings.Fields` 切回来"成为可逆操作。LLM 无法用含空格的 arg 把一行伪造成两个 token，
 也无法用换行伪造多条指令。方案 1 的封闭性由这条 pattern 承担。
 
@@ -232,9 +213,12 @@ schema，等于把契约选择权交给请求方，与"平台输出永远不可�
   "now": "2026-07-28T09:12:00Z",
   "variants": ["aarch64_Android_SNPE_1.68", "aarch64_Android_SNPE_2.21"],
   "recent_runs": [
-    { "commit": "9da3b9d9", "pipeline_iid": 56,
+    { "workflow_id": "device-test-grp/project-g9da3b9d9-p56",
+      "commit": "9da3b9d9", "pipeline_iid": 56,
+      "version": "1.4.0", "rule_version": "v2",
       "variant": "aarch64_Android_SNPE_1.68",
-      "verdict": "TEST_FAILED", "ended_at": "2026-07-27T14:03:00Z" }
+      "verdict": "TEST_FAILED", "ended_at": "2026-07-27T14:03:00Z",
+      "authoritative": true }
   ],
   "devices": [
     { "device_id": "dev-1", "serial": "513cd3de", "status": "QUARANTINED" }
@@ -319,16 +303,18 @@ DDL 同时进 `runtime/internal/store/schema.sql` 与
 ```text
 用户: "帮我重跑一下昨天 SNPE 1.68 那个失败的"
   → Parse → help → Translator
-  → LLM: {"command":"rerun","args":["9da3b9d9","56","aarch64_Android_SNPE_1.68"],
+  → LLM: {"translation_version":2,"command":"rerun",
+          "args":["device-test-grp/project-g9da3b9d9-p56","aarch64_Android_SNPE_1.68"],
           "confidence":0.9,"reason":"指代最近一次 SNPE 1.68 的失败运行"}
-  → 渲染 → Parse ✓ → validateSHA ✓ → iid 正整数 ✓ → 变体在 variants 内 ✓
+  → 渲染 → Parse ✓ → workflow ID 对应 authoritative 快照行 ✓ → 变体属于源 run ✓
   → 落审计 outcome=pending_confirm；pending[open_id] = {cmd, 到期时间 now+120s}
-  → 回复: "将执行: rerun 9da3b9d9 56 aarch64_Android_SNPE_1.68
+  → 回复: "将执行: rerun device-test-grp/project-g9da3b9d9-p56 aarch64_Android_SNPE_1.68
            (依据: 指代最近一次 SNPE 1.68 的失败运行)
            回复 y 确认,n 取消,120 秒后自动失效"
 
 用户: "y"
-  → 待确认命中且未过期 → 落审计 outcome=confirmed → execute(rerun ...) → 回复执行结果
+  → 待确认命中且未过期 → 落审计 outcome=confirmed → execute(rerun ...)
+  → 精确读取源 run + Temporal 终态输出 → 分配新 attempt → 回复执行结果
 ```
 
 待确认态语义：
@@ -361,14 +347,15 @@ LLM 调用。规则本身没变复杂——`n` 只是从"非应答词"挪进了�
 | 检查 | 依据 | 失败回复 |
 |---|---|---|
 | 回灌 `Parse` 命中四指令 | `Parse` | 拒绝，落 `rejected_args` |
-| `rerun` sha 形态 | `validateSHA`（`command.go:55`） | 拒绝，落 `rejected_args` |
-| `rerun` iid 正整数 | `strconv.Atoi` + `> 0` | 同上 |
-| `rerun` 变体存在 | 快照 `variants` 成员判定 | 同上 |
+| `rerun` 参数是 1 或 2 项且各项 ≤512 字符、无空白 | command v2 schema + Runtime 复校 | 拒绝，落 `rejected_args` |
+| `rerun` source 是快照中的 authoritative workflow ID | `RecentRuns` 精确身份 | 同上 |
+| `rerun` 可选变体属于源 run | authoritative 快照行 | 同上 |
 | `unquarantine` device_id 存在 | 快照 `devices` 成员判定 | 同上 |
 | `confidence ≥ 0.75` | 门限常量 | 落 `rejected_low_confidence` |
 
-注意"变体存在性"在翻译层是**对快照的成员判定**（快照即真相来源），而 `execute` 内部
-仍会独立做 artifacts 表查询——两层校验都保留，不因翻译层查过就跳过。
+快照校验只决定翻译结果能否进入确认态。`execute` 仍独立读取 immutable
+`workflow_runs`、精确查询 Temporal 是否关闭并取得 `DeviceTestOutput`，再按源输入恢复
+Version/RuleVersion/Project 与 packages；不能因为翻译层见过该 ID 就跳过执行期校验。
 
 ## 6. 错误处理
 
@@ -468,14 +455,12 @@ LLM 调用。规则本身没变复杂——`n` 只是从"非应答词"挪进了�
 `RecentRuns` / `SaveCommandTranslation` 进 `conformance_test.go`，MemStore 与 PGStore
 双实现跑同一组断言（仓库既有约束）。
 
-`RecentRuns` 的测试要覆盖 §3.2 的**完整语义**，而不只是前缀拼接：
+`RecentRuns` 的测试覆盖 §3.2 的权威与 fallback 边界：
 
-- bundle workflow（`Scope=""`，同一 `workflow_id` 下多个变体的 task）→ 断言按
-  `test_id` 取到正确变体，不串行
-- 变体级 workflow（`baseID-{variant}`）→ 断言命中
-- `-r{N}` 重跑行存在时取最新一条
-- 前缀构造函数与 `WorkflowID()` 对同一输入产出一致的 baseID（格式一改就红）
-- 项目名含下划线（如 `Algo_Super_SDK`）时不发生通配符误匹配
+- 新 run 只按 `workflow_runs.workflow_id = tasks.workflow_id` 精确关联，不接受相似前缀
+- authoritative 行携带完整 workflow ID、Version、RuleVersion 与 canonical variants
+- 有任何 `workflow_runs` 身份覆盖的 artifact key 不再追加 legacy fallback
+- 没有 run 身份的 legacy 行标记 `authoritative=false`，只展示且不能生成 rerun
 
 ### 8.6 手工验收
 
@@ -496,7 +481,7 @@ LLM 调用。规则本身没变复杂——`n` 只是从"非应答词"挪进了�
 
 ## 9. 验收标准
 
-- 指令面仍是四个 + help，`execute` 无任何行为变更
+- 指令面仍是四个 + help；rerun 当前语义为精确 source workflow，旧参数形式 fail closed
 - `Parse(render(x)) == x` 对 schema 允许的全部输入成立（有测试）
 - 翻译层禁用或失败时，行为与本轮改动前逐字节一致
 - 每次翻译在 `command_translations` 留痕，含原文、`context_digest`、渲染结果、outcome
@@ -511,12 +496,11 @@ LLM 调用。规则本身没变复杂——`n` 只是从"非应答词"挪进了�
 - Hermes 语义层：只读工具白名单、多轮对话、开放问答（"为什么挂""这块板成功率"）。
   本轮沉淀的 prompt 管理、输出 Schema 校验、翻译审计三件积木可直接复用。
 - 飞书交互卡片确认按钮替代文本 `y`（与 Phase 2 卡片改造合并）。
-- `workflows` 表补齐，`RecentRuns` 摆脱对 `WorkflowID()` 字符串格式的依赖。
 - **回复路由到消息发送者**。`feishu.Sender.SendText` 现在只发往静态
   `FEISHU_RECEIVE_ID`（`feishu.go:260`）。白名单只有 1 人时无差别；多人白名单那天，
   A 的指令回执会发到 B 眼前。届时给 `Sender` 加 `SendTextTo(ctx, openID, text)`，
   指令回复走它，通知仍走静态目标。本设计的其余部分不受影响。
 - **按 `message_id` 去重**。飞书长连接重连时可能重投 `im.message.receive_v1` 事件；
-  今天四个指令重复执行是幂等的（`rerun` 由 Temporal `RejectDuplicate` 挡住），但重投
-  会白白多花一次 LLM 调用。正解是拿事件的 `message_id` 做去重，比"每人 N 秒冷却"
-  更准——冷却挡不住间隔较长的重投，也会误伤连打两条指令的正常用户。
+  每次直接文本 `rerun` 都会分配新的 attempt 和 workflow ID，Temporal
+  `RejectDuplicate` 挡不住重复指令。正解是先按 `message_id` 去传输重投；下一轮按钮
+  还必须用持久化 claim 固定 attempt 与 target workflow ID，覆盖真实重复点击和并发点击。

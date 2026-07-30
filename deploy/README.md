@@ -52,8 +52,15 @@ card has no buttons or other interactive components. The worker also runs an
 optional command listener over the
 app's WebSocket event subscription: when `FEISHU_CMD_WHITELIST` (comma-separated
 open_ids) is set, whitelisted users can send the bot DM commands (`status`,
-`devices`, `rerun <sha8> <pipeline_iid> [variant]`, `unquarantine [device_id]`);
+`devices`, `rerun <source_workflow_id> [variant]`, `unquarantine [device_id]`);
 messages from anyone else are silently ignored.
+
+`rerun` accepts only an authoritative, closed source recorded in `workflow_runs`.
+Without a variant it retries the source output's failed variants; legacy rows returned
+by `RecentRuns` are display-only and cannot be rerun. Each direct text command allocates
+a fresh attempt and workflow ID. Temporal duplicate rejection is therefore not an
+idempotency mechanism for repeated commands; persistent action claims belong to the
+subsequent interactive-button round.
 
 ### 飞书指令自然语言翻译(可选)
 
@@ -164,6 +171,29 @@ added. When a release adds columns, apply the matching script in
 docker exec -i hermes-runtime-postgres-1 psql -U hermes_runtime -d hermes_runtime \
   -v ON_ERROR_STOP=1 < deploy/postgres/migrations/<file>.sql
 ```
+
+### workflow_runs migration gate
+
+`workflow_runs` is an immutable registry for new workflow inputs and is not backfilled
+from legacy artifacts or tasks. Its migration changes the artifact unique key from
+`(commit_sha, pipeline_id, variant)` to
+`(project, commit_sha, pipeline_id, variant)`, so it is not rolling-compatible with old
+artifact writers.
+
+The already-merged presign/evidence-v3/attribution batch must be deployed and observed stable first.
+Merging the workflow_runs branch does not authorize the production migration.
+Stop all old artifact writers before removing the old unique constraint.
+
+The mandatory production order is:
+
+```text
+prior batch stable -> stop writers -> migrate -> deploy all new binaries -> resume
+```
+
+During the stopped-writer window, stop every old Trigger/Runtime process that can insert
+artifacts, apply `deploy/postgres/migrations/2026-07-30-workflow-runs.sql`, deploy all new
+Trigger/Worker/Relay binaries as one release, and only then resume ingress. Do not combine
+this window with deployment of the prerequisite batch.
 
 ## Verify
 

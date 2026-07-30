@@ -14,6 +14,18 @@ INIT_DB = ROOT / "deploy" / "postgres" / "init" / "10-runtime-db.sh"
 LOCK_IMAGES = ROOT / "deploy" / "scripts" / "lock-images.sh"
 VALIDATE_ENV = ROOT / "deploy" / "scripts" / "validate-env.sh"
 VERIFY_PIPELINE = ROOT / "deploy" / "scripts" / "verify-pipeline.sh"
+WORKFLOW_RUNS_MIGRATION = (
+    ROOT / "deploy" / "postgres" / "migrations"
+    / "2026-07-30-workflow-runs.sql"
+)
+DEPLOY_README = ROOT / "deploy" / "README.md"
+CURRENT_OPERATIONAL_DOCS = (
+    ROOT / "CLAUDE.md",
+    ROOT / "docs" / "device-test-sequence.md",
+    ROOT / "docs" / "superpowers" / "specs"
+    / "2026-07-28-feishu-cmd-nl-translate-design.md",
+    DEPLOY_README,
+)
 
 
 class SecretExclusionContracts(unittest.TestCase):
@@ -322,6 +334,55 @@ class PipelineVerificationContracts(unittest.TestCase):
             ".started == false",
         ):
             self.assertIn(marker, text)
+
+
+class WorkflowRunsDeploymentContracts(unittest.TestCase):
+    def test_migration_rekeys_artifacts_and_creates_workflow_runs(self):
+        migration = WORKFLOW_RUNS_MIGRATION.read_text(encoding="utf-8")
+
+        self.assertIn("CREATE TABLE IF NOT EXISTS workflow_runs", migration)
+        self.assertIn("artifacts_project_key", migration)
+        self.assertRegex(
+            migration,
+            r"DROP CONSTRAINT\s+IF EXISTS\s+"
+            r"artifacts_commit_sha_pipeline_id_variant_key",
+        )
+
+    def test_documented_rollout_order_and_prerequisites_are_explicit(self):
+        deploy_readme = DEPLOY_README.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "prior batch stable -> stop writers -> migrate -> "
+            "deploy all new binaries -> resume",
+            deploy_readme,
+        )
+        self.assertIn(
+            "The already-merged presign/evidence-v3/attribution batch must "
+            "be deployed and observed stable first.",
+            deploy_readme,
+        )
+        self.assertIn(
+            "Merging the workflow_runs branch does not authorize the "
+            "production migration.",
+            deploy_readme,
+        )
+        self.assertIn(
+            "Stop all old artifact writers before removing the old unique "
+            "constraint.",
+            deploy_readme,
+        )
+
+    def test_current_docs_do_not_advertise_legacy_rerun_syntax(self):
+        legacy_syntax = re.compile(
+            r"rerun\s+<sha(?:8|[0-9]*)?>\s+<pipeline_iid>"
+        )
+
+        for path in CURRENT_OPERATIONAL_DOCS:
+            with self.subTest(path=path.relative_to(ROOT)):
+                self.assertNotRegex(
+                    path.read_text(encoding="utf-8"),
+                    legacy_syntax,
+                )
 
 
 if __name__ == "__main__":

@@ -241,7 +241,8 @@ verdict (终态后判定):
 
 ```text
 plans(plan_id PK, plan_json JSONB, origin, created_by, created_at)
-workflows(workflow_id PK, plan_id FK, status, started_at, ended_at)
+workflow_runs(workflow_id PK, project, commit_sha, pipeline_id, version, rule_version,
+              scope, attempt, variants TEXT[], source_workflow_id FK, created_at)
 tasks(task_id PK, workflow_id FK, test_id, attempt, idempotency_key UNIQUE,
       client_id, device_id, status, verdict, error_category, created_at, ended_at)
 clients(client_id PK, host, version, last_heartbeat, status)
@@ -256,6 +257,12 @@ decisions(decision_id PK, task_id, actor: hermes|human|rule, input_digest,
           model, prompt_version, output JSONB, created_at)   -- 一切裁决可回放
 audit_log(actor, action, target, payload_digest, ts)
 ```
+
+`workflow_runs` 是新运行输入的不可变权威索引，不保存 Temporal 状态或终态输出，也不从
+legacy artifacts/tasks 回填。`RecentRuns` 中无 `workflow_runs` 身份的 legacy 行只用于
+展示，不可触发副作用。人工重跑语法固定为
+`rerun <source_workflow_id> [variant]`；每条文本指令都会分配新的 attempt，不能把
+Temporal `RejectDuplicate` 当作指令幂等。持久化 action claim 留给下一轮飞书按钮实现。
 
 Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, started_at, ...)` + `events(seq, ...)`,每次状态迁移单事务落盘,崩溃重启后据此恢复。
 
