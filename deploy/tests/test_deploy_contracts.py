@@ -19,6 +19,10 @@ WORKFLOW_RUNS_MIGRATION = (
     / "2026-07-30-workflow-runs.sql"
 )
 DEPLOY_README = ROOT / "deploy" / "README.md"
+WORKFLOW_RUNS_SPEC = (
+    ROOT / "docs" / "superpowers" / "specs"
+    / "2026-07-30-workflow-runs-design.md"
+)
 NL_DESIGN = (
     ROOT / "docs" / "superpowers" / "specs"
     / "2026-07-28-feishu-cmd-nl-translate-design.md"
@@ -444,19 +448,23 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
     def test_documented_rollout_order_and_prerequisites_are_explicit(self):
         deploy_readme = DEPLOY_README.read_text(encoding="utf-8")
 
-        self.assertIn(
+        rollout_order = (
             "prior batch stable -> stop writers -> migrate -> update and restart "
-            "analyze_bridge on every hermes-agent host -> deploy all new binaries -> resume",
-            deploy_readme,
+            "analyze_bridge on every hermes-agent host -> deploy all new binaries -> resume"
         )
-        self.assertIn(
-            "command.schema.json v2",
-            deploy_readme,
+        mismatch_warning = (
+            "A forward or reverse v1/v2 mismatch breaks all natural-language commands."
         )
-        self.assertIn(
-            "all natural-language commands",
-            deploy_readme,
-        )
+        for path in (DEPLOY_README, WORKFLOW_RUNS_SPEC):
+            documented = " ".join(path.read_text(encoding="utf-8").split())
+            with self.subTest(path=path):
+                self.assertIn(rollout_order, documented)
+                self.assertIn("command.schema.json v2", documented)
+                self.assertIn(mismatch_warning, documented)
+                self.assertIn(
+                    "Only resume ingress after both sides are on v2.",
+                    documented,
+                )
         self.assertIn(
             "The already-merged presign/evidence-v3/attribution batch must "
             "be deployed and observed stable first.",

@@ -322,8 +322,20 @@ prompt、command schema、示例和参数校验同步改成新语法。该变化
 2. 完成既定观察期并确认该批功能稳定；未通过 go/no-go 时不得开始本轮迁移；
 3. 停止 trigger/worker 等 artifact 写入方；
 4. 执行 migration；
-5. 整组部署包含四元组逻辑键的新二进制；
-6. 启动 worker，再恢复 trigger/入口流量。
+5. 在每台 hermes-agent 主机同步 `hermes/analyze_bridge`（包含
+   `command.schema.json v2`）并重启 `analyze_bridge`；
+6. 整组部署包含四元组逻辑键和 translation v2 的新 Trigger/Worker/Relay 二进制；
+7. 确认 bridge 与 Runtime 两侧都已运行 v2 后，启动 worker 并恢复 trigger/入口流量。
+
+规范化后的完整顺序是：
+
+```text
+prior batch stable -> stop writers -> migrate -> update and restart analyze_bridge on every hermes-agent host -> deploy all new binaries -> resume
+```
+
+旧 bridge 会拒绝 Runtime 生成的 v2 翻译载荷；新 bridge 也会拒绝旧 Runtime 的 v1 载荷。
+A forward or reverse v1/v2 mismatch breaks all natural-language commands.
+Only resume ingress after both sides are on v2.
 
 不得 migration 后继续运行旧写入方，也不得先部署新 worker 再迁移。部署文档必须写明该
 短暂停写窗口。本轮代码完成、合并或构建镜像都不自动授权执行生产迁移；生产 go/no-go

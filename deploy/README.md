@@ -197,7 +197,8 @@ artifacts, apply `deploy/postgres/migrations/2026-07-30-workflow-runs.sql`, sync
 `hermes/analyze_bridge` including `command.schema.json v2` to every hermes-agent host and
 restart each `analyze_bridge`, then deploy all new Trigger/Worker/Relay binaries as one
 release. Only resume ingress after both sides are on v2. A forward or reverse version
-mismatch makes the bridge reject the other side's translation payload and breaks all natural-language commands.
+mismatch makes the bridge reject the other side's translation payload.
+A forward or reverse v1/v2 mismatch breaks all natural-language commands.
 Do not combine this window with deployment of the prerequisite batch.
 
 ## Verify
