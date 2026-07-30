@@ -61,13 +61,20 @@ func (s *PGStore) UnquarantineDevice(ctx context.Context, deviceID string) (bool
 	return n > 0, nil
 }
 
-// ListArtifacts 返回 (commit,pipeline) 逻辑键下的全部产物行(飞书指令 rerun
-// 重建 DeviceTestInput 用);无记录返回空切片。
+// ListArtifacts 是 Task 6 前的无 project 兼容入口。匹配唯一 project 时返回
+// 全部产物;跨 project 歧义时 fail closed。
 func (s *PGStore) ListArtifacts(ctx context.Context, commitSHA string, pipelineID int) ([]Artifact, error) {
+	project, found, err := s.legacyArtifactProject(ctx, commitSHA, pipelineID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list artifacts %s/%d: %w", commitSHA, pipelineID, err)
+	}
+	if !found {
+		return []Artifact{}, nil
+	}
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT project, commit_sha, pipeline_id, variant, build_type, url, sha256, size, manifest_digest
-		FROM artifacts WHERE commit_sha = $1 AND pipeline_id = $2 ORDER BY variant`,
-		commitSHA, pipelineID)
+		FROM artifacts WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3 ORDER BY variant`,
+		project, commitSHA, pipelineID)
 	if err != nil {
 		return nil, fmt.Errorf("list artifacts %s/%d: %w", commitSHA, pipelineID, err)
 	}
@@ -87,19 +94,25 @@ func (s *PGStore) ListArtifacts(ctx context.Context, commitSHA string, pipelineI
 	return out, nil
 }
 
-// NextWorkflowAttemptAll 把 (commit,pipeline) 键下全部产物行的 workflow_attempt
-// 原子 +1,返回新的最大值(bundle 级显式 rerun 的 -r{N} 后缀来源)。
-// 单条 UPDATE 原子递增;键下无记录返回错误。
+// NextWorkflowAttemptAll 是 Task 6 前的无 project 兼容入口。匹配唯一 project
+// 时原子递增全部变体并返回最大值;跨 project 歧义时 fail closed。
 func (s *PGStore) NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error) {
+	project, found, err := s.legacyArtifactProject(ctx, commitSHA, pipelineID, nil)
+	if err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%d: %w", commitSHA, pipelineID, err)
+	}
+	if !found {
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d", commitSHA, pipelineID)
+	}
 	var maxN int
-	err := s.DB.QueryRowContext(ctx, `
+	err = s.DB.QueryRowContext(ctx, `
 		WITH bumped AS (
 			UPDATE artifacts SET workflow_attempt = workflow_attempt + 1
-			WHERE commit_sha = $1 AND pipeline_id = $2
+			WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3
 			RETURNING workflow_attempt
 		)
 		SELECT COALESCE(MAX(workflow_attempt), 0) FROM bumped`,
-		commitSHA, pipelineID).Scan(&maxN)
+		project, commitSHA, pipelineID).Scan(&maxN)
 	if err != nil {
 		return 0, fmt.Errorf("next workflow attempt %s/%d: %w", commitSHA, pipelineID, err)
 	}

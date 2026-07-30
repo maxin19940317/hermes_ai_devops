@@ -29,8 +29,9 @@ type Artifact struct {
 	WorkflowAttempt int
 }
 
-// ArtifactStore 登记产物;实现必须幂等(同一 (commit,pipeline,variant) 重复登记无效果)。
-// NextWorkflowAttempt 供显式 retry 派生 -r{N} 序号(差距 #11);
+// ArtifactStore 登记产物;实现必须幂等(同一 (project,commit,pipeline,variant)
+// 重复登记无效果)。NextWorkflowAttempt 是 Task 6 前的无 project 兼容入口,
+// 供显式 retry 派生 -r{N} 序号(差距 #11);
 // ConclusiveWorkflowIDs 供 bundle webhook 跳过已测变体。
 type ArtifactStore interface {
 	RegisterArtifacts(ctx context.Context, arts []Artifact) error
@@ -86,7 +87,7 @@ func (s *MemStore) RegisterArtifacts(_ context.Context, arts []Artifact) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range arts {
-		key := a.CommitSHA + "|" + strconv.Itoa(a.PipelineID) + "|" + a.Variant
+		key := artifactKey(a.Project, a.CommitSHA, a.PipelineID, a.Variant)
 		if _, exists := s.rows[key]; !exists {
 			s.rows[key] = a
 			s.seq++
@@ -107,18 +108,35 @@ func (s *MemStore) Artifacts() []Artifact {
 	return out
 }
 
-// NextWorkflowAttempt 把 (commit,pipeline,variant) 逻辑键的 workflow_attempt
-// 原子 +1 并返回新值(显式 retry 的 -r{N} 后缀来源,差距 #11);
-// 键未登记(产物尚未 RegisterArtifacts)返回错误。
+func artifactKey(project, commit string, pipelineID int, variant string) string {
+	return project + "|" + commit + "|" + strconv.Itoa(pipelineID) + "|" + variant
+}
+
+// NextWorkflowAttempt 是 Task 6 前的无 project 兼容入口。匹配唯一 project 时
+// 原子递增 workflow_attempt;跨 project 歧义时 fail closed,不递增任何行。
 func (s *MemStore) NextWorkflowAttempt(_ context.Context, commitSHA string, pipelineID int, variant string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := commitSHA + "|" + strconv.Itoa(pipelineID) + "|" + variant
-	a, ok := s.rows[key]
-	if !ok {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s", key)
+	project := ""
+	found := false
+	var matched Artifact
+	for _, a := range s.rows {
+		if a.CommitSHA != commitSHA || a.PipelineID != pipelineID || a.Variant != variant {
+			continue
+		}
+		if found && a.Project != project {
+			return 0, fmt.Errorf("next workflow attempt: artifact identity spans multiple projects: %s/%d/%s",
+				commitSHA, pipelineID, variant)
+		}
+		project = a.Project
+		found = true
+		matched = a
 	}
-	a.WorkflowAttempt++
-	s.rows[key] = a
-	return a.WorkflowAttempt, nil
+	if !found {
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d/%s",
+			commitSHA, pipelineID, variant)
+	}
+	matched.WorkflowAttempt++
+	s.rows[artifactKey(project, commitSHA, pipelineID, variant)] = matched
+	return matched.WorkflowAttempt, nil
 }

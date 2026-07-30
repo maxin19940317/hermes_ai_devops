@@ -64,6 +64,39 @@ func TestPGStoreConformance(t *testing.T) {
 	runConformance(t, func(t *testing.T) fullStore { return openTestPG(t) })
 }
 
+func artifactAttempts(t *testing.T, s fullStore) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	switch st := s.(type) {
+	case *MemStore:
+		for _, row := range st.Artifacts() {
+			out[row.Project] = row.WorkflowAttempt
+		}
+	case *PGStore:
+		rows, err := st.DB.QueryContext(ctx, `
+			SELECT project, workflow_attempt FROM artifacts
+			WHERE commit_sha = 'abcd1234' AND pipeline_id = 42 AND variant = 'v1'`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var project string
+			var attempt int
+			if err := rows.Scan(&project, &attempt); err != nil {
+				t.Fatal(err)
+			}
+			out[project] = attempt
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unsupported store type %T", s)
+	}
+	return out
+}
+
 // runConformance 对一个空 store 实例跑全部行为断言;
 // newStore 每个子测试调用一次,必须返回干净实例。
 func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
@@ -1212,6 +1245,34 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 	})
 
+	t.Run("LegacyProjectAgnosticArtifactMethodsFailClosed", func(t *testing.T) {
+		s := newStore(t)
+		arts := []Artifact{
+			{Project: "grp/a", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1",
+				BuildType: "Release", URL: "a", SHA256: "sa", Size: 1, ManifestDigest: "ma"},
+			{Project: "grp/b", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1",
+				BuildType: "Release", URL: "b", SHA256: "sb", Size: 1, ManifestDigest: "mb"},
+		}
+		if err := s.RegisterArtifacts(ctx, arts); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := s.ListArtifacts(ctx, "abcd1234", 42); err == nil || len(got) != 0 {
+			t.Fatalf("ambiguous legacy list = %+v err=%v, want fail closed", got, err)
+		}
+		if _, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "v1"); err == nil {
+			t.Fatal("ambiguous legacy variant retry should fail closed")
+		}
+		if _, err := s.NextWorkflowAttemptAll(ctx, "abcd1234", 42); err == nil {
+			t.Fatal("ambiguous legacy bundle retry should fail closed")
+		}
+		attempts := artifactAttempts(t, s)
+		for _, project := range []string{"grp/a", "grp/b"} {
+			if attempts[project] != 0 {
+				t.Errorf("%s workflow attempt = %d, ambiguous retry must not increment", project, attempts[project])
+			}
+		}
+	})
+
 	t.Run("DecisionsRoundTripInOrder", func(t *testing.T) {
 		s := newStore(t)
 		_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w:t1:a1", IdempotencyKey: "w:t1:a1"})
@@ -1424,10 +1485,8 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatalf("adversary 项目名长度必须与 proj 一致才能对齐下划线位置: %d vs %d", len(advProj), len(proj))
 		}
 		advBase := wf.BaseWorkflowID(advProj, sha, iid)
-		// 复用与 proj 完全相同的 (commit, pipeline, variant) 三元组注册:
-		// artifacts 的唯一键不含 project(schema.sql: UNIQUE(commit_sha, pipeline_id,
-		// variant)),这里必然是空操作(proj 的 v1 行已占住该键),不影响下方断言,
-		// 保留调用只是如实反映"两个项目撞在同一逻辑键上"的场景。
+		// 复用与 proj 完全相同的 (commit, pipeline, variant) 三元组注册;
+		// project 已纳入 artifact identity,两个项目都必须保留独立行和结论。
 		if err := s.RegisterArtifacts(ctx, []Artifact{
 			{Project: advProj, CommitSHA: sha, PipelineID: iid, Variant: v1, URL: "adv", SHA256: "adv"},
 		}); err != nil {
@@ -1450,12 +1509,15 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if err != nil {
 			t.Fatalf("RecentRuns after adversary: %v", err)
 		}
-		byVariant = map[string]RecentRun{}
+		byProjectVariant := map[string]RecentRun{}
 		for _, r := range runs {
-			byVariant[r.Variant] = r
+			byProjectVariant[r.Project+"|"+r.Variant] = r
 		}
-		if got := byVariant[v1].Verdict; got != "PASSED" {
+		if got := byProjectVariant[proj+"|"+v1].Verdict; got != "PASSED" {
 			t.Errorf("%s verdict = %q, want PASSED(不得被下划线位置不同的对抗项目 %s 抢走结论)", v1, got, advProj)
+		}
+		if got := byProjectVariant[advProj+"|"+v1].Verdict; got != "INFRA_ERROR" {
+			t.Errorf("%s/%s verdict = %q, want INFRA_ERROR", advProj, v1, got)
 		}
 	})
 

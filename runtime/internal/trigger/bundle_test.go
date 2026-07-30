@@ -2,6 +2,7 @@ package trigger
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -41,6 +42,30 @@ func TestParseBundleInvalid(t *testing.T) {
 	}
 	if _, err := ParseBundle([]byte("not json")); err == nil {
 		t.Error("非 JSON 应被拒绝")
+	}
+}
+
+func TestBundleSchemaRejectsUncommandableProject(t *testing.T) {
+	rejected := []string{
+		"grp/bad project",
+		"/absolute",
+		"grp//double",
+		"grp/trailing\n",
+		strings.Repeat("a", 257),
+	}
+	for _, project := range rejected {
+		t.Run(project, func(t *testing.T) {
+			bundle := validBundle()
+			bundle["project"] = project
+			if _, err := ParseBundle(mustJSON(t, bundle)); err == nil {
+				t.Fatalf("project %q should be rejected", project)
+			}
+		})
+	}
+	bundle := validBundle()
+	bundle["project"] = "grp/good_project"
+	if _, err := ParseBundle(mustJSON(t, bundle)); err != nil {
+		t.Fatalf("commandable project rejected: %v", err)
 	}
 }
 

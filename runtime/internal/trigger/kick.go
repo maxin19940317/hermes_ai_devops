@@ -38,8 +38,11 @@ type kickPayload struct {
 
 var (
 	kickVariantRegexp = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
-	kickCommitRegexp  = regexp.MustCompile(`^[0-9a-f]{8,40}$`)
-	kickSHA256Regexp  = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	kickProjectRegexp = regexp.MustCompile(
+		`^[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$`,
+	)
+	kickCommitRegexp = regexp.MustCompile(`^[0-9a-f]{8,40}$`)
+	kickSHA256Regexp = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // validate 校验载荷形态与自洽性;gitlabBase 非空时要求产物 URL 指向
@@ -48,7 +51,8 @@ func (p *kickPayload) validate(gitlabBase string) error {
 	switch {
 	case !kickVariantRegexp.MatchString(p.Variant):
 		return errors.New("bad variant")
-	case p.Project == "" || strings.Contains(p.Project, ".."):
+	case len(p.Project) > 256 || !kickProjectRegexp.MatchString(p.Project) ||
+		strings.Contains(p.Project, ".."):
 		return errors.New("bad project")
 	case !kickCommitRegexp.MatchString(p.Commit):
 		return errors.New("bad commit")

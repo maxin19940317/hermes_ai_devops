@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -79,41 +78,59 @@ func (s *MemStore) UnquarantineDevice(_ context.Context, deviceID string) (bool,
 	return true, nil
 }
 
-// ListArtifacts 返回 (commit,pipeline) 逻辑键下的全部产物行(飞书指令 rerun
-// 重建 DeviceTestInput 用);无记录返回空切片。
+// ListArtifacts 是 Task 6 前的无 project 兼容入口。匹配唯一 project 时返回
+// 全部产物;跨 project 歧义时 fail closed。
 func (s *MemStore) ListArtifacts(_ context.Context, commitSHA string, pipelineID int) ([]Artifact, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := []Artifact{}
-	prefix := commitSHA + "|" + strconv.Itoa(pipelineID) + "|"
-	for k, a := range s.rows {
-		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
-			out = append(out, a)
+	project := ""
+	found := false
+	for _, a := range s.rows {
+		if a.CommitSHA != commitSHA || a.PipelineID != pipelineID {
+			continue
 		}
+		if found && a.Project != project {
+			return nil, fmt.Errorf("list artifacts: artifact identity spans multiple projects: %s/%d",
+				commitSHA, pipelineID)
+		}
+		project = a.Project
+		found = true
+		out = append(out, a)
 	}
 	return out, nil
 }
 
-// NextWorkflowAttemptAll 把 (commit,pipeline) 键下全部产物行的 workflow_attempt
-// 原子 +1,返回新的最大值(bundle 级显式 rerun 的 -r{N} 后缀来源;
-// 各变体行可能被 kick retry 单独递增过,取 max 保证 ID 唯一)。
-// 键下无记录返回错误。
+// NextWorkflowAttemptAll 是 Task 6 前的无 project 兼容入口。匹配唯一 project
+// 时递增全部变体并返回最大值;跨 project 歧义时 fail closed。
 func (s *MemStore) NextWorkflowAttemptAll(_ context.Context, commitSHA string, pipelineID int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prefix := commitSHA + "|" + strconv.Itoa(pipelineID) + "|"
+	project := ""
+	found := false
+	for _, a := range s.rows {
+		if a.CommitSHA != commitSHA || a.PipelineID != pipelineID {
+			continue
+		}
+		if found && a.Project != project {
+			return 0, fmt.Errorf("next workflow attempt: artifact identity spans multiple projects: %s/%d",
+				commitSHA, pipelineID)
+		}
+		project = a.Project
+		found = true
+	}
+	if !found {
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d", commitSHA, pipelineID)
+	}
 	maxN := 0
 	for k, a := range s.rows {
-		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
 			a.WorkflowAttempt++
 			s.rows[k] = a
 			if a.WorkflowAttempt > maxN {
 				maxN = a.WorkflowAttempt
 			}
 		}
-	}
-	if maxN == 0 {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d", commitSHA, pipelineID)
 	}
 	return maxN, nil
 }
