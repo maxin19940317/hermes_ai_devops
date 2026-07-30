@@ -13,15 +13,16 @@
 `Executor.execute` 执行 → 文本回复。不在这四个指令里的输入一律回 usage。
 
 本设计在 `Parse` 与 `execute` 之间插入一层**意图翻译器**：自然语言经 Hermes 翻译成
-一行合法指令文本，重走既有解析与校验，执行路径一个字节不变。目标是覆盖"懒得背指令
-格式"这个场景（"帮我重跑一下昨天 SNPE 1.68 那个失败的"），**不是**让 Hermes 回答开放
-问题（"为什么挂""这块板最近成功率"）——那属于语义层，需要只读工具白名单与多轮对话，
-单独设计。
+一行合法指令文本，重走当前解析与校验；翻译层不会分叉当前 `Parse/execute`。目标是覆盖
+"懒得背指令格式"这个场景（"帮我重跑一下昨天 SNPE 1.68 那个失败的"），**不是**让
+Hermes 回答开放问题（"为什么挂""这块板最近成功率"）——那属于语义层，需要只读工具
+白名单与多轮对话，单独设计。
 
 关键决策（已与负责人确认，2026-07-28）：
 
 1. **翻译只在 `help` 分支触发**。能被现有语法解析的输入原样走老路，解析不了才问
-   Hermes。省 token，且对既有指令零回归风险——LLM 不在任何一条已能工作的指令的路径上。
+   Hermes。省 token，且 LLM 不进入已能解析的指令路径。兼容承诺按当前 v2 指令面收窄：
+   非 rerun 手打指令保留既有行为；legacy rerun 有意 fail closed 并返回迁移提示。
 2. **翻译输出是一行指令文本，重走 `Parse`**。LLM 返回 `{command, args}`，Runtime 渲染成
    `rerun device-test-grp/project-g9da3b9d9-p56 aarch64_Android_SNPE_1.68`，原样喂回
    `Parse()`。翻译层的值域因此
@@ -435,7 +436,7 @@ Version/RuleVersion/Project 与 packages；不能因为翻译层见过该 ID 就
 - 逐条错误路径：schema 不过 / `none` / 回灌失败 / 伪造或 non-authoritative workflow /
   跨 source variant / 设备不存在 / 低置信度 —— 各断言回复文本与 `outcome` 落库值
 - 非白名单发自然语言：Translator **零调用**（断言 fake 计数为 0）
-- 翻译层禁用时 `help` 分支行为与今天逐字节一致
+- 翻译层禁用时不调用 Translator；当前非 rerun 手打指令仍走同一 `Parse/execute`
 
 ### 8.3 `hermesclient.Translate` 单测
 
@@ -487,7 +488,8 @@ Version/RuleVersion/Project 与 packages；不能因为翻译层见过该 ID 就
 
 - 指令面仍是四个 + help；rerun 当前语义为精确 source workflow，旧参数形式 fail closed
 - `Parse(render(x)) == x` 对 schema 允许的全部输入成立（有测试）
-- 翻译层禁用或失败时，行为与本轮改动前逐字节一致
+- 翻译层禁用或失败不会分叉当前 `Parse/execute`；非 rerun 手打指令保留既有行为，
+  legacy rerun 有意 fail closed 并返回迁移提示
 - 每次翻译在 `command_translations` 留痕，含原文、`context_digest`、渲染结果、outcome
 - 副作用指令未经用户确认不会执行（有测试）
 - 非白名单消息不触发任何 LLM 调用（有测试）

@@ -19,13 +19,58 @@ WORKFLOW_RUNS_MIGRATION = (
     / "2026-07-30-workflow-runs.sql"
 )
 DEPLOY_README = ROOT / "deploy" / "README.md"
-CURRENT_OPERATIONAL_DOCS = (
-    ROOT / "CLAUDE.md",
-    ROOT / "docs" / "device-test-sequence.md",
+NL_DESIGN = (
     ROOT / "docs" / "superpowers" / "specs"
-    / "2026-07-28-feishu-cmd-nl-translate-design.md",
+    / "2026-07-28-feishu-cmd-nl-translate-design.md"
+)
+CURRENT_OPERATIONAL_DOCS = (
+    ROOT / "README.md",
+    ROOT / "CLAUDE.md",
+    ROOT / "runtime" / "README.md",
+    ROOT / "agent" / "README.md",
+    ROOT / "ci" / "README.md",
+    ROOT / "hermes" / "analyze_bridge" / "README.md",
+    ROOT / "docs" / "device-test-sequence.md",
+    NL_DESIGN,
     DEPLOY_README,
 )
+LEGACY_RERUN_SYNTAX = re.compile(
+    r"\brerun\s+(?:"
+    r"<(?:sha(?:8|[0-9]*)?|commit_sha)>\s+"
+    r"<(?:pipeline_iid|pipeline_id)>"
+    r"|[0-9a-fA-F]{7,40}\s+[1-9][0-9]*"
+    r")(?=\s|$)"
+)
+WORKFLOW_RUNS_MIGRATION_PATTERNS = {
+    "workflow_runs table": re.compile(
+        r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"workflow_runs\s*\(",
+        re.IGNORECASE,
+    ),
+    "project artifact index": re.compile(
+        r"\bCREATE\s+UNIQUE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"artifacts_project_key\s+ON\s+artifacts\s*"
+        r"\(\s*project\s*,\s*commit_sha\s*,\s*pipeline_id\s*,\s*variant\s*\)",
+        re.IGNORECASE,
+    ),
+    "artifact constraint from index": re.compile(
+        r"\bALTER\s+TABLE\s+artifacts\s+ADD\s+CONSTRAINT\s+"
+        r"artifacts_project_key\s+UNIQUE\s+USING\s+INDEX\s+"
+        r"artifacts_project_key\s*;",
+        re.IGNORECASE,
+    ),
+    "old artifact constraint removal": re.compile(
+        r"\bALTER\s+TABLE\s+artifacts\s+DROP\s+CONSTRAINT\s+"
+        r"(?:IF\s+EXISTS\s+)?"
+        r"artifacts_commit_sha_pipeline_id_variant_key\s*;",
+        re.IGNORECASE,
+    ),
+}
+
+
+def strip_sql_comments(text):
+    without_blocks = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return re.sub(r"--[^\r\n]*", "", without_blocks)
 
 
 class SecretExclusionContracts(unittest.TestCase):
@@ -338,15 +383,28 @@ class PipelineVerificationContracts(unittest.TestCase):
 
 class WorkflowRunsDeploymentContracts(unittest.TestCase):
     def test_migration_rekeys_artifacts_and_creates_workflow_runs(self):
-        migration = WORKFLOW_RUNS_MIGRATION.read_text(encoding="utf-8")
-
-        self.assertIn("CREATE TABLE IF NOT EXISTS workflow_runs", migration)
-        self.assertIn("artifacts_project_key", migration)
-        self.assertRegex(
-            migration,
-            r"DROP CONSTRAINT\s+IF EXISTS\s+"
-            r"artifacts_commit_sha_pipeline_id_variant_key",
+        migration = strip_sql_comments(
+            WORKFLOW_RUNS_MIGRATION.read_text(encoding="utf-8")
         )
+
+        for label, pattern in WORKFLOW_RUNS_MIGRATION_PATTERNS.items():
+            with self.subTest(statement=label):
+                self.assertRegex(migration, pattern)
+
+    def test_commented_migration_statements_do_not_satisfy_contract(self):
+        migration = WORKFLOW_RUNS_MIGRATION.read_text(encoding="utf-8")
+        mutations = {
+            "line comments": "\n".join(
+                f"-- {line}" for line in migration.splitlines()
+            ),
+            "block comment": f"/*\n{migration}\n*/",
+        }
+
+        for name, mutation in mutations.items():
+            stripped = strip_sql_comments(mutation)
+            for label, pattern in WORKFLOW_RUNS_MIGRATION_PATTERNS.items():
+                with self.subTest(mutation=name, statement=label):
+                    self.assertNotRegex(stripped, pattern)
 
     def test_documented_rollout_order_and_prerequisites_are_explicit(self):
         deploy_readme = DEPLOY_README.read_text(encoding="utf-8")
@@ -373,16 +431,26 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
         )
 
     def test_current_docs_do_not_advertise_legacy_rerun_syntax(self):
-        legacy_syntax = re.compile(
-            r"rerun\s+<sha(?:8|[0-9]*)?>\s+<pipeline_iid>"
-        )
-
         for path in CURRENT_OPERATIONAL_DOCS:
             with self.subTest(path=path.relative_to(ROOT)):
                 self.assertNotRegex(
                     path.read_text(encoding="utf-8"),
-                    legacy_syntax,
+                    LEGACY_RERUN_SYNTAX,
                 )
+
+    def test_legacy_rerun_detector_covers_placeholders_and_concrete_ids(self):
+        mutations = (
+            "rerun <sha> <pipeline_iid>",
+            "rerun <sha8> <pipeline_id> variant",
+            "rerun <sha40> <pipeline_iid>",
+            "rerun <commit_sha> <pipeline_id>",
+            "rerun 9da3b9d9 56",
+            "rerun abcdef1234567890 1 variant",
+        )
+
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.assertRegex(mutation, LEGACY_RERUN_SYNTAX)
 
     def test_rerun_variant_selection_predicate_is_explicit(self):
         deploy_readme = " ".join(
@@ -390,7 +458,7 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
         )
         sequence = " ".join((
             ROOT / "docs" / "device-test-sequence.md"
-        ).read_text(encoding="utf-8").split())
+        ).read_text(encoding="utf-8").split()).replace("`", "")
 
         self.assertIn(
             "verdict != PASSED && verdict != SKIPPED",
@@ -409,6 +477,31 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
             "显式 variant 只要属于源 run 就仍可重跑，包括 PASSED 或 SKIPPED",
             sequence,
         )
+
+    def test_attempt_allocation_and_workflow_id_derivation_are_precise(self):
+        sequence = " ".join((
+            ROOT / "docs" / "device-test-sequence.md"
+        ).read_text(encoding="utf-8").split()).replace("`", "")
+
+        self.assertNotIn("原子分配新的 attempt 和 workflow ID", sequence)
+        self.assertIn("原子递增分配新的 attempt", sequence)
+        self.assertIn("workflow ID 随后由输入确定性派生", sequence)
+        self.assertIn("StartDeviceTest 失败会留下 attempt 空洞", sequence)
+
+    def test_nl_design_scopes_compatibility_promise(self):
+        design = " ".join(
+            NL_DESIGN.read_text(encoding="utf-8").split()
+        ).replace("`", "")
+
+        for stale in (
+            "执行路径一个字节不变",
+            "对既有指令零回归风险",
+            "行为与本轮改动前逐字节一致",
+        ):
+            self.assertNotIn(stale, design)
+        self.assertIn("翻译层不会分叉当前 Parse/execute", design)
+        self.assertIn("非 rerun 手打指令保留既有行为", design)
+        self.assertIn("legacy rerun 有意 fail closed 并返回迁移提示", design)
 
 
 if __name__ == "__main__":
