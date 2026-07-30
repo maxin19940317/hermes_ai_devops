@@ -1,7 +1,7 @@
 # Workflow Runs 设计
 
 **日期：** 2026-07-30
-**状态：** 待书面复核
+**状态：** 已批准
 **范围：** 三轮交互能力的第一轮，只建立权威 workflow 运行记录、精确 rerun 和项目隔离；不实现飞书按钮。
 
 ## 1. 背景
@@ -314,13 +314,16 @@ prompt、command schema、示例和参数校验同步改成新语法。
 旧二进制的 `ON CONFLICT (commit_sha,pipeline_id,variant)` 在旧约束删除后无法工作，因此这次
 不是可混跑升级。部署顺序固定为：
 
-1. 停止 trigger/worker 等 artifact 写入方；
-2. 执行 migration；
-3. 整组部署包含四元组逻辑键的新二进制；
-4. 启动 worker，再恢复 trigger/入口流量。
+1. 先独立部署当前已合入但尚未上线的按需预签、evidence v3 和归因功能；
+2. 完成既定观察期并确认该批功能稳定；未通过 go/no-go 时不得开始本轮迁移；
+3. 停止 trigger/worker 等 artifact 写入方；
+4. 执行 migration；
+5. 整组部署包含四元组逻辑键的新二进制；
+6. 启动 worker，再恢复 trigger/入口流量。
 
 不得 migration 后继续运行旧写入方，也不得先部署新 worker 再迁移。部署文档必须写明该
-短暂停写窗口。
+短暂停写窗口。本轮代码完成、合并或构建镜像都不自动授权执行生产迁移；生产 go/no-go
+必须在前一批功能独立稳定后另行确认。
 
 ## 8. 失败处理
 
