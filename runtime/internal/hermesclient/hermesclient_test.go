@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -333,6 +334,53 @@ func TestCommandSchemaRejectsArgTrailingNewline(t *testing.T) {
 	}
 	if err := commandSchema.Validate(doc); err == nil {
 		t.Fatal("want validation error for trailing-newline arg (anchor-free companion pattern should reject it), got nil")
+	}
+}
+
+func TestTranslateRejectsUnicodeWhitespaceArgs(t *testing.T) {
+	for _, whitespace := range []rune{'\u00a0', '\u2003', '\u3000'} {
+		t.Run(fmt.Sprintf("U+%04X", whitespace), func(t *testing.T) {
+			response, err := json.Marshal(Translation{
+				TranslationVersion: 2,
+				Command:            "rerun",
+				Args:               []string{"workflow" + string(whitespace) + "id"},
+				Confidence:         0.9,
+			})
+			if err != nil {
+				t.Fatalf("marshal response: %v", err)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write(response)
+			}))
+			defer srv.Close()
+
+			c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+			_, err = c.Translate(context.Background(), TranslateRequest{RawText: "重跑"})
+			if !errors.Is(err, ErrSchemaInvalid) {
+				t.Fatalf("Translate arg containing U+%04X error = %v, want ErrSchemaInvalid", whitespace, err)
+			}
+		})
+	}
+}
+
+func TestValidateTranslationArgsDefensiveBoundaries(t *testing.T) {
+	cases := []struct {
+		name string
+		arg  string
+		ok   bool
+	}{
+		{name: "valid", arg: "device-test-grp/algo-super-sdk-g9da3b9d9-p56", ok: true},
+		{name: "empty", arg: ""},
+		{name: "invalid_utf8", arg: string([]byte{0xff})},
+		{name: "too_long", arg: strings.Repeat("界", 513)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTranslationArgs([]string{tc.arg})
+			if (err == nil) != tc.ok {
+				t.Fatalf("validateTranslationArgs(%q) error = %v, want ok=%v", tc.arg, err, tc.ok)
+			}
+		})
 	}
 }
 

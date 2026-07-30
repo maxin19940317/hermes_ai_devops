@@ -69,6 +69,14 @@ func TestRenderParseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRenderParseUnicodeWhitespaceIsNotIdentity(t *testing.T) {
+	args := []string{"workflow\u00a0id"}
+	got := Parse(render("rerun", args))
+	if slices.Equal(got.Args, args) {
+		t.Fatalf("render+Parse unexpectedly preserved Unicode whitespace arg: %v", got.Args)
+	}
+}
+
 func TestTranslateReadOnlyCommandExecutesDirectly(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
 		TranslationVersion: 2, Command: "devices", Confidence: 0.95, Reason: "询问设备状态",

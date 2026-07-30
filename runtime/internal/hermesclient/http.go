@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
 )
@@ -228,5 +230,30 @@ func (c *HTTPClient) Translate(ctx context.Context, req TranslateRequest) (*Tran
 	if err := json.Unmarshal(raw, &tr); err != nil {
 		return nil, fmt.Errorf("hermesclient: 解析 Translation 失败: %w", err)
 	}
+	if err := validateTranslationArgs(tr.Args); err != nil {
+		snippet := string(raw)
+		if len(snippet) > errBodyLimit {
+			snippet = snippet[:errBodyLimit] + "..."
+		}
+		return nil, fmt.Errorf("hermesclient: 响应不符合 command.schema.json(视为翻译失败): %w: %w: body=%s", ErrSchemaInvalid, err, snippet)
+	}
 	return &tr, nil
+}
+
+func validateTranslationArgs(args []string) error {
+	for i, arg := range args {
+		if !utf8.ValidString(arg) {
+			return fmt.Errorf("args[%d] 不是合法 UTF-8", i)
+		}
+		runes := utf8.RuneCountInString(arg)
+		if runes < 1 || runes > 512 {
+			return fmt.Errorf("args[%d] 长度 %d 超出 1..512", i, runes)
+		}
+		for _, r := range arg {
+			if unicode.IsSpace(r) {
+				return fmt.Errorf("args[%d] 含 Unicode 空白 U+%04X", i, r)
+			}
+		}
+	}
+	return nil
 }

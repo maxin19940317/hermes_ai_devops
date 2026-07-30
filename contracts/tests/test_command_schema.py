@@ -82,7 +82,18 @@ class TestCommandSchema:
             with pytest.raises(ValidationError):
                 validators["command"].validate(doc)
 
-    @pytest.mark.parametrize("arg", ["wf id", "wf\tid", "wf\nid", "wf\rid"])
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "wf id",
+            "wf\tid",
+            "wf\nid",
+            "wf\rid",
+            "wf\u00a0id",
+            "wf\u2003id",
+            "wf\u3000id",
+        ],
+    )
     def test_args_reject_whitespace_anywhere(self, validators, arg):
         with pytest.raises(ValidationError):
             validators["command"].validate(
