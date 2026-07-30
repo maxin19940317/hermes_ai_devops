@@ -2,7 +2,7 @@
 
 日期：2026-07-30
 
-状态：待批准（v4，2026-07-30 第三轮评审后修订：降级数据通路、字段一致性逐条对齐、渲染安全与体积边界）
+状态：待批准（v5，2026-07-30 第四轮评审后修订：CardSender 而非扩展 Sender、全量动态文本、节点白名单、边界精确化）
 
 ## 1. 背景
 
@@ -26,7 +26,11 @@ verdict 与 category 要逐行读，看不出"这次该查代码还是查环境"
 3. **降级文本由 workflow 生成并随载荷下发**，activity 绝不自行拼文本（见 §5.1）。
 4. **header 颜色：业务失败优先于基础设施失败**（见 §4.1）。
 5. **卡片字段与纯文本严格对齐，仅一处有意偏离并显式列出**（见 §4.3）。
-6. **动态文本一律 `plain_text` 渲染，并有 UTF-8 安全的裁剪与总体积预算**（见 §4.4）。
+6. **卡片里**所有**动态文本节点一律 `plain_text` 渲染**，并有 UTF-8 安全的裁剪与总体积
+   预算（见 §4.4）。
+7. **不扩展 `feishu.Sender`，另加 `CardSender`**（见 §5.4）。往 `Sender` 上加方法会让
+   `notify_test.go` 与 `feishucmd/executor_test.go` 里两个只实现 `SendText` 的 fake
+   直接编译失败——而"既有测试一条未改"正是本轮的验收判据，那样就自相矛盾了。
 
 不采用的方案：
 
@@ -40,7 +44,7 @@ verdict 与 category 要逐行读，看不出"这次该查代码还是查环境"
 
 交付：
 
-- `feishu.Sender` 增加 `SendCard(ctx context.Context, card any) error`（webhook 与 app 两种实现）
+- `feishu` 包新增 `CardSender` 接口（`Sender` 原样不动）+ 两种实现的 `SendCard`（见 §5.4）
 - `buildNotificationCard`：workflow 侧确定性生成卡片结构
 - **新增** `NotifyCard(ctx, NotifyCardRequest) error` 活动（`Notify` 与 `buildNotification` 原样保留）
 - `workflow.GetVersion` 分支 + 旧 history 的 `WorkflowReplayer` 测试（见 §6）
@@ -114,21 +118,42 @@ verdict 与 category 要逐行读，看不出"这次该查代码还是查环境"
 
 ### 4.4 渲染安全与体积边界
 
-进入卡片的动态文本有两处：`TaskSummary.Reason`（失败原因，可能来自设备/Client 的任意
-错误文本）与 `Analysis.Summary`（**LLM 输出**）。
+**卡片里的每一处动态文本都是不可信输入，不只是 `Reason` 与 `Analysis.Summary`。**
+完整清单：
 
-**一律用 `plain_text` 渲染，不用 `lark_md`。** 理由不是洁癖：markdown 渲染会让
-`[text](url)`、`<at user_id="...">`、标签语法被解释。Analyzer summary 是模型产物，
-用 markdown 渲染等于允许模型在通知里插链接和 @ 提及。若将来某处确需 markdown，
-必须显式转义后再放。
+| 字段 | 来源 | 备注 |
+|---|---|---|
+| `TaskSummary.Reason` | 设备/Client 的任意错误文本 | 最不可控 |
+| `Analysis.Summary` | **LLM 输出** | 模型产物 |
+| `in.Project` | GitLab webhook / bundle | **没有字符白名单** |
+| `in.Version` | 业务仓库 CMakeLists | 形态约定为 X.Y.Z，但未强制校验 |
+| `in.Commit` | bundle | hex，形态受限 |
+| `TaskSummary.Variant` | `variants.yaml` | 受配置约束但仍是运行时输入 |
+| `TaskSummary.Verdict` / `Category` | 规则引擎枚举 | 取值有界 |
+
+**规则：卡片里所有文本节点一律 `plain_text`，不用 `lark_md`。** 理由不是洁癖：
+markdown 渲染会让 `[text](url)`、`<at user_id="...">`、标签语法被解释。Analyzer summary
+是模型产物，用 markdown 渲染等于允许模型在通知里插链接和 @ 提及；而 `Project` 连字符
+白名单都没有。若将来某处确需 markdown，必须显式转义后再放。
+
+验证方式是**递归断言整张卡片的每个文本节点类型**（§8），而不是逐字段列举——列举会随
+字段增加而漏。
 
 **裁剪与预算**（超出即截断并加省略标记）：
 
 | 项 | 上限 |
 |---|---|
-| 单个 `Reason` | 500 字符（rune） |
-| 单个 `Analysis.Summary` | 500 字符（rune） |
-| 卡片序列化后总大小 | 30 KB；超出则按变体顺序丢弃末尾变体的可选行（reason / hermes 行），并在正文末尾加一行"（N 个变体的详情已省略）" |
+| 单个 `Reason` | 500 rune |
+| 单个 `Analysis.Summary` | 500 rune |
+| 卡片总大小 | `len(json.Marshal(card)) <= 30*1024` |
+
+总大小的处置顺序，必须按此执行：
+
+1. 超限 → 按变体顺序从末尾丢弃可选行（reason 行、hermes 行）
+2. 加上"（N 个变体的详情已省略）"标注后**重新测量**——标注本身也占字节
+3. 仍超限 → 直接走降级纯文本（§5.2）
+
+第 2 步是容易漏的一环：加标注后不重测，等于把一个刚裁到边界的卡片又推回超限。
 
 裁剪必须**按 rune 边界**，不能按字节——中文在 UTF-8 里是 3 字节，按字节切会产生半个字符，
 飞书侧渲染成乱码甚至拒收。
@@ -186,6 +211,42 @@ req := NotifyCardRequest{
 
 app 侧的 token 过期重试逻辑（`SendText` 里那段"强制刷新重试一次"）必须同样覆盖 `SendCard`。
 
+### 5.4 用 `CardSender` 而不是扩展 `Sender`
+
+`feishu.Sender` 今天只有 `SendText`，而**两处测试 fake 只实现了它**：
+`activity/notify_test.go:12` 的 `fakeSender` 与 `feishucmd/executor_test.go` 的同名 fake。
+往 `Sender` 接口上加 `SendCard` 会让这两处直接编译失败——与本轮"既有 `notify_test.go`
+一条未改即通过"的验收判据正面冲突。
+
+因此：
+
+```go
+// Sender 原样不动。
+type Sender interface {
+	SendText(ctx context.Context, text string) error
+}
+
+// CardSender 是能发交互卡片的 Sender(差距:终态通知卡片化)。
+// 单独成接口而非扩展 Sender:后者会让只实现 SendText 的既有 fake 编译失败。
+type CardSender interface {
+	Sender
+	SendCard(ctx context.Context, card any) error
+}
+```
+
+`Acts.Feishu` 的静态类型仍是 `feishu.Sender`。`NotifyCard` 做类型断言：
+
+```go
+cs, ok := a.Feishu.(feishu.CardSender)
+if !ok {
+    // 注入的 Sender 不支持卡片(如老的测试 fake):直接走降级文本,不是错误
+    return a.Feishu.SendText(ctx, req.FallbackText)
+}
+```
+
+`NewSender` 返回的两种真实实现都满足 `CardSender`，所以生产路径总是走卡片；
+断言失败只会发生在注入了旧 fake 的测试里，而那时降级正是想要的行为。
+
 ## 6. Temporal 兼容
 
 1. `Notify(ctx, string)` **原样保留**，签名与行为一个字节不改。
@@ -195,12 +256,22 @@ app 侧的 token 过期重试逻辑（`SendText` 里那段"强制刷新重试一
    旧版本调 `Notify(buildNotification(...))`，新版本调 `NotifyCard(...)`。
 
 **重放验证不能只靠 fake activity。** 用 fake 只能证明"旧分支仍传字符串"，证明不了
-version marker 的位置不会与历史不匹配。验收要求一个 `WorkflowReplayer` 测试，
-喂一份**本次改动之前录制的 history**，断言重放无非确定性错误。
+version marker 的位置不会与历史不匹配。
 
-若在本仓库产出这样一份 history 的成本过高（需要跑一次真实 workflow 并导出），
-则**必须收窄验收表述**：改为"旧分支经 fake activity 断言仍走 `Notify(string)`"，
-并在 spec 与 CLAUDE.md 里注明重放未经真实 history 验证。不允许保留一个测不出来的承诺。
+**本轮选定：做 `WorkflowReplayer` 测试**（不留二选一——一个分叉的验收标准等于没有标准）。
+可行性已确认：仓库有 `internal/testtemporal` 的内嵌 Temporal，`spike` 包里已有跑真实
+workflow 的先例。
+
+实施顺序是关键，必须先录后改：
+
+1. **在动任何代码之前**，用当前（改动前）的 workflow 代码跑一次完整 `DeviceTestWorkflow`，
+   导出 history 为 JSON，作为 fixture 提交（如
+   `runtime/internal/workflow/testdata/history-pre-notify-card.json`）
+2. 再做本轮改动
+3. 加 `WorkflowReplayer` 测试，喂该 fixture，断言重放无非确定性错误
+
+顺序反了就录不到"改动前"的 history 了——这是本轮唯一一处对任务内步骤顺序有硬要求的地方，
+实施计划里要写明。
 
 ## 7. 错误处理
 
@@ -243,17 +314,24 @@ version marker 的位置不会与历史不匹配。验收要求一个 `WorkflowR
 
 渲染安全与边界：
 
-- 500 字符以上的 `Reason` 被截断并带省略标记
+- **递归遍历整张卡片，断言每个文本节点的类型都是 `plain_text`**。这是主断言——逐字段
+  列举会随字段增加而漏，递归不会。
+- 含 markdown / `<at>` 语法的输入，**逐字段各一例**，都断言渲染成字面文本：
+  `Reason`、`Analysis.Summary`（LLM 输出）、**`Project`**（无字符白名单）、**`Variant`**。
+  例如 `Project = "a[x](http://evil)b"`、`Variant = "v<at user_id=\"all\">"`。
 - **纯中文的超长 `Reason` 截断后仍是合法 UTF-8**（按 rune 切的判据；按字节切这条会红）
-- `Reason` 含 `[x](http://evil)`、`<at user_id="all">`、`<b>` 等 → 卡片里是**字面文本**，
-  节点类型为 `plain_text`
-- `Analysis.Summary` 同上（它是 LLM 输出）
-- 构造一份超总预算的输入 → 卡片被裁到预算内，且带"详情已省略"标注
+- 500 rune 以上的 `Reason` / `Summary` 被截断并带省略标记
+- 超总预算的输入 → 卡片被裁到 `len(json.Marshal(card)) <= 30*1024` 以内，带"详情已省略"标注，
+  **且标注计入后重新测量仍在预算内**
+- 裁到极限仍超预算 → 走降级纯文本（断言 `SendCard` 未被调用或其失败被降级接住）
 
-无交互组件：
+节点类型白名单（而非黑名单）：
 
-- 遍历生成的卡片树，断言**不含** `button`、`action`、`callback`、`value` 等交互节点。
-  这条守的是"本轮不做按钮"这个范围边界，防止按钮在后续改动里悄悄漏进展示卡片。
+- 递归遍历卡片树，断言每个节点的类型都在**本轮实际使用的白名单**内
+  （如 `header` / `div` / `plain_text` / `hr` —— 以实现为准）。
+- 用白名单而不是禁 `button`/`action`/`callback`/`value`：黑名单挡不住 `select`、
+  `overflow`、`picker`、带 `open-url` behavior 的节点等等。白名单守的是"本轮不做按钮"
+  这个范围边界，且不需要穷举飞书的全部交互组件类型。
 
 **Sender（两种实现，精确断言）**
 
@@ -277,13 +355,13 @@ version marker 的位置不会与历史不匹配。验收要求一个 `WorkflowR
 - `INFRA_ERROR` 与 `TEST_FAILED` 混合时是红色，不是橙色（有测试）
 - SKIPPED 变体在卡片上可见，不影响颜色，且不显示 attempt（有测试）
 - 卡片字段与 §4.3 的对照表逐条一致，除表中列出的唯一偏离（有测试）
-- 动态文本节点类型为 `plain_text`，markdown/at 语法不被解释（有测试）
-- 超长中文 `Reason` 截断后仍是合法 UTF-8（有测试）
-- 生成的卡片树不含任何交互组件（有测试）
+- **递归断言**整张卡片每个文本节点均为 `plain_text`；`Project` / `Variant` / `Reason` / `Summary` 各有含 markdown、`<at>` 语法的用例（有测试）
+- 超长中文 `Reason` 截断后仍是合法 UTF-8（按 rune 切，有测试）
+- 卡片总大小判据是 `len(json.Marshal(card)) <= 30*1024`，且省略标注计入后重新测量（有测试）
+- 卡片树每个节点类型都在本轮的白名单内（而非黑名单排除，有测试）
 - `SendCard` 失败时降级文本与 `buildNotification` 输出逐字节相同（有测试）
-- `Notify(ctx, string)` 未改签名，既有 `notify_test.go` 一条未改即通过
-- 在途 workflow 重放不失败——由旧 history 的 `WorkflowReplayer` 测试证明；
-  若该测试不可行，验收表述按 §6 收窄，并在文档注明
+- `Notify(ctx, string)` 未改签名；`feishu.Sender` 未扩展；`notify_test.go` 与 `feishucmd/executor_test.go` 的既有 fake 一行未改即编译通过
+- 在途 workflow 重放不失败——由改动前录制的 history fixture + `WorkflowReplayer` 测试证明（§6 已选定此项，不留二选一）
 - CLAUDE.md §4/§12 的 signal 描述已更正，并注明按钮未实现及其前置
 
 ## 10. 按钮为何拆出去（下一轮的输入）
