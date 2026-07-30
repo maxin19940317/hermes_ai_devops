@@ -75,12 +75,32 @@ workflow 代码，就再也录不到这份历史了，而设计 §6 把"旧 hist
 
 **录制器必须拒绝覆盖已存在的 fixture**：
 
-用 `O_CREATE|O_EXCL` **原子**取得首次写入权，而不是 `os.Stat` 预检查——
-后者是"检查后写入"竞态，且没处理 `Stat` 返回非 `NotExist` 错误的情形：
+`testdata/` 目录**当前不存在**，而 `os.OpenFile` 不会创建父目录。写盘必须按此固定顺序：
+
+1. 拉取 history 并序列化到内存（`data []byte`）
+2. **先校验**内容合格（含 `WorkflowExecutionStarted` 与 `WorkflowExecutionCompleted`）——
+   不合格就根本不该落盘
+3. `os.MkdirAll("testdata", 0o755)`
+4. `os.OpenFile(..., O_CREATE|O_EXCL|O_WRONLY, 0o644)` **原子**取得首次写入权
+5. 写入 → 检查 `Write` 与 `Close` 的返回
+6. **任何一步失败都要删掉半成品**——否则下次录制会被 `O_EXCL` 永久挡住，
+   而挡它的是一个残缺文件
+
+用 `O_EXCL` 而不是 `os.Stat` 预检查：后者是"检查后写入"竞态，且没处理 `Stat` 返回
+非 `NotExist` 错误的情形。
 
 ```go
 	const fixture = "testdata/history-pre-notify-card.json"
-	f, err := os.OpenFile(fixture, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+
+	data := serializeHistory(t, c, wfID, runID) // 步骤 1
+	if !bytes.Contains(data, []byte("WorkflowExecutionStarted")) ||
+		!bytes.Contains(data, []byte("WorkflowExecutionCompleted")) {
+		t.Fatalf("history 不完整,拒绝落盘(%d 字节)", len(data)) // 步骤 2
+	}
+	if err := os.MkdirAll(filepath.Dir(fixture), 0o755); err != nil {
+		t.Fatalf("创建 testdata 目录失败: %v", err) // 步骤 3
+	}
+	f, err := os.OpenFile(fixture, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644) // 步骤 4
 	if errors.Is(err, os.ErrExist) {
 		t.Fatalf("%s 已存在,拒绝覆盖。这份 history 必须是**改动前**录的;"+
 			"Task 5 之后再跑本录制器会把它替换成改动后的历史,"+
@@ -89,7 +109,21 @@ workflow 代码，就再也录不到这份历史了，而设计 §6 把"旧 hist
 	if err != nil {
 		t.Fatalf("创建 %s 失败: %v", fixture, err)
 	}
-	defer f.Close()
+	// 步骤 6:失败即删半成品,否则 O_EXCL 会被一个残缺文件永久占住
+	ok := false
+	defer func() {
+		cerr := f.Close()
+		if !ok || cerr != nil {
+			_ = os.Remove(fixture)
+			if cerr != nil {
+				t.Errorf("关闭 %s 失败,已删除: %v", fixture, cerr)
+			}
+		}
+	}()
+	if _, err := f.Write(data); err != nil { // 步骤 5
+		t.Fatalf("写入 %s 失败(将删除): %v", fixture, err)
+	}
+	ok = true
 ```
 
 这不是防呆，是防一种**会静默毁掉回归判据**的操作：文件被覆盖后重放测试照样绿，
@@ -283,7 +317,8 @@ Expected: 新用例全 PASS，**既有 `SendText` 用例一条未改即通过**
 - [ ] **Step 6: Commit**
 
 ```bash
-/home/maxin/.local/go/bin/gofmt -w runtime/internal/feishu/
+/home/maxin/.local/go/bin/gofmt -w \
+  runtime/internal/feishu/feishu.go runtime/internal/feishu/feishu_test.go
 git add runtime/internal/feishu/
 git commit -m "feat(feishu): add CardSender with per-mode wire shapes"
 ```
@@ -337,6 +372,25 @@ func TestBuildNotificationCardHeaderColor(t *testing.T) {
 	}
 }
 ```
+
+**空任务正文**——颜色断言挡不住"绿 header + 空 Elements"这种实现：
+
+```go
+// out.Tasks 为空时,正文必须是与纯文本同款的提示,而不是什么都不放。
+func TestBuildNotificationCardEmptyTasks(t *testing.T) {
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, &DeviceTestOutput{})
+	want := []CardElement{
+		{Tag: "div", Text: &CardText{Tag: "plain_text",
+			Content: "无可测变体(Android 包缺失或未配置)"}},
+	}
+	if !reflect.DeepEqual(card.Elements, want) {
+		t.Errorf("空任务正文不匹配\ngot:\n%swant:\n%s",
+			dumpElements(card.Elements), dumpElements(want))
+	}
+}
+```
+
+文案必须与 `buildNotification` 里那句**逐字相同**（设计 §4.3 对照表最后一行）。
 
 **封闭结构**（设计 §4.4；含三份反例证明断言不空转）：
 
@@ -502,9 +556,9 @@ Expected: 编译失败 —— `buildNotificationCard` / `NotificationCard` 未�
 - header 标题与 `buildNotification` 第一行同源：`[hermes-devops] {project} g{commit} p{pipeline} (v{version})`
 - 颜色：先算可判定失败集合（`verdict ∉ {PASSED, SKIPPED}`），非空且**存在非 INFRA** → red；
   非空且全 INFRA → orange；空 → green
-- 每个变体一个 `div`：主行 `{variant}  {verdict}` + 非 PASSED 时 `({category})`；
-  指标行仅在 `CasesTotal > 0` 时出现，含 duration 与 cases；
-  `SKIPPED` 不输出 attempt，其余输出
+- **每个变体产出多个 `div`**（不是一个）：主行、指标行、reason 行、hermes 行各自独立，
+  出现条件见上方格式表；变体之间插 `{Tag: "hr"}`（首个变体前不插）。
+  这一点必须与黄金测试的 `want` 完全一致——把四行塞进一个 `div` 会让黄金比对红
 - `Reason` / `Summary` 各自 `truncateRunes(s, 500)`
 - 全部文本节点 `Tag: "plain_text"`
 - 末尾按 §4.5 的两步裁剪：超预算 → 从末尾变体丢可选行 → 加标注 → **重新 Marshal 测量**
@@ -526,7 +580,8 @@ Expected: **FAIL**（`utf8.ValidString` 为假）。改回来确认恢复 PASS�
 - [ ] **Step 7: Commit**
 
 ```bash
-/home/maxin/.local/go/bin/gofmt -w runtime/internal/workflow/
+/home/maxin/.local/go/bin/gofmt -w \
+  runtime/internal/workflow/devicetest.go runtime/internal/workflow/devicetest_test.go
 git add runtime/internal/workflow/
 git commit -m "feat(workflow): build the notification card as a closed DTO"
 ```
@@ -674,7 +729,9 @@ Expected: **FAIL** —— "超预算"那条的 `wantCards=0` 不满足。改回�
 - [ ] **Step 7: Commit**
 
 ```bash
-/home/maxin/.local/go/bin/gofmt -w runtime/internal/activity/ runtime/internal/workflow/
+/home/maxin/.local/go/bin/gofmt -w \
+  runtime/internal/activity/notify_card.go runtime/internal/activity/notify_card_test.go \
+  runtime/internal/workflow/devicetest.go
 git add runtime/internal/activity/ runtime/internal/workflow/devicetest.go
 git commit -m "feat(activity): add NotifyCard with a single over-budget path"
 ```
@@ -746,7 +803,8 @@ Expected: 全部 PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-/home/maxin/.local/go/bin/gofmt -w runtime/internal/workflow/
+/home/maxin/.local/go/bin/gofmt -w \
+  runtime/internal/workflow/devicetest.go runtime/internal/workflow/devicetest_test.go
 git add runtime/internal/workflow/
 git commit -m "feat(workflow): send notification cards behind a version gate"
 ```
@@ -811,4 +869,3 @@ git commit -m "docs: notification cards shipped; correct the signal description"
 2. 触发一次含 `TEST_FAILED` 的 → **红色**；含 `INFRA_ERROR` 且无其他失败的 → **橙色**
 3. 一次同时含 `INFRA_ERROR` 与 `TEST_FAILED` 的 → **红色**（不是橙）
 4. 卡片上**没有任何按钮**
-
