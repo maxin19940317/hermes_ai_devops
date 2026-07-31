@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -436,6 +437,295 @@ func (s *PGStore) FinalizeAction(
 		return false, fmt.Errorf("finalize action %s: commit: %w", workflowID, err)
 	}
 	return true, nil
+}
+
+// PutCardSnapshot persists the original display card as JSONB.
+func (s *PGStore) PutCardSnapshot(
+	ctx context.Context, workflowID string, cardJSON []byte,
+) error {
+	if workflowID == "" || !json.Valid(cardJSON) {
+		return errors.New("put card snapshot: workflow id and valid JSON are required")
+	}
+	if _, err := s.DB.ExecContext(ctx, `
+		INSERT INTO card_action_snapshots (workflow_id, card_json)
+		VALUES ($1,$2::jsonb)
+		ON CONFLICT (workflow_id) DO UPDATE SET card_json=EXCLUDED.card_json`,
+		workflowID, string(cardJSON)); err != nil {
+		return fmt.Errorf("put card snapshot %s: %w", workflowID, err)
+	}
+	return nil
+}
+
+// GetCardSnapshot loads the persisted original display card.
+func (s *PGStore) GetCardSnapshot(ctx context.Context, workflowID string) ([]byte, error) {
+	var cardJSON []byte
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT card_json
+		  FROM card_action_snapshots
+		 WHERE workflow_id=$1`, workflowID).Scan(&cardJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s", ErrCardSnapshotNotFound, workflowID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get card snapshot %s: %w", workflowID, err)
+	}
+	return append([]byte(nil), cardJSON...), nil
+}
+
+// ClaimMessage atomically leases one due message. The candidate CTE reads the
+// message and action in one PostgreSQL statement snapshot, so action renders
+// cannot mix desired_revision with a different action revision/state.
+func (s *PGStore) ClaimMessage(
+	ctx context.Context, token string, lease time.Duration,
+) (*MessageClaim, error) {
+	var claim MessageClaim
+	var hasAction bool
+	var actionName, actorOpenID, state, owner, targetWorkflowID, lastError sql.NullString
+	var actionLease sql.NullTime
+	var attempt, revision sql.NullInt64
+	var targetInput []byte
+	err := s.DB.QueryRowContext(ctx, `
+		WITH candidate AS (
+			SELECT m.workflow_id, m.open_message_id, m.render_kind,
+			       m.rejection_reason, m.buttons_mode, m.desired_revision,
+			       a.workflow_id IS NOT NULL AS has_action,
+			       a.action, a.actor_open_id, a.state, a.owner,
+			       a.lease_expires_at, a.target_workflow_id, a.attempt,
+			       a.target_input, a.last_error, a.revision
+			  FROM card_action_messages m
+			  LEFT JOIN card_actions a
+			    ON a.workflow_id=m.workflow_id AND m.render_kind='action'
+			 WHERE m.update_state='pending'
+			   AND (m.lease_expires_at IS NULL OR m.lease_expires_at < clock_timestamp())
+			   AND (m.reconcile_after IS NULL OR m.reconcile_after <= clock_timestamp())
+			   AND (m.render_kind <> 'action' OR a.revision=m.desired_revision)
+			 ORDER BY m.updated_at, m.workflow_id, m.open_message_id
+			 LIMIT 1
+			 FOR UPDATE OF m SKIP LOCKED
+		), claimed AS (
+			UPDATE card_action_messages m
+			   SET owner=$1,
+			       lease_expires_at=clock_timestamp()+make_interval(secs => $2),
+			       attempts=m.attempts+1,
+			       updated_at=clock_timestamp()
+			  FROM candidate c
+			 WHERE m.workflow_id=c.workflow_id
+			   AND m.open_message_id=c.open_message_id
+			RETURNING m.workflow_id, m.open_message_id, m.render_kind,
+			          m.rejection_reason, m.buttons_mode, m.desired_revision
+		)
+		SELECT c.workflow_id, c.open_message_id, c.render_kind,
+		       c.rejection_reason, c.buttons_mode, c.desired_revision,
+		       c.has_action, c.action, c.actor_open_id, c.state, c.owner,
+		       c.lease_expires_at, c.target_workflow_id, c.attempt,
+		       c.target_input, c.last_error, c.revision
+		  FROM claimed
+		  JOIN candidate c USING (workflow_id, open_message_id)`,
+		token, lease.Seconds()).Scan(
+		&claim.WorkflowID, &claim.OpenMessageID, &claim.RenderKind,
+		&claim.RejectionReason, &claim.ButtonsMode, &claim.DesiredRevision,
+		&hasAction, &actionName, &actorOpenID, &state, &owner, &actionLease,
+		&targetWorkflowID, &attempt, &targetInput, &lastError, &revision,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim card action message: %w", err)
+	}
+	if hasAction {
+		action := CardAction{
+			WorkflowID: claim.WorkflowID, Action: actionName.String,
+			ActorOpenID: actorOpenID.String, State: state.String, Owner: owner.String,
+			TargetWorkflowID: targetWorkflowID.String, Attempt: int(attempt.Int64),
+			TargetInput: append([]byte(nil), targetInput...), LastError: lastError.String,
+			Revision: int(revision.Int64),
+		}
+		if actionLease.Valid {
+			expires := actionLease.Time.UTC()
+			action.LeaseExpiresAt = &expires
+		}
+		claim.Action = &action
+	}
+	return &claim, nil
+}
+
+// CompleteMessageRender marks one claimed revision rendered.
+func (s *PGStore) CompleteMessageRender(
+	ctx context.Context, claim MessageClaim, token string,
+) (bool, error) {
+	return s.finishMessageRender(ctx, claim, token, "succeeded", 0, "")
+}
+
+// DeferMessageRender leaves the message pending and delays its next sweep.
+func (s *PGStore) DeferMessageRender(
+	ctx context.Context, claim MessageClaim, token string, after time.Duration, lastErr string,
+) (bool, error) {
+	return s.finishMessageRender(ctx, claim, token, "deferred", after, lastErr)
+}
+
+// AbandonMessageRender terminates a permanently unrenderable message.
+func (s *PGStore) AbandonMessageRender(
+	ctx context.Context, claim MessageClaim, token, lastErr string,
+) (bool, error) {
+	return s.finishMessageRender(ctx, claim, token, "abandoned", 0, lastErr)
+}
+
+func (s *PGStore) finishMessageRender(
+	ctx context.Context,
+	claim MessageClaim,
+	token, outcome string,
+	after time.Duration,
+	lastErr string,
+) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("finish message render %s/%s: begin: %w",
+			claim.WorkflowID, claim.OpenMessageID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var owner, updateState string
+	var leaseExpiresAt sql.NullTime
+	var desiredRevision int
+	err = tx.QueryRowContext(ctx, `
+		SELECT owner, lease_expires_at, desired_revision, update_state
+		  FROM card_action_messages
+		 WHERE workflow_id=$1 AND open_message_id=$2
+		 FOR UPDATE`,
+		claim.WorkflowID, claim.OpenMessageID,
+	).Scan(&owner, &leaseExpiresAt, &desiredRevision, &updateState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("finish message render %s/%s: fence: %w",
+			claim.WorkflowID, claim.OpenMessageID, err)
+	}
+
+	acquiredAt := time.Now().UTC()
+	if updateState != "pending" || owner != token || !leaseExpiresAt.Valid ||
+		!leaseExpiresAt.Time.UTC().After(acquiredAt) ||
+		desiredRevision != claim.DesiredRevision {
+		return false, nil
+	}
+
+	var result sql.Result
+	switch outcome {
+	case "succeeded":
+		result, err = tx.ExecContext(ctx, `
+			UPDATE card_action_messages
+			   SET rendered_revision=$4, update_state='succeeded',
+			       owner='', lease_expires_at=NULL, reconcile_after=NULL,
+			       last_error='', updated_at=$5
+			 WHERE workflow_id=$1 AND open_message_id=$2
+			   AND owner=$3 AND desired_revision=$4 AND update_state='pending'`,
+			claim.WorkflowID, claim.OpenMessageID, token, claim.DesiredRevision, acquiredAt)
+	case "deferred":
+		result, err = tx.ExecContext(ctx, `
+			UPDATE card_action_messages
+			   SET update_state='pending', owner='', lease_expires_at=NULL,
+			       reconcile_after=$5, last_error=$6, updated_at=$7
+			 WHERE workflow_id=$1 AND open_message_id=$2
+			   AND owner=$3 AND desired_revision=$4 AND update_state='pending'`,
+			claim.WorkflowID, claim.OpenMessageID, token, claim.DesiredRevision,
+			acquiredAt.Add(after), lastErr, acquiredAt)
+	case "abandoned":
+		result, err = tx.ExecContext(ctx, `
+			UPDATE card_action_messages
+			   SET update_state='abandoned', owner='', lease_expires_at=NULL,
+			       reconcile_after=NULL, last_error=$5, updated_at=$6
+			 WHERE workflow_id=$1 AND open_message_id=$2
+			   AND owner=$3 AND desired_revision=$4 AND update_state='pending'`,
+			claim.WorkflowID, claim.OpenMessageID, token, claim.DesiredRevision,
+			lastErr, acquiredAt)
+	default:
+		return false, fmt.Errorf("finish message render: invalid outcome %q", outcome)
+	}
+	if err != nil {
+		return false, fmt.Errorf("finish message render %s/%s: update: %w",
+			claim.WorkflowID, claim.OpenMessageID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("finish message render %s/%s: rows affected: %w",
+			claim.WorkflowID, claim.OpenMessageID, err)
+	}
+	if affected != 1 {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("finish message render %s/%s: commit: %w",
+			claim.WorkflowID, claim.OpenMessageID, err)
+	}
+	return true, nil
+}
+
+// ClaimStaleAction leases one ownerless or expired pending action.
+func (s *PGStore) ClaimStaleAction(
+	ctx context.Context, token string, lease time.Duration,
+) (*CardAction, error) {
+	action, err := scanCardAction(s.DB.QueryRowContext(ctx, `
+		WITH candidate AS (
+			SELECT workflow_id
+			  FROM card_actions
+			 WHERE state='pending'
+			   AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp())
+			 ORDER BY updated_at, workflow_id
+			 LIMIT 1
+			 FOR UPDATE SKIP LOCKED
+		)
+		UPDATE card_actions a
+		   SET owner=$1,
+		       lease_expires_at=clock_timestamp()+make_interval(secs => $2),
+		       updated_at=clock_timestamp()
+		  FROM candidate c
+		 WHERE a.workflow_id=c.workflow_id
+		RETURNING a.workflow_id, a.action, a.actor_open_id, a.state, a.owner,
+		          a.lease_expires_at, a.target_workflow_id, a.attempt,
+		          a.target_input, a.last_error, a.revision`,
+		token, lease.Seconds()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim stale card action: %w", err)
+	}
+	return &action, nil
+}
+
+// ClaimStaleInbox leases one ownerless or expired received inbox row.
+func (s *PGStore) ClaimStaleInbox(
+	ctx context.Context, token string, lease time.Duration,
+) (*InboxRow, error) {
+	row, err := scanInboxRow(s.DB.QueryRowContext(ctx, `
+		WITH candidate AS (
+			SELECT event_id
+			  FROM card_action_inbox
+			 WHERE state='received'
+			   AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp())
+			 ORDER BY received_at, event_id
+			 LIMIT 1
+			 FOR UPDATE SKIP LOCKED
+		)
+		UPDATE card_action_inbox i
+		   SET owner=$1,
+		       lease_expires_at=clock_timestamp()+make_interval(secs => $2),
+		       attempts=i.attempts+1
+		  FROM candidate c
+		 WHERE i.event_id=c.event_id
+		RETURNING i.event_id, i.disposition, i.ack_toast, i.action,
+		          i.workflow_id, i.actor_open_id, i.open_message_id,
+		          i.payload_digest, i.state, i.owner, i.lease_expires_at,
+		          i.attempts, i.last_error, i.processed_at`,
+		token, lease.Seconds()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim stale card action inbox: %w", err)
+	}
+	return &row, nil
 }
 
 func upsertActionMessageTx(

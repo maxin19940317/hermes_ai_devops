@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -21,6 +22,8 @@ var (
 	// 或租约仍被别的 worker 持有——调用方对三者一视同仁(退避重试),故只用一个
 	// 哨兵值,不强行区分。
 	ErrInboxNotClaimable = errors.New("card action inbox event not claimable")
+	// ErrCardSnapshotNotFound 表示 workflow 尚未持久化原展示卡。
+	ErrCardSnapshotNotFound = errors.New("card action snapshot not found")
 )
 
 // InboxRow 对应 card_action_inbox 一行(schema.sql,设计文档 §3.1)。
@@ -67,6 +70,18 @@ type CardAction struct {
 	Attempt          int
 	Revision         int
 	TargetInput      []byte
+}
+
+// MessageClaim 是一次卡片渲染租约钉住的不可变输入。Action 仅在
+// RenderKind=action 时存在，且其 Revision 必须等于 DesiredRevision。
+type MessageClaim struct {
+	WorkflowID      string
+	OpenMessageID   string
+	RenderKind      string
+	RejectionReason string
+	ButtonsMode     string
+	DesiredRevision int
+	Action          *CardAction
 }
 
 // AcceptRequest 是 CompleteAccept 的原子输入。BuildTarget 只在首次 retry
@@ -376,6 +391,214 @@ func (s *MemStore) FinalizeAction(
 	s.cardActions[workflowID] = cloneCardAction(action)
 	s.reorderActionMessagesLocked(workflowID, action.Revision)
 	return true, nil
+}
+
+// PutCardSnapshot 按 workflow 保存原展示卡，并复制调用方字节。
+func (s *MemStore) PutCardSnapshot(_ context.Context, workflowID string, cardJSON []byte) error {
+	if workflowID == "" || !json.Valid(cardJSON) {
+		return errors.New("put card snapshot: workflow id and valid JSON are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cardSnapshots[workflowID] = append([]byte(nil), cardJSON...)
+	return nil
+}
+
+// GetCardSnapshot 返回原展示卡的副本，调用方修改返回值不会污染存储。
+func (s *MemStore) GetCardSnapshot(_ context.Context, workflowID string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cardJSON, ok := s.cardSnapshots[workflowID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrCardSnapshotNotFound, workflowID)
+	}
+	return append([]byte(nil), cardJSON...), nil
+}
+
+// ClaimMessage 取得一个到期且已到复核时间的 pending 消息。候选按键排序，
+// 让 MemStore 与 PostgreSQL 的 sweep 都有稳定归宿。
+func (s *MemStore) ClaimMessage(
+	_ context.Context, token string, lease time.Duration,
+) (*MessageClaim, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	keys := make([]string, 0, len(s.cardActionMessages))
+	for key, row := range s.cardActionMessages {
+		if row.UpdateState != "pending" ||
+			(row.LeaseExpiresAt != nil && !row.LeaseExpiresAt.Before(now)) ||
+			(row.ReconcileAfter != nil && row.ReconcileAfter.After(now)) {
+			continue
+		}
+		if row.RenderKind == "action" {
+			action, ok := s.cardActions[row.WorkflowID]
+			if !ok || action.Revision != row.DesiredRevision {
+				continue
+			}
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	sort.Strings(keys)
+
+	key := keys[0]
+	row := s.cardActionMessages[key]
+	acquiredAt := time.Now().UTC()
+	expires := acquiredAt.Add(lease)
+	row.Owner = token
+	row.LeaseExpiresAt = &expires
+	row.Attempts++
+	s.cardActionMessages[key] = row
+
+	claim := messageClaimFromRow(row)
+	if row.RenderKind == "action" {
+		action := cloneCardAction(s.cardActions[row.WorkflowID])
+		claim.Action = &action
+	}
+	return &claim, nil
+}
+
+// CompleteMessageRender marks the claimed revision rendered only while the
+// owner, live lease, message identity, and claimed revision still match.
+func (s *MemStore) CompleteMessageRender(
+	_ context.Context, claim MessageClaim, token string,
+) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, key, ok := s.liveMessageClaimLocked(claim, token)
+	if !ok {
+		return false, nil
+	}
+	row.RenderedRevision = claim.DesiredRevision
+	row.UpdateState = "succeeded"
+	row.Owner = ""
+	row.LeaseExpiresAt = nil
+	row.ReconcileAfter = nil
+	row.LastError = ""
+	s.cardActionMessages[key] = row
+	return true, nil
+}
+
+// DeferMessageRender keeps the row pending after an ambiguous PATCH result and
+// schedules a later reconciliation from a fresh wall-clock reading.
+func (s *MemStore) DeferMessageRender(
+	_ context.Context, claim MessageClaim, token string, after time.Duration, lastErr string,
+) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, key, ok := s.liveMessageClaimLocked(claim, token)
+	if !ok {
+		return false, nil
+	}
+	reconcileAfter := time.Now().UTC().Add(after)
+	row.UpdateState = "pending"
+	row.Owner = ""
+	row.LeaseExpiresAt = nil
+	row.ReconcileAfter = &reconcileAfter
+	row.LastError = lastErr
+	s.cardActionMessages[key] = row
+	return true, nil
+}
+
+// AbandonMessageRender terminates a permanently unrenderable message claim.
+func (s *MemStore) AbandonMessageRender(
+	_ context.Context, claim MessageClaim, token, lastErr string,
+) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, key, ok := s.liveMessageClaimLocked(claim, token)
+	if !ok {
+		return false, nil
+	}
+	row.UpdateState = "abandoned"
+	row.Owner = ""
+	row.LeaseExpiresAt = nil
+	row.ReconcileAfter = nil
+	row.LastError = lastErr
+	s.cardActionMessages[key] = row
+	return true, nil
+}
+
+// ClaimStaleAction leases one expired or ownerless pending action.
+func (s *MemStore) ClaimStaleAction(
+	_ context.Context, token string, lease time.Duration,
+) (*CardAction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	keys := make([]string, 0, len(s.cardActions))
+	for workflowID, row := range s.cardActions {
+		if row.State == "pending" &&
+			(row.LeaseExpiresAt == nil || row.LeaseExpiresAt.Before(now)) {
+			keys = append(keys, workflowID)
+		}
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	sort.Strings(keys)
+	workflowID := keys[0]
+	row := s.cardActions[workflowID]
+	expires := time.Now().UTC().Add(lease)
+	row.Owner = token
+	row.LeaseExpiresAt = &expires
+	s.cardActions[workflowID] = cloneCardAction(row)
+	out := cloneCardAction(row)
+	return &out, nil
+}
+
+// ClaimStaleInbox leases one expired or ownerless received inbox row.
+func (s *MemStore) ClaimStaleInbox(
+	_ context.Context, token string, lease time.Duration,
+) (*InboxRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	keys := make([]string, 0, len(s.inbox))
+	for eventID, row := range s.inbox {
+		if row.State == "received" &&
+			(row.LeaseExpiresAt == nil || row.LeaseExpiresAt.Before(now)) {
+			keys = append(keys, eventID)
+		}
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	sort.Strings(keys)
+	eventID := keys[0]
+	row := s.inbox[eventID]
+	expires := time.Now().UTC().Add(lease)
+	row.Owner = token
+	row.LeaseExpiresAt = &expires
+	row.Attempts++
+	s.inbox[eventID] = row
+	out := row
+	return &out, nil
+}
+
+func messageClaimFromRow(row cardActionMessage) MessageClaim {
+	return MessageClaim{
+		WorkflowID: row.WorkflowID, OpenMessageID: row.OpenMessageID,
+		RenderKind: row.RenderKind, RejectionReason: row.RejectionReason,
+		ButtonsMode: row.ButtonsMode, DesiredRevision: row.DesiredRevision,
+	}
+}
+
+func (s *MemStore) liveMessageClaimLocked(
+	claim MessageClaim, token string,
+) (cardActionMessage, string, bool) {
+	key := messageKey(claim.WorkflowID, claim.OpenMessageID)
+	row, ok := s.cardActionMessages[key]
+	now := time.Now().UTC()
+	if !ok || row.UpdateState != "pending" || row.Owner != token ||
+		row.LeaseExpiresAt == nil || !row.LeaseExpiresAt.After(now) ||
+		row.DesiredRevision != claim.DesiredRevision {
+		return cardActionMessage{}, key, false
+	}
+	return row, key, true
 }
 
 func validateAcceptEnvelope(req AcceptRequest) error {

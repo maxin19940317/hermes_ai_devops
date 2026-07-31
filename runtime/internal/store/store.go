@@ -69,6 +69,8 @@ type MemStore struct {
 	// cardActions/cardActionMessages 分别是设计文档 §3.2/§3.3 的内存视图。
 	cardActions        map[string]CardAction
 	cardActionMessages map[string]cardActionMessage
+	// cardSnapshots 是设计文档 §3.4 card_action_snapshots 的内存视图。
+	cardSnapshots map[string][]byte
 	// seq 是插入序计数器,给 artifacts/tasks 提供确定的"最近"排序
 	// (内存实现无 created_at 列)。
 	seq    int64
@@ -93,6 +95,7 @@ func NewMemStore() *MemStore {
 		inbox:              map[string]InboxRow{},
 		cardActions:        map[string]CardAction{},
 		cardActionMessages: map[string]cardActionMessage{},
+		cardSnapshots:      map[string][]byte{},
 	}
 }
 

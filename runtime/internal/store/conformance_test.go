@@ -66,6 +66,14 @@ type fullStore interface {
 	CompleteAccept(ctx context.Context, req AcceptRequest) (*AcceptOutcome, error)
 	CompleteReject(ctx context.Context, eventID, token string, r RejectRender) error
 	FinalizeAction(ctx context.Context, workflowID, token, state, lastErr string) (bool, error)
+	PutCardSnapshot(ctx context.Context, workflowID string, cardJSON []byte) error
+	GetCardSnapshot(ctx context.Context, workflowID string) ([]byte, error)
+	ClaimMessage(ctx context.Context, token string, lease time.Duration) (*MessageClaim, error)
+	CompleteMessageRender(ctx context.Context, claim MessageClaim, token string) (bool, error)
+	DeferMessageRender(ctx context.Context, claim MessageClaim, token string, after time.Duration, lastErr string) (bool, error)
+	AbandonMessageRender(ctx context.Context, claim MessageClaim, token, lastErr string) (bool, error)
+	ClaimStaleAction(ctx context.Context, token string, lease time.Duration) (*CardAction, error)
+	ClaimStaleInbox(ctx context.Context, token string, lease time.Duration) (*InboxRow, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -262,6 +270,235 @@ func TestPGCompletionRechecksLeaseAfterLockWait(t *testing.T) {
 			t.Fatalf("expired FinalizeAction changed action after lock wait: %#v", action)
 		}
 	})
+}
+
+func TestPGMessageCompletionRechecksLeaseAfterLockWait(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(*PGStore, MessageClaim) (bool, error)
+	}{
+		{name: "CompleteMessageRender", call: func(s *PGStore, c MessageClaim) (bool, error) {
+			return s.CompleteMessageRender(ctx, c, "renderer")
+		}},
+		{name: "DeferMessageRender", call: func(s *PGStore, c MessageClaim) (bool, error) {
+			return s.DeferMessageRender(ctx, c, "renderer", time.Minute, "timeout")
+		}},
+		{name: "AbandonMessageRender", call: func(s *PGStore, c MessageClaim) (bool, error) {
+			return s.AbandonMessageRender(ctx, c, "renderer", "gone")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTestPG(t)
+			seedAcceptedRetry(t, s, "wf1", "tokA")
+			claim, err := s.ClaimMessage(ctx, "renderer", 120*time.Second)
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimMessage: (%#v, %v)", claim, err)
+			}
+
+			blocker, err := s.DB.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatalf("begin message blocker: %v", err)
+			}
+			defer func() { _ = blocker.Rollback() }()
+			var blockerPID int
+			var expires time.Time
+			if err := blocker.QueryRowContext(ctx, `
+				UPDATE card_action_messages
+				   SET lease_expires_at=clock_timestamp()+interval '250 milliseconds'
+				 WHERE workflow_id='wf1' AND open_message_id='om_shared'
+				RETURNING pg_backend_pid(), lease_expires_at`).Scan(
+				&blockerPID, &expires,
+			); err != nil {
+				t.Fatalf("shorten and lock message lease: %v", err)
+			}
+
+			type renderResult struct {
+				ok  bool
+				err error
+			}
+			result := make(chan renderResult, 1)
+			go func() {
+				ok, err := tc.call(s, *claim)
+				result <- renderResult{ok: ok, err: err}
+			}()
+			waitForBlockedCardActionQuery(t, s, blockerPID)
+			sleepPast(t, expires)
+			if err := blocker.Commit(); err != nil {
+				t.Fatalf("release message lock: %v", err)
+			}
+
+			got := <-result
+			if got.err != nil || got.ok {
+				t.Fatalf("%s after lease expiry = (%v, %v), want false", tc.name, got.ok, got.err)
+			}
+			message := mustGetActionMessage(t, s, "wf1", "om_shared")
+			if message.UpdateState != "pending" || message.RenderedRevision != 0 ||
+				message.ReconcileAfter != nil || message.LastError != "" ||
+				message.Owner != "renderer" || message.Attempts != 1 {
+				t.Fatalf("expired %s changed message: %#v", tc.name, message)
+			}
+		})
+	}
+}
+
+func TestPGConcurrentStaleClaimsAreExclusive(t *testing.T) {
+	type claimResult struct {
+		id  string
+		err error
+	}
+	run := func(t *testing.T, claim func(string) (string, error)) {
+		t.Helper()
+		start := make(chan struct{})
+		results := make(chan claimResult, 2)
+		var wg sync.WaitGroup
+		for _, token := range []string{"sweeper-a", "sweeper-b"} {
+			token := token
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				id, err := claim(token)
+				results <- claimResult{id: id, err: err}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+
+		claimed := 0
+		for result := range results {
+			if result.err != nil {
+				t.Fatalf("concurrent claim: %v", result.err)
+			}
+			if result.id != "" {
+				claimed++
+			}
+		}
+		if claimed != 1 {
+			t.Fatalf("claimed=%d, want exactly one", claimed)
+		}
+	}
+
+	t.Run("Message", func(t *testing.T) {
+		s := openTestPG(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		run(t, func(token string) (string, error) {
+			claim, err := s.ClaimMessage(ctx, token, 120*time.Second)
+			if claim == nil {
+				return "", err
+			}
+			return claim.WorkflowID + "/" + claim.OpenMessageID, err
+		})
+	})
+
+	t.Run("Action", func(t *testing.T) {
+		s := openTestPG(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		expireActionLease(t, s, "wf1")
+		run(t, func(token string) (string, error) {
+			claim, err := s.ClaimStaleAction(ctx, token, 120*time.Second)
+			if claim == nil {
+				return "", err
+			}
+			return claim.WorkflowID, err
+		})
+	})
+
+	t.Run("Inbox", func(t *testing.T) {
+		s := openTestPG(t)
+		if _, inserted, err := s.PutInbox(ctx, InboxRow{
+			EventID: "e1", Disposition: "accepted", AckToast: "ack",
+			Action: "retry", WorkflowID: "wf1", ActorOpenID: "ou_x",
+			OpenMessageID: "om_1", State: "received",
+		}, nil); err != nil || !inserted {
+			t.Fatalf("PutInbox = (%v, %v)", inserted, err)
+		}
+		run(t, func(token string) (string, error) {
+			claim, err := s.ClaimStaleInbox(ctx, token, 120*time.Second)
+			if claim == nil {
+				return "", err
+			}
+			return claim.EventID, err
+		})
+	})
+}
+
+func TestPGMessageClaimActionSnapshotMatchesDesiredRevisionDuringFinalize(t *testing.T) {
+	s := openTestPG(t)
+	for i := 0; i < 12; i++ {
+		workflowID := fmt.Sprintf("wf-race-%02d", i)
+		seedAcceptedRetry(t, s, workflowID, "tokA")
+
+		start := make(chan struct{})
+		type claimResult struct {
+			claim *MessageClaim
+			err   error
+		}
+		claimed := make(chan claimResult, 1)
+		finalized := make(chan error, 1)
+		go func() {
+			<-start
+			claim, err := s.ClaimMessage(ctx, "renderer-"+workflowID, 120*time.Second)
+			claimed <- claimResult{claim: claim, err: err}
+		}()
+		go func() {
+			<-start
+			ok, err := s.FinalizeAction(ctx, workflowID, "tokA", "succeeded", "")
+			if err == nil && !ok {
+				err = errors.New("FinalizeAction lost live action claim")
+			}
+			finalized <- err
+		}()
+		close(start)
+
+		got := <-claimed
+		finalizeErr := <-finalized
+		claimToken := "renderer-" + workflowID
+		if got.err == nil && got.claim == nil {
+			claimToken = "renderer-retry-" + workflowID
+			got.claim, got.err = s.ClaimMessage(
+				ctx, claimToken, 120*time.Second,
+			)
+		}
+		if got.err != nil || got.claim == nil || got.claim.Action == nil {
+			t.Fatalf("iteration %d ClaimMessage = (%#v, %v)", i, got.claim, got.err)
+		}
+		if got.claim.WorkflowID != workflowID ||
+			got.claim.Action.Revision != got.claim.DesiredRevision {
+			t.Fatalf("iteration %d observed mixed revisions: %#v", i, got.claim)
+		}
+		switch got.claim.DesiredRevision {
+		case 1:
+			if got.claim.Action.State != "pending" {
+				t.Fatalf("revision 1 snapshot state=%q, want pending", got.claim.Action.State)
+			}
+		case 2:
+			if got.claim.Action.State != "succeeded" {
+				t.Fatalf("revision 2 snapshot state=%q, want succeeded", got.claim.Action.State)
+			}
+		default:
+			t.Fatalf("unexpected claim revision %#v", got.claim)
+		}
+		if finalizeErr != nil {
+			t.Fatalf("iteration %d finalize: %v", i, finalizeErr)
+		}
+		if got.claim.DesiredRevision == 1 {
+			if ok, err := s.CompleteMessageRender(ctx, *got.claim, claimToken); err != nil || ok {
+				t.Fatalf("iteration %d stale rev1 completion = (%v, %v)", i, ok, err)
+			}
+			claimToken = "renderer-final-" + workflowID
+			got.claim, got.err = s.ClaimMessage(ctx, claimToken, 120*time.Second)
+			if got.err != nil || got.claim == nil || got.claim.WorkflowID != workflowID ||
+				got.claim.DesiredRevision != 2 || got.claim.Action == nil ||
+				got.claim.Action.Revision != 2 {
+				t.Fatalf("iteration %d final rev2 claim = (%#v, %v)", i, got.claim, got.err)
+			}
+		}
+		if ok, err := s.CompleteMessageRender(ctx, *got.claim, claimToken); err != nil || !ok {
+			t.Fatalf("iteration %d final completion = (%v, %v)", i, ok, err)
+		}
+	}
 }
 
 func TestPGConcurrentRetryAndIgnoreHaveSingleWinner(t *testing.T) {
@@ -628,7 +865,8 @@ func actionExists(t *testing.T, s fullStore, workflowID string) bool {
 
 type actionMessageState struct {
 	RenderKind, RejectionReason, ButtonsMode, UpdateState, Owner string
-	DesiredRevision                                              int
+	LastError                                                    string
+	DesiredRevision, RenderedRevision, Attempts                  int
 	LeaseExpiresAt, ReconcileAfter                               *time.Time
 }
 
@@ -645,19 +883,22 @@ func mustGetActionMessage(t *testing.T, s fullStore, workflowID, openMessageID s
 		return actionMessageState{
 			RenderKind: row.RenderKind, RejectionReason: row.RejectionReason,
 			ButtonsMode: row.ButtonsMode, UpdateState: row.UpdateState, Owner: row.Owner,
-			DesiredRevision: row.DesiredRevision, LeaseExpiresAt: row.LeaseExpiresAt,
-			ReconcileAfter: row.ReconcileAfter,
+			LastError: row.LastError, DesiredRevision: row.DesiredRevision,
+			RenderedRevision: row.RenderedRevision, Attempts: row.Attempts,
+			LeaseExpiresAt: row.LeaseExpiresAt, ReconcileAfter: row.ReconcileAfter,
 		}
 	case *PGStore:
 		var row actionMessageState
 		var lease, reconcile sql.NullTime
 		if err := st.DB.QueryRowContext(ctx, `
 			SELECT render_kind, rejection_reason, buttons_mode, desired_revision,
-			       update_state, owner, lease_expires_at, reconcile_after
+			       rendered_revision, update_state, owner, lease_expires_at,
+			       reconcile_after, attempts, last_error
 			  FROM card_action_messages
 			 WHERE workflow_id=$1 AND open_message_id=$2`, workflowID, openMessageID).Scan(
-			&row.RenderKind, &row.RejectionReason, &row.ButtonsMode, &row.DesiredRevision,
-			&row.UpdateState, &row.Owner, &lease, &reconcile,
+			&row.RenderKind, &row.RejectionReason, &row.ButtonsMode,
+			&row.DesiredRevision, &row.RenderedRevision, &row.UpdateState,
+			&row.Owner, &lease, &reconcile, &row.Attempts, &row.LastError,
 		); err != nil {
 			t.Fatalf("get card action message %s/%s: %v", workflowID, openMessageID, err)
 		}
@@ -763,6 +1004,70 @@ func expireActionLease(t *testing.T, s fullStore, workflowID string) {
 	case *PGStore:
 		if _, err := st.DB.ExecContext(ctx,
 			`UPDATE card_actions SET lease_expires_at=$2 WHERE workflow_id=$1`, workflowID, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func clearActionLease(t *testing.T, s fullStore, workflowID string) {
+	t.Helper()
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		row := st.cardActions[workflowID]
+		row.Owner = ""
+		row.LeaseExpiresAt = nil
+		st.cardActions[workflowID] = row
+		st.mu.Unlock()
+	case *PGStore:
+		if _, err := st.DB.ExecContext(ctx, `
+			UPDATE card_actions
+			   SET owner='', lease_expires_at=NULL
+			 WHERE workflow_id=$1`, workflowID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func expireMessageLease(t *testing.T, s fullStore, workflowID, openMessageID string) {
+	t.Helper()
+	past := time.Now().UTC().Add(-time.Minute)
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		key := messageKey(workflowID, openMessageID)
+		row := st.cardActionMessages[key]
+		row.LeaseExpiresAt = &past
+		st.cardActionMessages[key] = row
+		st.mu.Unlock()
+	case *PGStore:
+		if _, err := st.DB.ExecContext(ctx, `
+			UPDATE card_action_messages
+			   SET lease_expires_at=$3
+			 WHERE workflow_id=$1 AND open_message_id=$2`,
+			workflowID, openMessageID, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func makeMessageReconcileDue(t *testing.T, s fullStore, workflowID, openMessageID string) {
+	t.Helper()
+	past := time.Now().UTC().Add(-time.Minute)
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		key := messageKey(workflowID, openMessageID)
+		row := st.cardActionMessages[key]
+		row.ReconcileAfter = &past
+		st.cardActionMessages[key] = row
+		st.mu.Unlock()
+	case *PGStore:
+		if _, err := st.DB.ExecContext(ctx, `
+			UPDATE card_action_messages
+			   SET reconcile_after=$3
+			 WHERE workflow_id=$1 AND open_message_id=$2`,
+			workflowID, openMessageID, past); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -3312,6 +3617,269 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		// 租约未过期时第二个 worker 抢不到
 		if _, err := s.ClaimInbox(ctx, "e1", "tokB", 120*time.Second); !errors.Is(err, ErrInboxNotClaimable) {
 			t.Fatalf("租约有效期内第二次 claim 应失败, got %v", err)
+		}
+	})
+
+	t.Run("MessageSweepPredicateAcceptsNullLease", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+
+		claim, err := s.ClaimMessage(ctx, "tokM", 120*time.Second)
+		if err != nil || claim == nil {
+			t.Fatalf("NULL 租约的 message 必须可 claim: (%#v, %v)", claim, err)
+		}
+		if claim.WorkflowID != "wf1" || claim.OpenMessageID != "om_shared" ||
+			claim.RenderKind != "action" || claim.DesiredRevision != 1 ||
+			claim.Action == nil || claim.Action.Revision != claim.DesiredRevision {
+			t.Fatalf("message claim 未钉住一致的 action revision: %#v", claim)
+		}
+		if msg := mustGetActionMessage(t, s, "wf1", "om_shared"); msg.Attempts != 1 ||
+			msg.Owner != "tokM" || msg.LeaseExpiresAt == nil {
+			t.Fatalf("claim 未写 owner/lease/attempts: %#v", msg)
+		}
+	})
+
+	t.Run("MessageCompletionNeedsOwnerLeaseAndRevision", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		claim, err := s.ClaimMessage(ctx, "tokM", 120*time.Second)
+		if err != nil || claim == nil {
+			t.Fatalf("ClaimMessage: (%#v, %v)", claim, err)
+		}
+		if ok, err := s.FinalizeAction(ctx, "wf1", "tokA", "succeeded", ""); err != nil || !ok {
+			t.Fatalf("FinalizeAction: (%v, %v)", ok, err)
+		}
+
+		ok, err := s.CompleteMessageRender(ctx, *claim, "tokM")
+		if err != nil || ok {
+			t.Fatalf("旧 revision completion = (%v, %v), want false", ok, err)
+		}
+		msg := mustGetActionMessage(t, s, "wf1", "om_shared")
+		if msg.UpdateState != "pending" || msg.DesiredRevision != 2 ||
+			msg.RenderedRevision != 0 {
+			t.Fatalf("rev2 必须留在 pending 等待 sweep: %#v", msg)
+		}
+		next, err := s.ClaimMessage(ctx, "tokN", 120*time.Second)
+		if err != nil || next == nil || next.DesiredRevision != 2 ||
+			next.Action == nil || next.Action.Revision != 2 {
+			t.Fatalf("rev2 未被下一轮一致 claim: (%#v, %v)", next, err)
+		}
+	})
+
+	t.Run("MessageRenderOutcomesUpdateClaimedRow", func(t *testing.T) {
+		t.Run("succeeded", func(t *testing.T) {
+			s := newStore(t)
+			seedAcceptedRetry(t, s, "wf1", "tokA")
+			claim, _ := s.ClaimMessage(ctx, "tokM", 120*time.Second)
+			if ok, err := s.CompleteMessageRender(ctx, *claim, "tokM"); err != nil || !ok {
+				t.Fatalf("CompleteMessageRender = (%v, %v)", ok, err)
+			}
+			msg := mustGetActionMessage(t, s, "wf1", "om_shared")
+			if msg.UpdateState != "succeeded" || msg.RenderedRevision != 1 ||
+				msg.Owner != "" || msg.LeaseExpiresAt != nil ||
+				msg.ReconcileAfter != nil || msg.LastError != "" {
+				t.Fatalf("successful render state = %#v", msg)
+			}
+		})
+
+		t.Run("abandoned", func(t *testing.T) {
+			s := newStore(t)
+			seedAcceptedRetry(t, s, "wf1", "tokA")
+			claim, _ := s.ClaimMessage(ctx, "tokM", 120*time.Second)
+			if ok, err := s.AbandonMessageRender(
+				ctx, *claim, "tokM", "message gone",
+			); err != nil || !ok {
+				t.Fatalf("AbandonMessageRender = (%v, %v)", ok, err)
+			}
+			msg := mustGetActionMessage(t, s, "wf1", "om_shared")
+			if msg.UpdateState != "abandoned" || msg.RenderedRevision != 0 ||
+				msg.LastError != "message gone" || msg.Owner != "" ||
+				msg.LeaseExpiresAt != nil || msg.ReconcileAfter != nil {
+				t.Fatalf("abandoned render state = %#v", msg)
+			}
+		})
+
+		t.Run("rejection metadata", func(t *testing.T) {
+			s := newStore(t)
+			token := claimForTest(t, s, "e1", "wf1", "retry")
+			if err := s.CompleteReject(ctx, "e1", token, RejectRender{
+				Code: "StillRunning", RejectionReason: "still running",
+			}); err != nil {
+				t.Fatalf("CompleteReject: %v", err)
+			}
+			claim, err := s.ClaimMessage(ctx, "tokM", 120*time.Second)
+			if err != nil || claim == nil || claim.RenderKind != "rejection" ||
+				claim.RejectionReason != "still running" || claim.ButtonsMode != "both" ||
+				claim.DesiredRevision != 1 || claim.Action != nil {
+				t.Fatalf("rejection claim = (%#v, %v)", claim, err)
+			}
+		})
+	})
+
+	t.Run("LostLeaseWriterWritesNothing", func(t *testing.T) {
+		calls := []struct {
+			name string
+			call func(fullStore, MessageClaim) (bool, error)
+		}{
+			{name: "succeeded", call: func(s fullStore, c MessageClaim) (bool, error) {
+				return s.CompleteMessageRender(ctx, c, "tokM")
+			}},
+			{name: "timeout", call: func(s fullStore, c MessageClaim) (bool, error) {
+				return s.DeferMessageRender(ctx, c, "tokM", time.Minute, "timeout")
+			}},
+			{name: "abandoned", call: func(s fullStore, c MessageClaim) (bool, error) {
+				return s.AbandonMessageRender(ctx, c, "tokM", "gone")
+			}},
+		}
+		for _, tc := range calls {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newStore(t)
+				seedAcceptedRetry(t, s, "wf1", "tokA")
+				claim, err := s.ClaimMessage(ctx, "tokM", 120*time.Second)
+				if err != nil || claim == nil {
+					t.Fatalf("ClaimMessage: (%#v, %v)", claim, err)
+				}
+				expireMessageLease(t, s, "wf1", "om_shared")
+				before := mustGetActionMessage(t, s, "wf1", "om_shared")
+
+				ok, err := tc.call(s, *claim)
+				if err != nil || ok {
+					t.Fatalf("expired writer = (%v, %v), want false", ok, err)
+				}
+				after := mustGetActionMessage(t, s, "wf1", "om_shared")
+				if !reflect.DeepEqual(before, after) {
+					t.Fatalf("expired writer changed message:\nbefore=%#v\nafter=%#v", before, after)
+				}
+			})
+		}
+	})
+
+	t.Run("ReconcileAfterDelaysNextClaim", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		claim, err := s.ClaimMessage(ctx, "tokM", 120*time.Second)
+		if err != nil || claim == nil {
+			t.Fatalf("ClaimMessage: (%#v, %v)", claim, err)
+		}
+		before := time.Now().UTC()
+		if ok, err := s.DeferMessageRender(
+			ctx, *claim, "tokM", time.Minute, "patch timeout",
+		); err != nil || !ok {
+			t.Fatalf("DeferMessageRender = (%v, %v)", ok, err)
+		}
+		deferred := mustGetActionMessage(t, s, "wf1", "om_shared")
+		if deferred.UpdateState != "pending" || deferred.ReconcileAfter == nil ||
+			deferred.ReconcileAfter.Before(before.Add(55*time.Second)) ||
+			deferred.Owner != "" || deferred.LeaseExpiresAt != nil {
+			t.Fatalf("timeout 未按 fresh wall time 延迟复核: %#v", deferred)
+		}
+		if got, err := s.ClaimMessage(ctx, "tokN", 120*time.Second); err != nil || got != nil {
+			t.Fatalf("reconcile_after 未到期时 claim = (%#v, %v), want nil", got, err)
+		}
+		makeMessageReconcileDue(t, s, "wf1", "om_shared")
+		if got, err := s.ClaimMessage(ctx, "tokN", 120*time.Second); err != nil || got == nil {
+			t.Fatalf("reconcile_after 到期后必须可 claim: (%#v, %v)", got, err)
+		}
+	})
+
+	t.Run("ReconcileRevisionReorderBecomesImmediatelyEligible", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		claim, _ := s.ClaimMessage(ctx, "tokM", 120*time.Second)
+		if ok, err := s.DeferMessageRender(
+			ctx, *claim, "tokM", time.Hour, "patch timeout",
+		); err != nil || !ok {
+			t.Fatalf("DeferMessageRender = (%v, %v)", ok, err)
+		}
+		if ok, err := s.FinalizeAction(ctx, "wf1", "tokA", "succeeded", ""); err != nil || !ok {
+			t.Fatalf("FinalizeAction = (%v, %v)", ok, err)
+		}
+		got, err := s.ClaimMessage(ctx, "tokN", 120*time.Second)
+		if err != nil || got == nil || got.DesiredRevision != 2 {
+			t.Fatalf("revision 重排必须清 defer 并立即可 claim: (%#v, %v)", got, err)
+		}
+	})
+
+	t.Run("SnapshotRoundTripUsesDefensiveCopies", func(t *testing.T) {
+		s := newStore(t)
+		input := []byte(`{"config":{"wide_screen_mode":true,"update_multi":true}}`)
+		var want any
+		if err := json.Unmarshal(input, &want); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutCardSnapshot(ctx, "wf1", input); err != nil {
+			t.Fatalf("PutCardSnapshot: %v", err)
+		}
+		input[0] = '['
+		got, err := s.GetCardSnapshot(ctx, "wf1")
+		var gotJSON any
+		if err == nil {
+			err = json.Unmarshal(got, &gotJSON)
+		}
+		if err != nil || !reflect.DeepEqual(gotJSON, want) {
+			t.Fatalf("GetCardSnapshot = (%s, %v), want %#v", got, err, want)
+		}
+		got[0] = '['
+		again, err := s.GetCardSnapshot(ctx, "wf1")
+		var againJSON any
+		if err == nil {
+			err = json.Unmarshal(again, &againJSON)
+		}
+		if err != nil || !reflect.DeepEqual(againJSON, want) {
+			t.Fatalf("snapshot leaked returned byte mutation: (%s, %v)", again, err)
+		}
+	})
+
+	t.Run("StaleActionClaimIsExclusive", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		expireActionLease(t, s, "wf1")
+
+		first, err := s.ClaimStaleAction(ctx, "sweeper-a", 120*time.Second)
+		if err != nil || first == nil || first.Owner != "sweeper-a" ||
+			first.LeaseExpiresAt == nil {
+			t.Fatalf("ClaimStaleAction first = (%#v, %v)", first, err)
+		}
+		second, err := s.ClaimStaleAction(ctx, "sweeper-b", 120*time.Second)
+		if err != nil || second != nil {
+			t.Fatalf("live action lease 被重复 claim: (%#v, %v)", second, err)
+		}
+	})
+
+	t.Run("StaleActionNullLeaseIsClaimable", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		clearActionLease(t, s, "wf1")
+		claim, err := s.ClaimStaleAction(ctx, "sweeper-a", 120*time.Second)
+		if err != nil || claim == nil || claim.Owner != "sweeper-a" {
+			t.Fatalf("NULL action lease claim = (%#v, %v)", claim, err)
+		}
+	})
+
+	t.Run("StaleInboxClaimIsExclusive", func(t *testing.T) {
+		s := newStore(t)
+		if _, inserted, err := s.PutInbox(ctx, InboxRow{
+			EventID: "e1", Disposition: "accepted", AckToast: "ack",
+			Action: "retry", WorkflowID: "wf1", ActorOpenID: "ou_x",
+			OpenMessageID: "om_1", State: "received",
+		}, nil); err != nil || !inserted {
+			t.Fatalf("PutInbox = (%v, %v)", inserted, err)
+		}
+
+		first, err := s.ClaimStaleInbox(ctx, "sweeper-a", 120*time.Second)
+		if err != nil || first == nil || first.Owner != "sweeper-a" ||
+			first.Attempts != 1 || first.LeaseExpiresAt == nil {
+			t.Fatalf("ClaimStaleInbox first = (%#v, %v)", first, err)
+		}
+		second, err := s.ClaimStaleInbox(ctx, "sweeper-b", 120*time.Second)
+		if err != nil || second != nil {
+			t.Fatalf("live inbox lease 被重复 claim: (%#v, %v)", second, err)
+		}
+		expireInboxLease(t, s, "e1")
+		third, err := s.ClaimStaleInbox(ctx, "sweeper-c", 120*time.Second)
+		if err != nil || third == nil || third.Owner != "sweeper-c" ||
+			third.Attempts != 2 {
+			t.Fatalf("expired inbox lease 未被接管: (%#v, %v)", third, err)
 		}
 	})
 }
