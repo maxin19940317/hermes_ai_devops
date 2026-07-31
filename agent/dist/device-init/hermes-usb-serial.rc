@@ -1,9 +1,0 @@
-service hermes-usb-serial /system/bin/sh /vendor/bin/hermes-usb-serial.sh
-    class late_start
-    user root
-    group root shell
-    disabled
-    oneshot
-
-on property:sys.boot_completed=1
-    start hermes-usb-serial

@@ -147,10 +147,8 @@ agent-cli run --package-file smoke-pkg-ok.tar.gz --sha256 <打印的sha256> `
   ADB 命令仍以 `-s ?` 寻址;多台 `?` 无法消歧时拒绝使用。
   修复:`adb root` 后
   `echo 513cd3de > /config/usb_gadget/g1/strings/0x409/serialnumber`,拔插 USB 生效。
-  **重启后丢失**;长期持久化使用
-  [`dist/device-init/`](dist/device-init/README.md) 的板端脚本与 Android init 服务。
-  当前 trinket 镜像的 `adb remount` 使用 late overlay,新增 `.rc` 不会被 init
-  扫描,必须把这两个文件集成进 vendor 镜像后刷机。
+  **重启后丢失**。当前 trinket 镜像的 `adb remount` 使用 late overlay,
+  无法通过新增 `.rc` 实现持久化;长期修复需在固件构建阶段正确配置 USB iSerial。
   启示:设备注册不能假设 USB serial 总是可用。
 - **WSL 下跑 Linux 版 agent-cli + adb.exe 时,`ANDROID_ADB_SERVER_PORT` 不会传给
   Windows 进程**(WSL interop 需 WSLENV 显式声明),即私有 5137 端口静默失效,
