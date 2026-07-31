@@ -3,6 +3,7 @@ package feishu
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -452,6 +453,51 @@ func TestAppSenderPatchCardBusinessErrorDoesNotRetry(t *testing.T) {
 	tokenCalls, messageCalls := f.counts()
 	if tokenCalls != 1 || messageCalls != 1 {
 		t.Fatalf("calls token/message = %d/%d, want 1/1", tokenCalls, messageCalls)
+	}
+}
+
+func TestAppSenderPatchCardRequiresExplicitSuccessAcknowledgement(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty body", body: ""},
+		{name: "empty object", body: `{}`},
+		{name: "missing code", body: `{"msg":"ok"}`},
+		{name: "malformed JSON", body: `{"code":`},
+		{name: "wrong code type", body: `{"code":"0","msg":"ok"}`},
+		{name: "null code", body: `{"code":null,"msg":"ok"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeOpenAPI{messageReplies: []string{tt.body}}
+			srv := f.server(t)
+			s, _ := NewSender(appCfg(srv.URL))
+
+			err := s.(CardUpdater).PatchCard(
+				ctx, "om_1", map[string]any{"header": "x"},
+			)
+			if !errors.Is(err, ErrPatchResultUnknown) {
+				t.Fatalf("PatchCard error = %v, want ErrPatchResultUnknown", err)
+			}
+			tokenCalls, messageCalls := f.counts()
+			if tokenCalls != 1 || messageCalls != 1 {
+				t.Fatalf("calls token/message = %d/%d, want 1/1",
+					tokenCalls, messageCalls)
+			}
+		})
+	}
+}
+
+func TestAppSenderPatchCardAcceptsExplicitZeroCode(t *testing.T) {
+	f := &fakeOpenAPI{messageReplies: []string{`{"code":0,"msg":"ok"}`}}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+
+	if err := s.(CardUpdater).PatchCard(
+		ctx, "om_1", map[string]any{"header": "x"},
+	); err != nil {
+		t.Fatalf("PatchCard: %v", err)
 	}
 }
 

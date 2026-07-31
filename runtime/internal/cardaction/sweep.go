@@ -249,11 +249,17 @@ func (s *Sweeper) sweepCard(ctx context.Context) error {
 	}
 	snapshot, err := s.Store.GetCardSnapshot(ctx, claim.WorkflowID)
 	if err != nil {
-		return fmt.Errorf("get card snapshot %s: %w", claim.WorkflowID, err)
+		snapshotErr := fmt.Errorf("get card snapshot %s: %w", claim.WorkflowID, err)
+		if !errors.Is(err, store.ErrCardSnapshotNotFound) {
+			return snapshotErr
+		}
+		// The persisted claim cannot acquire a missing snapshot on retry, so converge it.
+		return s.abandonDeterministicRender(ctx, *claim, token, snapshotErr)
 	}
 	rendered, err := RenderCard(snapshot, *claim)
 	if err != nil {
-		return fmt.Errorf("render message %s: %w", claim.OpenMessageID, err)
+		renderErr := fmt.Errorf("render message %s: %w", claim.OpenMessageID, err)
+		return s.abandonDeterministicRender(ctx, *claim, token, renderErr)
 	}
 	if s.Updater == nil {
 		return fmt.Errorf("patch message %s: updater is nil", claim.OpenMessageID)
@@ -284,7 +290,8 @@ func (s *Sweeper) sweepCard(ctx context.Context) error {
 		if !ok {
 			s.warnLostFence("message", claim.WorkflowID, claim.OpenMessageID)
 		}
-		return fmt.Errorf("patch message %s was ambiguous: %w", claim.OpenMessageID, patchErr)
+		s.warnPatchAmbiguous(*claim, patchErr)
+		return nil
 	case patchPermanent:
 		ok, err := s.Store.AbandonMessageRender(
 			ctx, *claim, token, patchErr.Error(),
@@ -301,6 +308,37 @@ func (s *Sweeper) sweepCard(ctx context.Context) error {
 	default:
 		return fmt.Errorf("patch message %s: unknown classification", claim.OpenMessageID)
 	}
+}
+
+func (s *Sweeper) abandonDeterministicRender(
+	ctx context.Context,
+	claim store.MessageClaim,
+	token string,
+	cause error,
+) error {
+	ok, err := s.Store.AbandonMessageRender(ctx, claim, token, cause.Error())
+	if err != nil {
+		return errors.Join(
+			cause,
+			fmt.Errorf("abandon message render %s: %w", claim.OpenMessageID, err),
+		)
+	}
+	if !ok {
+		s.warnLostFence("message", claim.WorkflowID, claim.OpenMessageID)
+	}
+	return nil
+}
+
+func (s *Sweeper) warnPatchAmbiguous(claim store.MessageClaim, err error) {
+	if s == nil || s.Log == nil {
+		return
+	}
+	s.Log.Warn().
+		Err(err).
+		Str("workflow_id", claim.WorkflowID).
+		Str("open_message_id", claim.OpenMessageID).
+		Int("desired_revision", claim.DesiredRevision).
+		Msg("card patch result is ambiguous; render deferred")
 }
 
 func (s *Sweeper) warnLostFence(kind, workflowID, messageID string) {
@@ -326,6 +364,9 @@ const (
 func classifyPatchError(err error) patchResult {
 	if err == nil {
 		return patchOK
+	}
+	if errors.Is(err, feishu.ErrPatchResultUnknown) {
+		return patchAmbiguous
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return patchAmbiguous

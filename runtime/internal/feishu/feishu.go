@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,10 @@ const tokenRefreshMargin = 5 * time.Minute
 // tokenExpiredCodes 是 tenant_access_token 过期/无效的业务错误码,
 // 命中后强制刷新 token 并重试一次。
 var tokenExpiredCodes = map[int]bool{99991663: true, 99991661: true}
+
+// ErrPatchResultUnknown means Feishu did not explicitly acknowledge a PATCH.
+// The request may still have landed, so callers must reconcile instead of retrying immediately.
+var ErrPatchResultUnknown = errors.New("feishu: patch result unknown")
 
 // Sender 发送纯文本消息。
 type Sender interface {
@@ -395,28 +400,72 @@ func (s *appSender) patchMessage(ctx context.Context, token, messageID, content 
 	if err != nil {
 		return fmt.Errorf("feishu: read patch response: %w", err)
 	}
-	var ack struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-	}
-	var decodeErr error
-	if len(bytes.TrimSpace(respBody)) > 0 {
-		decodeErr = json.Unmarshal(respBody, &ack)
-		if decodeErr == nil && ack.Code != 0 &&
-			resp.StatusCode < http.StatusInternalServerError &&
-			resp.StatusCode != http.StatusTooManyRequests {
-			return &apiError{Code: ack.Code, Msg: ack.Msg}
-		}
-	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode < http.StatusInternalServerError &&
+			resp.StatusCode != http.StatusTooManyRequests {
+			code, msg, ackErr := decodePatchAcknowledgement(respBody)
+			if ackErr == nil && code != 0 {
+				return &apiError{Code: code, Msg: msg}
+			}
+		}
 		return &httpStatusError{
 			operation: "patch " + endpoint,
 			status:    resp.StatusCode,
 			body:      truncate(string(respBody), 256),
 		}
 	}
-	if decodeErr != nil {
-		return fmt.Errorf("feishu: decode patch ack: %w", decodeErr)
+	code, msg, err := decodePatchAcknowledgement(respBody)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return &apiError{Code: code, Msg: msg}
 	}
 	return nil
+}
+
+func decodePatchAcknowledgement(body []byte) (int, string, error) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return 0, "", fmt.Errorf("%w: empty response body", ErrPatchResultUnknown)
+	}
+	var ack map[string]json.RawMessage
+	if err := json.Unmarshal(body, &ack); err != nil {
+		return 0, "", fmt.Errorf(
+			"%w: invalid JSON acknowledgement: %v", ErrPatchResultUnknown, err,
+		)
+	}
+	if ack == nil {
+		return 0, "", fmt.Errorf(
+			"%w: response is not a JSON object", ErrPatchResultUnknown,
+		)
+	}
+	rawCode, ok := ack["code"]
+	if !ok {
+		return 0, "", fmt.Errorf("%w: code field is missing", ErrPatchResultUnknown)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(rawCode))
+	decoder.UseNumber()
+	var codeValue any
+	if err := decoder.Decode(&codeValue); err != nil {
+		return 0, "", fmt.Errorf(
+			"%w: code field is not numeric", ErrPatchResultUnknown,
+		)
+	}
+	codeNumber, ok := codeValue.(json.Number)
+	if !ok {
+		return 0, "", fmt.Errorf(
+			"%w: code field is not numeric", ErrPatchResultUnknown,
+		)
+	}
+	code64, err := strconv.ParseInt(codeNumber.String(), 10, 64)
+	if err != nil || int64(int(code64)) != code64 {
+		return 0, "", fmt.Errorf(
+			"%w: code field is not numeric", ErrPatchResultUnknown,
+		)
+	}
+	var msg string
+	if rawMsg, ok := ack["msg"]; ok {
+		_ = json.Unmarshal(rawMsg, &msg)
+	}
+	return int(code64), msg, nil
 }

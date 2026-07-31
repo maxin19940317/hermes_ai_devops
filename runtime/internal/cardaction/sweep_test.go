@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.temporal.io/api/serviceerror"
 
 	"hermes-devops/runtime/internal/feishu"
@@ -424,34 +425,145 @@ func TestActionFinalizeFailureIsReturnedAndLostFenceHasNoCompensation(t *testing
 	})
 }
 
-func TestCardRecoveryMissingOrInvalidSnapshotNeverPatches(t *testing.T) {
+func TestCardRecoveryDeterministicSnapshotFailuresAbandonOriginalClaim(t *testing.T) {
 	tests := []struct {
-		name        string
-		snapshot    []byte
-		snapshotErr error
+		name          string
+		snapshot      []byte
+		snapshotErr   error
+		wantLastError string
 	}{
-		{"missing", nil, store.ErrCardSnapshotNotFound},
-		{"malformed", []byte(`{"config":`), nil},
+		{
+			name:          "missing snapshot",
+			snapshotErr:   store.ErrCardSnapshotNotFound,
+			wantLastError: "get card snapshot wf-source: card action snapshot not found",
+		},
+		{
+			name:          "malformed snapshot",
+			snapshot:      []byte(`{"config":`),
+			wantLastError: "render message om_1: render card: parse snapshot: invalid JSON",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			st := newSweepTestStore()
-			st.messageClaim = messageClaimForSweep()
+			claim := richMessageClaimForSweep()
+			st.messageClaim = &claim
+			original := copyMessageClaim(claim)
 			st.snapshot = tt.snapshot
 			st.snapshotErr = tt.snapshotErr
 			updater := &fakeCardUpdater{}
 			s := &Sweeper{Store: st, Updater: updater}
 
-			err := s.RunOnce(context.Background())
-			if err == nil {
-				t.Fatal("RunOnce must surface snapshot/render failure")
+			if err := s.RunOnce(context.Background()); err != nil {
+				t.Fatalf("RunOnce: %v", err)
 			}
-			if updater.calls != 0 || st.completeCalls != 0 ||
-				st.deferCalls != 0 || st.abandonCalls != 0 {
-				t.Fatalf("patch=%d complete=%d defer=%d abandon=%d, want all zero",
+			if updater.calls != 0 || st.completeCalls != 0 || st.deferCalls != 0 ||
+				st.abandonCalls != 1 {
+				t.Fatalf("patch=%d complete=%d defer=%d abandon=%d, want 0/0/0/1",
 					updater.calls, st.completeCalls, st.deferCalls, st.abandonCalls)
 			}
+			assertExactMessageCompletion(
+				t, st.abandonClaim, st.abandonToken, original, st.claimTokens[2],
+			)
+			if st.abandonError != tt.wantLastError {
+				t.Fatalf("abandon last error = %q, want %q",
+					st.abandonError, tt.wantLastError)
+			}
+			if !reflect.DeepEqual(claim, original) {
+				t.Fatalf("deterministic failure mutated action:\ngot=%#v\nwant=%#v",
+					claim, original)
+			}
 		})
+	}
+}
+
+func TestCardRecoveryTransientSnapshotFailureRemainsRetryable(t *testing.T) {
+	st := newSweepTestStore()
+	claim := richMessageClaimForSweep()
+	st.messageClaim = &claim
+	snapshotErr := errors.New("snapshot database unavailable")
+	st.snapshotErr = snapshotErr
+	updater := &fakeCardUpdater{}
+	s := &Sweeper{Store: st, Updater: updater}
+
+	err := s.RunOnce(context.Background())
+	if !errors.Is(err, snapshotErr) ||
+		!strings.Contains(err.Error(), "get card snapshot wf-source") {
+		t.Fatalf("RunOnce error = %v, want wrapped transient snapshot error", err)
+	}
+	if updater.calls != 0 || st.completeCalls != 0 ||
+		st.deferCalls != 0 || st.abandonCalls != 0 {
+		t.Fatalf("patch=%d complete=%d defer=%d abandon=%d, want all zero",
+			updater.calls, st.completeCalls, st.deferCalls, st.abandonCalls)
+	}
+}
+
+func TestCardRecoveryDeterministicFailureAbandonErrorsJoinBothCauses(t *testing.T) {
+	tests := []struct {
+		name              string
+		snapshot          []byte
+		snapshotErr       error
+		wantOriginalCause error
+		wantText          string
+	}{
+		{
+			name:              "missing snapshot",
+			snapshotErr:       store.ErrCardSnapshotNotFound,
+			wantOriginalCause: store.ErrCardSnapshotNotFound,
+			wantText:          "get card snapshot wf-source",
+		},
+		{
+			name:     "malformed snapshot",
+			snapshot: []byte(`{"config":`),
+			wantText: "render message om_1",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newSweepTestStore()
+			claim := richMessageClaimForSweep()
+			st.messageClaim = &claim
+			st.snapshot = tt.snapshot
+			st.snapshotErr = tt.snapshotErr
+			abandonErr := errors.New("abandon database unavailable")
+			st.abandonErr = abandonErr
+			s := &Sweeper{Store: st, Updater: &fakeCardUpdater{}}
+
+			err := s.RunOnce(context.Background())
+			if !errors.Is(err, abandonErr) {
+				t.Fatalf("RunOnce error = %v, want abandon store error", err)
+			}
+			if tt.wantOriginalCause != nil && !errors.Is(err, tt.wantOriginalCause) {
+				t.Fatalf("RunOnce error = %v, want original cause %v",
+					err, tt.wantOriginalCause)
+			}
+			if !strings.Contains(err.Error(), tt.wantText) ||
+				!strings.Contains(err.Error(), "abandon message render om_1") {
+				t.Fatalf("RunOnce error = %v, want deterministic and abandon context", err)
+			}
+			if st.abandonCalls != 1 || st.completeCalls != 0 || st.deferCalls != 0 {
+				t.Fatalf("complete/defer/abandon = %d/%d/%d, want 0/0/1",
+					st.completeCalls, st.deferCalls, st.abandonCalls)
+			}
+		})
+	}
+}
+
+func TestCardRecoveryDeterministicFailureLostFenceHasNoCompensation(t *testing.T) {
+	st := newSweepTestStore()
+	claim := richMessageClaimForSweep()
+	st.messageClaim = &claim
+	st.snapshotErr = store.ErrCardSnapshotNotFound
+	st.abandonOK = false
+	s := &Sweeper{Store: st, Updater: &fakeCardUpdater{}}
+
+	if err := s.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if st.abandonCalls != 1 || st.completeCalls != 0 || st.deferCalls != 0 ||
+		st.finalizeCalls != 0 {
+		t.Fatalf("complete/defer/abandon/finalize = %d/%d/%d/%d, want 0/0/1/0",
+			st.completeCalls, st.deferCalls, st.abandonCalls, st.finalizeCalls)
 	}
 }
 
@@ -483,9 +595,17 @@ func TestCardRecoveryCompletionsForwardExactClaimAndThirdToken(t *testing.T) {
 			updater: func(*testing.T) feishu.CardUpdater {
 				return &fakeCardUpdater{err: ambiguousErr}
 			},
-			wantRunErr:    context.DeadlineExceeded,
 			wantDefer:     1,
 			wantLastError: ambiguousErr.Error(),
+		},
+		{
+			name:  "unknown acknowledgement defers",
+			claim: richMessageClaimForSweep,
+			updater: func(t *testing.T) feishu.CardUpdater {
+				return realPatchUpdater(t, http.StatusOK, `{}`)
+			},
+			wantDefer:     1,
+			wantLastError: "feishu: patch result unknown: code field is missing",
 		},
 		{
 			name:  "permanent abandons",
@@ -564,6 +684,51 @@ func TestCardRecoveryCompletionsForwardExactClaimAndThirdToken(t *testing.T) {
 				t.Fatalf("claimed snapshot mutated:\ngot=%#v\nwant=%#v", claim, original)
 			}
 		})
+	}
+}
+
+func TestCardRecoveryAmbiguousDeferFailureJoinsPatchAndStoreErrors(t *testing.T) {
+	st := newSweepTestStore()
+	claim := richMessageClaimForSweep()
+	st.messageClaim = &claim
+	patchErr := fmt.Errorf("patch timed out: %w", context.DeadlineExceeded)
+	deferErr := errors.New("defer database unavailable")
+	st.deferErr = deferErr
+	s := &Sweeper{Store: st, Updater: &fakeCardUpdater{err: patchErr}}
+
+	err := s.RunOnce(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, deferErr) {
+		t.Fatalf("RunOnce error = %v, want joined patch and defer errors", err)
+	}
+	if !strings.Contains(err.Error(), "patch message om_1 was ambiguous") ||
+		!strings.Contains(err.Error(), "defer message render om_1") {
+		t.Fatalf("RunOnce error = %v, want patch and defer context", err)
+	}
+	if st.deferCalls != 1 || st.completeCalls != 0 || st.abandonCalls != 0 {
+		t.Fatalf("complete/defer/abandon = %d/%d/%d, want 0/1/0",
+			st.completeCalls, st.deferCalls, st.abandonCalls)
+	}
+}
+
+func TestCardRecoverySuccessfulAmbiguityDeferralLogsWarningNotSweepFailure(t *testing.T) {
+	st := newSweepTestStore()
+	claim := richMessageClaimForSweep()
+	st.messageClaim = &claim
+	patchErr := fmt.Errorf("patch timed out: %w", context.DeadlineExceeded)
+	var logs strings.Builder
+	logger := zerolog.New(&logs)
+	s := &Sweeper{
+		Store: st, Updater: &fakeCardUpdater{err: patchErr}, Log: &logger,
+	}
+
+	s.runAndLog(context.Background())
+
+	got := logs.String()
+	if !strings.Contains(got, "card patch result is ambiguous; render deferred") {
+		t.Fatalf("logs = %s, want ambiguity warning", got)
+	}
+	if strings.Contains(got, "card action recovery sweep failed") {
+		t.Fatalf("logs = %s, successful deferral must not log sweep failure", got)
 	}
 }
 
@@ -705,8 +870,7 @@ func TestCardRecoveryLostFencingNeverFallsBackOrMutatesAction(t *testing.T) {
 			loseFence: func(st *sweepTestStore) {
 				st.deferOK = false
 			},
-			wantRunErr: context.DeadlineExceeded,
-			wantDefer:  1,
+			wantDefer: 1,
 		},
 		{
 			name: "abandon",
