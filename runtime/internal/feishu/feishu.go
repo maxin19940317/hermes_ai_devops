@@ -100,6 +100,42 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("feishu api: code %d: %s", e.Code, e.Msg)
 }
 
+func (e *apiError) businessErrorCode() int {
+	return e.Code
+}
+
+type httpStatusError struct {
+	operation string
+	status    int
+	body      string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("feishu: %s: status %d: %s", e.operation, e.status, e.body)
+}
+
+func (e *httpStatusError) httpErrorStatus() int {
+	return e.status
+}
+
+// BusinessErrorCode returns the Feishu business code carried by err.
+func BusinessErrorCode(err error) (int, bool) {
+	var coded interface{ businessErrorCode() int }
+	if !errors.As(err, &coded) {
+		return 0, false
+	}
+	return coded.businessErrorCode(), true
+}
+
+// HTTPErrorStatus returns the HTTP status carried by a Feishu transport error.
+func HTTPErrorStatus(err error) (int, bool) {
+	var status interface{ httpErrorStatus() int }
+	if !errors.As(err, &status) {
+		return 0, false
+	}
+	return status.httpErrorStatus(), true
+}
+
 func isTokenExpired(err error) bool {
 	var ae *apiError
 	if !errors.As(err, &ae) {
@@ -359,21 +395,28 @@ func (s *appSender) patchMessage(ctx context.Context, token, messageID, content 
 	if err != nil {
 		return fmt.Errorf("feishu: read patch response: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("feishu: patch %s: status %d: %s",
-			endpoint, resp.StatusCode, truncate(string(respBody), 256))
-	}
 	var ack struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
 	}
+	var decodeErr error
 	if len(bytes.TrimSpace(respBody)) > 0 {
-		if err := json.Unmarshal(respBody, &ack); err != nil {
-			return fmt.Errorf("feishu: decode patch ack: %w", err)
+		decodeErr = json.Unmarshal(respBody, &ack)
+		if decodeErr == nil && ack.Code != 0 &&
+			resp.StatusCode < http.StatusInternalServerError &&
+			resp.StatusCode != http.StatusTooManyRequests {
+			return &apiError{Code: ack.Code, Msg: ack.Msg}
 		}
 	}
-	if ack.Code != 0 {
-		return &apiError{Code: ack.Code, Msg: ack.Msg}
+	if resp.StatusCode != http.StatusOK {
+		return &httpStatusError{
+			operation: "patch " + endpoint,
+			status:    resp.StatusCode,
+			body:      truncate(string(respBody), 256),
+		}
+	}
+	if decodeErr != nil {
+		return fmt.Errorf("feishu: decode patch ack: %w", decodeErr)
 	}
 	return nil
 }

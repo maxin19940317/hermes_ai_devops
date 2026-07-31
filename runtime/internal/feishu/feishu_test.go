@@ -26,6 +26,7 @@ type fakeOpenAPI struct {
 	messageAuth    []string
 	tokenBodies    []map[string]any
 	messageReplies []string // 依次消费;耗尽后默认 {"code":0}
+	messageStatus  []int
 }
 
 func (f *fakeOpenAPI) server(t *testing.T) *httptest.Server {
@@ -54,6 +55,10 @@ func (f *fakeOpenAPI) server(t *testing.T) *httptest.Server {
 			if len(f.messageReplies) > 0 {
 				reply = f.messageReplies[0]
 				f.messageReplies = f.messageReplies[1:]
+			}
+			if len(f.messageStatus) > 0 {
+				w.WriteHeader(f.messageStatus[0])
+				f.messageStatus = f.messageStatus[1:]
 			}
 			_, _ = w.Write([]byte(reply))
 		default:
@@ -447,5 +452,43 @@ func TestAppSenderPatchCardBusinessErrorDoesNotRetry(t *testing.T) {
 	tokenCalls, messageCalls := f.counts()
 	if tokenCalls != 1 || messageCalls != 1 {
 		t.Fatalf("calls token/message = %d/%d, want 1/1", tokenCalls, messageCalls)
+	}
+}
+
+func TestPatchCardErrorsExposeTypedBusinessCodeAndHTTPStatus(t *testing.T) {
+	t.Run("business code", func(t *testing.T) {
+		f := &fakeOpenAPI{
+			messageReplies: []string{`{"code":230001,"msg":"message not found"}`},
+			messageStatus:  []int{http.StatusBadRequest},
+		}
+		srv := f.server(t)
+		s, _ := NewSender(appCfg(srv.URL))
+		err := s.(CardUpdater).PatchCard(ctx, "om_missing", map[string]any{"header": "x"})
+		code, ok := BusinessErrorCode(err)
+		if !ok || code != 230001 {
+			t.Fatalf("BusinessErrorCode(%v) = (%d, %v), want (230001, true)", err, code, ok)
+		}
+		if _, ok := HTTPErrorStatus(err); ok {
+			t.Fatalf("business error unexpectedly exposed HTTP status: %v", err)
+		}
+	})
+
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			f := &fakeOpenAPI{
+				messageReplies: []string{`{"code":0,"msg":"ignored"}`},
+				messageStatus:  []int{status},
+			}
+			srv := f.server(t)
+			s, _ := NewSender(appCfg(srv.URL))
+			err := s.(CardUpdater).PatchCard(ctx, "om_1", map[string]any{"header": "x"})
+			got, ok := HTTPErrorStatus(err)
+			if !ok || got != status {
+				t.Fatalf("HTTPErrorStatus(%v) = (%d, %v), want (%d, true)", err, got, ok, status)
+			}
+			if _, ok := BusinessErrorCode(err); ok {
+				t.Fatalf("HTTP status error unexpectedly exposed business code: %v", err)
+			}
+		})
 	}
 }
