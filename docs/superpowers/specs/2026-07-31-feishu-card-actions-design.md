@@ -1,7 +1,7 @@
 # 飞书终态卡片按钮设计（重试 / 忽略）
 
 **日期：** 2026-07-31
-**状态：** 待评审（v2；v1 评审发现两处架构阻断，已重写 §3 §5 §6 §7 §8）
+**状态：** 待评审（v3）
 **范围：** 三轮交互能力的第二轮。终态通知卡片上加两个**卡片级**按钮——「重试失败变体」「忽略」。
 不含 NL 确认/取消按钮（第三轮）、隔离按钮、证据链接、卡片模板化。
 
@@ -9,28 +9,36 @@
 - `2026-07-30-feishu-notification-card-design.md`（展示卡片，§10 是本轮的输入清单）
 - `2026-07-30-workflow-runs-design.md`（权威运行记录，解除了 §10(3)(4)）
 
-> **v1 → v2 的两处架构阻断**（评审发现，均已实证）：
-> 1. PostgreSQL 的 CHECK **不可延迟到 COMMIT**，也不接受 `DEFERRABLE`
->    （实测：先插默认值再 UPDATE → `SQLSTATE 23514`；`CHECK ... DEFERRABLE` → `SQLSTATE 0A000`）。
->    v1 的"先 INSERT 再 UPDATE 钉死"必然失败。§5 改为锁定后**一次性插入完整行**。
-> 2. 同步 ACK 与异步 claim 之间没有持久交接，进程在两者之间退出会让点击**永久消失**
->    （飞书已收到成功应答，不再重投）。§6 新增 `card_action_inbox`。
+## 修订史
+
+| 版本 | 评审发现的阻断 | 处置 |
+|---|---|---|
+| v1 → v2 | PostgreSQL 的 CHECK 不可延迟到 COMMIT，"先插后钉"必然 `23514` | §5 改为锁定后**一次性插入完整行** |
+| v1 → v2 | 同步 ACK 与异步 claim 之间无持久交接，点击会永久消失 | 新增 `card_action_inbox` |
+| v2 → v3 | 第二段部署改变 `NotifyCard` 的 activity input，需版本门与新 fixture | **改为 activity 注入按钮**，workflow 完全不参与，版本门问题消失（§7） |
+| v2 → v3 | inbox 消费与 `processed` 不原子，重跑会写重复审计 | 接受/拒绝各收敛为**一个** store 事务（§5、§6） |
+
+实证过的事实（不再重新论证）：
+
+- `CHECK ... DEFERRABLE` → `SQLSTATE 0A000`；先插默认值再 UPDATE → `SQLSTATE 23514`。
+- WS handler 返回 error → SDK 应答 500（`ws/client.go:638`）→ 飞书重投。
+- `webhookSender` 已实现 `SendCard`（`feishu.go:168`）。
+- SDK v3.9.9 提供 `WithOnReady` / `WithOnError` / `WithOnReconnecting` / `WithOnReconnected` /
+  `WithOnDisconnected`。
 
 ---
 
 ## 1. 门禁裁决与实测结论
 
 开工前跑了一次性 spike（`runtime/cmd/spike-cardaction`），对真实飞书应用验证。**裁决：GO。**
-四条实测结论是本设计的事实基础，不再重新论证：
 
-1. **WS 通道成立。** `card.action.trigger` 经长连接送达，事件订阅保持现状即可，**不需要公网回调 URL**。
-   实现路径唯一：在现有 `dispatcher.EventDispatcher` 上注册 `OnP2CardActionTrigger`。
-   （`ws.WithCardHandler` 在 SDK v3.9.9 是注释掉的，`MessageTypeCard` 帧被
-   `ws/client.go:626` 直接丢弃——那条路走不通，不要再试。）
-2. **反馈必须分两层。** 即时层 = toast，**best-effort**（实测存在错误码 200671）；
-   权威层 = 卡片延迟更新，**不受 3 秒响应预算限制，这层必须做**。
-3. **重复投递是常态。** 实测一次 ignore 点击收到 **3 次**回调。幂等按动作幂等键消费，
-   **不以到达次数为准**。
+1. **WS 通道成立。** `card.action.trigger` 经长连接送达，事件订阅保持现状即可，
+   **不需要公网回调 URL**。实现路径唯一：在现有 `dispatcher.EventDispatcher` 上注册
+   `OnP2CardActionTrigger`。（`ws.WithCardHandler` 是注释掉的，`MessageTypeCard` 帧被
+   `ws/client.go:626` 直接丢弃。）
+2. **反馈分两层。** 即时层 = toast，**best-effort**（实测存在错误码 200671）；
+   权威层 = 卡片延迟更新，不受 3 秒预算限制。
+3. **重复投递是常态。** 实测一次 ignore 收到 **3 次**回调。
 4. **载荷最小化验证通过。** `value` 只放 `action` + `source_workflow_id`。
 
 ---
@@ -39,70 +47,69 @@
 
 ### 2.1 重试
 
-**完整复用 `rerun` 的业务语义**，但**不复用其调用路径**——这两件事必须分开承诺。
+**完整复用 `rerun` 的业务语义**，不复用其调用路径。失败集合与 `rerun` 逐字一致：
+源 workflow 已关闭，从 Temporal `DeviceTestOutput` 取 `verdict ∉ {PASSED, SKIPPED}` 的
+`TaskSummary`。**不从 tasks 缺行推断 SKIPPED**。
 
-失败集合与 `rerun` 逐字一致：源 workflow 已关闭，从 Temporal `DeviceTestOutput` 取
-`verdict ∉ {PASSED, SKIPPED}` 的 `TaskSummary`。**不从 tasks 缺行推断 SKIPPED**——
-`AcquireDevice` 耗尽、`CreateTask` 活动自身失败都会产出没有 task 行的失败 summary。
-
-重试产生**新的 workflow，并发出它自己的终态卡片**。若仍失败，从新卡片继续重试。
-因此原卡片只承载一次 chosen action。
+重试产生**新的 workflow，并发出它自己的终态卡片**。原卡片只承载一次 chosen action。
 
 ### 2.2 忽略
 
-**只表示人工确认**：某人看过这次失败并决定不处理。不修改 `tasks.verdict`；不触发任何策略；
-**当下没有任何消费方读取它**。这三条必须写在用户可见文档里，否则第一个用的人会以为按钮坏了。
+**只表示人工确认**：不修改 `tasks.verdict`；不触发任何策略；**当下没有任何消费方读取它**。
+这三条必须写在用户可见文档里。权威记录是 `card_actions` + `audit_log`，**不写 `decisions`**（§3.6）。
 
-权威记录是 `card_actions` + `audit_log`。**不写 `decisions`**——理由见 §3.5。
+### 2.3 权威性边界（重要）
 
-### 2.3 按钮出现条件
-
-见 §7.1：readiness 是**五项合取**，且只能承诺"发送瞬间 ready"。
+- **数据库中的动作状态是权威的。** 重试是否发生、忽略是否被记录，以 `card_actions` 为准。
+- **卡片更新是 best-effort 的最终呈现。** 飞书 `PATCH` **没有条件版本写**，因此
+  **本设计不承诺卡片严格收敛**——理由与缓解见 §8.3。任何依赖"卡片显示什么"来判断
+  "系统做了什么"的读法都是错的。
 
 ---
 
 ## 3. 数据模型
 
-四张表：`card_action_inbox`（传输层）、`card_actions`（动作）、`card_action_messages`（卡片渲染）、
-`audit_log`（审计）。分开的理由各自写在下面。
+四张表。`schema.sql` 与独立 migration 同步。
 
 ### 3.1 card_action_inbox —— 同步段的持久交接
 
-同步应答一旦返回成功，飞书**不再重投**。因此在返回之前必须先落盘，否则进程在
-"已应答、未 claim"之间退出，动作永久消失。
+同步应答一旦返回成功，飞书**不再重投**。因此返回之前必须先落盘。
 
 ```sql
 CREATE TABLE IF NOT EXISTS card_action_inbox (
-    event_id         TEXT PRIMARY KEY,          -- 飞书事件 ID:跨进程、跨重启的去重依据
+    event_id         TEXT PRIMARY KEY,          -- 飞书事件 ID:跨进程、跨重启去重
     disposition      TEXT NOT NULL CHECK (disposition IN ('accepted','rejected')),
     ack_toast        TEXT NOT NULL,             -- 同步应答原文,重投时原样重放
     action           TEXT NOT NULL DEFAULT '',
     workflow_id      TEXT NOT NULL DEFAULT '',
     actor_open_id    TEXT NOT NULL DEFAULT '',
     open_message_id  TEXT NOT NULL DEFAULT '',
+    -- 同步段算出的摘要;恢复路径不得重新猜(原始 payload 已不在手上)
+    payload_digest   TEXT NOT NULL DEFAULT '',
     state            TEXT NOT NULL DEFAULT 'received'
         CHECK (state IN ('received','processed')),
     owner            TEXT        NOT NULL DEFAULT '',
     lease_expires_at TIMESTAMPTZ,
-    attempts         INTEGER     NOT NULL DEFAULT 0,
+    attempts         INTEGER     NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     last_error       TEXT        NOT NULL DEFAULT '',
     received_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     processed_at     TIMESTAMPTZ,
-    -- rejected 是同步段的终局,不需要异步消费
     CONSTRAINT inbox_rejected_is_terminal CHECK (
-        disposition <> 'rejected' OR state = 'processed')
+        disposition <> 'rejected' OR state = 'processed'),
+    CONSTRAINT inbox_processed_pairs_timestamp CHECK (
+        (state = 'processed') = (processed_at IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS card_action_inbox_sweep_idx
     ON card_action_inbox(lease_expires_at) WHERE state = 'received';
 ```
 
-**它没有指向 `workflow_runs` 或 `card_actions` 的外键**——同步段还没做权威校验，
-此时唯一确定的事实是"一个形态合法、身份获授权的点击到达过"。
+**没有指向 `workflow_runs` 或 `card_actions` 的外键**——同步段还没做权威校验，此时唯一确定的
+事实是"一个形态合法、身份获授权的点击到达过"。
 
-`event_id` 主键同时承担三件事：跨进程去重（进程内缓存做不到）、跨重启去重（`dedupCache`
-重启即失效）、以及**同步应答重放**——重投读出既有行返回同一条 `ack_toast`，
-既满足实测结论 3 的"三次相同 toast"，又保证审计不重复。
+`event_id` 主键承担三件事：跨进程去重、跨重启去重（进程内 `dedupCache` 重启即失效）、
+以及**同步应答重放**——重投读出既有行返回同一条 `ack_toast`，既满足"三次相同 toast"，
+又保证审计不重复。
 
 ### 3.2 card_actions —— 动作，按 workflow 唯一
 
@@ -115,61 +122,77 @@ CREATE TABLE IF NOT EXISTS card_actions (
     owner              TEXT        NOT NULL DEFAULT '',
     lease_expires_at   TIMESTAMPTZ,
     target_workflow_id TEXT        NOT NULL DEFAULT '',
-    attempt            INTEGER     NOT NULL DEFAULT 0,
+    attempt            INTEGER     NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    -- 恢复用的完整启动输入;StartDeviceTest 收的是 DeviceTestInput,不是 ID
+    target_input       JSONB,
     last_error         TEXT        NOT NULL DEFAULT '',
-    -- 每次对用户可见的状态变化 +1;卡片渲染以它为收敛目标(§3.3)
     revision           INTEGER     NOT NULL DEFAULT 1 CHECK (revision > 0),
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT card_actions_retry_pinned CHECK (
-        action <> 'retry'  OR (attempt >  0 AND target_workflow_id <> '')),
+        action <> 'retry'  OR (attempt > 0 AND target_workflow_id <> '' AND target_input IS NOT NULL)),
     CONSTRAINT card_actions_ignore_unpinned CHECK (
-        action <> 'ignore' OR (attempt =  0 AND target_workflow_id =  ''))
+        action <> 'ignore' OR (attempt = 0 AND target_workflow_id = '' AND target_input IS NULL)),
+    -- ignore 没有外部副作用,不存在执行中或执行失败
+    CONSTRAINT card_actions_ignore_terminal CHECK (
+        action <> 'ignore' OR state = 'succeeded')
 );
 
 CREATE INDEX IF NOT EXISTS card_actions_sweep_idx
     ON card_actions(lease_expires_at) WHERE state = 'pending';
 ```
 
-**`workflow_id` 做主键**是本设计的支点，一次性消解三个问题：
+**`workflow_id` 做主键**一次性消解三个问题：互斥（一次运行最多一个 claim，`action` 只是列）、
+不同点击间的竞争、legacy 隔离（FK 让没有权威行的历史运行不可能产生 claim）。
 
-- **互斥**（§10(5)）：一次运行最多一个 claim，`action` 只是列。不需要额外的互斥规则。
-- **幂等**：与 inbox 的 `event_id` 互补——inbox 挡同一次点击的重投，主键挡不同点击的竞争。
-- **legacy 隔离**：`REFERENCES workflow_runs(workflow_id)` 让没有权威行的历史运行不可能产生 claim。
+**`target_input JSONB` 是 v3 新增**：`StartDeviceTest(ctx, in wf.DeviceTestInput)` 收完整输入，
+不能按 ID 启动，所以只存 attempt/target 的恢复路径无法真正恢复。首次 claim 时持久化
+canonical 序列化的完整输入，并断言 `target_input.WorkflowID() == target_workflow_id`。
+恢复时**逐字段复用**，不重新 Resolve。
 
-**两个 CHECK 是 §10(2) 的机械化，且因为 PostgreSQL 的 CHECK 不可延迟（实证见文首），
-它们把"接受动作必须一次性写入完整行"变成了数据库层面不可违反的约束**——任何
-"先插 pending 再补 attempt"的实现会在第一条 INSERT 就拿到 `23514`。
+三个 CHECK 因为 PostgreSQL 的 CHECK 不可延迟（实证见修订史），把"接受动作必须一次性写入
+完整行"变成数据库层面不可违反的约束。
 
 ### 3.3 card_action_messages —— 卡片渲染，按消息唯一
 
 `NotifyCard` 是**可重试活动**：飞书已收到、活动 ACK 丢失时会重发，同一 workflow 可能存在
-**多张卡片**。因此"一个 workflow 一个 `open_message_id`"不成立，必须按消息实例收敛。
+多张卡片。因此按消息实例收敛。
 
 ```sql
 CREATE TABLE IF NOT EXISTS card_action_messages (
-    workflow_id       TEXT        NOT NULL REFERENCES card_actions(workflow_id),
+    -- 不加指向 card_actions 的外键:legacy / 仍在运行 / 无失败变体这些拒绝路径
+    -- 不会产生 action 行,但同样需要把结论渲染到卡片上
+    workflow_id       TEXT        NOT NULL,
     open_message_id   TEXT        NOT NULL,
+    render_kind       TEXT        NOT NULL CHECK (render_kind IN ('action','rejection')),
+    rejection_reason  TEXT        NOT NULL DEFAULT '',
+    desired_revision  INTEGER     NOT NULL DEFAULT 1 CHECK (desired_revision > 0),
+    rendered_revision INTEGER     NOT NULL DEFAULT 0 CHECK (rendered_revision >= 0),
     update_state      TEXT        NOT NULL DEFAULT 'pending'
         CHECK (update_state IN ('pending','succeeded','abandoned')),
-    -- 已确认渲染到飞书的 revision;收敛目标是 card_actions.revision
-    rendered_revision INTEGER     NOT NULL DEFAULT 0,
     owner             TEXT        NOT NULL DEFAULT '',
     lease_expires_at  TIMESTAMPTZ,
-    attempts          INTEGER     NOT NULL DEFAULT 0,
+    reconcile_after   TIMESTAMPTZ,               -- 模糊超时后的延迟复核(§8.3)
+    attempts          INTEGER     NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     last_error        TEXT        NOT NULL DEFAULT '',
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (workflow_id, open_message_id)
+    PRIMARY KEY (workflow_id, open_message_id),
+    CONSTRAINT messages_rejection_has_reason CHECK (
+        render_kind <> 'rejection' OR rejection_reason <> '')
 );
 
 CREATE INDEX IF NOT EXISTS card_action_messages_sweep_idx
     ON card_action_messages(lease_expires_at) WHERE update_state = 'pending';
+CREATE INDEX IF NOT EXISTS card_action_messages_reconcile_idx
+    ON card_action_messages(reconcile_after) WHERE reconcile_after IS NOT NULL;
 ```
 
-每个通过校验的回调**先登记消息实例**（`ON CONFLICT DO NOTHING`）：动作按 workflow 唯一，
-卡片按 message 唯一收敛。用户在哪张卡片上点，哪张卡片一定会被更新；其余同 workflow 的卡片
-也会被同一个 sweep 收敛到同一状态。
+**每一个通过校验的回调都登记消息实例**——包括 `conflict` 分支和业务拒绝分支，不只是首次接受。
+v2 的伪代码只在首次接受时登记，导致后来者点的那张卡片永远不更新。
+
+**收敛承诺收窄为**：所有**已观测到的**（即产生过回调的）message instance 收敛。
+系统无法发现从未被点击的重复通知卡片——那些 message ID 从未进入过任何回调载荷。
 
 ### 3.4 audit_log
 
@@ -182,109 +205,141 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action                  TEXT        NOT NULL,
     target                  TEXT        NOT NULL,
     payload_digest          TEXT        NOT NULL DEFAULT '',
-    -- 一个 accepted action 恰好一条审计;被拒点击写 NULL(UNIQUE 放行多个 NULL)
+    -- 一个 accepted action 恰好一条审计
     card_action_workflow_id TEXT UNIQUE REFERENCES card_actions(workflow_id),
+    -- 一个 inbox 事件恰好一条审计:消费重跑不会写出第二行(v3 新增)
+    inbox_event_id          TEXT UNIQUE REFERENCES card_action_inbox(event_id),
     ts                      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-### 3.5 decisions 不动
+两个 UNIQUE 是正交的两层保护：`card_action_workflow_id` 挡"同一 workflow 的第二次 accepted"，
+`inbox_event_id` 挡"同一事件被消费两次"。
 
-**明确否决**"把 `decisions.task_id` 改成可空"。它是全局放宽：会允许 `rule` / `hermes` 的
-decision 也写成无归属的 NULL task。而且 `decisions` 没有 `workflow_id` 列，run 级归属只能
-藏进 JSON，FK 与查询接口都无法保证。
+### 3.5 owner 是随机 fencing token
 
-> 将来若确有消费方需要把 run 级人工决策放进 `decisions`，必须新增
+所有 `owner` 列存的是**每次 acquire 新生成的随机 token**（如 128 bit hex），
+**不是进程 ID 或主机名**。可复用的 owner 会让"接管后原持有者的迟到写"无法被 fencing 识别。
+
+### 3.6 decisions 不动
+
+**明确否决**"把 `decisions.task_id` 改成可空"——它是全局放宽，会允许 `rule` / `hermes` 的
+decision 也变成无归属；且 `decisions` 没有 `workflow_id` 列，run 级归属只能藏进 JSON。
+
+> 将来若确需把 run 级人工决策放进 `decisions`，必须新增
 > `workflow_id REFERENCES workflow_runs(workflow_id)` 并加
 > `CHECK ((task_id IS NULL) <> (workflow_id IS NULL))`，**不能只放宽 NOT NULL**。
 
-### 3.6 文档同步修正
+### 3.7 文档同步修正
 
 - **CLAUDE.md:37**（§3 规则 7）——终态卡片确认是 **run 级**动作，记于 `card_actions` +
   `audit_log`，不属于 task-level decision。
-- **CLAUDE.md §11 数据模型**——补四张表。
+- **CLAUDE.md §11**——补四张表。
 - **`docs/device-test-sequence.md`**——终态卡片确认**不投 workflow signal、不走 outbox**。
 
 ---
 
 ## 4. 共享 RerunResolver
 
-文本 `rerun` 与按钮重试必须共用一份业务语义，否则两处实现必然漂移。
-
-新增包 `runtime/internal/rerun`（不放进 `feishucmd`，否则 `cardaction` 要反向依赖指令包）：
+文本 `rerun` 与按钮重试共用一份业务语义。新增包 `runtime/internal/rerun`
+（不放进 `feishucmd`，否则 `cardaction` 要反向依赖指令包）。
 
 ```go
-// Resolve 是只读的:不分配 attempt、不写库、不启动 workflow。
-// variant 为空 = "未指定 variant" 模式(按钮唯一使用的模式);
-// 非空 = 显式单变体模式(文本 rerun 专用)。
+// Resolve 只读:不分配 attempt、不写库、不启动 workflow。
 func (r *Resolver) Resolve(ctx context.Context, workflowID, variant string) (*Resolution, error)
+```
 
-type Resolution struct {
-    Run      store.WorkflowRun
-    Targets  []string        // canonical 顺序
-    Packages []wf.PackageRef // 与 Targets 一一对应
-    Scope    string          // 显式模式 = variant;未指定模式 = Run.Scope
+### 4.1 两种模式的精确差异
+
+**这两条是文本 `rerun` 现有行为的规格化，不是新增语义**：
+
+| | 显式 variant（文本专用） | 空 variant（按钮唯一使用） |
+|---|---|---|
+| `WorkflowResult` | **不调用** | 调用 |
+| 允许 PASSED / SKIPPED | **允许**（用户显式选择） | 排除 |
+| 目标集来源 | 参数本身 | output 中 `verdict ∉ {PASSED,SKIPPED}` 的 summary |
+| 空 `Variant` 的 summary | 不适用 | 忽略 |
+| 去重与排序 | 不适用 | 去重后按字典序 |
+| `Scope` | = variant | = `Run.Scope` |
+
+### 4.2 拒绝原因必须带字段
+
+单一枚举值无法保留既有文案。拒绝原因是**带字段的封闭结构**：
+
+```go
+type RejectReason struct {
+    Code       string // NotAuthoritative | StillRunning | ResultUnreadable |
+                      // NoFailedVariants | VariantNotMember | ArtifactMissing
+    WorkflowID string
+    Variant    string // VariantNotMember / ArtifactMissing
+    Count      int    // ArtifactMissing:实际命中的 artifact 行数
 }
 ```
 
-**硬约束：必须支持 optional variant**，使文本 `rerun` 的显式单变体语义**和回复文案逐字不变**。
-`executor_test.go` 里既有的 rerun 用例一行不改即通过，是本轮验收项。
+`ArtifactMissing` 必须带 `Count`，否则文本 `rerun` 现有的
+`变体 %s 的 artifact 数量为 %d，要求恰好 1 个` 无法逐字复现——而"回复逐字不变"是本轮验收项。
 
 `Resolve` 含 Temporal 调用，**必须在数据库事务之外执行**。
 
-拒绝原因是封闭枚举：`NotAuthoritative` / `StillRunning` / `ResultUnreadable` /
-`NoFailedVariants` / `VariantNotMember` / `ArtifactMissing`。
-
 ---
 
-## 5. 接受动作：单事务、一次性插入
+## 5. 接受动作：一个事务
 
 ### 5.1 边界
 
-CHECK 不可延迟，所以顺序是**先锁、再算、最后一次性插入完整行**：
+CHECK 不可延迟，所以顺序是**先锁、再算、最后一次性插入完整行**；且 inbox 的 `processed`
+必须与业务写入同事务，否则重跑会写出重复审计。
 
 ```text
-[事务外·只读] Resolve(workflow_id, "") → 目标集 + packages,或封闭枚举的拒绝原因
+[事务外·只读] Resolve(workflow_id, "") → 目标集 + packages,或 RejectReason
 
+AcceptCardAction(eventID, owner, ...)  —— 单事务
 BEGIN
-  SELECT 1 FROM workflow_runs WHERE workflow_id = $1 FOR UPDATE
-    ├ 无行 → rejected.legacy,事务结束
-    └ 取得行锁 = 该 workflow 的所有 claim 竞争在此串行化
-       (显式先查并加锁,不把 FK 违反当控制流;FK 只是最后防线)
+  UPDATE card_action_inbox SET owner=$owner, lease_expires_at=now()+120s
+   WHERE event_id=$e AND state='received'
+     AND (lease_expires_at IS NULL OR lease_expires_at < now())
+    └ 影响 0 行 → 已被他人接管或已处理,直接返回,不做任何业务写入
 
-  SELECT * FROM card_actions WHERE workflow_id = $1        -- 已在上面的锁保护下
-    │
+  SELECT 1 FROM workflow_runs WHERE workflow_id=$w FOR UPDATE
+    └ 无行 → 走 §6.4 的拒绝分支(同一事务内完成)
+
+  SELECT * FROM card_actions WHERE workflow_id=$w      -- 已在上面的行锁保护下
     ├ 无行(首次) →
-    │     retry : 锁 artifacts 推进水位得 N → Go 侧算 target_workflow_id
-    │     INSERT card_actions(...完整行,含 attempt/target/state/revision=1)  ← 唯一一条 INSERT
-    │     INSERT card_action_messages(workflow_id, open_message_id, ...) ON CONFLICT DO NOTHING
-    │     INSERT audit_log(..., card_action_workflow_id = workflow_id)
-    │
-    ├ 同 action 且 state='failed' → §5.3 失败后重试
-    │
-    └ 其余 → rejected.conflict
+    │     retry : 推进水位得 N → Go 侧算 target_input 与 target_workflow_id
+    │             断言 target_input.WorkflowID() == target_workflow_id
+    │     INSERT card_actions(...完整行,含 attempt/target/target_input/revision=1)
+    │     INSERT audit_log(..., card_action_workflow_id=$w, inbox_event_id=$e)
+    ├ 同 action 且 state='failed' → §5.3 失败后重试(不写 accepted 审计)
+    └ 其余 → 写 rejected.conflict 审计(inbox_event_id=$e, FK 为 NULL)
+
+  INSERT card_action_messages(workflow_id, open_message_id, render_kind='action', ...)
+    ON CONFLICT (workflow_id, open_message_id) DO UPDATE SET
+        update_state='pending', desired_revision = <当前 revision>
+    -- 所有分支都登记,包括 conflict
+
+  UPDATE card_action_inbox SET state='processed', processed_at=now() WHERE event_id=$e
 COMMIT
+
+[事务外·幂等] retry: StartDeviceTest(target_input) → finalize succeeded / failed
+[事务外·幂等] 卡片 sweep: 渲染 → PATCH
 ```
 
-`SELECT ... FOR UPDATE` 加在 `workflow_runs` 而非 `card_actions` 上，因为首次点击时
-`card_actions` 行**还不存在**，不存在的行锁不住。父表行锁是唯一能串行化"检查是否已有 claim →
-决定是否插入"的位置。`INSERT card_actions` 本身会对同一父行取 `FOR KEY SHARE`，
-弱于已持有的 `FOR UPDATE`，不存在锁升级死锁。
+`SELECT ... FOR UPDATE` 加在 `workflow_runs` 而非 `card_actions`：首次点击时 `card_actions`
+行**还不存在**，不存在的行锁不住。父表行锁是唯一能串行化"检查是否已有 claim → 决定是否插入"
+的位置。`INSERT card_actions` 自身取的 `FOR KEY SHARE` 弱于已持有的 `FOR UPDATE`，
+不存在锁升级死锁。
 
 水位分配要能组合进本事务，因此 `NextWorkflowAttemptAll` 需抽出 tx 作用域的内部函数
-（当前实现自己 `BeginTx`，见 `postgres_fleet.go:95`），独立方法与本事务共用同一份实现。
+（当前实现自己 `BeginTx`，见 `postgres_fleet.go:95`）。
 
-**验收要求真实 PG 并发测试**：N 个并发点击同一 workflow，断言恰好一次 accepted、
+**验收要求真实 PG 并发测试**：N 个并发点击同一 workflow → 恰好一次 accepted、
 artifacts 水位**恰好推进一次**、其余全部 `rejected.conflict`。
 
 ### 5.2 三条 fencing 规则
 
-全部落在 store API 上，不靠调用方自律：
-
 1. **finalize 必须带 fencing**：`UPDATE ... WHERE workflow_id=? AND state='pending' AND owner=?`。
-   租约过期被接管后，原 owner 迟到的 finalize 影响 0 行。
-2. **恢复与 `failed → pending` 一律复用原 `attempt` / `target_workflow_id`，绝不推进水位。**
-   水位推进只发生在首次接受的那个事务里，一次 claim 一次；此后该行的 attempt 只读。
+2. **恢复与 `failed → pending` 一律复用原 `attempt` / `target_workflow_id` / `target_input`，
+   绝不推进水位、绝不重新 Resolve。** 水位推进只发生在首次接受的事务里。
 3. **租约只管活性，不管正确性。** 正确性来自"钉死 + CAS"：重复执行只会用同一个 workflow ID
    撞 Temporal `RejectDuplicate`。租约取 **120 秒**。
 
@@ -292,62 +347,51 @@ artifacts 水位**恰好推进一次**、其余全部 `rejected.conflict`。
 
 | 既有行 | 本次点击 | 归宿 |
 |---|---|---|
-| 任意 action，`pending` / `succeeded` | 任意 | **被占**：写 `rejected.conflict` 审计 |
-| `action` 相同，`state='failed'` | 相同 action | **失败后重试**：CAS `failed → pending`，取新 owner 与租约，**复用原 `attempt` / `target`**，`revision + 1`，重排该 workflow 的全部消息行；不写新的 accepted 审计 |
-| `action` 不同，`state='failed'` | 另一 action | **被占**：写 `rejected.conflict` 审计 |
+| 任意 action，`pending` / `succeeded` | 任意 | **被占**：`rejected.conflict` 审计 + 登记本次 message |
+| `action` 相同，`state='failed'` | 相同 action | **失败后重试**：CAS `failed → pending`，取新 owner，**复用原 attempt / target / target_input**，`revision + 1`，重排该 workflow 全部消息行；不写新的 accepted 审计 |
+| `action` 不同，`state='failed'` | 另一 action | **被占**：`rejected.conflict` 审计 |
 
-**动作在首次接受时即固定，不可改换。** retry 失败后只能重试 retry——否则 `attempt` /
-`target_workflow_id` 就得清空，与"钉死后只读"和两个 CHECK 直接冲突。这也是 §7.4 里
-失败态**只保留「重新重试」一个按钮**的原因：摆一个必然 `conflict` 的 ignore 按钮是误导。
-
-失败后重试不写第二行 accepted 审计（`card_action_workflow_id` 有 UNIQUE 约束）。
+**动作在首次接受时即固定，不可改换。** retry 失败后只能重试 retry——否则钉死的三个字段
+就得清空，与两个 CHECK 直接冲突。这也是 §7.4 失败态**只保留「重新重试」**的原因：
+摆一个必然 `conflict` 的 ignore 按钮是误导。
 
 ### 5.4 revision 与卡片重排
 
-**每一次对用户可见的状态变化，都在同一事务内 `revision + 1` 并把该 workflow 的全部
-`card_action_messages` 重置为 `update_state='pending'`、清空 owner/lease。** 触发点恰好四个：
+每一次对用户可见的状态变化，都在同一事务内 `revision + 1` 并把该 workflow 全部
+`card_action_messages` 置 `update_state='pending'`、`desired_revision = 新 revision`、
+**清空自己持有的 owner**（见 §8.3 关于"不得抹掉新 owner"）。触发点恰好四个：
 
 | 变化 | revision |
 |---|---|
-| 首次接受（`pending` 或 `succeeded`） | 置 1 |
+| 首次接受 | 置 1 |
 | retry finalize → `succeeded` | +1 |
 | retry finalize → `failed` | +1 |
-| `failed → pending`（失败后重试） | +1 |
-
-v1 的缺陷是 retry finalize 后没有重新排队，卡片会永远停在「正在启动…」。上表把它闭合。
+| `failed → pending` | +1 |
 
 ---
 
 ## 6. 回调处理
 
-### 6.1 同步段与异步段
+### 6.1 同步段
 
-飞书响应预算约 3 秒，超时即重投（实测 3 次）。`Resolve` 含两次 Temporal 调用，
-**不能放进同步段**。切分点就是 inbox：
+飞书响应预算约 3 秒，`Resolve` 含两次 Temporal 调用，不能放进同步段。切分点是 inbox。
 
-**同步段**（毫秒级，一次 INSERT，返回 toast）：
+同步段**只做无 I/O 校验 + 一次 inbox 写入**，整体带**固定 2 秒 deadline**：
 
-1. **来源校验**（§6.2，全部无 I/O）与载荷校验、身份、白名单、readiness。
-2. `INSERT card_action_inbox (event_id, disposition, ack_toast, ...) ON CONFLICT (event_id) DO NOTHING`
+1. §6.2 的来源与载荷校验、身份、白名单、readiness（全部无 I/O）。
+2. `INSERT card_action_inbox (...) ON CONFLICT (event_id) DO NOTHING`：
    - **影响 0 行（重投）** → 读出既有行，**原样重放 `ack_toast`**，不写审计、不重复处理；
-   - **插入成功且 `disposition='rejected'`** → 同事务写拒绝审计，返回精确 toast；
+   - **插入成功且 `disposition='rejected'`** → 同事务写拒绝审计并置 `processed`，返回精确 toast；
    - **插入成功且 `disposition='accepted'`** → 返回 toast「已收到，正在处理」，交异步段。
-3. 拿不到 `event_id` 的畸形事件：拒绝 + 只记日志，**不写审计**——无法去重的审计在重投下无界增长。
+3. 拿不到 `event_id` 的畸形事件：拒绝 + 只记日志，**不写审计**（无法去重的审计在重投下无界增长）。
 
-**异步段**（无时限，结果经卡片 Patch 呈现）：从 inbox 消费 → `Resolve` → 接受事务 → 执行 →
-标记 inbox `processed`。用 listener 的生命周期 ctx，**不用回调 ctx**（后者在应答返回时即取消）。
-
-> **inbox 同时是崩溃兜底**：进程在 ACK 之后、claim 之前退出时，inbox 行留在 `received`，
-> 由 §8.1 的 sweep 接管。这正是 v1 缺失的持久交接。
->
-> 两层反馈的分工由此固定：toast 是**临时回执**，卡片才是**权威结论**。
-> 任何需要 I/O 才能判定的结果（legacy、无失败变体、已被占、启动失败）都由卡片承载，
-> **不由 toast 承载**——异步段跑完时同步应答早已返回。
+**inbox 持久化失败（含 2 秒超时）必须向 SDK 返回 error，不得返回成功 toast。**
+`ws/client.go:638` 会把 error 应答成 500，飞书据此重投——这正是我们要的。返回成功 toast
+等于把一次点击静默丢弃。
 
 ### 6.2 来源与载荷校验（fail-closed）
 
-**全部在任何持久副作用之前完成**，任一不满足即不写 inbox 的 accepted 行、不 claim、
-不分配 attempt、不启动 workflow：
+**全部在任何持久副作用之前完成**：
 
 | 检查 | 拒绝原因 |
 |---|---|
@@ -362,72 +406,98 @@ v1 的缺陷是 retry finalize 后没有重新排队，卡片会永远停在「�
 | **当前 readiness 为真**（§7.1） | `disabled` |
 | open_id 在 `FEISHU_CMD_WHITELIST` 内 | `unauthorized` |
 
-白名单复用 `FEISHU_CMD_WHITELIST`：同一批人有权发指令就有权点按钮，再引入第二份名单只会漂移。
+白名单复用 `FEISHU_CMD_WHITELIST`：同一批人有权发指令就有权点按钮。
 
 非白名单提示必须走**同步 callback toast**，绝不能用 `SendText`——后者会发到固定的
-`FEISHU_RECEIVE_ID`（可能是群），等于把一次未授权点击广播给所有人。
+`FEISHU_RECEIVE_ID`（可能是群），等于把未授权点击广播给所有人。
 
-### 6.3 审计口径
+### 6.3 异步段
+
+从 inbox 消费 → `Resolve` → `AcceptCardAction`（§5.1）或 `FinalizeInboxRejection`（§6.4）→
+执行 → 卡片 sweep。用 listener 的生命周期 ctx，**不用回调 ctx**（后者在应答返回时即取消）。
+
+### 6.4 业务拒绝也是一个事务
+
+`Resolve` 返回 `RejectReason`（legacy / 仍在运行 / 结果不可读 / 无失败变体 / 缺 artifact）时，
+**不能只写审计然后各自标记**。收敛为单事务 `FinalizeInboxRejection(eventID, owner, reason)`：
+
+```text
+BEGIN
+  UPDATE card_action_inbox ... 取 fencing(同 §5.1)
+  INSERT audit_log(..., inbox_event_id=$e, card_action_workflow_id=NULL)
+  INSERT card_action_messages(..., render_kind='rejection', rejection_reason=<渲染文案>,
+                              update_state='pending')
+    ON CONFLICT DO UPDATE SET ...   -- 不覆盖已有的 render_kind='action'
+  UPDATE card_action_inbox SET state='processed', processed_at=now()
+COMMIT
+```
+
+这就是 `card_action_messages` **不能引用 `card_actions`** 的原因：这些路径没有 action 行，
+但结论仍须呈现到卡片上。
+
+冲突处理：目标行已是 `render_kind='action'` 时**保留 action**——卡片应显示胜出者的动作状态，
+而不是后来者的拒绝理由。
+
+### 6.5 审计口径
 
 审计对象是**人的点击尝试与 accepted action**，不是内部执行状态迁移。
 
-| 场景 | action | FK |
-|---|---|---|
-| 接受（claim 事务内，恰好一行） | `card.retry.accepted` / `card.ignore.accepted` | 设置 |
-| 非白名单 | `card.<action>.rejected.unauthorized` | NULL |
-| readiness 关闭 | `card.<action>.rejected.disabled` | NULL |
-| 来源/载荷不合法 | `card.unknown.rejected.payload` | NULL |
-| 无权威 run | `card.<action>.rejected.legacy` | NULL |
-| 已被占 | `card.<action>.rejected.conflict` | NULL |
-| 源未关闭 / 结果不可读 / 无失败变体 / 缺 artifact | `card.<action>.rejected.<reason>` | NULL |
-| 失败后重试、恢复、Start、finalize、Patch | **不写审计** | — |
+| 场景 | action | workflow FK | event FK |
+|---|---|---|---|
+| 接受 | `card.retry.accepted` / `card.ignore.accepted` | 设置 | 设置 |
+| 非白名单 | `card.<action>.rejected.unauthorized` | NULL | 设置 |
+| readiness 关闭 | `card.<action>.rejected.disabled` | NULL | 设置 |
+| 来源/载荷不合法 | `card.unknown.rejected.payload` | NULL | 设置 |
+| 无权威 run / 仍在运行 / 结果不可读 / 无失败变体 / 缺 artifact | `card.<action>.rejected.<code>` | NULL | 设置 |
+| 已被占 | `card.<action>.rejected.conflict` | NULL | 设置 |
+| 失败后重试、恢复、Start、finalize、Patch | **不写审计** | — | — |
 
-- `actor` 固定 `feishu:<open_id>`；空身份用固定值 `feishu:unknown`。
+- `actor` 固定 `feishu:<open_id>`；空身份用 `feishu:unknown`。
 - `target` = `source_workflow_id`（无法解析时空串）。
-- `payload_digest` = 对**经过大小限制后的**原始 action payload 做 canonical JSON 的 SHA-256。
-  **不保存不可信原文。**
-- inbox 去重跑在拒绝审计**之前**；不同的真实点击各留一行。
+- `payload_digest` = 同步段对**经过大小限制后的**原始 payload 做 canonical JSON 的 SHA-256，
+  **存进 inbox**；异步段与恢复路径直接取用，**不重新计算**（原始 payload 已不在手上）。
 
 ---
 
-## 7. 卡片形态
+## 7. 卡片形态：按钮由 activity 注入
 
-### 7.1 readiness —— 五项合取
+### 7.1 架构决定：workflow 完全不参与
 
-按钮可用性是运行时配置与运行时状态的合取，不能进 activity 载荷——activity 输入由 workflow
-写进 history，worker 装配时改不了。
+**`buildNotificationCard` 一行不改，`NotifyCard` 的 activity input 逐字节不变。**
+按钮由 `NotifyCard` 活动在发送前注入。
 
-1. `FEISHU_CARD_ACTIONS_ENABLED=true`（显式开关。**本地注册 handler 不能证明飞书后台已订阅
-   `card.action.trigger`**，所以必须独立成开关）；
-2. `FEISHU_CMD_WHITELIST` 非空（否则 listener 根本不启动）；
-3. `NewSender` 返回的 mode == `"app"`（**webhook 模式收不到回调**，缺 `ReceiveID` 时会静默
-   回退到 webhook——v1 漏了这一项）；
-4. card action handler 已装配；
-5. **WS 当前 ready**。用 SDK v3.9.9 的生命周期钩子维护一个原子布尔：
-   `WithOnReady` / `WithOnReconnected` → 置真；
-   `WithOnReconnecting` / `WithOnDisconnected` / `WithOnError` → 置假；ctx 取消 → 置假。
+这条决定同时解决三个问题：
 
-**只能承诺"发送瞬间 ready"**：卡片发出后连接可能断开。因此回调路径必须**再查一次
-readiness**（§6.2），对历史卡片上残留的按钮返回 toast「按钮已停用」并写
-`rejected.disabled`——这就是 `rejected.disabled` 的实际检查入口。
+1. **不需要 Temporal 版本门。** workflow 的 command 序列与活动入参都没变，
+   第一段部署产生的 history 在第二段代码下重放无异议，不需要录制新 fixture。
+2. **readiness 天然落在正确的位置。** readiness 是运行时状态（§7.2 含 WS 连接活性），
+   activity 输入由 workflow 写进 history、worker 装配时改不了——注入本来就只能在活动侧做。
+3. **预算路径闭合。** workflow 按**不含按钮**的卡片裁剪（与今天完全一致），
+   活动侧再注入。若注入后超预算，**发送原展示卡片（无按钮），不降级为纯文本**。
+   反过来做（workflow 按含按钮卡片裁剪、活动再剥掉）会导致 readiness 关闭时详情被多裁，
+   违反"其余内容逐字不变"。
 
-不满足时 `NotifyCard` 侧**剥掉按钮**发展示卡片，其余内容逐字不变。
-
-### 7.2 卡片 DTO 变更
-
-1. `CardConfig` 增加 `UpdateMulti bool \`json:"update_multi"\``，**恒为 `true`**。
-   飞书 `PATCH /open-apis/im/v1/messages/:message_id` 要求原卡片带 `config.update_multi = true`。
-2. 新增封闭的 action 模块。**`value` 用固定字段结构体，不用 `map[string]string`**——
-   map 不是封闭 DTO，多一个键的断言无从谈起：
+DTO 上要能表达 action 元素，但 **workflow 永不设置它**：
 
 ```go
-type CardActionModule struct {
-    Tag     string       `json:"tag"`     // 恒为 "action"
-    Actions []CardButton `json:"actions"`
+// CardElement 是封闭的 tagged union,三种形态互斥:
+//   tag=div    → Text 非空, Actions 为 nil
+//   tag=hr     → 两者皆 nil
+//   tag=action → Text 为 nil, Actions 非空(只由 NotifyCard 活动构造)
+type CardElement struct {
+    Tag     string       `json:"tag"`
+    Text    *CardText    `json:"text,omitempty"`
+    Actions []CardButton `json:"actions,omitempty"`
 }
+```
 
-// CardButton 没有 behaviors、没有 url、没有 multi_url——
-// 按钮只能回调,不可能变成跳转或表单。
+`omitempty` + workflow 永不设值 ⇒ workflow 产出的卡片序列化**逐字节不变**，
+这是"无需版本门"的机械依据，必须有测试锁住（§10.7）。
+
+按钮 `value` 用固定字段结构体，不用 `map[string]string`——map 不是封闭 DTO，
+"恰好两个键"的断言无从谈起：
+
+```go
 type CardButton struct {
     Tag   string          `json:"tag"`   // 恒为 "button"
     Text  CardText        `json:"text"`  // plain_text
@@ -435,22 +505,50 @@ type CardButton struct {
     Value CardActionValue `json:"value"`
 }
 
-// CardActionValue 是封闭的两字段结构:序列化后恰好两个键。
+// 序列化后恰好两个键。没有 behaviors、没有 url、没有 multi_url。
 type CardActionValue struct {
     Action           string `json:"action"`             // retry | ignore
     SourceWorkflowID string `json:"source_workflow_id"`
 }
 ```
 
-**同步影响**：展示卡片轮的递归键断言（`devicetest_test.go:1007`）把 `config` 的键集合精确
-锁死为 `{"wide_screen_mode"}`，且把带 `actions` 的卡片判为非法。这两处**必须同步放宽到新的
-封闭集合，而不是删除断言**——反例改为"带 `behaviors`""带 `url`""带 `multi_url`"
-"button value 含第三个键""value 含 `variant`"，仍须判红。
+**`config.update_multi`** 恒为 `true`（飞书 `PATCH /open-apis/im/v1/messages/:message_id`
+的前置要求）。这是**唯一**的 workflow 侧 DTO 变更，随第一段部署上线（§11）。
 
-**30 KiB 门禁不变**，action 模块与主行同级**不可裁剪**：裁剪到底仍须保留按钮；
-含按钮后仍超预算则按既有规则整卡降级为纯文本（此时自然无按钮）。
+**同步影响**：展示卡片轮的递归键断言（`devicetest_test.go:1007`）把 `config` 键集合锁死为
+`{"wide_screen_mode"}`、把带 `actions` 的卡片判为非法。两处**必须同步放宽到新的封闭集合，
+而不是删除断言**——反例改为"带 `behaviors`""带 `url`""带 `multi_url`"
+"button value 含第三个键""value 含 `variant`""tag=div 同时带 actions"，仍须判红。
 
-### 7.3 动作后的卡片
+### 7.2 readiness —— 五项合取
+
+1. `FEISHU_CARD_ACTIONS_ENABLED=true`（显式开关。**本地注册 handler 不能证明飞书后台已订阅
+   `card.action.trigger`**）；
+2. `FEISHU_CMD_WHITELIST` 非空（否则 listener 不启动）；
+3. `NewSender` 返回的 mode == `"app"`（**webhook 模式收不到回调**，缺 `ReceiveID` 会静默回退）；
+4. card action handler 已装配；
+5. **WS 当前 ready**：用 SDK 生命周期钩子维护原子布尔——
+   `WithOnReady` / `WithOnReconnected` → 真；
+   `WithOnReconnecting` / `WithOnDisconnected` / `WithOnError` → 假；ctx 取消 → 假。
+
+**只能承诺"发送瞬间 ready"**。因此回调路径必须**再查一次 readiness**（§6.2），
+对历史卡片上残留的按钮返回 toast「按钮已停用」并写 `rejected.disabled`。
+
+### 7.3 更新接口：独立的 CardUpdater
+
+**绝不往 `CardSender` 上加 `PatchCard`**：`webhookSender` 已实现 `SendCard`（`feishu.go:168`），
+扩接口会让它掉出 `CardSender`，于是 `notify_card.go` 的类型断言失败，
+**webhook 模式的展示卡片静默退化成纯文本**。让 webhook 假实现一个必然失败的 `PatchCard`
+同样错误。
+
+```go
+// CardUpdater 只由 app sender 实现:webhook 自定义机器人没有消息更新能力。
+type CardUpdater interface {
+    PatchCard(ctx context.Context, messageID string, card any) error
+}
+```
+
+### 7.4 动作后的卡片
 
 按钮整块被替换为一行状态文本（`tag=div`, `plain_text`）：
 
@@ -460,8 +558,8 @@ type CardActionValue struct {
 | retry succeeded | `已由 <open_id> 重试 → <target_workflow_id>` | 无 |
 | retry failed | `重试启动失败：<last_error>` | **只保留「重新重试」** |
 | ignore succeeded | `已由 <open_id> 忽略（仅记录，不改变判定）` | 无 |
+| 业务拒绝（`render_kind='rejection'`） | `<rejection_reason>` | 保留原按钮 |
 
-失败态**只保留「重新重试」**：动作已固定，再摆一个必然 `conflict` 的 ignore 按钮是误导。
 括号里"不改变判定"是 §2.2 语义的用户可见落点，不可省略。
 
 ---
@@ -470,8 +568,8 @@ type CardActionValue struct {
 
 ### 8.1 三个 sweep
 
-worker 启动时各跑一次，之后按 30 秒间隔轮询。**租约谓词必须容纳 NULL**——
-v1 用 `lease_expires_at < now()` 而默认值是 NULL，首次 pending 永不命中：
+worker 启动时各跑一次，之后 30 秒轮询。**租约谓词必须容纳 NULL**——
+`lease_expires_at < now()` 配 NULL 默认值时首次 pending 永不命中：
 
 ```sql
 WHERE <state 列> = '<pending 值>'
@@ -480,43 +578,43 @@ WHERE <state 列> = '<pending 值>'
 
 | sweep | 表 | 动作 |
 |---|---|---|
-| inbox | `card_action_inbox` | CAS 取 owner → 走异步段（Resolve → 接受事务 → 执行）→ `processed` |
-| 动作 | `card_actions` | CAS 取 owner → 用**钉死的** target 重新 `StartDeviceTest` → finalize |
-| 卡片 | `card_action_messages` | CAS 取 owner → 渲染 `card_actions.revision` 对应的卡片 → Patch |
+| inbox | `card_action_inbox` | CAS 取 owner → `Resolve` → `AcceptCardAction` / `FinalizeInboxRejection` |
+| 动作 | `card_actions` | CAS 取 owner → 用**持久化的 `target_input`** 重新 `StartDeviceTest` → finalize |
+| 卡片 | `card_action_messages` | CAS 取 owner → 渲染 `desired_revision` → PATCH；另含 §8.3 的 `reconcile_after` 到期行 |
 
-飞书长连接在多个 worker 实例间负载均衡，点击可能落到任一实例；owner + 租约让 A 崩溃后
-B 能接管。**单实例部署下同样必要**——进程重启就是一次接管。
-
-### 8.2 卡片收敛与迟到写
-
-数据库 fencing 挡不住**已经发生的外部写**：A 的 PATCH 超时后 B 渲染并写成
-`succeeded`，A 的请求仍可能迟到落到飞书，把卡片覆盖回旧内容。因此：
-
-- 卡片 sweep 渲染时读取当时的 `card_actions.revision`，记为 `r`；
-- PATCH 成功后执行带 fencing 的更新：
-  `UPDATE ... SET rendered_revision = r, update_state = CASE WHEN r >= <当前 revision> THEN 'succeeded' ELSE 'pending' END WHERE workflow_id=? AND open_message_id=? AND owner=?`；
-- **该更新影响 0 行（租约已被接管）时，写方必须无条件重排**：
-  `UPDATE ... SET update_state='pending', owner='', lease_expires_at=NULL`。
-  重排是安全的：同一 revision 的 PATCH 内容相同，重复渲染幂等，最坏代价是多一次 PATCH。
-
-收敛性由两条保证：§5.4 的每次可见变化都重排；本节的迟到写被发现后也重排。
-终态是 `rendered_revision = revision AND update_state='succeeded'`。
-
-### 8.3 错误分类
+### 8.2 错误分类
 
 | 来源 | 永久（不重试） | 暂时（退避重试） |
 |---|---|---|
 | `StartDeviceTest` | artifact 缺失、非法输入 | Temporal 不可达、超时 |
-| 卡片 Patch | 超过飞书 14 天更新期限、message 不存在、权限不足 | 网络错误、限流、5xx |
+| 卡片 PATCH | 超过飞书 14 天更新期限、message 不存在、权限不足 | 网络错误、限流、5xx |
 
 **`StartDeviceTest` 返回 `started=false`（`AlreadyStarted`）是幂等成功，不是失败**：
-target 已钉死，说明该 workflow 已在运行。finalize 为 `succeeded`。这条必须进状态机与测试。
+target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。这条必须进状态机与测试。
 
 永久错误：动作侧 → `state='failed'` + `last_error`；卡片侧 → `update_state='abandoned'`。
-`attempts` 累加，退避上限后转 `abandoned`。
 
-**卡片 Patch 的任何结果都不回写动作 `state`。** 卡片没更新成功不代表重试没发生。
-toast 的 200671 属于即时层，**不影响任何状态**，只记日志。
+**卡片 PATCH 的任何结果都不回写动作 `state`。** toast 的 200671 属于即时层，只记日志。
+
+### 8.3 卡片收敛的诚实边界
+
+飞书 `PATCH` **没有条件版本写**，因此存在一个**无法用数据库手段消除**的反例：
+
+> A 发出 PATCH(rev=1) 后**超时，没有拿到任何响应**；B 接管、PATCH(rev=2) 成功并标 `succeeded`；
+> 此后 A 的旧请求才在飞书端生效。系统**永远不会收到 A 的结果**，数据库却认为已收敛，
+> 而卡片显示的是旧内容。
+
+对此**不承诺严格收敛**（§2.3 已把权威性交给数据库），只做三件事：
+
+1. **明确超时 ≠ 失败。** PATCH 返回超时或不确定错误时，**不得**直接标 `succeeded` 或
+   `abandoned`；写入 `reconcile_after = now() + 60s`，由卡片 sweep 在到期后**再渲染一次
+   当前 `desired_revision`**，然后清空 `reconcile_after`。重复渲染同一 revision 是幂等的，
+   最坏代价是多一次 PATCH。
+2. **重排不得抹掉新 owner。** 失去租约的写方只能清除**自己持有的** owner：
+   `UPDATE ... SET owner='', lease_expires_at=NULL WHERE ... AND owner = <my token>`。
+   owner 已换人时只设 `reconcile_after`，不碰 owner——否则会把新持有者踢掉，形成互相抢占。
+   这也是 §3.5 要求 owner 是**不可复用随机 token** 的原因。
+3. **文档写明。** 用户可见文档与 §12 都必须写明"卡片是最终呈现、数据库是权威"。
 
 ---
 
@@ -525,25 +623,12 @@ toast 的 200671 属于即时层，**不影响任何状态**，只记日志。
 | 位置 | 职责 |
 |---|---|
 | `runtime/internal/rerun`（新） | 只读 `Resolver`，被 `feishucmd` 与 `cardaction` 共用 |
-| `runtime/internal/cardaction`（新） | 回调 handler、异步消费、三个 sweep、卡片渲染 |
-| `runtime/internal/store` | 四张表的访问层；接受事务是**一个** store 方法 |
-| `runtime/internal/feishucmd/listener.go` | 增注册 `OnP2CardActionTrigger` 与五个生命周期钩子；本身不含业务逻辑 |
-| `runtime/internal/feishu` | **新增独立接口 `CardUpdater`**，只由 app sender 实现 |
-| `runtime/internal/workflow/devicetest.go` | 卡片 DTO 增 `update_multi` 与 action 模块 |
-
-**绝不往 `CardSender` 上加 `PatchCard`**：`webhookSender` 已实现 `SendCard`（`feishu.go:168`），
-扩接口会让它掉出 `CardSender`，于是 `notify_card.go` 的类型断言失败，**webhook 模式的展示
-卡片静默退化成纯文本**。让 webhook 假实现一个必然失败的 `PatchCard` 同样错误。
-
-```go
-// CardUpdater 只有 app sender 实现:webhook 自定义机器人没有消息更新能力。
-type CardUpdater interface {
-    PatchCard(ctx context.Context, messageID string, card any) error
-}
-```
-
-接受事务作为**单个 store 方法**暴露（`AcceptCardAction`），事务边界不外泄，
-就不存在"调用方忘了带 owner"这种失败模式。
+| `runtime/internal/cardaction`（新） | 回调 handler、异步消费、三个 sweep、卡片渲染与注入 |
+| `runtime/internal/store` | 四张表访问层；`AcceptCardAction` / `FinalizeInboxRejection` 各是**一个**方法，事务边界不外泄 |
+| `runtime/internal/feishucmd/listener.go` | 增注册 `OnP2CardActionTrigger` 与五个生命周期钩子；不含业务逻辑 |
+| `runtime/internal/feishu` | 新增独立接口 `CardUpdater`，只由 app sender 实现 |
+| `runtime/internal/activity/notify_card.go` | readiness 判定与按钮注入 |
+| `runtime/internal/workflow/devicetest.go` | **只加 `update_multi` 与 `CardElement.Actions` 字段**；`buildNotificationCard` 逻辑不变 |
 
 ---
 
@@ -551,96 +636,109 @@ type CardUpdater interface {
 
 ### 10.1 Store conformance（MemStore 与 PGStore 共用）
 
-- 接受事务：首次成功；`retry` 行落库即已钉死；
-- **`retry` 分两步写入必被拒**（先插默认值再 UPDATE → `23514`），证明"一次性插入"不可绕过；
-- `ignore` 行 attempt=0、target 为空、落库即 `succeeded`；
-- §5.3 三种归宿逐行覆盖；`failed → pending` 复用原 attempt/target；
+- 接受事务：首次成功；`retry` 行落库即已钉死 attempt/target/target_input；
+- **`retry` 分两步写入必被拒**（先插默认值再 UPDATE → `23514`）；
+- `ignore` 行 attempt=0、target 空、target_input NULL、state 恒为 `succeeded`
+  （`card_actions_ignore_terminal` 的机械证明）；
+- `target_input.WorkflowID() == target_workflow_id` 断言；
+- §5.3 三种归宿逐行覆盖；`failed → pending` 复用原三字段且不重新 Resolve；
 - finalize fencing：owner 不匹配影响 0 行；
 - 恢复不推进水位（断言 artifacts 计数器不变）；
-- 一次接受恰好一行 accepted 审计；失败后重试不产生第二行；
-- 拒绝审计可多行且 FK 为 NULL；
+- 一次接受恰好一行 accepted 审计；**同一 event 重复消费不写第二行**（`inbox_event_id` UNIQUE）；
 - `workflow_id` 不在 `workflow_runs` 中 → FK 拒绝；
-- revision：四个触发点各 +1 并重排全部消息行；
-- 卡片子状态机与动作 state 相互不影响；
-- **租约谓词命中 NULL**（首次 pending 能被 sweep 选中）。
+- revision 四个触发点各 +1 并重排全部消息行；
+- **租约谓词命中 NULL**；`attempts` 负值被拒；`processed` 与 `processed_at` 必须配对。
 
-### 10.2 真实 PG 并发（不可用 MemStore 替代）
+### 10.2 真实 PG 并发
 
-- N 个并发点击同一 workflow → 恰好一次 accepted，**artifacts 水位恰好推进一次**，
-  其余 `rejected.conflict`；
+- N 个并发点击同一 workflow → 恰好一次 accepted，**水位恰好推进一次**，其余 `conflict`；
 - 并发 retry 与 ignore → 恰好一个胜出；
 - 两个 sweep 实例并发取同一行 → 恰好一个取得 owner。
 
-### 10.3 回调处理
+### 10.3 inbox 与崩溃恢复
 
-- 同一 event ID 重投 3 次 → 一次 claim、**一行审计**、**三次相同 toast**（由 inbox 重放）；
-- 不同真实点击各留一行审计；
-- ACK 之后、claim 之前进程退出 → inbox 行留 `received`，sweep 接管后动作照常完成
-  （**v1 阻断 2 的回归测试**）；
+- 同一 event ID 重投 3 次 → 一次 claim、**一行审计**、**三次相同 toast**（inbox 重放）；
+- **ACK 之后、claim 之前进程退出** → inbox 留 `received`，sweep 接管后动作完成（v1 阻断 2 回归）；
+- **AcceptCardAction 提交后、标 processed 前崩溃不可能发生**（同事务），
+  以"重跑同一 event 不产生第二行审计"机械证明（v2 阻断 2 回归）；
+- **Start 成功、finalize 前崩溃** → 恢复用持久化的 `target_input` 逐字段相同地重提，
+  `started=false` → 收敛为 `succeeded`；
+- inbox 持久化失败 → handler **返回 error**（断言 SDK 应答非 200），不返回成功 toast。
+
+### 10.4 回调校验
+
 - §6.2 表格逐行覆盖：AppID 不符、tenant 空/不等、`Action.Tag != "button"`、
   `OpenMessageID` 空、host 非消息卡片、超量 payload、value 多一个键；
 - 非白名单 → 同步 toast + `rejected.unauthorized`，且 `SendText` **零调用**（机械断言）；
-- readiness 五项各自为假时 → `rejected.disabled`，不进 claim；
-- 无失败变体 / legacy / 源仍在运行 → `NextWorkflowAttempt*` 与 `StartDeviceTest` **零调用**；
-- `started=false` → finalize `succeeded`。
+- readiness 五项各自为假 → `rejected.disabled`，不进 claim；
+- 无失败变体 / legacy / 源仍在运行 → `NextWorkflowAttempt*` 与 `StartDeviceTest` **零调用**，
+  且经 `FinalizeInboxRejection` 在卡片上留下结论。
 
-### 10.4 卡片
+### 10.5 Resolver 兼容
 
-- 含 `config.update_multi = true`；
+- **`feishucmd/executor_test.go` 既有全部 rerun 用例一行不改即通过**；
+- 显式 variant 模式 **`WorkflowResult` 零调用**，且允许 PASSED / SKIPPED；
+- 空 variant 模式忽略空 `Variant` 的 summary，去重并按字典序排序；
+- `ArtifactMissing` 携带 `Count`，文案 `变体 %s 的 artifact 数量为 %d，要求恰好 1 个` 逐字复现。
+
+### 10.6 卡片
+
+- `config.update_multi = true`；
 - button `value` 序列化后恰好两个键；含第三个键或含 `variant` 判红；
-- 带 `behaviors` / `url` / `multi_url` 判红；
-- 全绿运行不带按钮；readiness 任一项为假时不带按钮且其余内容逐字不变；
-- 30 KiB 门禁下裁剪到底仍保留按钮；
-- §7.3 四种状态文本逐字匹配（表格是契约），失败态**只有一个按钮**；
-- 同一 workflow 多张卡片（`NotifyCard` 重试）→ 全部收敛到同一状态；
-- 迟到写场景：A 失去租约后的 PATCH 被发现 → 重排 → 最终 `rendered_revision = revision`。
+- 带 `behaviors` / `url` / `multi_url` 判红；`tag=div` 同时带 `actions` 判红；
+- 全绿运行不带按钮；readiness 任一项为假 → 不带按钮**且其余内容与 workflow 产出逐字相同**；
+- 注入按钮后超预算 → **发送原展示卡片，不降级纯文本**（机械断言 `SendText` 零调用）；
+- §7.4 五种状态文本逐字匹配，失败态**只有一个按钮**；
+- 同一 workflow 多张已观测卡片 → 全部收敛；
+- PATCH 超时 → 不标 `succeeded`，设 `reconcile_after`，到期重渲染一次；
+- 失去租约的写方**不清除他人 owner**。
 
-### 10.5 文本 rerun 不回归
+### 10.7 workflow 侧不变性（关键）
 
-`feishucmd/executor_test.go` 既有的全部 rerun 用例**一行不改即通过**。这是 `RerunResolver`
-抽取正确的判据——语义共用而非复制。
+- **`buildNotificationCard` 的输出在加入 `Actions` 字段前后序列化逐字节相同**
+  （这是"无需 Temporal 版本门"的机械依据）；
+- `history-pre-notify-card.json` 继续原样重放通过；
+- workflow 代码中不存在对 `CardElement.Actions` 的任何赋值（可用测试断言遍历产出卡片，
+  所有元素 `Actions == nil`）。
 
-### 10.6 Migration
+### 10.8 Migration
 
 - 独立幂等 migration，**连续执行两次结果相同**；
-- fresh `schema.sql` 与 upgraded 库的最终约束一致（复用 `migration_workflow_runs_test.go` 的模式）；
+- fresh `schema.sql` 与 upgraded 库最终约束一致（复用 `migration_workflow_runs_test.go` 模式）；
 - `pgtest` 的 TRUNCATE 清单补入四张表；
-- **前置检查**：migration 断言 `workflow_runs` 表已存在（本轮 FK 依赖它），
-  未完成 workflow_runs 生产迁移时明确失败而非静默建表。
-
-### 10.7 重放
-
-`history-pre-notify-card.json` 继续原样重放通过（它走 DefaultVersion 文本分支，
-不调 `buildNotificationCard`，不受 DTO 影响）。
+- **前置检查**：断言 `workflow_runs` 已存在，未完成 workflow_runs 生产迁移时明确失败。
 
 ---
 
 ## 11. 部署顺序（两段，不可合并）
 
-`update_multi` 是**无副作用的展示 DTO 变更**，而按钮涉及四张新表与交互处理。两者分开：
+**第一段——并入 `workflow-runs` 的首次部署**：只带 `config.update_multi: true` 与
+`CardElement.Actions` 字段声明（workflow 永不设值，序列化不变），以及对应的断言放宽。
+卡片仍无按钮，行为不变，但此后发出的卡片**具备被更新的能力**。
 
-**第一段——并入 `workflow-runs` 的首次部署**：只带 `config.update_multi: true`
-（以及对应的断言放宽）。卡片仍无按钮，行为不变，但此后发出的卡片**具备被更新的能力**。
-这样零重放风险、零版本门——当前生产是 `origin/master`，不存在含 `NotifyCard` 的 history。
+**第二段——`workflow-runs` rollout 稳定之后**：迁移四张新表、部署 `cardaction` 与
+activity 注入、打开 `FEISHU_CARD_ACTIONS_ENABLED`。因为 workflow 侧无改动，
+**第二段不含任何 Temporal 版本门与 fixture 录制**。
 
-**第二段——`workflow-runs` rollout 稳定之后**：迁移四张新表并启用按钮。
-**绝不把交互处理混进 workflow_runs 的停写窗口**——那个窗口已经同时承担了
-artifact 唯一键变更与 analyze_bridge v2 切换，再叠一层新表和新回调路径，
-故障归因会变得不可能。
+**绝不把交互处理混进 workflow_runs 的停写窗口**——那个窗口已同时承担 artifact 唯一键变更
+与 analyze_bridge v2 切换，再叠一层新表和新回调路径，故障归因会变得不可能。
 
 ---
 
 ## 12. 完成定义
 
-- 终态卡片在有失败变体且 readiness 五项全真时带两个按钮，其余情况逐字保持展示卡片形态；
+- 终态卡片在有失败变体且 readiness 五项全真时带两个按钮，其余情况**与 workflow 产出逐字相同**；
 - 一次点击 = 一次 claim = 一行 accepted 审计，与回调到达次数无关；
 - ACK 之后进程退出，动作仍由 inbox sweep 完成，不丢失；
-- 重试的 attempt 与 workflow ID 在接受事务内**一次性写入**，恢复路径永不推进水位；
-- 卡片最终收敛到 `rendered_revision = revision`，且 Patch 失败不污染动作状态；
+- 接受与业务拒绝各是**一个事务**，重跑不产生重复审计；
+- 重试的 attempt / target / **完整输入**在接受事务内一次性写入，恢复逐字段复用，
+  永不推进水位、永不重新 Resolve；
+- **卡片是 best-effort 最终呈现，数据库动作状态是权威**——不承诺卡片严格收敛（§8.3）；
+- 已观测到的 message instance 全部收敛（未被点击的重复卡片不在承诺范围内）；
 - webhook 模式的展示卡片未退化（`CardSender` 未被扩展）；
 - 未授权点击只得到同步 toast，`SendText` 零调用；
 - 文本 `rerun` 外部行为与回复逐字不变；
-- `decisions` 表未被修改；
+- `decisions` 表未被修改；**workflow 代码除两个字段声明外未改动**；
 - runtime 全测试、store PG conformance、真实 PG 并发测试、`go vet ./...` 全绿；
 - CLAUDE.md §3 规则 7 / §11 与 `docs/device-test-sequence.md` 已同步修正。
 
