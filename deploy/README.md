@@ -1,5 +1,7 @@
 # Hermes DevOps Runtime deployment
 
+日常更新/回滚/排障命令见 [RUNBOOK.md](RUNBOOK.md)。
+
 This Compose project is independent from `/opt/hermes`. It must not stop, rename,
 or reconfigure the existing Hermes Agent containers or the process using host port 8090.
 
