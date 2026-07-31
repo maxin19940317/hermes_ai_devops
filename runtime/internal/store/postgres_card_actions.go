@@ -185,7 +185,11 @@ func (s *PGStore) CompleteAccept(
 	if err != nil {
 		return nil, fmt.Errorf("complete accept %s: fence inbox: %w", req.EventID, err)
 	}
-	if inbox.LeaseExpiresAt == nil || !inbox.LeaseExpiresAt.After(time.Now().UTC()) {
+	leaseLive, err := leaseIsLiveTx(ctx, tx, inbox.LeaseExpiresAt)
+	if err != nil {
+		return nil, fmt.Errorf("complete accept %s: check lease: %w", req.EventID, err)
+	}
+	if !leaseLive {
 		return &AcceptOutcome{Kind: "lost"}, nil
 	}
 	if err := validateAcceptMatchesInbox(req, inbox); err != nil {
@@ -202,6 +206,13 @@ func (s *PGStore) CompleteAccept(
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := completeLegacyAcceptTx(ctx, tx, inbox); err != nil {
 			return nil, fmt.Errorf("complete accept %s: legacy: %w", req.EventID, err)
+		}
+		processed, err := processClaimedInboxTx(ctx, tx, inbox.EventID, req.Token)
+		if err != nil {
+			return nil, fmt.Errorf("complete accept %s: process legacy inbox: %w", req.EventID, err)
+		}
+		if !processed {
+			return &AcceptOutcome{Kind: "lost"}, nil
 		}
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("complete accept %s: commit legacy: %w", req.EventID, err)
@@ -252,14 +263,15 @@ func (s *PGStore) CompleteAccept(
 			if err := validateTargetPins(targetInput, targetWorkflowID); err != nil {
 				return nil, fmt.Errorf("complete accept: build target: %w", err)
 			}
-			leaseExpiresAt := time.Now().UTC().Add(cardActionLease)
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO card_actions
 					(workflow_id, action, actor_open_id, state, owner, lease_expires_at,
 					 target_workflow_id, attempt, target_input, revision)
-				VALUES ($1,$2,$3,'pending',$4,$5,$6,$7,$8::jsonb,1)`,
+				VALUES ($1,$2,$3,'pending',$4,
+				        clock_timestamp()+make_interval(secs => $5),
+				        $6,$7,$8::jsonb,1)`,
 				req.WorkflowID, req.Action, req.ActorOpenID, req.ActionToken,
-				leaseExpiresAt, targetWorkflowID, attempt, string(targetInput)); err != nil {
+				cardActionLease.Seconds(), targetWorkflowID, attempt, string(targetInput)); err != nil {
 				return nil, fmt.Errorf("complete accept %s: insert retry action: %w", req.EventID, err)
 			}
 			outcome = AcceptOutcome{
@@ -284,14 +296,13 @@ func (s *PGStore) CompleteAccept(
 			return nil, errors.New("complete accept: resume requires action token")
 		}
 		revision = action.Revision + 1
-		leaseExpiresAt := time.Now().UTC().Add(cardActionLease)
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE card_actions
 			   SET state='pending', owner=$2,
-			       lease_expires_at=$3,
+			       lease_expires_at=clock_timestamp()+make_interval(secs => $3),
 			       last_error='', revision=$4, updated_at=now()
 			 WHERE workflow_id=$1 AND state='failed'`,
-			req.WorkflowID, req.ActionToken, leaseExpiresAt, revision); err != nil {
+			req.WorkflowID, req.ActionToken, cardActionLease.Seconds(), revision); err != nil {
 			return nil, fmt.Errorf("complete accept %s: resume action: %w", req.EventID, err)
 		}
 		if err := insertAuditTx(ctx, tx, AuditRow{
@@ -325,8 +336,12 @@ func (s *PGStore) CompleteAccept(
 			return nil, fmt.Errorf("complete accept %s: reorder messages: %w", req.EventID, err)
 		}
 	}
-	if err := processInboxTx(ctx, tx, inbox.EventID); err != nil {
+	processed, err := processClaimedInboxTx(ctx, tx, inbox.EventID, req.Token)
+	if err != nil {
 		return nil, fmt.Errorf("complete accept %s: process inbox: %w", req.EventID, err)
+	}
+	if !processed {
+		return &AcceptOutcome{Kind: "lost"}, nil
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("complete accept %s: commit: %w", req.EventID, err)
@@ -361,9 +376,39 @@ func (s *PGStore) CompleteReject(
 	if err != nil {
 		return fmt.Errorf("complete reject %s: fence inbox: %w", eventID, err)
 	}
-	if inbox.LeaseExpiresAt == nil || !inbox.LeaseExpiresAt.After(time.Now().UTC()) {
+	leaseLive, err := leaseIsLiveTx(ctx, tx, inbox.LeaseExpiresAt)
+	if err != nil {
+		return fmt.Errorf("complete reject %s: check lease: %w", eventID, err)
+	}
+	if !leaseLive {
 		return nil
 	}
+
+	var existingAction *CardAction
+	var authoritative int
+	err = tx.QueryRowContext(ctx, `
+		SELECT 1
+		  FROM workflow_runs
+		 WHERE workflow_id=$1
+		 FOR UPDATE`, inbox.WorkflowID).Scan(&authoritative)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("complete reject %s: lock workflow run: %w", eventID, err)
+	}
+	if err == nil {
+		action, actionErr := scanCardAction(tx.QueryRowContext(ctx,
+			`SELECT `+cardActionColumns+`
+			   FROM card_actions
+			  WHERE workflow_id=$1
+			  FOR UPDATE`,
+			inbox.WorkflowID))
+		if actionErr != nil && !errors.Is(actionErr, sql.ErrNoRows) {
+			return fmt.Errorf("complete reject %s: lock action: %w", eventID, actionErr)
+		}
+		if actionErr == nil {
+			existingAction = &action
+		}
+	}
+
 	if err := insertAuditTx(ctx, tx, AuditRow{
 		Actor:  actorAudit(inbox.ActorOpenID),
 		Action: rejectionAuditAction(inbox.Action, render.Code),
@@ -371,13 +416,25 @@ func (s *PGStore) CompleteReject(
 	}); err != nil {
 		return fmt.Errorf("complete reject %s: audit: %w", eventID, err)
 	}
-	if err := upsertRejectionMessageTx(
-		ctx, tx, inbox.WorkflowID, inbox.OpenMessageID, render.RejectionReason, buttonsMode,
-	); err != nil {
-		return fmt.Errorf("complete reject %s: register message: %w", eventID, err)
+	if existingAction != nil {
+		if err := upsertActionMessageTx(
+			ctx, tx, inbox.WorkflowID, inbox.OpenMessageID, existingAction.Revision,
+		); err != nil {
+			return fmt.Errorf("complete reject %s: register action message: %w", eventID, err)
+		}
+	} else {
+		if err := upsertRejectionMessageTx(
+			ctx, tx, inbox.WorkflowID, inbox.OpenMessageID, render.RejectionReason, buttonsMode,
+		); err != nil {
+			return fmt.Errorf("complete reject %s: register rejection message: %w", eventID, err)
+		}
 	}
-	if err := processInboxTx(ctx, tx, inbox.EventID); err != nil {
+	processed, err := processClaimedInboxTx(ctx, tx, inbox.EventID, token)
+	if err != nil {
 		return fmt.Errorf("complete reject %s: process inbox: %w", eventID, err)
+	}
+	if !processed {
+		return nil
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("complete reject %s: commit: %w", eventID, err)
@@ -400,7 +457,7 @@ func (s *PGStore) FinalizeAction(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	action, err := scanCardAction(tx.QueryRowContext(ctx, `
+	_, err = scanCardAction(tx.QueryRowContext(ctx, `
 		SELECT `+cardActionColumns+`
 		  FROM card_actions
 		 WHERE workflow_id=$1 AND state='pending' AND owner=$2
@@ -412,9 +469,6 @@ func (s *PGStore) FinalizeAction(
 	if err != nil {
 		return false, fmt.Errorf("finalize action %s: fence: %w", workflowID, err)
 	}
-	if action.LeaseExpiresAt == nil || !action.LeaseExpiresAt.After(time.Now().UTC()) {
-		return false, nil
-	}
 
 	var revision int
 	err = tx.QueryRowContext(ctx, `
@@ -422,6 +476,7 @@ func (s *PGStore) FinalizeAction(
 		   SET state=$3, last_error=$4, revision=revision+1,
 		       owner='', lease_expires_at=NULL, updated_at=now()
 		 WHERE workflow_id=$1 AND state='pending' AND owner=$2
+		   AND lease_expires_at > clock_timestamp()
 		RETURNING revision`,
 		workflowID, token, state, lastErr).Scan(&revision)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -603,10 +658,16 @@ func (s *PGStore) finishMessageRender(
 			claim.WorkflowID, claim.OpenMessageID, err)
 	}
 
-	acquiredAt := time.Now().UTC()
 	if updateState != "pending" || owner != token || !leaseExpiresAt.Valid ||
-		!leaseExpiresAt.Time.UTC().After(acquiredAt) ||
 		desiredRevision != claim.DesiredRevision {
+		return false, nil
+	}
+	leaseLive, err := leaseIsLiveTx(ctx, tx, &leaseExpiresAt.Time)
+	if err != nil {
+		return false, fmt.Errorf("finish message render %s/%s: check lease: %w",
+			claim.WorkflowID, claim.OpenMessageID, err)
+	}
+	if !leaseLive {
 		return false, nil
 	}
 
@@ -617,28 +678,33 @@ func (s *PGStore) finishMessageRender(
 			UPDATE card_action_messages
 			   SET rendered_revision=$4, update_state='succeeded',
 			       owner='', lease_expires_at=NULL, reconcile_after=NULL,
-			       last_error='', updated_at=$5
+			       last_error='', updated_at=clock_timestamp()
 			 WHERE workflow_id=$1 AND open_message_id=$2
-			   AND owner=$3 AND desired_revision=$4 AND update_state='pending'`,
-			claim.WorkflowID, claim.OpenMessageID, token, claim.DesiredRevision, acquiredAt)
+			   AND owner=$3 AND desired_revision=$4 AND update_state='pending'
+			   AND lease_expires_at > clock_timestamp()`,
+			claim.WorkflowID, claim.OpenMessageID, token, claim.DesiredRevision)
 	case "deferred":
 		result, err = tx.ExecContext(ctx, `
 			UPDATE card_action_messages
 			   SET update_state='pending', owner='', lease_expires_at=NULL,
-			       reconcile_after=$5, last_error=$6, updated_at=$7
+			       reconcile_after=clock_timestamp()+make_interval(secs => $5),
+			       last_error=$6, updated_at=clock_timestamp()
 			 WHERE workflow_id=$1 AND open_message_id=$2
-			   AND owner=$3 AND desired_revision=$4 AND update_state='pending'`,
+			   AND owner=$3 AND desired_revision=$4 AND update_state='pending'
+			   AND lease_expires_at > clock_timestamp()`,
 			claim.WorkflowID, claim.OpenMessageID, token, claim.DesiredRevision,
-			acquiredAt.Add(after), lastErr, acquiredAt)
+			after.Seconds(), lastErr)
 	case "abandoned":
 		result, err = tx.ExecContext(ctx, `
 			UPDATE card_action_messages
 			   SET update_state='abandoned', owner='', lease_expires_at=NULL,
-			       reconcile_after=NULL, last_error=$5, updated_at=$6
+			       reconcile_after=NULL, last_error=$5,
+			       updated_at=clock_timestamp()
 			 WHERE workflow_id=$1 AND open_message_id=$2
-			   AND owner=$3 AND desired_revision=$4 AND update_state='pending'`,
+			   AND owner=$3 AND desired_revision=$4 AND update_state='pending'
+			   AND lease_expires_at > clock_timestamp()`,
 			claim.WorkflowID, claim.OpenMessageID, token, claim.DesiredRevision,
-			lastErr, acquiredAt)
+			lastErr)
 	default:
 		return false, fmt.Errorf("finish message render: invalid outcome %q", outcome)
 	}
@@ -767,7 +833,8 @@ func reorderActionMessagesTx(
 ) error {
 	_, err := tx.ExecContext(ctx, `
 		UPDATE card_action_messages
-		   SET desired_revision=$2, update_state='pending',
+		   SET render_kind='action', rejection_reason='', buttons_mode='none',
+		       desired_revision=$2, update_state='pending',
 		       owner='', lease_expires_at=NULL, reconcile_after=NULL,
 		       updated_at=now()
 		 WHERE workflow_id=$1`,
@@ -775,13 +842,37 @@ func reorderActionMessagesTx(
 	return err
 }
 
-func processInboxTx(ctx context.Context, tx *sql.Tx, eventID string) error {
-	_, err := tx.ExecContext(ctx, `
+func leaseIsLiveTx(ctx context.Context, tx *sql.Tx, expiresAt *time.Time) (bool, error) {
+	if expiresAt == nil {
+		return false, nil
+	}
+	var live bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT $1::timestamptz > clock_timestamp()`,
+		*expiresAt,
+	).Scan(&live); err != nil {
+		return false, err
+	}
+	return live, nil
+}
+
+func processClaimedInboxTx(
+	ctx context.Context, tx *sql.Tx, eventID, token string,
+) (bool, error) {
+	result, err := tx.ExecContext(ctx, `
 		UPDATE card_action_inbox
-		   SET state='processed', processed_at=now()
-		 WHERE event_id=$1`,
-		eventID)
-	return err
+		   SET state='processed', processed_at=clock_timestamp()
+		 WHERE event_id=$1 AND state='received' AND owner=$2
+		   AND lease_expires_at > clock_timestamp()`,
+		eventID, token)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }
 
 func completeLegacyAcceptTx(ctx context.Context, tx *sql.Tx, inbox InboxRow) error {
@@ -804,5 +895,5 @@ func completeLegacyAcceptTx(ctx context.Context, tx *sql.Tx, inbox InboxRow) err
 	); err != nil {
 		return err
 	}
-	return processInboxTx(ctx, tx, inbox.EventID)
+	return nil
 }

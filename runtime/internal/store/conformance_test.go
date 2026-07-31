@@ -21,6 +21,11 @@ import (
 
 var ctx = context.Background()
 
+type asyncCompletionResult struct {
+	out *AcceptOutcome
+	err error
+}
+
 // fullStore 是 workflow 活动(internal/activity.Store)与回调服务
 // (internal/callbacks.Store)所需持久层方法的并集;
 // MemStore 与 PGStore 必须行为一致,由本套件保证。
@@ -272,6 +277,68 @@ func TestPGCompletionRechecksLeaseAfterLockWait(t *testing.T) {
 	})
 }
 
+func TestPGCompletionRechecksInboxLeaseAfterWorkflowWait(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(*PGStore, string) (*AcceptOutcome, error)
+	}{
+		{name: "CompleteAccept", call: func(s *PGStore, token string) (*AcceptOutcome, error) {
+			return s.CompleteAccept(ctx, acceptReq("e1", token, "wf1", "retry"))
+		}},
+		{name: "CompleteReject", call: func(s *PGStore, token string) (*AcceptOutcome, error) {
+			err := s.CompleteReject(ctx, "e1", token, RejectRender{
+				Code: "StillRunning", RejectionReason: "still running",
+			})
+			return nil, err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTestPG(t)
+			seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+			token := claimForTest(t, s, "e1", "wf1", "retry")
+			expires := shortenInboxLease(t, s, "e1")
+
+			blocker, err := s.DB.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatalf("begin workflow blocker: %v", err)
+			}
+			defer func() { _ = blocker.Rollback() }()
+			var blockerPID int
+			if err := blocker.QueryRowContext(ctx, `
+				SELECT pg_backend_pid()
+				  FROM workflow_runs
+				 WHERE workflow_id='wf1'
+				 FOR UPDATE`).Scan(&blockerPID); err != nil {
+				t.Fatalf("lock workflow run: %v", err)
+			}
+
+			result := make(chan asyncCompletionResult, 1)
+			go func() {
+				out, err := tc.call(s, token)
+				result <- asyncCompletionResult{out: out, err: err}
+			}()
+			waitForBlockedWorkflowQuery(t, s, blockerPID, result)
+			sleepPast(t, expires)
+			if err := blocker.Commit(); err != nil {
+				t.Fatalf("release workflow lock: %v", err)
+			}
+
+			got := <-result
+			if got.err != nil {
+				t.Fatalf("%s: %v", tc.name, got.err)
+			}
+			if tc.name == "CompleteAccept" && (got.out == nil || got.out.Kind != "lost") {
+				t.Fatalf("CompleteAccept = %#v, want lost", got.out)
+			}
+			if actionExists(t, s, "wf1") || actionMessageExists(t, s, "wf1", "om_shared") ||
+				countAudit(t, s, "e1") != 0 || mustGetInbox(t, s, "e1").State != "received" {
+				t.Fatalf("%s committed after inbox lease expired", tc.name)
+			}
+		})
+	}
+}
+
 func TestPGMessageCompletionRechecksLeaseAfterLockWait(t *testing.T) {
 	cases := []struct {
 		name string
@@ -339,6 +406,40 @@ func TestPGMessageCompletionRechecksLeaseAfterLockWait(t *testing.T) {
 				t.Fatalf("expired %s changed message: %#v", tc.name, message)
 			}
 		})
+	}
+}
+
+func waitForBlockedWorkflowQuery(
+	t *testing.T,
+	s *PGStore,
+	blockerPID int,
+	result <-chan asyncCompletionResult,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case got := <-result:
+			t.Fatalf("completion bypassed workflow lock: (%#v, %v)", got.out, got.err)
+		default:
+		}
+		var waiting int
+		if err := s.DB.QueryRowContext(ctx, `
+			SELECT count(*)
+			  FROM pg_stat_activity
+			 WHERE datname=current_database()
+			   AND pid <> $1
+			   AND wait_event_type='Lock'
+			   AND query LIKE '%workflow_runs%'`, blockerPID).Scan(&waiting); err != nil {
+			t.Fatalf("inspect blocked workflow query: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("completion did not wait on the workflow_runs row")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -559,6 +660,77 @@ func TestPGConcurrentRetryAndIgnoreHaveSingleWinner(t *testing.T) {
 		}
 	default:
 		t.Fatalf("unexpected winning action %#v", action)
+	}
+}
+
+func TestPGCompleteRejectSerializesWithActionAcceptance(t *testing.T) {
+	s := openTestPG(t)
+	seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+	token := claimForTestMessage(t, s, "rejected", "wf1", "retry", "om_rejected")
+
+	acceptance, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin acceptance transaction: %v", err)
+	}
+	defer func() { _ = acceptance.Rollback() }()
+	var blockerPID int
+	if err := acceptance.QueryRowContext(ctx, `
+		SELECT pg_backend_pid()
+		  FROM workflow_runs
+		 WHERE workflow_id='wf1'
+		 FOR UPDATE`).Scan(&blockerPID); err != nil {
+		t.Fatalf("lock workflow run: %v", err)
+	}
+	if _, err := acceptance.ExecContext(ctx, `
+		INSERT INTO card_actions
+			(workflow_id, action, actor_open_id, state, revision)
+		VALUES ('wf1','ignore','ou_winner','succeeded',1)`); err != nil {
+		t.Fatalf("insert uncommitted action: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- s.CompleteReject(ctx, "rejected", token, RejectRender{
+			Code: "StillRunning", RejectionReason: "still running",
+		})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case err := <-result:
+			t.Fatalf("CompleteReject bypassed workflow serialization: %v", err)
+		default:
+		}
+		var waiting int
+		if err := s.DB.QueryRowContext(ctx, `
+			SELECT count(*)
+			  FROM pg_stat_activity
+			 WHERE datname=current_database()
+			   AND pid <> $1
+			   AND wait_event_type='Lock'
+			   AND query LIKE '%workflow_runs%'`, blockerPID).Scan(&waiting); err != nil {
+			t.Fatalf("inspect blocked rejection: %v", err)
+		}
+		if waiting > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("CompleteReject did not wait on the workflow_runs row")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := acceptance.Commit(); err != nil {
+		t.Fatalf("commit acceptance transaction: %v", err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("CompleteReject: %v", err)
+	}
+	message := mustGetActionMessage(t, s, "wf1", "om_rejected")
+	if message.RenderKind != "action" || message.RejectionReason != "" ||
+		message.ButtonsMode != "none" || message.DesiredRevision != 1 {
+		t.Fatalf("rejection did not converge to winning action: %#v", message)
 	}
 }
 
@@ -3108,6 +3280,39 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 	})
 
+	t.Run("AcceptBuildTargetCannotOutliveInboxLease", func(t *testing.T) {
+		s := newStore(t)
+		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+		if _, inserted, err := s.PutInbox(ctx, InboxRow{
+			EventID: "e1", Disposition: "accepted", AckToast: "received",
+			Action: "retry", WorkflowID: "wf1", ActorOpenID: "ou_x",
+			OpenMessageID: "om_shared", PayloadDigest: "digest-e1", State: "received",
+		}, nil); err != nil || !inserted {
+			t.Fatalf("PutInbox = (%v, %v)", inserted, err)
+		}
+		token := "short-lease"
+		if _, err := s.ClaimInbox(ctx, "e1", token, 25*time.Millisecond); err != nil {
+			t.Fatalf("ClaimInbox: %v", err)
+		}
+		request := acceptReq("e1", token, "wf1", "retry")
+		build := request.BuildTarget
+		request.BuildTarget = func(attempt int) ([]byte, string, error) {
+			time.Sleep(75 * time.Millisecond)
+			return build(attempt)
+		}
+		out, err := s.CompleteAccept(ctx, request)
+		if err != nil || out == nil || out.Kind != "lost" {
+			t.Fatalf("CompleteAccept = (%#v, %v), want lost", out, err)
+		}
+		if actionExists(t, s, "wf1") || actionMessageExists(t, s, "wf1", "om_shared") ||
+			countAudit(t, s, "e1") != 0 || mustGetInbox(t, s, "e1").State != "received" {
+			t.Fatal("expired BuildTarget completion left business writes")
+		}
+		if got := artifactAttempt(t, s, "grp/p"); got != 0 {
+			t.Fatalf("expired BuildTarget advanced waterline to %d", got)
+		}
+	})
+
 	t.Run("AcceptIsSerializedAndBumpsWaterlineOnce", func(t *testing.T) {
 		s := newStore(t)
 		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1", "v2")
@@ -3270,28 +3475,32 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 
 	t.Run("AcceptedActionUpgradesPriorRejectionMessage", func(t *testing.T) {
 		s := newStore(t)
-		token := claimForTest(t, s, "rejected", "wf1", "retry")
+		token := claimForTestMessage(t, s, "rejected", "wf1", "retry", "om_rejected")
 		if err := s.CompleteReject(ctx, "rejected", token, RejectRender{
 			Code: "StillRunning", RejectionReason: "still running",
 		}); err != nil {
 			t.Fatalf("CompleteReject: %v", err)
 		}
-		rejection := mustGetActionMessage(t, s, "wf1", "om_shared")
+		rejection := mustGetActionMessage(t, s, "wf1", "om_rejected")
 		if rejection.RenderKind != "rejection" {
 			t.Fatalf("initial message = %#v", rejection)
 		}
 
 		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
-		token = claimForTest(t, s, "accepted", "wf1", "retry")
-		out, err := s.CompleteAccept(ctx, acceptReq("accepted", token, "wf1", "retry"))
+		token = claimForTestMessage(t, s, "accepted", "wf1", "retry", "om_accepted")
+		out, err := s.CompleteAccept(
+			ctx, acceptReqMessage("accepted", token, "wf1", "retry", "om_accepted"),
+		)
 		if err != nil || out == nil || out.Kind != "accepted" {
 			t.Fatalf("CompleteAccept = (%#v, %v)", out, err)
 		}
-		action := mustGetActionMessage(t, s, "wf1", "om_shared")
-		if action.RenderKind != "action" || action.RejectionReason != "" ||
-			action.ButtonsMode != "none" || action.DesiredRevision != 1 ||
-			action.UpdateState != "pending" {
-			t.Fatalf("rejection was not upgraded to action: %#v", action)
+		for _, messageID := range []string{"om_rejected", "om_accepted"} {
+			action := mustGetActionMessage(t, s, "wf1", messageID)
+			if action.RenderKind != "action" || action.RejectionReason != "" ||
+				action.ButtonsMode != "none" || action.DesiredRevision != 1 ||
+				action.UpdateState != "pending" {
+				t.Fatalf("%s was not upgraded to action: %#v", messageID, action)
+			}
 		}
 	})
 
@@ -3374,6 +3583,28 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if countAudit(t, s, "e2") != 1 || mustGetInbox(t, s, "e2").State != "processed" {
 			t.Fatal("保留 action message 时仍必须完成拒绝审计与 inbox")
+		}
+	})
+
+	t.Run("ActionRejectNewMessageShowsExistingAction", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		action := mustGetAction(t, s, "wf1")
+
+		token := claimForTestMessage(t, s, "e2", "wf1", "retry", "om_new")
+		if err := s.CompleteReject(ctx, "e2", token, RejectRender{
+			Code: "StillRunning", RejectionReason: "stale rejection",
+		}); err != nil {
+			t.Fatalf("CompleteReject: %v", err)
+		}
+		message := mustGetActionMessage(t, s, "wf1", "om_new")
+		if message.RenderKind != "action" || message.RejectionReason != "" ||
+			message.ButtonsMode != "none" || message.DesiredRevision != action.Revision ||
+			message.UpdateState != "pending" {
+			t.Fatalf("new message did not converge to existing action: %#v", message)
+		}
+		if countAudit(t, s, "e2") != 1 || mustGetInbox(t, s, "e2").State != "processed" {
+			t.Fatal("action convergence must still complete rejection audit and inbox")
 		}
 	})
 
@@ -3740,6 +3971,10 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 					t.Fatalf("ClaimMessage: (%#v, %v)", claim, err)
 				}
 				expireMessageLease(t, s, "wf1", "om_shared")
+				replacement, err := s.ClaimMessage(ctx, "tokN", 120*time.Second)
+				if err != nil || replacement == nil {
+					t.Fatalf("replacement ClaimMessage: (%#v, %v)", replacement, err)
+				}
 				before := mustGetActionMessage(t, s, "wf1", "om_shared")
 
 				ok, err := tc.call(s, *claim)
@@ -3751,6 +3986,50 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 					t.Fatalf("expired writer changed message:\nbefore=%#v\nafter=%#v", before, after)
 				}
 			})
+		}
+	})
+
+	t.Run("ClaimLeasePointersAreDefensiveCopies", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+
+		messageClaim, err := s.ClaimMessage(ctx, "tokM", 120*time.Second)
+		if err != nil || messageClaim == nil || messageClaim.Action == nil ||
+			messageClaim.Action.LeaseExpiresAt == nil {
+			t.Fatalf("ClaimMessage = (%#v, %v)", messageClaim, err)
+		}
+		storedActionLease := *mustGetAction(t, s, "wf1").LeaseExpiresAt
+		*messageClaim.Action.LeaseExpiresAt = messageClaim.Action.LeaseExpiresAt.Add(24 * time.Hour)
+		if got := mustGetAction(t, s, "wf1").LeaseExpiresAt; got == nil || !got.Equal(storedActionLease) {
+			t.Fatalf("message claim mutated stored action lease: got=%v want=%v", got, storedActionLease)
+		}
+
+		expireActionLease(t, s, "wf1")
+		actionClaim, err := s.ClaimStaleAction(ctx, "tokB", 120*time.Second)
+		if err != nil || actionClaim == nil || actionClaim.LeaseExpiresAt == nil {
+			t.Fatalf("ClaimStaleAction = (%#v, %v)", actionClaim, err)
+		}
+		storedActionLease = *mustGetAction(t, s, "wf1").LeaseExpiresAt
+		*actionClaim.LeaseExpiresAt = actionClaim.LeaseExpiresAt.Add(24 * time.Hour)
+		if got := mustGetAction(t, s, "wf1").LeaseExpiresAt; got == nil || !got.Equal(storedActionLease) {
+			t.Fatalf("stale action claim mutated stored lease: got=%v want=%v", got, storedActionLease)
+		}
+
+		if _, inserted, err := s.PutInbox(ctx, InboxRow{
+			EventID: "lease-copy", Disposition: "accepted", AckToast: "ok",
+			Action: "retry", WorkflowID: "wf2", ActorOpenID: "ou_x",
+			OpenMessageID: "om_2", State: "received",
+		}, nil); err != nil || !inserted {
+			t.Fatalf("PutInbox = (%v, %v)", inserted, err)
+		}
+		inboxClaim, err := s.ClaimStaleInbox(ctx, "inbox-owner", 120*time.Second)
+		if err != nil || inboxClaim == nil || inboxClaim.LeaseExpiresAt == nil {
+			t.Fatalf("ClaimStaleInbox = (%#v, %v)", inboxClaim, err)
+		}
+		storedInboxLease := *mustGetInbox(t, s, "lease-copy").LeaseExpiresAt
+		*inboxClaim.LeaseExpiresAt = inboxClaim.LeaseExpiresAt.Add(24 * time.Hour)
+		if got := mustGetInbox(t, s, "lease-copy").LeaseExpiresAt; got == nil || !got.Equal(storedInboxLease) {
+			t.Fatalf("stale inbox claim mutated stored lease: got=%v want=%v", got, storedInboxLease)
 		}
 	})
 
@@ -3770,6 +4049,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		deferred := mustGetActionMessage(t, s, "wf1", "om_shared")
 		if deferred.UpdateState != "pending" || deferred.ReconcileAfter == nil ||
 			deferred.ReconcileAfter.Before(before.Add(55*time.Second)) ||
+			deferred.ReconcileAfter.After(time.Now().UTC().Add(65*time.Second)) ||
 			deferred.Owner != "" || deferred.LeaseExpiresAt != nil {
 			t.Fatalf("timeout 未按 fresh wall time 延迟复核: %#v", deferred)
 		}

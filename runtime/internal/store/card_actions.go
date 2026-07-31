@@ -161,7 +161,7 @@ func (s *MemStore) PutInbox(_ context.Context, row InboxRow, auditOnReject *Audi
 	defer s.mu.Unlock()
 
 	if existing, ok := s.inbox[row.EventID]; ok {
-		out := existing
+		out := cloneInboxRow(existing)
 		return &out, false, nil
 	}
 
@@ -177,11 +177,11 @@ func (s *MemStore) PutInbox(_ context.Context, row InboxRow, auditOnReject *Audi
 		row.ProcessedAt = &now
 	}
 
-	s.inbox[row.EventID] = row
+	s.inbox[row.EventID] = cloneInboxRow(row)
 	if auditOnReject != nil {
 		s.auditLog = append(s.auditLog, *auditOnReject)
 	}
-	out := row
+	out := cloneInboxRow(row)
 	return &out, true, nil
 }
 
@@ -193,7 +193,7 @@ func (s *MemStore) GetInbox(_ context.Context, eventID string) (*InboxRow, error
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrInboxNotFound, eventID)
 	}
-	out := row
+	out := cloneInboxRow(row)
 	return &out, nil
 }
 
@@ -218,8 +218,8 @@ func (s *MemStore) ClaimInbox(_ context.Context, eventID, token string, lease ti
 	expires := now.Add(lease)
 	row.LeaseExpiresAt = &expires
 	row.Attempts++
-	s.inbox[eventID] = row
-	out := row
+	s.inbox[eventID] = cloneInboxRow(row)
+	out := cloneInboxRow(row)
 	return &out, nil
 }
 
@@ -234,19 +234,26 @@ func (s *MemStore) CompleteAccept(_ context.Context, req AcceptRequest) (*Accept
 	defer s.mu.Unlock()
 
 	inbox, ok := s.inbox[req.EventID]
-	now := time.Now().UTC()
-	if !ok || inbox.State != "received" || inbox.Owner != req.Token ||
-		inbox.LeaseExpiresAt == nil || !inbox.LeaseExpiresAt.After(now) {
+	if !ok || !liveInboxClaim(inbox, req.Token) {
 		return &AcceptOutcome{Kind: "lost"}, nil
 	}
 	if err := validateAcceptMatchesInbox(req, inbox); err != nil {
 		return nil, err
 	}
+	snapshot := s.snapshotCardActionTxnLocked()
 
 	run, authoritative := s.workflowRuns[req.WorkflowID]
 	if !authoritative {
+		if !liveInboxClaim(inbox, req.Token) {
+			return &AcceptOutcome{Kind: "lost"}, nil
+		}
+		now := time.Now().UTC()
 		if err := s.completeLegacyAcceptLocked(inbox, now); err != nil {
 			return nil, err
+		}
+		if !liveInboxClaim(inbox, req.Token) {
+			s.restoreCardActionTxnLocked(snapshot)
+			return &AcceptOutcome{Kind: "lost"}, nil
 		}
 		return &AcceptOutcome{Kind: "legacy"}, nil
 	}
@@ -279,6 +286,9 @@ func (s *MemStore) CompleteAccept(_ context.Context, req AcceptRequest) (*Accept
 			if err := validateTargetPins(targetInput, targetWorkflowID); err != nil {
 				return nil, fmt.Errorf("complete accept: build target: %w", err)
 			}
+			if !liveInboxClaim(inbox, req.Token) {
+				return &AcceptOutcome{Kind: "lost"}, nil
+			}
 			expires := time.Now().UTC().Add(cardActionLease)
 			action = CardAction{
 				WorkflowID: req.WorkflowID, Action: req.Action, ActorOpenID: req.ActorOpenID,
@@ -289,6 +299,9 @@ func (s *MemStore) CompleteAccept(_ context.Context, req AcceptRequest) (*Accept
 			s.setWorkflowAttemptAllLocked(req.Project, req.CommitSHA, req.PipelineID, attempt)
 			outcome = AcceptOutcome{Kind: "accepted", ActionToken: req.ActionToken, Attempt: attempt}
 		case "ignore":
+			if !liveInboxClaim(inbox, req.Token) {
+				return &AcceptOutcome{Kind: "lost"}, nil
+			}
 			action = CardAction{
 				WorkflowID: req.WorkflowID, Action: req.Action, ActorOpenID: req.ActorOpenID,
 				State: "succeeded", Revision: 1,
@@ -301,6 +314,9 @@ func (s *MemStore) CompleteAccept(_ context.Context, req AcceptRequest) (*Accept
 	case action.Action == req.Action && action.State == "failed":
 		if req.ActionToken == "" {
 			return nil, errors.New("complete accept: resume requires action token")
+		}
+		if !liveInboxClaim(inbox, req.Token) {
+			return &AcceptOutcome{Kind: "lost"}, nil
 		}
 		expires := time.Now().UTC().Add(cardActionLease)
 		action.State = "pending"
@@ -318,6 +334,9 @@ func (s *MemStore) CompleteAccept(_ context.Context, req AcceptRequest) (*Accept
 		}
 		revision = action.Revision
 	default:
+		if !liveInboxClaim(inbox, req.Token) {
+			return &AcceptOutcome{Kind: "lost"}, nil
+		}
 		s.auditLog = append(s.auditLog, AuditRow{
 			Actor: actorAudit(inbox.ActorOpenID), Action: "card." + inbox.Action + ".rejected.conflict",
 			Target: inbox.WorkflowID, PayloadDigest: inbox.PayloadDigest, InboxEventID: inbox.EventID,
@@ -330,7 +349,11 @@ func (s *MemStore) CompleteAccept(_ context.Context, req AcceptRequest) (*Accept
 	if outcome.Kind == "accepted" || outcome.Kind == "resumed" {
 		s.reorderActionMessagesLocked(inbox.WorkflowID, revision)
 	}
-	s.processInboxLocked(inbox, now)
+	s.processInboxLocked(inbox, time.Now().UTC())
+	if !liveInboxClaim(inbox, req.Token) {
+		s.restoreCardActionTxnLocked(snapshot)
+		return &AcceptOutcome{Kind: "lost"}, nil
+	}
 	return &outcome, nil
 }
 
@@ -353,15 +376,23 @@ func (s *MemStore) CompleteReject(
 		inbox.LeaseExpiresAt == nil || !inbox.LeaseExpiresAt.After(now) {
 		return nil
 	}
+	snapshot := s.snapshotCardActionTxnLocked()
 	s.auditLog = append(s.auditLog, AuditRow{
 		Actor:  actorAudit(inbox.ActorOpenID),
 		Action: rejectionAuditAction(inbox.Action, render.Code),
 		Target: inbox.WorkflowID, PayloadDigest: inbox.PayloadDigest, InboxEventID: inbox.EventID,
 	})
-	s.upsertRejectionMessageLocked(
-		inbox.WorkflowID, inbox.OpenMessageID, render.RejectionReason, buttonsMode,
-	)
+	if action, exists := s.cardActions[inbox.WorkflowID]; exists {
+		s.upsertActionMessageLocked(inbox.WorkflowID, inbox.OpenMessageID, action.Revision)
+	} else {
+		s.upsertRejectionMessageLocked(
+			inbox.WorkflowID, inbox.OpenMessageID, render.RejectionReason, buttonsMode,
+		)
+	}
 	s.processInboxLocked(inbox, now)
+	if !liveInboxClaim(inbox, token) {
+		s.restoreCardActionTxnLocked(snapshot)
+	}
 	return nil
 }
 
@@ -574,8 +605,8 @@ func (s *MemStore) ClaimStaleInbox(
 	row.Owner = token
 	row.LeaseExpiresAt = &expires
 	row.Attempts++
-	s.inbox[eventID] = row
-	out := row
+	s.inbox[eventID] = cloneInboxRow(row)
+	out := cloneInboxRow(row)
 	return &out, nil
 }
 
@@ -599,6 +630,11 @@ func (s *MemStore) liveMessageClaimLocked(
 		return cardActionMessage{}, key, false
 	}
 	return row, key, true
+}
+
+func liveInboxClaim(inbox InboxRow, token string) bool {
+	return inbox.State == "received" && inbox.Owner == token &&
+		inbox.LeaseExpiresAt != nil && inbox.LeaseExpiresAt.After(time.Now().UTC())
 }
 
 func validateAcceptEnvelope(req AcceptRequest) error {
@@ -672,9 +708,69 @@ func acceptedAudit(inbox InboxRow) AuditRow {
 	}
 }
 
+type memCardActionTxnSnapshot struct {
+	rows               map[string]Artifact
+	inbox              map[string]InboxRow
+	cardActions        map[string]CardAction
+	cardActionMessages map[string]cardActionMessage
+	auditLog           []AuditRow
+}
+
+func (s *MemStore) snapshotCardActionTxnLocked() memCardActionTxnSnapshot {
+	snapshot := memCardActionTxnSnapshot{
+		rows:               make(map[string]Artifact, len(s.rows)),
+		inbox:              make(map[string]InboxRow, len(s.inbox)),
+		cardActions:        make(map[string]CardAction, len(s.cardActions)),
+		cardActionMessages: make(map[string]cardActionMessage, len(s.cardActionMessages)),
+		auditLog:           append([]AuditRow(nil), s.auditLog...),
+	}
+	for key, row := range s.rows {
+		snapshot.rows[key] = row
+	}
+	for key, row := range s.inbox {
+		snapshot.inbox[key] = cloneInboxRow(row)
+	}
+	for key, row := range s.cardActions {
+		snapshot.cardActions[key] = cloneCardAction(row)
+	}
+	for key, row := range s.cardActionMessages {
+		snapshot.cardActionMessages[key] = cloneCardActionMessage(row)
+	}
+	return snapshot
+}
+
+func (s *MemStore) restoreCardActionTxnLocked(snapshot memCardActionTxnSnapshot) {
+	s.rows = snapshot.rows
+	s.inbox = snapshot.inbox
+	s.cardActions = snapshot.cardActions
+	s.cardActionMessages = snapshot.cardActionMessages
+	s.auditLog = snapshot.auditLog
+}
+
 func cloneCardAction(action CardAction) CardAction {
 	action.TargetInput = append([]byte(nil), action.TargetInput...)
+	action.LeaseExpiresAt = cloneTime(action.LeaseExpiresAt)
 	return action
+}
+
+func cloneCardActionMessage(row cardActionMessage) cardActionMessage {
+	row.LeaseExpiresAt = cloneTime(row.LeaseExpiresAt)
+	row.ReconcileAfter = cloneTime(row.ReconcileAfter)
+	return row
+}
+
+func cloneInboxRow(row InboxRow) InboxRow {
+	row.LeaseExpiresAt = cloneTime(row.LeaseExpiresAt)
+	row.ProcessedAt = cloneTime(row.ProcessedAt)
+	return row
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func messageKey(workflowID, openMessageID string) string {
@@ -725,6 +821,9 @@ func (s *MemStore) reorderActionMessagesLocked(workflowID string, revision int) 
 		if row.WorkflowID != workflowID {
 			continue
 		}
+		row.RenderKind = "action"
+		row.RejectionReason = ""
+		row.ButtonsMode = "none"
 		row.DesiredRevision = revision
 		row.UpdateState = "pending"
 		row.Owner = ""
