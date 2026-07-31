@@ -22,8 +22,11 @@ type consumerTestStore struct {
 	actions             map[string]store.CardAction
 	messages            map[string]store.MessageClaim
 	claimTokens         []string
+	claimInboxCalls     int
+	staleClaimCalls     int
 	getActionCalls      int
 	getActionErr        error
+	getActionNil        bool
 	acceptCalls         int
 	rejectCalls         int
 	finalizeCalls       int
@@ -55,6 +58,7 @@ func newConsumerTestStore(action string) *consumerTestStore {
 func (s *consumerTestStore) ClaimInbox(
 	_ context.Context, eventID, token string, lease time.Duration,
 ) (*store.InboxRow, error) {
+	s.claimInboxCalls++
 	s.claimTokens = append(s.claimTokens, token)
 	row, ok := s.inbox[eventID]
 	if !ok || row.State != "received" || row.Owner != "" || lease <= 0 {
@@ -70,12 +74,39 @@ func (s *consumerTestStore) ClaimInbox(
 	return &copy, nil
 }
 
+func (s *consumerTestStore) ClaimStaleInbox(
+	_ context.Context, token string, lease time.Duration,
+) (*store.InboxRow, error) {
+	s.staleClaimCalls++
+	if lease <= 0 {
+		return nil, nil
+	}
+	now := time.Now().UTC()
+	for eventID, row := range s.inbox {
+		if row.State != "received" ||
+			(row.Owner != "" && row.LeaseExpiresAt != nil && row.LeaseExpiresAt.After(now)) {
+			continue
+		}
+		expires := now.Add(lease)
+		row.Owner = token
+		row.LeaseExpiresAt = &expires
+		row.Attempts++
+		s.inbox[eventID] = row
+		copy := row
+		return &copy, nil
+	}
+	return nil, nil
+}
+
 func (s *consumerTestStore) GetCardAction(
 	_ context.Context, workflowID string,
 ) (*store.CardAction, error) {
 	s.getActionCalls++
 	if s.getActionErr != nil {
 		return nil, s.getActionErr
+	}
+	if s.getActionNil {
+		return nil, nil
 	}
 	action, ok := s.actions[workflowID]
 	if !ok {
@@ -365,6 +396,62 @@ func TestCrashBetweenAckAndClaimIsRecovered(t *testing.T) {
 	}
 }
 
+func TestClaimedStaleInboxIsConsumedWithoutReclaim(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("ignore")
+	const token = "stale-inbox-owner"
+	row, err := st.ClaimStaleInbox(context.Background(), token, consumerLeaseTTL)
+	if err != nil || row == nil {
+		t.Fatalf("ClaimStaleInbox = (%#v, %v)", row, err)
+	}
+
+	if err := c.consumeClaimed(context.Background(), row, token); err != nil {
+		t.Fatalf("consumeClaimed: %v", err)
+	}
+	if st.staleClaimCalls != 1 || st.claimInboxCalls != 0 {
+		t.Fatalf(
+			"claims stale=%d immediate=%d, want 1/0",
+			st.staleClaimCalls, st.claimInboxCalls,
+		)
+	}
+	if action := st.actions["wf1"]; action.State != "succeeded" {
+		t.Fatalf("action = %#v, want succeeded", action)
+	}
+	if resolver.failureRunCalls != 1 || starter.startCalls != 0 {
+		t.Fatalf(
+			"calls ResolveFailureRun=%d StartDeviceTest=%d, want 1/0",
+			resolver.failureRunCalls, starter.startCalls,
+		)
+	}
+}
+
+func TestConsumeClaimedRejectsInvalidFence(t *testing.T) {
+	tests := []struct {
+		name  string
+		row   *store.InboxRow
+		token string
+	}{
+		{name: "nil row", token: "owner"},
+		{name: "empty token", row: &store.InboxRow{Owner: "owner"}},
+		{name: "owner mismatch", row: &store.InboxRow{Owner: "owner"}, token: "other"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, st, resolver, starter := newTestConsumer("ignore")
+			if err := c.consumeClaimed(context.Background(), tt.row, tt.token); err == nil {
+				t.Fatal("invalid claimed row fence must fail")
+			}
+			if st.claimInboxCalls != 0 || st.acceptCalls != 0 || st.rejectCalls != 0 ||
+				resolver.failureRunCalls != 0 || starter.startCalls != 0 {
+				t.Fatalf(
+					"invalid fence side effects claim=%d accept=%d reject=%d resolve=%d start=%d",
+					st.claimInboxCalls, st.acceptCalls, st.rejectCalls,
+					resolver.failureRunCalls, starter.startCalls,
+				)
+			}
+		})
+	}
+}
+
 func TestRejectionRendersOnCard(t *testing.T) {
 	for _, code := range []string{"NotAuthoritative", "StillRunning", "NoFailedVariants"} {
 		t.Run(code, func(t *testing.T) {
@@ -421,6 +508,9 @@ func TestIgnoreUsesFailureRunOnlyAndDoesNotStart(t *testing.T) {
 	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
 		t.Fatalf("ConsumeOne: %v", err)
 	}
+	if st.getActionCalls != 1 {
+		t.Fatalf("GetCardAction calls = %d, want 1", st.getActionCalls)
+	}
 	if resolver.failureRunCalls != 1 || resolver.resolveRetryCalls != 0 {
 		t.Fatalf("resolver calls failure=%d retry=%d", resolver.failureRunCalls, resolver.resolveRetryCalls)
 	}
@@ -430,6 +520,76 @@ func TestIgnoreUsesFailureRunOnlyAndDoesNotStart(t *testing.T) {
 	if action := st.actions["wf1"]; action.State != "succeeded" ||
 		action.TargetWorkflowID != "" || len(action.TargetInput) != 0 {
 		t.Fatalf("ignore action = %#v", action)
+	}
+}
+
+func TestExistingRetryActionMakesIgnoreUseAuthoritativeConflict(t *testing.T) {
+	for _, state := range []string{"pending", "succeeded"} {
+		t.Run(state, func(t *testing.T) {
+			c, st, resolver, starter := newTestConsumer("ignore")
+			st.actions["wf1"] = store.CardAction{
+				WorkflowID: "wf1", Action: "retry", ActorOpenID: "ou_previous",
+				State: state, Owner: "existing-owner", Attempt: 3, Revision: 1,
+			}
+			st.acceptKind = "conflict"
+			resolver.err = &rerun.RejectReason{
+				Code: "ResultUnreadable", WorkflowID: "wf1",
+				Err: errors.New("temporary result read failure"),
+			}
+
+			if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+				t.Fatalf("ConsumeOne: %v", err)
+			}
+			if st.getActionCalls != 1 || resolver.failureRunCalls != 0 {
+				t.Fatalf(
+					"preflight calls GetCardAction=%d ResolveFailureRun=%d, want 1/0",
+					st.getActionCalls, resolver.failureRunCalls,
+				)
+			}
+			if st.acceptCalls != 1 || st.acceptKind != "conflict" || st.rejectCalls != 0 {
+				t.Fatalf(
+					"completion calls accept=%d kind=%q reject=%d, want 1/conflict/0",
+					st.acceptCalls, st.acceptKind, st.rejectCalls,
+				)
+			}
+			if starter.startCalls != 0 {
+				t.Fatalf("StartDeviceTest calls = %d, want 0", starter.startCalls)
+			}
+		})
+	}
+}
+
+func TestIgnoreActionLookupErrorPropagates(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("ignore")
+	lookupErr := errors.New("database unavailable")
+	st.getActionErr = lookupErr
+
+	err := c.ConsumeOne(context.Background(), "e1")
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("ConsumeOne error = %v, want wrapped lookup error", err)
+	}
+	if resolver.failureRunCalls != 0 || st.acceptCalls != 0 || st.rejectCalls != 0 ||
+		starter.startCalls != 0 {
+		t.Fatalf(
+			"lookup error calls resolve=%d accept=%d reject=%d start=%d",
+			resolver.failureRunCalls, st.acceptCalls, st.rejectCalls, starter.startCalls,
+		)
+	}
+}
+
+func TestIgnoreActionLookupNilIsImplementationError(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("ignore")
+	st.getActionNil = true
+
+	if err := c.ConsumeOne(context.Background(), "e1"); err == nil {
+		t.Fatal("nil action with nil error must fail")
+	}
+	if resolver.failureRunCalls != 0 || st.acceptCalls != 0 || st.rejectCalls != 0 ||
+		starter.startCalls != 0 {
+		t.Fatalf(
+			"nil lookup calls resolve=%d accept=%d reject=%d start=%d",
+			resolver.failureRunCalls, st.acceptCalls, st.rejectCalls, starter.startCalls,
+		)
 	}
 }
 

@@ -70,23 +70,68 @@ func (c *Consumer) ConsumeOne(ctx context.Context, eventID string) error {
 	if err != nil {
 		return fmt.Errorf("consume card action %s: claim inbox: %w", eventID, err)
 	}
-	if row == nil {
-		return fmt.Errorf("consume card action %s: claim inbox returned nil row", eventID)
-	}
+	return c.consumeClaimed(ctx, row, token)
+}
 
+// consumeClaimed processes a row already fenced by ClaimInbox or
+// ClaimStaleInbox. Task 10's sweeper must call this directly, without reacquiring.
+func (c *Consumer) consumeClaimed(ctx context.Context, row *store.InboxRow, token string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c == nil || c.Store == nil {
+		return errors.New("consume claimed card action: store is nil")
+	}
+	if c.Resolver == nil {
+		return errors.New("consume claimed card action: resolver is nil")
+	}
+	if row == nil {
+		return errors.New("consume claimed card action: row is nil (implementation defect)")
+	}
+	if token == "" {
+		return fmt.Errorf(
+			"consume card action %s: claimed token is empty (implementation defect)",
+			row.EventID,
+		)
+	}
+	if row.Owner != token {
+		return fmt.Errorf(
+			"consume card action %s: claimed owner %q does not match token (implementation defect)",
+			row.EventID, row.Owner,
+		)
+	}
 	switch row.Action {
 	case "ignore":
 		return c.consumeIgnore(ctx, row, token)
 	case "retry":
 		return c.consumeRetry(ctx, row, token)
 	default:
-		return fmt.Errorf("consume card action %s: unsupported persisted action %q", eventID, row.Action)
+		return fmt.Errorf(
+			"consume card action %s: unsupported persisted action %q",
+			row.EventID, row.Action,
+		)
 	}
 }
 
 func (c *Consumer) consumeIgnore(ctx context.Context, row *store.InboxRow, token string) error {
-	if _, err := c.Resolver.ResolveFailureRun(ctx, row.WorkflowID); err != nil {
-		return c.completeRejection(ctx, row, token, err)
+	existing, err := c.Store.GetCardAction(ctx, row.WorkflowID)
+	noExistingAction := errors.Is(err, store.ErrCardActionNotFound)
+	if err != nil && !noExistingAction {
+		return fmt.Errorf(
+			"consume card action %s: get existing action for ignore: %w",
+			row.EventID, err,
+		)
+	}
+	if err == nil && existing == nil {
+		return fmt.Errorf(
+			"consume card action %s: get existing action for ignore returned nil",
+			row.EventID,
+		)
+	}
+	if noExistingAction {
+		if _, err := c.Resolver.ResolveFailureRun(ctx, row.WorkflowID); err != nil {
+			return c.completeRejection(ctx, row, token, err)
+		}
 	}
 	out, err := c.Store.CompleteAccept(ctx, acceptRequest(row, token, ""))
 	if err != nil {
