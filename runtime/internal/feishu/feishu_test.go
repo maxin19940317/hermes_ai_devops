@@ -20,6 +20,8 @@ type fakeOpenAPI struct {
 	tokenCalls     int
 	messageCalls   int
 	messageBodies  []map[string]any
+	messageMethods []string
+	messagePaths   []string
 	messageQueries []string
 	tokenBodies    []map[string]any
 	messageReplies []string // 依次消费;耗尽后默认 {"code":0}
@@ -38,8 +40,10 @@ func (f *fakeOpenAPI) server(t *testing.T) *httptest.Server {
 			_ = json.Unmarshal(body, &b)
 			f.tokenBodies = append(f.tokenBodies, b)
 			_, _ = w.Write([]byte(`{"code":0,"tenant_access_token":"tok-` + json.Number(jsonString(f.tokenCalls)) + `","expire":7200}`))
-		case strings.HasSuffix(r.URL.Path, "/im/v1/messages"):
+		case strings.Contains(r.URL.Path, "/im/v1/messages"):
 			f.messageCalls++
+			f.messageMethods = append(f.messageMethods, r.Method)
+			f.messagePaths = append(f.messagePaths, r.URL.EscapedPath())
 			f.messageQueries = append(f.messageQueries, r.URL.RawQuery)
 			var b map[string]any
 			_ = json.Unmarshal(body, &b)
@@ -76,6 +80,16 @@ func (f *fakeOpenAPI) lastMessage() (body map[string]any, query string) {
 		return nil, ""
 	}
 	return f.messageBodies[len(f.messageBodies)-1], f.messageQueries[len(f.messageQueries)-1]
+}
+
+func (f *fakeOpenAPI) lastMessageRequest() (method, path string, body map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.messageBodies) == 0 {
+		return "", "", nil
+	}
+	last := len(f.messageBodies) - 1
+	return f.messageMethods[last], f.messagePaths[last], f.messageBodies[last]
 }
 
 func (f *fakeOpenAPI) lastTokenReq() map[string]any {
@@ -313,5 +327,112 @@ func TestAppSendCardRefreshesExpiredToken(t *testing.T) {
 	tokenCalls, msgCalls := f.counts()
 	if tokenCalls != 2 || msgCalls != 2 {
 		t.Fatalf("calls token/message = %d/%d, want 2/2", tokenCalls, msgCalls)
+	}
+}
+
+// webhook 自定义机器人没有消息更新能力,但必须继续支持发送卡片。
+func TestWebhookSenderIsNotCardUpdater(t *testing.T) {
+	s, mode := NewSender(Config{WebhookURL: "https://example/hook"})
+	if mode != "webhook" {
+		t.Fatalf("mode = %q", mode)
+	}
+	if _, ok := s.(CardSender); !ok {
+		t.Fatal("webhook sender 必须仍然满足 CardSender")
+	}
+	if _, ok := s.(CardUpdater); ok {
+		t.Fatal("webhook sender 不应满足 CardUpdater")
+	}
+}
+
+func TestAppSenderPatchCardWireShape(t *testing.T) {
+	f := &fakeOpenAPI{}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+	updater, ok := s.(CardUpdater)
+	if !ok {
+		t.Fatal("app sender 必须满足 CardUpdater")
+	}
+	card := map[string]any{"config": map[string]any{"update_multi": true}}
+	if err := updater.PatchCard(ctx, "om_1", card); err != nil {
+		t.Fatalf("PatchCard: %v", err)
+	}
+	method, path, body := f.lastMessageRequest()
+	if method != http.MethodPatch {
+		t.Errorf("method = %q, want PATCH", method)
+	}
+	if path != "/open-apis/im/v1/messages/om_1" {
+		t.Errorf("path = %q", path)
+	}
+	if len(body) != 1 {
+		t.Fatalf("body = %v, want only content", body)
+	}
+	content, ok := body["content"].(string)
+	if !ok {
+		t.Fatalf("content = %T, want serialized JSON string", body["content"])
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(content), &decoded); err != nil {
+		t.Fatalf("content is not valid JSON: %v", err)
+	}
+	if !reflect.DeepEqual(decoded, card) {
+		t.Errorf("decoded content = %v, want %v", decoded, card)
+	}
+}
+
+func TestAppSenderPatchCardEscapesMessageID(t *testing.T) {
+	f := &fakeOpenAPI{}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+	err := s.(CardUpdater).PatchCard(ctx, "om_1/../../other", map[string]any{"header": "x"})
+	if err != nil {
+		t.Fatalf("PatchCard: %v", err)
+	}
+	_, path, _ := f.lastMessageRequest()
+	if path != "/open-apis/im/v1/messages/om_1%2F..%2F..%2Fother" {
+		t.Errorf("escaped path = %q", path)
+	}
+}
+
+func TestAppSenderPatchCardRejectsEmptyMessageID(t *testing.T) {
+	f := &fakeOpenAPI{}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+	err := s.(CardUpdater).PatchCard(ctx, " \t", map[string]any{"header": "x"})
+	if err == nil || !strings.Contains(err.Error(), "message ID") {
+		t.Fatalf("empty message ID error = %v", err)
+	}
+	tokenCalls, messageCalls := f.counts()
+	if tokenCalls != 0 || messageCalls != 0 {
+		t.Fatalf("empty message ID made token/message calls = %d/%d", tokenCalls, messageCalls)
+	}
+}
+
+func TestAppSenderPatchCardRefreshesExpiredTokenOnce(t *testing.T) {
+	f := &fakeOpenAPI{messageReplies: []string{
+		`{"code":99991661,"msg":"invalid token"}`,
+		`{"code":0,"msg":"ok"}`,
+	}}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+	if err := s.(CardUpdater).PatchCard(ctx, "om_1", map[string]any{"header": "x"}); err != nil {
+		t.Fatalf("expired token retry: %v", err)
+	}
+	tokenCalls, messageCalls := f.counts()
+	if tokenCalls != 2 || messageCalls != 2 {
+		t.Fatalf("calls token/message = %d/%d, want 2/2", tokenCalls, messageCalls)
+	}
+}
+
+func TestAppSenderPatchCardBusinessErrorDoesNotRetry(t *testing.T) {
+	f := &fakeOpenAPI{messageReplies: []string{`{"code":230001,"msg":"message not found"}`}}
+	srv := f.server(t)
+	s, _ := NewSender(appCfg(srv.URL))
+	err := s.(CardUpdater).PatchCard(ctx, "om_missing", map[string]any{"header": "x"})
+	if err == nil || !strings.Contains(err.Error(), "230001") {
+		t.Fatalf("business error = %v", err)
+	}
+	tokenCalls, messageCalls := f.counts()
+	if tokenCalls != 1 || messageCalls != 1 {
+		t.Fatalf("calls token/message = %d/%d, want 1/1", tokenCalls, messageCalls)
 	}
 }

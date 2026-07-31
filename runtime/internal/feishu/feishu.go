@@ -3,7 +3,7 @@
 // tenant_access_token 缓存 + 过期强制刷新重试一次);
 // 群自定义机器人 webhook(未配置应用凭据时兜底,行为与历史完全一致)。
 // 纯文本走 Sender.SendText;交互卡片走可选的 CardSender.SendCard
-// (两种模式各自实现,wire 形态不对称,见 CardSender 注释)。消息更新属后续版本。
+// (两种模式各自实现,wire 形态不对称,见 CardSender 注释)。
 package feishu
 
 import (
@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -40,6 +41,12 @@ type Sender interface {
 type CardSender interface {
 	Sender
 	SendCard(ctx context.Context, card any) error
+}
+
+// CardUpdater 是能更新已发送卡片消息的发送方能力。
+// 该能力仅适用于企业自建应用机器人;群自定义机器人不支持更新消息。
+type CardUpdater interface {
+	PatchCard(ctx context.Context, messageID string, card any) error
 }
 
 // Config 是发送方配置;Mode 由 NewSender 按凭据齐全度判定。
@@ -209,6 +216,18 @@ func (s *appSender) SendCard(ctx context.Context, card any) error {
 	return s.send(ctx, "interactive", string(content))
 }
 
+// PatchCard 更新应用机器人已发送的卡片消息。
+func (s *appSender) PatchCard(ctx context.Context, messageID string, card any) error {
+	if strings.TrimSpace(messageID) == "" {
+		return fmt.Errorf("feishu: message ID is required")
+	}
+	content, err := json.Marshal(card)
+	if err != nil {
+		return fmt.Errorf("feishu: encode patch card content: %w", err)
+	}
+	return s.patch(ctx, messageID, string(content))
+}
+
 // send 是 SendText/SendCard 共用的发送逻辑:取 token(缓存)→ 发消息;
 // token 过期错误码 → 强制刷新重试一次。
 func (s *appSender) send(ctx context.Context, msgType, content string) error {
@@ -226,6 +245,25 @@ func (s *appSender) send(ctx context.Context, msgType, content string) error {
 			return err
 		}
 		return s.sendMessage(ctx, tok, msgType, content)
+	}
+	return nil
+}
+
+// patch 复用 send 的 token 缓存与过期重试策略更新一条卡片消息。
+func (s *appSender) patch(ctx context.Context, messageID, content string) error {
+	tok, err := s.tenantToken(ctx, false)
+	if err != nil {
+		return err
+	}
+	if err := s.patchMessage(ctx, tok, messageID, content); err != nil {
+		if !isTokenExpired(err) {
+			return err
+		}
+		tok, err = s.tenantToken(ctx, true)
+		if err != nil {
+			return err
+		}
+		return s.patchMessage(ctx, tok, messageID, content)
 	}
 	return nil
 }
@@ -295,4 +333,47 @@ func (s *appSender) sendMessage(ctx context.Context, token, msgType, content str
 			"msg_type":   msgType,
 			"content":    content,
 		})
+}
+
+// patchMessage 向 im/v1/messages/{message_id} 发送已序列化的完整卡片。
+func (s *appSender) patchMessage(ctx context.Context, token, messageID, content string) error {
+	body, err := json.Marshal(map[string]string{"content": content})
+	if err != nil {
+		return fmt.Errorf("feishu: encode patch payload: %w", err)
+	}
+	endpoint := s.base + "/open-apis/im/v1/messages/" + url.PathEscape(messageID)
+	reqCtx, cancel := context.WithTimeout(ctx, s.cfg.timeout())
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPatch, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("feishu: build patch request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := s.cfg.httpClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("feishu: patch %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("feishu: read patch response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("feishu: patch %s: status %d: %s",
+			endpoint, resp.StatusCode, truncate(string(respBody), 256))
+	}
+	var ack struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if len(bytes.TrimSpace(respBody)) > 0 {
+		if err := json.Unmarshal(respBody, &ack); err != nil {
+			return fmt.Errorf("feishu: decode patch ack: %w", err)
+		}
+	}
+	if ack.Code != 0 {
+		return &apiError{Code: ack.Code, Msg: ack.Msg}
+	}
+	return nil
 }
