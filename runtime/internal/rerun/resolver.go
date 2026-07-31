@@ -71,11 +71,30 @@ type RejectReason struct {
 	WorkflowID string
 	Variant    string
 	Count      int
+	// Err 携带触发本次拒绝的底层错误,仅 CheckFailed(WorkflowClosed 探测失败)
+	// 与 ResultUnreadable(WorkflowResult 读取失败)两种 Code 非空。原
+	// executor.rerun 对这两种情况的回复都是 "...失败: %v"(err 原文,例如
+	// "context deadline exceeded"),丢弃它会让运维无法从回复区分超时/网络/
+	// 权限等不同故障——这是"文案逐字不变"约束的一部分,不是可选项。
+	Err error
 }
 
+// Error 满足 error 接口;不是 executor 渲染回复用的文案(那由 Code 驱动),
+// 只用于日志/兜底场景下人可读的诊断串。
 func (e *RejectReason) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("rerun rejected: %s (workflow=%s variant=%s count=%d): %v",
+			e.Code, e.WorkflowID, e.Variant, e.Count, e.Err)
+	}
 	return fmt.Sprintf("rerun rejected: %s (workflow=%s variant=%s count=%d)",
 		e.Code, e.WorkflowID, e.Variant, e.Count)
+}
+
+// Unwrap 暴露 Err,让 errors.Is/errors.As 能穿透 RejectReason 找到底层原因
+// (例如上游想单独判断是不是 context.DeadlineExceeded),同时 Code 仍留给
+// executor 做分支渲染,两者不冲突。
+func (e *RejectReason) Unwrap() error {
+	return e.Err
 }
 
 // resolveRun 取权威 run 并确认它已终结:两个入口(ResolveFailureRun 的隐式路径、
@@ -90,7 +109,7 @@ func (r *Resolver) resolveRun(ctx context.Context, workflowID string) (*store.Wo
 	}
 	closed, err := r.Starter.WorkflowClosed(ctx, workflowID)
 	if err != nil {
-		return nil, &RejectReason{Code: "CheckFailed", WorkflowID: workflowID}
+		return nil, &RejectReason{Code: "CheckFailed", WorkflowID: workflowID, Err: err}
 	}
 	if !closed {
 		return nil, &RejectReason{Code: "StillRunning", WorkflowID: workflowID}
@@ -108,7 +127,7 @@ func (r *Resolver) ResolveFailureRun(ctx context.Context, workflowID string) (*F
 	}
 	out, err := r.Starter.WorkflowResult(ctx, workflowID)
 	if err != nil {
-		return nil, &RejectReason{Code: "ResultUnreadable", WorkflowID: workflowID}
+		return nil, &RejectReason{Code: "ResultUnreadable", WorkflowID: workflowID, Err: err}
 	}
 	seen := map[string]struct{}{}
 	for _, s := range out.Tasks {

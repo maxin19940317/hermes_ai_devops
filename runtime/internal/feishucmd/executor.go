@@ -353,9 +353,9 @@ func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
 			case "StillRunning":
 				return fmt.Sprintf("workflow 尚未结束: %s", reason.WorkflowID), nil
 			case "CheckFailed":
-				return fmt.Sprintf("检查 workflow 状态失败: %s", reason.WorkflowID), nil
+				return fmt.Sprintf("检查 workflow 状态失败: %v", reason.Err), nil
 			case "ResultUnreadable":
-				return fmt.Sprintf("读取 workflow 结果失败: %s", reason.WorkflowID), nil
+				return fmt.Sprintf("读取 workflow 结果失败: %v", reason.Err), nil
 			case "NoFailedVariants":
 				return fmt.Sprintf("workflow 没有失败变体: %s", reason.WorkflowID), nil
 			case "VariantNotMember":

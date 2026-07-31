@@ -203,3 +203,47 @@ func TestVariantNotMemberRejected(t *testing.T) {
 		t.Fatalf("err = %v, want RejectReason{VariantNotMember, v2}", err)
 	}
 }
+
+// TestCheckFailedCarriesUnderlyingError: a WorkflowClosed probe failure (e.g.
+// a Temporal Describe timeout) must not be reduced to a bare Code — the
+// caller's reply text embeds the real error ("检查 workflow 状态失败: %v"),
+// so RejectReason.Err must round-trip it, and errors.Unwrap must reach it
+// (a caller checking errors.Is(err, context.DeadlineExceeded) must still work
+// through the RejectReason wrapper).
+func TestCheckFailedCarriesUnderlyingError(t *testing.T) {
+	st := newFakeStore(t, run("wf1", "grp/p", "abcd1234", 42, "v1"))
+	underlying := errors.New("context deadline exceeded")
+	r := &Resolver{Store: st, Starter: &fakeLookup{closed: false, closedErr: underlying}}
+
+	_, err := r.ResolveRetry(ctx, "wf1", "")
+	var reason *RejectReason
+	if !errors.As(err, &reason) || reason.Code != "CheckFailed" {
+		t.Fatalf("err = %v, want RejectReason{CheckFailed}", err)
+	}
+	if reason.Err != underlying {
+		t.Fatalf("reason.Err = %v, want %v", reason.Err, underlying)
+	}
+	if !errors.Is(err, underlying) {
+		t.Fatalf("errors.Is(err, underlying) = false, Unwrap must expose Err")
+	}
+}
+
+// TestResultUnreadableCarriesUnderlyingError: same guarantee for a
+// WorkflowResult read failure ("读取 workflow 结果失败: %v").
+func TestResultUnreadableCarriesUnderlyingError(t *testing.T) {
+	st := newFakeStore(t, run("wf1", "grp/p", "abcd1234", 42, "v1"))
+	underlying := errors.New("result unavailable")
+	r := &Resolver{Store: st, Starter: &fakeLookup{closed: true, resultErr: underlying}}
+
+	_, err := r.ResolveRetry(ctx, "wf1", "")
+	var reason *RejectReason
+	if !errors.As(err, &reason) || reason.Code != "ResultUnreadable" {
+		t.Fatalf("err = %v, want RejectReason{ResultUnreadable}", err)
+	}
+	if reason.Err != underlying {
+		t.Fatalf("reason.Err = %v, want %v", reason.Err, underlying)
+	}
+	if !errors.Is(err, underlying) {
+		t.Fatalf("errors.Is(err, underlying) = false, Unwrap must expose Err")
+	}
+}
