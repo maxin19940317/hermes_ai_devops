@@ -101,6 +101,20 @@ func (s *PGStore) NextWorkflowAttemptAll(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	target, err := nextWorkflowAttemptAllTx(ctx, tx, project, commitSHA, pipelineID)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: commit: %w",
+			project, commitSHA, pipelineID, err)
+	}
+	return target, nil
+}
+
+func nextWorkflowAttemptAllTx(
+	ctx context.Context, tx *sql.Tx, project, commitSHA string, pipelineID int,
+) (int, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT workflow_attempt
 		FROM artifacts
@@ -139,10 +153,6 @@ func (s *PGStore) NextWorkflowAttemptAll(
 		WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3`,
 		project, commitSHA, pipelineID, target); err != nil {
 		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: update: %w",
-			project, commitSHA, pipelineID, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: commit: %w",
 			project, commitSHA, pipelineID, err)
 	}
 	return target, nil

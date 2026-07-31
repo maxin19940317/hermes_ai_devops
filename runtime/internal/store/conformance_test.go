@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,6 +63,9 @@ type fullStore interface {
 	PutInbox(ctx context.Context, row InboxRow, auditOnReject *AuditRow) (*InboxRow, bool, error)
 	GetInbox(ctx context.Context, eventID string) (*InboxRow, error)
 	ClaimInbox(ctx context.Context, eventID, token string, lease time.Duration) (*InboxRow, error)
+	CompleteAccept(ctx context.Context, req AcceptRequest) (*AcceptOutcome, error)
+	CompleteReject(ctx context.Context, eventID, token string, r RejectRender) error
+	FinalizeAction(ctx context.Context, workflowID, token, state, lastErr string) (bool, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -69,6 +74,319 @@ func TestMemStoreConformance(t *testing.T) {
 
 func TestPGStoreConformance(t *testing.T) {
 	runConformance(t, func(t *testing.T) fullStore { return openTestPG(t) })
+}
+
+func TestPGCardActionRetryCheckRejectsIncompleteRow(t *testing.T) {
+	s := openTestPG(t)
+	seedRunAndArtifacts(t, s, "wf-check", "grp/p", "abcd1234", 42, "v1")
+	if _, err := s.DB.ExecContext(ctx, `
+		INSERT INTO card_actions (workflow_id, action, actor_open_id, state)
+		VALUES ('wf-check', 'retry', 'ou_x', 'pending')`); err == nil {
+		t.Fatal("retry without attempt/target/target_input must fail the database CHECK")
+	}
+	if actionExists(t, s, "wf-check") {
+		t.Fatal("failed incomplete insert left a card_actions row")
+	}
+}
+
+func TestPGCompleteAcceptSerializesWithFinalize(t *testing.T) {
+	s := openTestPG(t)
+	seedAcceptedRetry(t, s, "wf1", "tokA")
+
+	token := claimForTestMessage(t, s, "observed", "wf1", "retry", "om_race")
+	out, err := s.CompleteAccept(
+		ctx, acceptReqMessage("observed", token, "wf1", "retry", "om_race"),
+	)
+	if err != nil || out.Kind != "conflict" {
+		t.Fatalf("register race message = (%#v, %v)", out, err)
+	}
+
+	token = claimForTestMessage(t, s, "racing", "wf1", "retry", "om_race")
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin finalize transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var finalizerPID int
+	if err := tx.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&finalizerPID); err != nil {
+		t.Fatalf("finalizer backend PID: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE card_actions
+		   SET state='succeeded', revision=revision+1,
+		       owner='', lease_expires_at=NULL, updated_at=now()
+		 WHERE workflow_id='wf1'`); err != nil {
+		t.Fatalf("advance action revision: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE card_action_messages
+		   SET desired_revision=2, update_state='pending',
+		       owner='', lease_expires_at=NULL, reconcile_after=NULL,
+		       updated_at=now()
+		 WHERE workflow_id='wf1'`); err != nil {
+		t.Fatalf("reorder messages: %v", err)
+	}
+
+	type acceptResult struct {
+		out *AcceptOutcome
+		err error
+	}
+	result := make(chan acceptResult, 1)
+	go func() {
+		out, err := s.CompleteAccept(
+			ctx, acceptReqMessage("racing", token, "wf1", "retry", "om_race"),
+		)
+		result <- acceptResult{out: out, err: err}
+	}()
+
+	waitForBlockedCardActionQuery(t, s, finalizerPID)
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit finalize transaction: %v", err)
+	}
+	got := <-result
+	if got.err != nil || got.out == nil || got.out.Kind != "conflict" {
+		t.Fatalf("racing CompleteAccept = (%#v, %v)", got.out, got.err)
+	}
+	message := mustGetActionMessage(t, s, "wf1", "om_race")
+	if message.DesiredRevision != 2 {
+		t.Fatalf("stale accept overwrote finalized revision: %#v", message)
+	}
+}
+
+func TestPGCompletionRechecksLeaseAfterLockWait(t *testing.T) {
+	t.Run("CompleteAccept", func(t *testing.T) {
+		s := openTestPG(t)
+		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+		token := claimForTest(t, s, "e1", "wf1", "retry")
+		expires := shortenInboxLease(t, s, "e1")
+
+		blocker, blockerPID := lockCardActionRow(
+			t, s, `SELECT event_id FROM card_action_inbox WHERE event_id='e1' FOR UPDATE`,
+		)
+		type acceptResult struct {
+			out *AcceptOutcome
+			err error
+		}
+		result := make(chan acceptResult, 1)
+		go func() {
+			out, err := s.CompleteAccept(ctx, acceptReq("e1", token, "wf1", "retry"))
+			result <- acceptResult{out: out, err: err}
+		}()
+		waitForBlockedCardActionQuery(t, s, blockerPID)
+		sleepPast(t, expires)
+		if err := blocker.Commit(); err != nil {
+			t.Fatalf("release inbox lock: %v", err)
+		}
+
+		got := <-result
+		if got.err != nil || got.out == nil || got.out.Kind != "lost" {
+			t.Fatalf("CompleteAccept after lease expiry = (%#v, %v), want lost", got.out, got.err)
+		}
+		if actionExists(t, s, "wf1") || countAudit(t, s, "e1") != 0 ||
+			mustGetInbox(t, s, "e1").State != "received" {
+			t.Fatal("expired CompleteAccept wrote business state after lock wait")
+		}
+	})
+
+	t.Run("CompleteReject", func(t *testing.T) {
+		s := openTestPG(t)
+		token := claimForTest(t, s, "e1", "wf1", "retry")
+		expires := shortenInboxLease(t, s, "e1")
+
+		blocker, blockerPID := lockCardActionRow(
+			t, s, `SELECT event_id FROM card_action_inbox WHERE event_id='e1' FOR UPDATE`,
+		)
+		result := make(chan error, 1)
+		go func() {
+			result <- s.CompleteReject(ctx, "e1", token, RejectRender{
+				Code: "StillRunning", RejectionReason: "still running",
+			})
+		}()
+		waitForBlockedCardActionQuery(t, s, blockerPID)
+		sleepPast(t, expires)
+		if err := blocker.Commit(); err != nil {
+			t.Fatalf("release inbox lock: %v", err)
+		}
+
+		if err := <-result; err != nil {
+			t.Fatalf("CompleteReject after lease expiry: %v", err)
+		}
+		if actionMessageExists(t, s, "wf1", "om_shared") || countAudit(t, s, "e1") != 0 ||
+			mustGetInbox(t, s, "e1").State != "received" {
+			t.Fatal("expired CompleteReject wrote business state after lock wait")
+		}
+	})
+
+	t.Run("FinalizeAction", func(t *testing.T) {
+		s := openTestPG(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+
+		blocker, err := s.DB.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin action blocker: %v", err)
+		}
+		defer func() { _ = blocker.Rollback() }()
+		var blockerPID int
+		var expires time.Time
+		if err := blocker.QueryRowContext(ctx, `
+			UPDATE card_actions
+			   SET lease_expires_at=clock_timestamp()+interval '250 milliseconds'
+			 WHERE workflow_id='wf1'
+			RETURNING pg_backend_pid(), lease_expires_at`).Scan(&blockerPID, &expires); err != nil {
+			t.Fatalf("shorten and lock action lease: %v", err)
+		}
+
+		type finalizeResult struct {
+			ok  bool
+			err error
+		}
+		result := make(chan finalizeResult, 1)
+		go func() {
+			ok, err := s.FinalizeAction(ctx, "wf1", "tokA", "succeeded", "")
+			result <- finalizeResult{ok: ok, err: err}
+		}()
+		waitForBlockedCardActionQuery(t, s, blockerPID)
+		sleepPast(t, expires)
+		if err := blocker.Commit(); err != nil {
+			t.Fatalf("release action lock: %v", err)
+		}
+
+		got := <-result
+		if got.err != nil || got.ok {
+			t.Fatalf("FinalizeAction after lease expiry = (%v, %v), want false", got.ok, got.err)
+		}
+		action := mustGetAction(t, s, "wf1")
+		if action.State != "pending" || action.Revision != 1 {
+			t.Fatalf("expired FinalizeAction changed action after lock wait: %#v", action)
+		}
+	})
+}
+
+func TestPGConcurrentRetryAndIgnoreHaveSingleWinner(t *testing.T) {
+	s := openTestPG(t)
+	seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+	retryToken := claimForTestMessage(t, s, "retry", "wf1", "retry", "om_retry")
+	ignoreToken := claimForTestMessage(t, s, "ignore", "wf1", "ignore", "om_ignore")
+
+	requests := []AcceptRequest{
+		acceptReqMessage("retry", retryToken, "wf1", "retry", "om_retry"),
+		acceptReqMessage("ignore", ignoreToken, "wf1", "ignore", "om_ignore"),
+	}
+	type acceptResult struct {
+		out *AcceptOutcome
+		err error
+	}
+	results := make(chan acceptResult, len(requests))
+	var wg sync.WaitGroup
+	for _, request := range requests {
+		request := request
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out, err := s.CompleteAccept(ctx, request)
+			results <- acceptResult{out: out, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	accepted, conflicts := 0, 0
+	for result := range results {
+		if result.err != nil || result.out == nil {
+			t.Fatalf("concurrent accept = (%#v, %v)", result.out, result.err)
+		}
+		switch result.out.Kind {
+		case "accepted":
+			accepted++
+		case "conflict":
+			conflicts++
+		default:
+			t.Fatalf("unexpected outcome %#v", result.out)
+		}
+	}
+	if accepted != 1 || conflicts != 1 {
+		t.Fatalf("accepted=%d conflicts=%d, want 1/1", accepted, conflicts)
+	}
+
+	action := mustGetAction(t, s, "wf1")
+	switch action.Action {
+	case "retry":
+		if action.State != "pending" || artifactAttempt(t, s, "grp/p") != 1 {
+			t.Fatalf("retry winner = %#v", action)
+		}
+	case "ignore":
+		if action.State != "succeeded" || artifactAttempt(t, s, "grp/p") != 0 {
+			t.Fatalf("ignore winner = %#v", action)
+		}
+	default:
+		t.Fatalf("unexpected winning action %#v", action)
+	}
+}
+
+func waitForBlockedCardActionQuery(t *testing.T, s *PGStore, blockerPID int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting int
+		err := s.DB.QueryRowContext(ctx, `
+			SELECT count(*)
+			  FROM pg_stat_activity
+			 WHERE datname=current_database()
+			   AND pid <> $1
+			   AND wait_event_type='Lock'
+			   AND query LIKE '%card_action%'`, blockerPID).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("inspect blocked card action query: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("card action query did not block on the expected row lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func shortenInboxLease(t *testing.T, s *PGStore, eventID string) time.Time {
+	t.Helper()
+	var expires time.Time
+	if err := s.DB.QueryRowContext(ctx, `
+		UPDATE card_action_inbox
+		   SET lease_expires_at=clock_timestamp()+interval '250 milliseconds'
+		 WHERE event_id=$1
+		RETURNING lease_expires_at`, eventID).Scan(&expires); err != nil {
+		t.Fatalf("shorten inbox lease: %v", err)
+	}
+	return expires
+}
+
+func lockCardActionRow(t *testing.T, s *PGStore, query string) (*sql.Tx, int) {
+	t.Helper()
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin row blocker: %v", err)
+	}
+	var ignored string
+	if err := tx.QueryRowContext(ctx, query).Scan(&ignored); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("lock card action row: %v", err)
+	}
+	var pid int
+	if err := tx.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("row blocker backend PID: %v", err)
+	}
+	return tx, pid
+}
+
+func sleepPast(t *testing.T, deadline time.Time) {
+	t.Helper()
+	if wait := time.Until(deadline.Add(50 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
 }
 
 func TestPGRecentRunsUsesOneSnapshot(t *testing.T) {
@@ -173,6 +491,318 @@ func countAudit(t *testing.T, s fullStore, eventID string) int {
 	default:
 		t.Fatalf("unsupported store type %T", s)
 		return 0
+	}
+}
+
+func seedRunAndArtifacts(
+	t *testing.T, s fullStore, workflowID, project, commitSHA string, pipelineID int, variants ...string,
+) {
+	t.Helper()
+	if err := s.RecordWorkflowRun(ctx, WorkflowRun{
+		WorkflowID: workflowID, Project: project, CommitSHA: commitSHA, PipelineID: pipelineID,
+		Version: "1.2.3", RuleVersion: "rules-v1", Variants: variants,
+	}); err != nil {
+		t.Fatalf("RecordWorkflowRun: %v", err)
+	}
+	arts := make([]Artifact, 0, len(variants))
+	for _, variant := range variants {
+		arts = append(arts, Artifact{
+			Project: project, CommitSHA: commitSHA, PipelineID: pipelineID, Variant: variant,
+			BuildType: "Release", URL: "https://registry/" + variant, SHA256: "sha-" + variant,
+			Size: 1, ManifestDigest: "manifest-" + variant,
+		})
+	}
+	if err := s.RegisterArtifacts(ctx, arts); err != nil {
+		t.Fatalf("RegisterArtifacts: %v", err)
+	}
+}
+
+func claimForTest(t *testing.T, s fullStore, eventID, workflowID, action string) string {
+	return claimForTestMessage(t, s, eventID, workflowID, action, "om_shared")
+}
+
+func claimForTestMessage(
+	t *testing.T, s fullStore, eventID, workflowID, action, openMessageID string,
+) string {
+	t.Helper()
+	token := "inbox-" + eventID
+	_, inserted, err := s.PutInbox(ctx, InboxRow{
+		EventID: eventID, Disposition: "accepted", AckToast: "已收到，正在处理",
+		Action: action, WorkflowID: workflowID, ActorOpenID: "ou_x",
+		OpenMessageID: openMessageID, PayloadDigest: "digest-" + eventID, State: "received",
+	}, nil)
+	if err != nil || !inserted {
+		t.Fatalf("PutInbox(%s) = (%v, %v)", eventID, inserted, err)
+	}
+	if _, err := s.ClaimInbox(ctx, eventID, token, 120*time.Second); err != nil {
+		t.Fatalf("ClaimInbox(%s): %v", eventID, err)
+	}
+	return token
+}
+
+func acceptReq(eventID, token, workflowID, action string) AcceptRequest {
+	return acceptReqMessage(eventID, token, workflowID, action, "om_shared")
+}
+
+func acceptReqMessage(eventID, token, workflowID, action, openMessageID string) AcceptRequest {
+	req := AcceptRequest{
+		EventID: eventID, Token: token, WorkflowID: workflowID, Action: action,
+		ActorOpenID: "ou_x", OpenMessageID: openMessageID, PayloadDigest: "digest-" + eventID,
+		ActionToken: "action-" + eventID, Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42,
+	}
+	if action == "retry" {
+		req.BuildTarget = func(attempt int) ([]byte, string, error) {
+			in := wf.DeviceTestInput{
+				Project: "grp/p", Commit: "abcd1234", PipelineID: 42,
+				Version: "1.2.3", RuleVersion: "rules-v1",
+				Packages: []wf.PackageRef{{
+					Variant: "v1", PackageFile: "v1.tar.gz", URL: "https://registry/v1",
+					SHA256: "sha-v1", Size: 1, ManifestDigest: "manifest-v1",
+				}},
+				Scope: "v1", Attempt: attempt, SourceWorkflowID: workflowID,
+			}
+			raw, err := json.Marshal(in)
+			return raw, in.WorkflowID(), err
+		}
+	}
+	return req
+}
+
+func mustGetAction(t *testing.T, s fullStore, workflowID string) CardAction {
+	t.Helper()
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		row, ok := st.cardActions[workflowID]
+		if !ok {
+			t.Fatalf("card action %s not found", workflowID)
+		}
+		row.TargetInput = append([]byte(nil), row.TargetInput...)
+		return row
+	case *PGStore:
+		var row CardAction
+		var lease sql.NullTime
+		var target []byte
+		if err := st.DB.QueryRowContext(ctx, `
+			SELECT workflow_id, action, actor_open_id, state, owner, lease_expires_at,
+			       target_workflow_id, attempt, target_input, last_error, revision
+			  FROM card_actions WHERE workflow_id=$1`, workflowID).Scan(
+			&row.WorkflowID, &row.Action, &row.ActorOpenID, &row.State, &row.Owner, &lease,
+			&row.TargetWorkflowID, &row.Attempt, &target, &row.LastError, &row.Revision,
+		); err != nil {
+			t.Fatalf("get card action %s: %v", workflowID, err)
+		}
+		if lease.Valid {
+			expires := lease.Time.UTC()
+			row.LeaseExpiresAt = &expires
+		}
+		row.TargetInput = append([]byte(nil), target...)
+		return row
+	default:
+		t.Fatalf("unsupported store type %T", s)
+		return CardAction{}
+	}
+}
+
+func actionExists(t *testing.T, s fullStore, workflowID string) bool {
+	t.Helper()
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		_, ok := st.cardActions[workflowID]
+		return ok
+	case *PGStore:
+		var exists bool
+		if err := st.DB.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM card_actions WHERE workflow_id=$1)`, workflowID).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		return exists
+	default:
+		t.Fatalf("unsupported store type %T", s)
+		return false
+	}
+}
+
+type actionMessageState struct {
+	RenderKind, RejectionReason, ButtonsMode, UpdateState, Owner string
+	DesiredRevision                                              int
+	LeaseExpiresAt, ReconcileAfter                               *time.Time
+}
+
+func mustGetActionMessage(t *testing.T, s fullStore, workflowID, openMessageID string) actionMessageState {
+	t.Helper()
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		row, ok := st.cardActionMessages[workflowID+"\x00"+openMessageID]
+		if !ok {
+			t.Fatalf("card action message %s/%s not found", workflowID, openMessageID)
+		}
+		return actionMessageState{
+			RenderKind: row.RenderKind, RejectionReason: row.RejectionReason,
+			ButtonsMode: row.ButtonsMode, UpdateState: row.UpdateState, Owner: row.Owner,
+			DesiredRevision: row.DesiredRevision, LeaseExpiresAt: row.LeaseExpiresAt,
+			ReconcileAfter: row.ReconcileAfter,
+		}
+	case *PGStore:
+		var row actionMessageState
+		var lease, reconcile sql.NullTime
+		if err := st.DB.QueryRowContext(ctx, `
+			SELECT render_kind, rejection_reason, buttons_mode, desired_revision,
+			       update_state, owner, lease_expires_at, reconcile_after
+			  FROM card_action_messages
+			 WHERE workflow_id=$1 AND open_message_id=$2`, workflowID, openMessageID).Scan(
+			&row.RenderKind, &row.RejectionReason, &row.ButtonsMode, &row.DesiredRevision,
+			&row.UpdateState, &row.Owner, &lease, &reconcile,
+		); err != nil {
+			t.Fatalf("get card action message %s/%s: %v", workflowID, openMessageID, err)
+		}
+		if lease.Valid {
+			v := lease.Time.UTC()
+			row.LeaseExpiresAt = &v
+		}
+		if reconcile.Valid {
+			v := reconcile.Time.UTC()
+			row.ReconcileAfter = &v
+		}
+		return row
+	default:
+		t.Fatalf("unsupported store type %T", s)
+		return actionMessageState{}
+	}
+}
+
+func actionMessageExists(t *testing.T, s fullStore, workflowID, openMessageID string) bool {
+	t.Helper()
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		_, ok := st.cardActionMessages[workflowID+"\x00"+openMessageID]
+		return ok
+	case *PGStore:
+		var exists bool
+		if err := st.DB.QueryRowContext(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM card_action_messages
+				 WHERE workflow_id=$1 AND open_message_id=$2)`,
+			workflowID, openMessageID).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		return exists
+	default:
+		t.Fatalf("unsupported store type %T", s)
+		return false
+	}
+}
+
+func countAuditByAction(t *testing.T, s fullStore, action string) int {
+	t.Helper()
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		n := 0
+		for _, row := range st.auditLog {
+			if row.Action == action {
+				n++
+			}
+		}
+		return n
+	case *PGStore:
+		var n int
+		if err := st.DB.QueryRowContext(ctx,
+			`SELECT count(*) FROM audit_log WHERE action=$1`, action).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	default:
+		t.Fatalf("unsupported store type %T", s)
+		return 0
+	}
+}
+
+func artifactAttempt(t *testing.T, s fullStore, project string) int {
+	t.Helper()
+	attempts := artifactAttempts(t, s)
+	return attempts[project]
+}
+
+func expireInboxLease(t *testing.T, s fullStore, eventID string) {
+	t.Helper()
+	past := time.Now().UTC().Add(-time.Minute)
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		row := st.inbox[eventID]
+		row.LeaseExpiresAt = &past
+		st.inbox[eventID] = row
+		st.mu.Unlock()
+	case *PGStore:
+		if _, err := st.DB.ExecContext(ctx,
+			`UPDATE card_action_inbox SET lease_expires_at=$2 WHERE event_id=$1`, eventID, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func expireActionLease(t *testing.T, s fullStore, workflowID string) {
+	t.Helper()
+	past := time.Now().UTC().Add(-time.Minute)
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		row := st.cardActions[workflowID]
+		row.LeaseExpiresAt = &past
+		st.cardActions[workflowID] = row
+		st.mu.Unlock()
+	case *PGStore:
+		if _, err := st.DB.ExecContext(ctx,
+			`UPDATE card_actions SET lease_expires_at=$2 WHERE workflow_id=$1`, workflowID, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func seedAcceptedRetry(t *testing.T, s fullStore, workflowID, actionToken string) {
+	t.Helper()
+	seedRunAndArtifacts(t, s, workflowID, "grp/p", "abcd1234", 42, "v1")
+	token := claimForTest(t, s, "seed-"+workflowID, workflowID, "retry")
+	req := acceptReq("seed-"+workflowID, token, workflowID, "retry")
+	req.ActionToken = actionToken
+	out, err := s.CompleteAccept(ctx, req)
+	if err != nil || out.Kind != "accepted" {
+		t.Fatalf("seed CompleteAccept = (%#v, %v)", out, err)
+	}
+}
+
+func setMessageBusyForTest(t *testing.T, s fullStore, workflowID, openMessageID string) {
+	t.Helper()
+	future := time.Now().UTC().Add(time.Minute)
+	reconcile := future.Add(time.Minute)
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		key := workflowID + "\x00" + openMessageID
+		row := st.cardActionMessages[key]
+		row.Owner = "renderer"
+		row.LeaseExpiresAt = &future
+		row.ReconcileAfter = &reconcile
+		row.UpdateState = "succeeded"
+		st.cardActionMessages[key] = row
+		st.mu.Unlock()
+	case *PGStore:
+		if _, err := st.DB.ExecContext(ctx, `
+			UPDATE card_action_messages
+			   SET owner='renderer', lease_expires_at=$3, reconcile_after=$4, update_state='succeeded'
+			 WHERE workflow_id=$1 AND open_message_id=$2`,
+			workflowID, openMessageID, future, reconcile); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -2094,6 +2724,516 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if second[0].Project != "p" || second[0].Verdict != "" {
 			t.Fatalf("stored result mutated through caller slice: %#v", second[0])
+		}
+	})
+
+	t.Run("AcceptWritesCompleteRetryRowInOneStatement", func(t *testing.T) {
+		s := newStore(t)
+		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+		tok := claimForTest(t, s, "e1", "wf1", "retry")
+
+		var builtAttempt int
+		req := acceptReq("e1", tok, "wf1", "retry")
+		build := req.BuildTarget
+		req.BuildTarget = func(attempt int) ([]byte, string, error) {
+			builtAttempt = attempt
+			return build(attempt)
+		}
+		out, err := s.CompleteAccept(ctx, req)
+		if err != nil || out == nil || out.Kind != "accepted" {
+			t.Fatalf("CompleteAccept = (%#v, %v)", out, err)
+		}
+		if builtAttempt != out.Attempt || out.Attempt != 1 {
+			t.Fatalf("BuildTarget attempt=%d outcome=%#v", builtAttempt, out)
+		}
+		got := mustGetAction(t, s, "wf1")
+		if got.Attempt != out.Attempt || got.TargetWorkflowID == "" || len(got.TargetInput) == 0 {
+			t.Fatalf("retry 行必须落库即钉死: %#v", got)
+		}
+		var target wf.DeviceTestInput
+		if err := json.Unmarshal(got.TargetInput, &target); err != nil {
+			t.Fatalf("target_input: %v", err)
+		}
+		if target.Attempt != got.Attempt || target.WorkflowID() != got.TargetWorkflowID ||
+			target.SourceWorkflowID != "wf1" || target.Version != "1.2.3" ||
+			target.RuleVersion != "rules-v1" || len(target.Packages) != 1 {
+			t.Fatalf("target_input 未完整钉死: %#v action=%#v", target, got)
+		}
+		if inbox := mustGetInbox(t, s, "e1"); inbox.State != "processed" || inbox.ProcessedAt == nil {
+			t.Fatalf("inbox 未与接受事务一起完成: %#v", inbox)
+		}
+		if n := countAuditByAction(t, s, "card.retry.accepted"); n != 1 {
+			t.Fatalf("accepted 审计=%d, want 1", n)
+		}
+		msg := mustGetActionMessage(t, s, "wf1", "om_shared")
+		if msg.RenderKind != "action" || msg.DesiredRevision != 1 || msg.UpdateState != "pending" {
+			t.Fatalf("message=%#v", msg)
+		}
+	})
+
+	t.Run("AcceptBuildTargetFailureRollsBackEverything", func(t *testing.T) {
+		s := newStore(t)
+		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+		tok := claimForTest(t, s, "e1", "wf1", "retry")
+		before := artifactAttempt(t, s, "grp/p")
+		req := acceptReq("e1", tok, "wf1", "retry")
+		req.BuildTarget = func(attempt int) ([]byte, string, error) {
+			if attempt != before+1 {
+				t.Fatalf("BuildTarget attempt=%d, want %d", attempt, before+1)
+			}
+			return nil, "", errors.New("target mismatch")
+		}
+		if out, err := s.CompleteAccept(ctx, req); err == nil || out != nil {
+			t.Fatalf("CompleteAccept=(%#v,%v), want rollback error", out, err)
+		}
+		if artifactAttempt(t, s, "grp/p") != before {
+			t.Fatal("BuildTarget 失败不得推进水位")
+		}
+		if actionExists(t, s, "wf1") || actionMessageExists(t, s, "wf1", "om_shared") ||
+			countAudit(t, s, "e1") != 0 {
+			t.Fatal("BuildTarget 失败不得留下 action/message/audit")
+		}
+		if inbox := mustGetInbox(t, s, "e1"); inbox.State != "received" {
+			t.Fatalf("BuildTarget 失败不得处理 inbox: %#v", inbox)
+		}
+
+		req = acceptReq("e1", tok, "wf1", "retry")
+		if out, err := s.CompleteAccept(ctx, req); err != nil || out.Kind != "accepted" {
+			t.Fatalf("同一 live claim 应可重试完成: (%#v,%v)", out, err)
+		}
+	})
+
+	t.Run("AcceptIsSerializedAndBumpsWaterlineOnce", func(t *testing.T) {
+		s := newStore(t)
+		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1", "v2")
+		before := artifactAttempt(t, s, "grp/p")
+
+		const n = 8
+		toks := make([]string, n)
+		for i := range n {
+			toks[i] = claimForTest(t, s, fmt.Sprintf("e%d", i), "wf1", "retry")
+		}
+
+		kinds := make(chan string, n)
+		errs := make(chan error, n)
+		var builds atomic.Int32
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				req := acceptReq(fmt.Sprintf("e%d", i), toks[i], "wf1", "retry")
+				build := req.BuildTarget
+				req.BuildTarget = func(attempt int) ([]byte, string, error) {
+					builds.Add(1)
+					return build(attempt)
+				}
+				out, err := s.CompleteAccept(ctx, req)
+				if err != nil {
+					errs <- err
+					return
+				}
+				kinds <- out.Kind
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("concurrent accept: %v", err)
+		}
+		close(kinds)
+		accepted, conflicts := 0, 0
+		for kind := range kinds {
+			switch kind {
+			case "accepted":
+				accepted++
+			case "conflict":
+				conflicts++
+			default:
+				t.Fatalf("unexpected outcome %q", kind)
+			}
+		}
+		if accepted != 1 || conflicts != n-1 {
+			t.Fatalf("accepted=%d conflicts=%d, want 1/%d", accepted, conflicts, n-1)
+		}
+		if diff := artifactAttempt(t, s, "grp/p") - before; diff != 1 {
+			t.Fatalf("水位推进 %d 次, want 1", diff)
+		}
+		if builds.Load() != 1 {
+			t.Fatalf("BuildTarget 调用=%d, want 1", builds.Load())
+		}
+		if countAuditByAction(t, s, "card.retry.accepted") != 1 ||
+			countAuditByAction(t, s, "card.retry.rejected.conflict") != n-1 {
+			t.Fatal("并发接受的 accepted/conflict 审计数量不对")
+		}
+	})
+
+	t.Run("AcceptRequiresMatchingOwnerAndLiveLease", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			prepare func(fullStore, string)
+			token   string
+		}{
+			{name: "owner mismatch", token: "wrong-token"},
+			{name: "expired lease", token: "inbox-e1", prepare: func(s fullStore, _ string) {
+				expireInboxLease(t, s, "e1")
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newStore(t)
+				seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+				tok := claimForTest(t, s, "e1", "wf1", "retry")
+				if tc.prepare != nil {
+					tc.prepare(s, tok)
+				}
+				before := artifactAttempt(t, s, "grp/p")
+				var built atomic.Int32
+				req := acceptReq("e1", tc.token, "wf1", "retry")
+				build := req.BuildTarget
+				req.BuildTarget = func(attempt int) ([]byte, string, error) {
+					built.Add(1)
+					return build(attempt)
+				}
+				out, err := s.CompleteAccept(ctx, req)
+				if err != nil || out == nil || out.Kind != "lost" {
+					t.Fatalf("CompleteAccept=(%#v,%v), want lost", out, err)
+				}
+				if built.Load() != 0 || artifactAttempt(t, s, "grp/p") != before ||
+					actionExists(t, s, "wf1") || actionMessageExists(t, s, "wf1", "om_shared") ||
+					countAudit(t, s, "e1") != 0 {
+					t.Fatal("失去 fencing 的 CompleteAccept 必须零业务写入")
+				}
+				if inbox := mustGetInbox(t, s, "e1"); inbox.State != "received" {
+					t.Fatalf("inbox changed: %#v", inbox)
+				}
+			})
+		}
+	})
+
+	t.Run("AcceptedEventReconsumptionWritesNoSecondAudit", func(t *testing.T) {
+		s := newStore(t)
+		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+		token := claimForTest(t, s, "e1", "wf1", "retry")
+		request := acceptReq("e1", token, "wf1", "retry")
+		var builds atomic.Int32
+		build := request.BuildTarget
+		request.BuildTarget = func(attempt int) ([]byte, string, error) {
+			builds.Add(1)
+			return build(attempt)
+		}
+		first, err := s.CompleteAccept(ctx, request)
+		if err != nil || first == nil || first.Kind != "accepted" {
+			t.Fatalf("first CompleteAccept = (%#v, %v)", first, err)
+		}
+		before := mustGetAction(t, s, "wf1")
+		second, err := s.CompleteAccept(ctx, request)
+		if err != nil || second == nil || second.Kind != "lost" {
+			t.Fatalf("second CompleteAccept = (%#v, %v), want lost", second, err)
+		}
+		if builds.Load() != 1 || countAudit(t, s, "e1") != 1 {
+			t.Fatalf("reconsumption builds=%d audits=%d, want 1/1", builds.Load(), countAudit(t, s, "e1"))
+		}
+		if after := mustGetAction(t, s, "wf1"); !reflect.DeepEqual(after, before) {
+			t.Fatalf("reconsumption changed action: before=%#v after=%#v", before, after)
+		}
+	})
+
+	t.Run("AcceptLegacyWritesOnlyRejection", func(t *testing.T) {
+		s := newStore(t)
+		tok := claimForTest(t, s, "e1", "legacy-wf", "retry")
+		var built atomic.Int32
+		req := acceptReq("e1", tok, "legacy-wf", "retry")
+		req.BuildTarget = func(int) ([]byte, string, error) {
+			built.Add(1)
+			return nil, "", nil
+		}
+		out, err := s.CompleteAccept(ctx, req)
+		if err != nil || out == nil || out.Kind != "legacy" {
+			t.Fatalf("CompleteAccept=(%#v,%v), want legacy", out, err)
+		}
+		if built.Load() != 0 || actionExists(t, s, "legacy-wf") {
+			t.Fatal("legacy 分支不得构造 target 或写 action")
+		}
+		msg := mustGetActionMessage(t, s, "legacy-wf", "om_shared")
+		if msg.RenderKind != "rejection" || msg.RejectionReason == "" || msg.ButtonsMode != "none" {
+			t.Fatalf("legacy message=%#v", msg)
+		}
+		if countAudit(t, s, "e1") != 1 || mustGetInbox(t, s, "e1").State != "processed" {
+			t.Fatal("legacy 拒绝审计与 inbox 必须同事务完成")
+		}
+	})
+
+	t.Run("AcceptedActionUpgradesPriorRejectionMessage", func(t *testing.T) {
+		s := newStore(t)
+		token := claimForTest(t, s, "rejected", "wf1", "retry")
+		if err := s.CompleteReject(ctx, "rejected", token, RejectRender{
+			Code: "StillRunning", RejectionReason: "still running",
+		}); err != nil {
+			t.Fatalf("CompleteReject: %v", err)
+		}
+		rejection := mustGetActionMessage(t, s, "wf1", "om_shared")
+		if rejection.RenderKind != "rejection" {
+			t.Fatalf("initial message = %#v", rejection)
+		}
+
+		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+		token = claimForTest(t, s, "accepted", "wf1", "retry")
+		out, err := s.CompleteAccept(ctx, acceptReq("accepted", token, "wf1", "retry"))
+		if err != nil || out == nil || out.Kind != "accepted" {
+			t.Fatalf("CompleteAccept = (%#v, %v)", out, err)
+		}
+		action := mustGetActionMessage(t, s, "wf1", "om_shared")
+		if action.RenderKind != "action" || action.RejectionReason != "" ||
+			action.ButtonsMode != "none" || action.DesiredRevision != 1 ||
+			action.UpdateState != "pending" {
+			t.Fatalf("rejection was not upgraded to action: %#v", action)
+		}
+	})
+
+	t.Run("ActionRejectCompletesAtomicallyAndMapsButtons", func(t *testing.T) {
+		cases := map[string]string{
+			"StillRunning":     "both",
+			"ResultUnreadable": "both",
+			"ArtifactMissing":  "both",
+			"NotAuthoritative": "none",
+			"NoFailedVariants": "none",
+		}
+		for code, wantButtons := range cases {
+			t.Run(code, func(t *testing.T) {
+				s := newStore(t)
+				tok := claimForTest(t, s, "e1", "wf1", "retry")
+				err := s.CompleteReject(ctx, "e1", tok, RejectRender{
+					Code: code, RejectionReason: "rejected: " + code,
+				})
+				if err != nil {
+					t.Fatalf("CompleteReject: %v", err)
+				}
+				msg := mustGetActionMessage(t, s, "wf1", "om_shared")
+				if msg.RenderKind != "rejection" || msg.RejectionReason != "rejected: "+code ||
+					msg.ButtonsMode != wantButtons || msg.UpdateState != "pending" {
+					t.Fatalf("message=%#v, want buttons=%q", msg, wantButtons)
+				}
+				if countAudit(t, s, "e1") != 1 {
+					t.Fatal("CompleteReject 必须恰好写一行审计")
+				}
+				if inbox := mustGetInbox(t, s, "e1"); inbox.State != "processed" || inbox.ProcessedAt == nil {
+					t.Fatalf("inbox=%#v", inbox)
+				}
+			})
+		}
+	})
+
+	t.Run("ActionRejectRequiresMatchingOwnerAndLiveLease", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			token  string
+			expire bool
+		}{
+			{name: "owner mismatch", token: "wrong-token"},
+			{name: "expired lease", token: "inbox-e1", expire: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newStore(t)
+				claimForTest(t, s, "e1", "wf1", "retry")
+				if tc.expire {
+					expireInboxLease(t, s, "e1")
+				}
+				if err := s.CompleteReject(ctx, "e1", tc.token, RejectRender{
+					Code: "StillRunning", RejectionReason: "still running",
+				}); err != nil {
+					t.Fatalf("CompleteReject: %v", err)
+				}
+				if actionMessageExists(t, s, "wf1", "om_shared") || countAudit(t, s, "e1") != 0 {
+					t.Fatal("失去 fencing 的 CompleteReject 必须零业务写入")
+				}
+				if inbox := mustGetInbox(t, s, "e1"); inbox.State != "received" {
+					t.Fatalf("inbox changed: %#v", inbox)
+				}
+			})
+		}
+	})
+
+	t.Run("ActionRejectNeverOverwritesActionMessage", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		before := mustGetActionMessage(t, s, "wf1", "om_shared")
+		tok := claimForTest(t, s, "e2", "wf1", "retry")
+		if err := s.CompleteReject(ctx, "e2", tok, RejectRender{
+			Code: "StillRunning", RejectionReason: "stale rejection",
+		}); err != nil {
+			t.Fatalf("CompleteReject: %v", err)
+		}
+		after := mustGetActionMessage(t, s, "wf1", "om_shared")
+		if !reflect.DeepEqual(after, before) {
+			t.Fatalf("rejection 覆盖了 action message: before=%#v after=%#v", before, after)
+		}
+		if countAudit(t, s, "e2") != 1 || mustGetInbox(t, s, "e2").State != "processed" {
+			t.Fatal("保留 action message 时仍必须完成拒绝审计与 inbox")
+		}
+	})
+
+	t.Run("FinalizeRequiresOwnerAndLiveLease", func(t *testing.T) {
+		for _, state := range []string{"succeeded", "failed"} {
+			t.Run(state, func(t *testing.T) {
+				s := newStore(t)
+				seedAcceptedRetry(t, s, "wf1", "tokA")
+				before := mustGetAction(t, s, "wf1")
+
+				ok, err := s.FinalizeAction(ctx, "wf1", "wrong-token", state, "must not land")
+				if err != nil || ok {
+					t.Fatalf("owner mismatch finalize=(%v,%v)", ok, err)
+				}
+				expireActionLease(t, s, "wf1")
+				ok, err = s.FinalizeAction(ctx, "wf1", "tokA", state, "must not land")
+				if err != nil || ok {
+					t.Fatalf("expired finalize=(%v,%v)", ok, err)
+				}
+				got := mustGetAction(t, s, "wf1")
+				before.LeaseExpiresAt = got.LeaseExpiresAt
+				if !reflect.DeepEqual(got, before) {
+					t.Fatalf("失败的 finalize 不得改动 action: before=%#v got=%#v", before, got)
+				}
+			})
+		}
+	})
+
+	t.Run("FinalizeAdvancesRevisionAndReordersAllMessages", func(t *testing.T) {
+		for _, state := range []string{"succeeded", "failed"} {
+			t.Run(state, func(t *testing.T) {
+				s := newStore(t)
+				seedAcceptedRetry(t, s, "wf1", "tokA")
+				tok := claimForTestMessage(t, s, "e2", "wf1", "retry", "om_second")
+				out, err := s.CompleteAccept(
+					ctx, acceptReqMessage("e2", tok, "wf1", "retry", "om_second"),
+				)
+				if err != nil || out.Kind != "conflict" {
+					t.Fatalf("register second message=(%#v,%v)", out, err)
+				}
+				for _, messageID := range []string{"om_shared", "om_second"} {
+					setMessageBusyForTest(t, s, "wf1", messageID)
+				}
+				lastErr := ""
+				if state == "failed" {
+					lastErr = "temporal down"
+				}
+				ok, err := s.FinalizeAction(ctx, "wf1", "tokA", state, lastErr)
+				if err != nil || !ok {
+					t.Fatalf("FinalizeAction=(%v,%v)", ok, err)
+				}
+				action := mustGetAction(t, s, "wf1")
+				if action.State != state || action.Revision != 2 || action.LastError != lastErr ||
+					action.Owner != "" || action.LeaseExpiresAt != nil {
+					t.Fatalf("action=%#v", action)
+				}
+				for _, messageID := range []string{"om_shared", "om_second"} {
+					msg := mustGetActionMessage(t, s, "wf1", messageID)
+					if msg.DesiredRevision != 2 || msg.UpdateState != "pending" || msg.Owner != "" ||
+						msg.LeaseExpiresAt != nil || msg.ReconcileAfter != nil {
+						t.Fatalf("%s 未被重排: %#v", messageID, msg)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("FailedActionResumesReusingPins", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		tok := claimForTestMessage(t, s, "conflict", "wf1", "retry", "om_second")
+		if out, err := s.CompleteAccept(ctx,
+			acceptReqMessage("conflict", tok, "wf1", "retry", "om_second")); err != nil ||
+			out.Kind != "conflict" {
+			t.Fatalf("register second message=(%#v,%v)", out, err)
+		}
+		if ok, err := s.FinalizeAction(ctx, "wf1", "tokA", "failed", "temporal down"); err != nil || !ok {
+			t.Fatalf("seed failed action=(%v,%v)", ok, err)
+		}
+		before := mustGetAction(t, s, "wf1")
+		waterBefore := artifactAttempt(t, s, "grp/p")
+		for _, messageID := range []string{"om_shared", "om_second"} {
+			setMessageBusyForTest(t, s, "wf1", messageID)
+		}
+
+		tok = claimForTestMessage(t, s, "e2", "wf1", "retry", "om_third")
+		req := acceptReqMessage("e2", tok, "wf1", "retry", "om_third")
+		req.ActionToken = "tokB"
+		req.Project, req.CommitSHA, req.PipelineID = "", "", 0
+		req.BuildTarget = func(int) ([]byte, string, error) {
+			t.Fatal("resume 不得重新 BuildTarget")
+			return nil, "", nil
+		}
+		out, err := s.CompleteAccept(ctx, req)
+		if err != nil || out == nil || out.Kind != "resumed" {
+			t.Fatalf("CompleteAccept=(%#v,%v), want resumed", out, err)
+		}
+		after := mustGetAction(t, s, "wf1")
+		if after.Attempt != before.Attempt || after.TargetWorkflowID != before.TargetWorkflowID ||
+			!bytes.Equal(after.TargetInput, before.TargetInput) {
+			t.Fatalf("resume 必须复用原 pins: before=%#v after=%#v", before, after)
+		}
+		if after.State != "pending" || after.Revision != before.Revision+1 ||
+			after.Owner != "tokB" || after.LeaseExpiresAt == nil || after.LastError != "" {
+			t.Fatalf("resume state=%#v", after)
+		}
+		if artifactAttempt(t, s, "grp/p") != waterBefore {
+			t.Fatal("resume 不得推进水位")
+		}
+		if countAuditByAction(t, s, "card.retry.accepted") != 1 ||
+			countAuditByAction(t, s, "card.retry.resumed") != 1 {
+			t.Fatal("resume 不得重复 accepted 审计,且必须写 resumed 审计")
+		}
+		for _, messageID := range []string{"om_shared", "om_second", "om_third"} {
+			msg := mustGetActionMessage(t, s, "wf1", messageID)
+			if msg.RenderKind != "action" || msg.DesiredRevision != after.Revision ||
+				msg.UpdateState != "pending" || msg.Owner != "" || msg.LeaseExpiresAt != nil ||
+				msg.ReconcileAfter != nil {
+				t.Fatalf("%s resume 后未重排: %#v", messageID, msg)
+			}
+		}
+	})
+
+	t.Run("ActionCannotChangeAfterAccept", func(t *testing.T) {
+		s := newStore(t)
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		if ok, err := s.FinalizeAction(ctx, "wf1", "tokA", "failed", "boom"); err != nil || !ok {
+			t.Fatalf("FinalizeAction=(%v,%v)", ok, err)
+		}
+		before := mustGetAction(t, s, "wf1")
+		tok := claimForTestMessage(t, s, "e3", "wf1", "ignore", "om_ignore")
+		out, err := s.CompleteAccept(ctx, acceptReqMessage("e3", tok, "wf1", "ignore", "om_ignore"))
+		if err != nil || out == nil || out.Kind != "conflict" {
+			t.Fatalf("异 action 必须 conflict, got (%#v,%v)", out, err)
+		}
+		after := mustGetAction(t, s, "wf1")
+		if !reflect.DeepEqual(after, before) {
+			t.Fatalf("conflict 改动了既有 action: before=%#v after=%#v", before, after)
+		}
+		msg := mustGetActionMessage(t, s, "wf1", "om_ignore")
+		if msg.RenderKind != "action" || msg.DesiredRevision != before.Revision {
+			t.Fatalf("conflict message=%#v", msg)
+		}
+	})
+
+	t.Run("IgnoreLandsTerminalWithoutPins", func(t *testing.T) {
+		s := newStore(t)
+		seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1")
+		tok := claimForTest(t, s, "e1", "wf1", "ignore")
+		req := acceptReq("e1", tok, "wf1", "ignore")
+		req.BuildTarget = func(int) ([]byte, string, error) {
+			t.Fatal("ignore 不得 BuildTarget")
+			return nil, "", nil
+		}
+		out, err := s.CompleteAccept(ctx, req)
+		if err != nil || out == nil || out.Kind != "accepted" {
+			t.Fatalf("ignore accept=(%#v,%v)", out, err)
+		}
+		got := mustGetAction(t, s, "wf1")
+		if got.State != "succeeded" || got.Attempt != 0 || got.TargetWorkflowID != "" ||
+			got.TargetInput != nil || got.Owner != "" || got.LeaseExpiresAt != nil {
+			t.Fatalf("ignore 行必须终态且无 pins: %#v", got)
+		}
+		if out.ActionToken != "" || out.Attempt != 0 {
+			t.Fatalf("ignore outcome=%#v", out)
 		}
 	})
 

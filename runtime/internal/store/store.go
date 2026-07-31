@@ -66,6 +66,9 @@ type MemStore struct {
 	inbox map[string]InboxRow
 	// auditLog 是 audit_log 表(设计文档 §3.5)的内存视图。
 	auditLog []AuditRow
+	// cardActions/cardActionMessages 分别是设计文档 §3.2/§3.3 的内存视图。
+	cardActions        map[string]CardAction
+	cardActionMessages map[string]cardActionMessage
 	// seq 是插入序计数器,给 artifacts/tasks 提供确定的"最近"排序
 	// (内存实现无 created_at 列)。
 	seq    int64
@@ -74,20 +77,22 @@ type MemStore struct {
 
 func NewMemStore() *MemStore {
 	return &MemStore{
-		rows:             map[string]Artifact{},
-		clients:          map[string]Client{},
-		devices:          map[string]*deviceRow{},
-		tasks:            map[string]*taskRecord{},
-		events:           map[string]TaskEvent{},
-		results:          map[string]wf.ResultRecord{},
-		outboxByKey:      map[string]*outboxRow{},
-		outboxByID:       map[int64]*outboxRow{},
-		workflowRuns:     map[string]WorkflowRun{},
-		runSeq:           map[string]int64{},
-		evidenceSnaps:    map[string]EvidenceSnapshot{},
-		rowSeq:           map[string]int64{},
-		clientFailStreak: map[string]int{},
-		inbox:            map[string]InboxRow{},
+		rows:               map[string]Artifact{},
+		clients:            map[string]Client{},
+		devices:            map[string]*deviceRow{},
+		tasks:              map[string]*taskRecord{},
+		events:             map[string]TaskEvent{},
+		results:            map[string]wf.ResultRecord{},
+		outboxByKey:        map[string]*outboxRow{},
+		outboxByID:         map[int64]*outboxRow{},
+		workflowRuns:       map[string]WorkflowRun{},
+		runSeq:             map[string]int64{},
+		evidenceSnaps:      map[string]EvidenceSnapshot{},
+		rowSeq:             map[string]int64{},
+		clientFailStreak:   map[string]int{},
+		inbox:              map[string]InboxRow{},
+		cardActions:        map[string]CardAction{},
+		cardActionMessages: map[string]cardActionMessage{},
 	}
 }
 

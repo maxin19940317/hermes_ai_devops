@@ -101,6 +101,17 @@ func (s *MemStore) NextWorkflowAttemptAll(
 ) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	target, err := s.nextWorkflowAttemptAllTargetLocked(project, commitSHA, pipelineID)
+	if err != nil {
+		return 0, err
+	}
+	s.setWorkflowAttemptAllLocked(project, commitSHA, pipelineID, target)
+	return target, nil
+}
+
+func (s *MemStore) nextWorkflowAttemptAllTargetLocked(
+	project, commitSHA string, pipelineID int,
+) (int, error) {
 	maxN := -1
 	for _, a := range s.rows {
 		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
@@ -113,14 +124,18 @@ func (s *MemStore) NextWorkflowAttemptAll(
 		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d",
 			project, commitSHA, pipelineID)
 	}
-	target := maxN + 1
+	return maxN + 1, nil
+}
+
+func (s *MemStore) setWorkflowAttemptAllLocked(
+	project, commitSHA string, pipelineID, target int,
+) {
 	for k, a := range s.rows {
 		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
 			a.WorkflowAttempt = target
 			s.rows[k] = a
 		}
 	}
-	return target, nil
 }
 
 // RecentRun 是快照里的一次运行(设计文档 §4.2)。Verdict 为空表示尚无终态结论。
