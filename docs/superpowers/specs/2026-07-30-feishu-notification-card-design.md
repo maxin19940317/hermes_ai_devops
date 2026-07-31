@@ -2,7 +2,11 @@
 
 日期：2026-07-30
 
-状态：**已批准**（2026-07-30 第六轮评审通过；v6 + 超预算断言表述统一）
+状态：**已批准并已实现**（2026-07-30 第六轮评审通过；v6 + 超预算断言表述统一）
+
+> 2026-07-31 修订：只改 §10（下一轮的输入）——`workflow_runs` 已合入，（3）解除、（4）
+> 前置具备，并补入 `decisions.task_id` FK 约束与 WS `card.action.trigger` 可达性风险（11）。
+> §1—§9 描述的展示卡片本体未变，不重新评审。
 
 ## 1. 背景
 
@@ -445,7 +449,12 @@ workflow 的先例。
 
 ## 10. 按钮为何拆出去（下一轮的输入）
 
-前两轮评审把按钮的前置条件挖清楚了。这些结论必须留在这里，否则下一轮会重新发现一遍：
+前两轮评审把按钮的前置条件挖清楚了。这些结论必须留在这里，否则下一轮会重新发现一遍。
+
+> **2026-07-31 更新：`workflow_runs` 那一轮已合入**（见
+> `2026-07-30-workflow-runs-design.md`）。下面的 **（3）已解除**，**（4）的前置条件已具备**，
+> 两条改写为"落地结论"保留，供按钮轮直接引用。**（1）（2）（5）—（10）全部仍然成立**，
+> 是按钮轮的实际需求清单。新增 **（11）** 记录本地查证 SDK 得到的可行性风险。
 
 **（1）幂等不能靠事件 ID。** 两次真实点击是两个不同的飞书事件 ID；`listener.go` 的
 `dedupCache` 是进程内 10 分钟缓存、重启即失效；多人同点同样是不同事件。事件 ID 只能挡
@@ -459,20 +468,26 @@ workflow 的先例。
 状态条件的 CAS（`UPDATE … WHERE state='failed' RETURNING`），`pending` 必须有 owner 与租约，
 否则 claim 后崩溃会永久卡在"处理中"。
 
-**（3）`Version` / `RuleVersion` 没有权威来源。** `artifacts` 与 `tasks` **都没有**这两列
-（`schema.sql` 的 `version` 在 `clients` 表，是 agent 版本）。这不只是历史数据问题——
-新写入的数据同样恢复不出来。而 `rerun` 指令今天就在丢它们（`executor.go:339` 只填
-Project/Commit/PipelineID），于是对同一产物的重跑可能用**不同规则版本**重新判定，
-而 `rule_version` 存在的全部目的就是让判定可回放。需要新建持久化模型（`workflow_runs`：
-workflow_id / project / commit / pipeline / version / rule_version），定义写入点、唯一键与
-历史行 fallback。**这实际就是 CLAUDE.md §11 声明却从未建过的 `workflows` 表**——
-它已经绞了两轮设计（差距 #10 那轮的 `RecentRuns` 也是因为它缺失才退化成 workflow_id
-字符串前缀匹配）。
+**（3）~~`Version` / `RuleVersion` 没有权威来源~~ —— 已解除（2026-07-31）。**
+`workflow_runs` 表已落地：`workflow_id` 主键，逐字保存 project / commit_sha /
+pipeline_id / version / rule_version / scope / attempt / variants /
+source_workflow_id。写入点是 `DeviceTestWorkflow` 内 `record-workflow-run-v1` 版本门后、
+`SelectTestSpecs` **之前**的 `RecordWorkflowRun` 活动，因此**任何进入设备测试的新运行都
+必有一行权威记录**；不可变，重复写按内容比较，不一致返回 `ErrWorkflowRunConflict`。
+`rerun` 已改为从源 run 继承 Version/RuleVersion，不再丢失。按钮轮直接
+`GetWorkflowRun(source_workflow_id)` 即可，不需要再设计恢复路径。
+**遗留约束**：该表不回填，历史运行没有行；`RecentRuns` 里 `Authoritative=false` 的
+legacy 行只可展示，**不可触发副作用**——按钮轮必须沿用这条，无权威行即拒绝。
 
-**（4）目标绑定必须完全从权威记录派生。** 只校验 task 的 workflow_id 不够：载荷仍可用
-workflow A 的合法 task 通过校验，却拿 workflow B 的 project/commit/pipeline 去查 artifacts
-并启动。按钮应只携带 `source_workflow_id` + `action`，其余全部从权威 run/task 记录派生；
-查询必须精确匹配 workflow_id，**不能复用 `RecentRuns` 的 base-prefix 语义**。
+**（4）目标绑定必须完全从权威记录派生 —— 前置已具备，约束仍然生效。**
+只校验 task 的 workflow_id 不够：载荷仍可用 workflow A 的合法 task 通过校验，却拿
+workflow B 的 project/commit/pipeline 去查 artifacts 并启动。按钮应只携带
+`source_workflow_id` + `variant` + `action`，其余全部从 `workflow_runs` 派生；查询必须精确
+匹配 workflow_id，**不能复用 `RecentRuns` 的 base-prefix 语义**。
+现在这条可以机械执行了：`GetWorkflowRun` 是精确主键查询，`variant` 必须落在
+`source.variants` 集合内，artifacts 按 `(project, commit_sha, pipeline_id, variant)` 四元组
+精确取且要求恰好命中一行——`rerun` 那轮已经把这套校验实现并测试过，按钮轮复用同一条路径，
+不要另写一份。
 
 **（5）retry 与 ignore 是否互斥要先定义。** 若 action key 含 action，两人同时点 retry 与
 ignore 都能 claim 成功；而卡片"点任一按钮后两个都置灰"的观感暗示互斥。互斥就按
@@ -480,7 +495,15 @@ ignore 都能 claim 成功；而卡片"点任一按钮后两个都置灰"的观�
 
 **（6）ignore 的三次写入需要原子边界。** `decisions` 写完、`audit_log` 或 `succeeded`
 更新前崩溃，恢复会重复写 human decision。三者应在一个 store 事务内完成，用 action key 保幂等。
-另注意 `decisions.output` 是 `JSONB NOT NULL`（`schema.sql:109`），必须给出具体 JSON。
+另注意 `decisions.output` 是 `JSONB NOT NULL`（`schema.sql:129`），必须给出具体 JSON。
+
+> **2026-07-31 补充的硬约束**：`decisions.task_id` 是
+> `NOT NULL REFERENCES tasks(task_id)`（`schema.sql:124`）。而工作流可以产出**没有 task 行**
+> 的失败 `TaskSummary`——`AcquireDevice` 耗尽、`CreateTask` 活动自身失败都会如此（这正是
+> `rerun` 不查 tasks、改用 Temporal output 作失败集合权威来源的原因）。因此
+> **"忽略一个没有 task 行的失败变体"写不进 `decisions`**。按钮轮必须显式选一条：
+> 要么这类变体不显示 ignore 按钮，要么 ignore 只写 `audit_log` + `card_actions` 而跳过
+> `decisions`。不选就会在实施期撞 FK 违反。
 
 **（7）readiness 是运行时配置，不能放进 activity 载荷。** activity 输入由 workflow 写入
 history，worker 装配时改不了。按钮可用性应是 `Acts`/sender 的运行时配置，由 `NotifyCard`
@@ -493,14 +516,42 @@ handler 在发送前决定是否剥掉按钮；并且**本地注册 handler 不�
 非白名单提示必须是**同步 callback toast**——不能用 `SendText`，那会发到固定的
 `FEISHU_RECEIVE_ID`（可能是群），等于把一次未授权点击广播给所有人。
 
-**（9）`audit_log` 表不存在。** CLAUDE.md §37 要求"所有操作落 audit_log"、§11 给了结构，
-但 `schema.sql` 里没有这张表、全仓库无写入方。按钮那轮应建表并成为第一个写入方。
+**（9）`audit_log` 表不存在。** CLAUDE.md §3 规则 7 要求"所有操作落 `audit_log`"、§11 给了
+结构（`audit_log(actor, action, target, payload_digest, ts)`），但 `schema.sql` 里没有这张表、
+全仓库无写入方。按钮那轮应建表并成为第一个写入方。2026-07-31 复查确认仍然不存在，
+`card_actions` 同样不存在——两张表都要在按钮轮新建。
 
 **（10）「忽略」的语义要写清**：它只记录"人看过并决定忽略"，不修改 `tasks.verdict`、
 不影响任何后续策略；当下**没有任何消费方读取 human decision**。不写明的话，第一个用它的人
 会以为按钮坏了。
 
-建议下一轮的顺序：先做 `workflow_runs`（它已经绞了两轮设计，且不只服务按钮），再做按钮。
+**（11）WS 长连接能否投递 `card.action.trigger` 未经证实（2026-07-31 新增）。**
+查 `oapi-sdk-go v3.9.9` 源码得到三个事实：
+
+- `ws.WithCardHandler` 是**注释掉的**（`ws/client.go:70`），长连接客户端接不了
+  `larkcard.CardActionHandler`；
+- WS 收到 `MessageTypeCard` 帧时 `case MessageTypeCard: return`（`ws/client.go:626`）
+  **直接丢弃，不回帧**；
+- 但 `OnP2CardActionTrigger` 把 handler 注册进 `EventDispatcher` 的
+  `callbackType2CallbackHandler`，而 `Do()` **优先查这张表**并返回响应对象，WS 的
+  `MessageTypeEvent` 分支正好有一句 `if rsp != nil { // for cardCallback }` 把它 marshal 回帧。
+
+即：**可行路径只有一条**——复用现有 dispatcher 注册 `OnP2CardActionTrigger`，前提是飞书把
+`card.action.trigger` 当作 `type="event"` 帧下发。若它走的是那条被丢弃的 `card` 帧，则 WS
+方案不成立，必须改用公网 HTTPS 回调端点（新增暴露面 + 验签 + 内网穿透，与现有纯 WS 部署
+形态不一致）。这一点本地无法证实。
+
+好消息是：若走通，§10（8）要的**同步 toast 是原生支持**的——handler 返回
+`*callback.CardActionTriggerResponse{Toast: ...}` 即可，不需要额外 API 调用。
+
+`runtime/cmd/spike-cardaction` 是为此写的一次性验证程序（发一张卡片 1.0 形态、带
+`tag: action` 的卡片，点击后打印载荷并回 toast）。**按钮轮的 spec 必须在该 spike
+go/no-go 之后再定架构**，不要把 WS 可达性当作已知前提。
+
+---
+
+原"建议下一轮先做 `workflow_runs` 再做按钮"已执行完毕：`workflow_runs` 轮已于 2026-07-31
+完成评审并合入。按钮轮的前置只剩（11）的 spike。
 
 ## 11. 后续（不在本轮，也不在按钮那轮）
 
