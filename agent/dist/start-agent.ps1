@@ -21,7 +21,7 @@ $env:AGENT_RUNTIME_CALLBACK_URL = "http://${QUAT}:18091"
 $env:AGENT_BASE_URL             = "http://${AGENT_BASE_IP}:8480"
 $env:AGENT_ADB_PATH             = $ADB
 $env:AGENT_SOC_ALIASES          = "trinket:QCM6125"
-$env:AGENT_DEVICE_CAPABILITIES  = "hexagon"
+$env:AGENT_DEVICE_CAPABILITIES_MAP = '{"QCM6125":["hexagon"]}'
 # optional: AGENT_LISTEN_ADDR / AGENT_VERSION / AGENT_RUNS_ROOT / AGENT_DB_PATH / AGENT_HEARTBEAT_INTERVAL
 
 Write-Host "==> 1/4 Prepare private adb server (5137)" -ForegroundColor Cyan

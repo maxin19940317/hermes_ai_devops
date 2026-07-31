@@ -29,11 +29,12 @@ CREATE TABLE IF NOT EXISTS clients (
     fail_streak    INTEGER     NOT NULL DEFAULT 0   -- client 级连续失败(差距 #10)
 );
 
--- 设备状态(§11):IDLE|BUSY|OFFLINE|QUARANTINED。心跳(UpsertClientDevices)只刷新属性,
--- 绝不触碰 status/fail_streak——隔离/占用状态只能由 AcquireDevice/ReleaseDevice 改变。
+-- 设备状态(§11):IDLE|BUSY|OFFLINE|QUARANTINED。心跳可在无 Runtime 租约时切换
+-- IDLE/OFFLINE,但绝不解除 BUSY/QUARANTINED 或清空 fail_streak。
 CREATE TABLE IF NOT EXISTS devices (
     device_id    TEXT PRIMARY KEY,
     serial       TEXT        NOT NULL UNIQUE,
+    display_name TEXT        NOT NULL DEFAULT '',
     client_id    TEXT        NOT NULL REFERENCES clients(client_id),
     soc          TEXT        NOT NULL DEFAULT '',
     abi          TEXT        NOT NULL DEFAULT '',
@@ -41,6 +42,8 @@ CREATE TABLE IF NOT EXISTS devices (
     status       TEXT        NOT NULL DEFAULT 'IDLE',
     fail_streak  INTEGER     NOT NULL DEFAULT 0
 );
+
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT '';
 
 -- 独占租约:AcquireDevice 用 `SELECT ... FOR UPDATE OF d SKIP LOCKED` 行锁保证并发下
 -- 只有一个调用者拿到同一设备(§3 规则 3 独占,§11)。

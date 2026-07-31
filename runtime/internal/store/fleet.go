@@ -15,6 +15,7 @@ import (
 type DeviceStatus struct {
 	DeviceID    string
 	Serial      string
+	DisplayName string
 	SOC         string
 	Status      string // IDLE|BUSY|OFFLINE|QUARANTINED
 	FailStreak  int
@@ -57,7 +58,7 @@ func (s *MemStore) FleetOverview(_ context.Context) (*FleetOverview, error) {
 			out.ActiveLeases++
 		}
 		out.Devices = append(out.Devices, DeviceStatus{
-			DeviceID: row.DeviceID, Serial: row.Serial, SOC: row.SOC,
+			DeviceID: row.DeviceID, Serial: row.Serial, DisplayName: row.DisplayName, SOC: row.SOC,
 			Status: row.Status, FailStreak: row.FailStreak, LeaseTaskID: leaseTask,
 			ClientID: row.ClientID, ClientFailStreak: s.clientFailStreak[row.ClientID],
 		})

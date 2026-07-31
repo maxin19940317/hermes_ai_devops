@@ -289,8 +289,8 @@ func (e *Executor) status(ctx context.Context) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "运行中 workflow: %d\n活跃租约: %d\n设备(%d):", ov.InflightWorkflows, ov.ActiveLeases, len(ov.Devices))
 	for _, d := range ov.Devices {
-		fmt.Fprintf(&b, "\n  %s %s %s fail_streak=%d client=%s client_fail=%d",
-			d.Serial, d.SOC, d.Status, d.FailStreak, d.ClientID, d.ClientFailStreak)
+		fmt.Fprintf(&b, "\n  %s serial=%s soc=%s %s fail_streak=%d client=%s client_fail=%d",
+			deviceDisplayName(d), d.Serial, d.SOC, d.Status, d.FailStreak, d.ClientID, d.ClientFailStreak)
 		if d.LeaseTaskID != "" {
 			fmt.Fprintf(&b, " lease=%s", d.LeaseTaskID)
 		}
@@ -308,10 +308,20 @@ func (e *Executor) devices(ctx context.Context) (string, error) {
 	}
 	var b strings.Builder
 	for _, d := range ov.Devices {
-		fmt.Fprintf(&b, "%s  soc=%s status=%s fail_streak=%d client=%s client_fail=%d\n",
-			d.Serial, d.SOC, d.Status, d.FailStreak, d.ClientID, d.ClientFailStreak)
+		fmt.Fprintf(&b, "%s  serial=%s soc=%s status=%s fail_streak=%d client=%s client_fail=%d\n",
+			deviceDisplayName(d), d.Serial, d.SOC, d.Status, d.FailStreak, d.ClientID, d.ClientFailStreak)
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+func deviceDisplayName(d store.DeviceStatus) string {
+	if d.DisplayName != "" {
+		return d.DisplayName
+	}
+	if d.SOC != "" {
+		return strings.ToUpper(d.SOC) + "-" + d.Serial
+	}
+	return "UNKNOWN-" + d.Serial
 }
 
 // rerun <sha8> <pipeline_iid> [variant]:用 artifacts 表重建 DeviceTestInput

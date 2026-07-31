@@ -68,6 +68,7 @@ type DeviceProps struct {
 // 探测失败(如设备刚掉线)时省略该字段,而非谎报 0。
 type DeviceInfo struct {
 	Serial        string       `json:"serial"`
+	DisplayName   string       `json:"display_name"`
 	State         DeviceState  `json:"state"`
 	Props         *DeviceProps `json:"props,omitempty"`
 	WorkdirFreeMB *int64       `json:"workdir_free_mb,omitempty"`

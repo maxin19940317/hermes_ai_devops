@@ -21,7 +21,8 @@
 //	AGENT_DB_PATH                可选,SQLite 路径(默认 ./agent.db)
 //	AGENT_HEARTBEAT_INTERVAL     可选,心跳周期,Go duration(默认 10s)
 //	AGENT_SOC_ALIASES            可选,平台代号→SoC 型号别名(如 trinket:QCM6125,多个用逗号分隔)
-//	AGENT_DEVICE_CAPABILITIES    可选,设备能力声明(如 hexagon,多个用逗号分隔;调度子集匹配用)
+//	AGENT_DEVICE_CAPABILITIES    可选,旧版单设备能力声明(多设备时忽略)
+//	AGENT_DEVICE_CAPABILITIES_MAP 可选,按 serial/SoC 声明能力的 JSON 对象
 package main
 
 import (
@@ -60,6 +61,7 @@ type Config struct {
 	HeartbeatInterval  time.Duration
 	SOCAliases         map[string]string
 	Capabilities       []string
+	DeviceCapabilities map[string][]string
 }
 
 // parseCSV 解析逗号分隔列表(AGENT_DEVICE_CAPABILITIES),去空白;空串返回 nil。
@@ -71,6 +73,25 @@ func parseCSV(raw string) []string {
 		}
 	}
 	return out
+}
+
+func parseDeviceCapabilities(raw string) (map[string][]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var parsed map[string][]string
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, fmt.Errorf("AGENT_DEVICE_CAPABILITIES_MAP 不是合法 JSON 对象: %w", err)
+	}
+	out := make(map[string][]string, len(parsed))
+	for key, caps := range parsed {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" {
+			return nil, errors.New("AGENT_DEVICE_CAPABILITIES_MAP 不允许空设备键")
+		}
+		out[key] = append([]string(nil), caps...)
+	}
+	return out, nil
 }
 
 // parseSOCAliases 解析 "trinket:QCM6125,kalama:SM8550" 形式的
@@ -212,6 +233,10 @@ func loadConfig(path string, getenv func(string) string) (Config, error) {
 	}
 	cfg.SOCAliases = aliases
 	cfg.Capabilities = parseCSV(get("AGENT_DEVICE_CAPABILITIES"))
+	cfg.DeviceCapabilities, err = parseDeviceCapabilities(get("AGENT_DEVICE_CAPABILITIES_MAP"))
+	if err != nil {
+		return Config{}, err
+	}
 
 	var missing []string
 	for _, req := range []struct {
@@ -300,18 +325,19 @@ func runAgent(ctx context.Context, cfg Config) error {
 	}
 
 	srv := server.New(server.Config{
-		Store:        st,
-		Runner:       runner,
-		Events:       events,
-		Results:      results,
-		Uploader:     &uploader.Uploader{Logf: logf},
-		Reporter:     client, // 差距 #8:按需签发 upload-requests 复用回调客户端
-		RunsRoot:     cfg.RunsRoot,
-		AgentVersion: cfg.Version,
-		ClientID:     cfg.ClientID,
-		SOCAliases:   cfg.SOCAliases,
-		Capabilities: cfg.Capabilities,
-		Logf:         logf,
+		Store:              st,
+		Runner:             runner,
+		Events:             events,
+		Results:            results,
+		Uploader:           &uploader.Uploader{Logf: logf},
+		Reporter:           client, // 差距 #8:按需签发 upload-requests 复用回调客户端
+		RunsRoot:           cfg.RunsRoot,
+		AgentVersion:       cfg.Version,
+		ClientID:           cfg.ClientID,
+		SOCAliases:         cfg.SOCAliases,
+		Capabilities:       cfg.Capabilities,
+		DeviceCapabilities: cfg.DeviceCapabilities,
+		Logf:               logf,
 	})
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -323,6 +349,7 @@ func runAgent(ctx context.Context, cfg Config) error {
 		Runner: runner, Store: st, Client: client, Logf: logf,
 		ClientID: cfg.ClientID, AgentVersion: cfg.Version, BaseURL: cfg.BaseURL,
 		Interval: cfg.HeartbeatInterval, SOCAliases: cfg.SOCAliases, Capabilities: cfg.Capabilities,
+		DeviceCapabilities: cfg.DeviceCapabilities,
 		// LEASE_NOT_OWNED 停止钩子(§10/差距 #15):租约易主立即停止本地执行
 		StopTask: srv.StopTask,
 	}
@@ -363,20 +390,28 @@ func abortInflight(ctx context.Context, st *store.Store, events *reporter.EventR
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, t := range inf.Tasks {
-		events.OnTransition(t.TaskID, executor.Status(t.State), executor.StatusFailed,
-			"agent restarted, task aborted")
-		writeSyntheticSummary(t)
+		if err := writeSyntheticSummary(t); err != nil {
+			errs = append(errs, fmt.Errorf("task %s: %w", t.TaskID, err))
+			continue
+		}
+		if err := events.OnTransition(t.TaskID, executor.Status(t.State), executor.StatusFailed,
+			"agent restarted, task aborted"); err != nil {
+			errs = append(errs, fmt.Errorf("task %s: transition failed: %w", t.TaskID, err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // writeSyntheticSummary 为被中止的任务补一份最小 run-summary.json
 // (已存在则不覆盖)。退出码 -1 表示未能跑完。
-func writeSyntheticSummary(t store.Task) {
+func writeSyntheticSummary(t store.Task) error {
 	path := filepath.Join(t.OutDir, "run-summary.json")
 	if _, err := os.Stat(path); err == nil {
-		return
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat synthetic summary %s: %w", path, err)
 	}
 	var d struct {
 		DeviceSerial string `json:"device_serial"`
@@ -390,13 +425,13 @@ func writeSyntheticSummary(t store.Task) {
 	}
 	data, err := json.MarshalIndent(sum, "", "  ")
 	if err != nil {
-		return
+		return fmt.Errorf("marshal synthetic summary: %w", err)
 	}
 	if err := os.MkdirAll(t.OutDir, 0o755); err != nil {
-		logf("recovery: mkdir %s: %v", t.OutDir, err)
-		return
+		return fmt.Errorf("mkdir synthetic summary dir %s: %w", t.OutDir, err)
 	}
 	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
-		logf("recovery: write synthetic summary %s: %v", path, err)
+		return fmt.Errorf("write synthetic summary %s: %w", path, err)
 	}
+	return nil
 }

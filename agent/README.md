@@ -27,14 +27,15 @@ CLI 细节见 [`dist/README.md`](dist/README.md)。
   0 字节文件显式 `Content-Length: 0`(Go 对空 body 默认 chunked,S3 回 411)。
 - `internal/executor`:流水线 + `Cancel()`(RUNNING 中 kill 设备进程仍收集,终态 CANCELED)。
 - 设备属性显式化(adb 无法可靠探测):`AGENT_SOC_ALIASES` 平台代号→SoC 型号
-  (trinket→QCM6125)、`AGENT_DEVICE_CAPABILITIES` 能力声明(hexagon),
+  (trinket→QCM6125)、`AGENT_DEVICE_CAPABILITIES_MAP` 按 serial/SoC 声明能力
+  (`{"QCM6125":["hexagon"]}`),旧 `AGENT_DEVICE_CAPABILITIES` 仅兼容单设备 Client,
   心跳与 executor 预检共用同一映射——调度匹配与预检不一致曾导致派单后预检失败。
 
 ### 配置(env 或 -config KEY=VALUE 文件)
 
 必填:`AGENT_CLIENT_ID` / `AGENT_RUNTIME_CALLBACK_URL` / `AGENT_BASE_URL` / `AGENT_ADB_PATH`。
 可选:`AGENT_LISTEN_ADDR`(:8480)/`AGENT_VERSION`/`AGENT_RUNS_ROOT`/`AGENT_DB_PATH`/
-`AGENT_HEARTBEAT_INTERVAL`(10s)/`AGENT_SOC_ALIASES`/`AGENT_DEVICE_CAPABILITIES`。
+`AGENT_HEARTBEAT_INTERVAL`(10s)/`AGENT_SOC_ALIASES`/`AGENT_DEVICE_CAPABILITIES_MAP`。
 
 ### 运行
 

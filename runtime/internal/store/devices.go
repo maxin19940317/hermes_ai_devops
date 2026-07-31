@@ -44,18 +44,21 @@ type Client struct {
 
 // Device 对应 devices 表一行(§11)。
 type Device struct {
-	DeviceID     string
-	Serial       string
-	ClientID     string
-	SOC          string
-	ABI          string
-	Capabilities []string
+	DeviceID      string
+	Serial        string
+	DisplayName   string
+	ClientID      string
+	ReportedState string
+	SOC           string
+	ABI           string
+	Capabilities  []string
 }
 
 // 设备状态(§11):IDLE|BUSY|OFFLINE|QUARANTINED。
 const (
 	DeviceIdle        = "IDLE"
 	DeviceBusy        = "BUSY"
+	DeviceOffline     = "OFFLINE"
 	DeviceQuarantined = "QUARANTINED"
 )
 
@@ -96,20 +99,40 @@ func attemptMatches(taskID string, attempt int) bool {
 	return err == nil && n == attempt
 }
 
-// UpsertClientDevices 处理心跳注册(§8.2):新设备以 IDLE 入库,
-// 已有设备只刷新属性,不触碰 status/fail_streak(心跳不得解除隔离)。
+// UpsertClientDevices 处理心跳注册(§8.2):Agent 只可在无 Runtime 租约时
+// 切换 IDLE/OFFLINE;BUSY 与 QUARANTINED 由 Runtime 保持。心跳中缺席的
+// IDLE 设备置 OFFLINE,避免已拔出的设备继续被调度。
 func (s *MemStore) UpsertClientDevices(_ context.Context, c Client, devs []Device) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clients[c.ClientID] = c
+	present := make(map[string]struct{}, len(devs))
 	for _, d := range devs {
+		present[d.DeviceID] = struct{}{}
 		if row, ok := s.devices[d.DeviceID]; ok {
 			row.Device = d
+			if row.Status == DeviceIdle || row.Status == DeviceOffline {
+				row.Status = availableState(d.ReportedState)
+			}
 			continue
 		}
-		s.devices[d.DeviceID] = &deviceRow{Device: d, Status: DeviceIdle}
+		s.devices[d.DeviceID] = &deviceRow{Device: d, Status: availableState(d.ReportedState)}
+	}
+	for deviceID, row := range s.devices {
+		if row.ClientID == c.ClientID && row.Status == DeviceIdle {
+			if _, ok := present[deviceID]; !ok {
+				row.Status = DeviceOffline
+			}
+		}
 	}
 	return nil
+}
+
+func availableState(reported string) string {
+	if reported == "" || reported == DeviceIdle {
+		return DeviceIdle
+	}
+	return DeviceOffline
 }
 
 // AcquireDevice 按 selector 选一台可租设备并租给 taskID(§11 device_leases 独占)。

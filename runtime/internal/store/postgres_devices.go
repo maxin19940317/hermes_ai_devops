@@ -12,8 +12,9 @@ import (
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
-// UpsertClientDevices 处理心跳注册(§8.2):新设备以 IDLE 入库,
-// 已有设备只刷新属性,不触碰 status/fail_streak(心跳不得解除隔离)。
+// UpsertClientDevices 处理心跳注册(§8.2):Agent 只可在无 Runtime 租约时
+// 切换 IDLE/OFFLINE;BUSY 与 QUARANTINED 由 Runtime 保持。心跳中缺席的
+// IDLE 设备置 OFFLINE,避免已拔出的设备继续被调度。
 func (s *PGStore) UpsertClientDevices(ctx context.Context, c Client, devs []Device) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -38,14 +39,25 @@ func (s *PGStore) UpsertClientDevices(ctx context.Context, c Client, devs []Devi
 			caps = []string{}
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO devices (device_id, serial, client_id, soc, abi, capabilities, status, fail_streak)
-			VALUES ($1, $2, $3, $4, $5, $6, 'IDLE', 0)
+			INSERT INTO devices (device_id, serial, display_name, client_id, soc, abi, capabilities, status, fail_streak)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0)
 			ON CONFLICT (device_id) DO UPDATE SET
-				serial = EXCLUDED.serial, client_id = EXCLUDED.client_id,
-				soc = EXCLUDED.soc, abi = EXCLUDED.abi, capabilities = EXCLUDED.capabilities`,
-			d.DeviceID, d.Serial, d.ClientID, d.SOC, d.ABI, pq.Array(caps)); err != nil {
+				serial = EXCLUDED.serial, display_name = EXCLUDED.display_name, client_id = EXCLUDED.client_id,
+				soc = EXCLUDED.soc, abi = EXCLUDED.abi, capabilities = EXCLUDED.capabilities,
+				status = CASE WHEN devices.status IN ('IDLE', 'OFFLINE') THEN EXCLUDED.status ELSE devices.status END`,
+			d.DeviceID, d.Serial, d.DisplayName, d.ClientID, d.SOC, d.ABI, pq.Array(caps), availableState(d.ReportedState)); err != nil {
 			return fmt.Errorf("upsert device %s: %w", d.DeviceID, err)
 		}
+	}
+	deviceIDs := make([]string, 0, len(devs))
+	for _, d := range devs {
+		deviceIDs = append(deviceIDs, d.DeviceID)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE devices SET status = 'OFFLINE'
+		WHERE client_id = $1 AND status = 'IDLE' AND NOT (device_id = ANY($2))`,
+		c.ClientID, pq.Array(deviceIDs)); err != nil {
+		return fmt.Errorf("mark missing devices offline: %w", err)
 	}
 	return tx.Commit()
 }

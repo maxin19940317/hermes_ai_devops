@@ -83,13 +83,14 @@ type Config struct {
 	// nil → 即使 dispatch 携带 upload_request_url 也直接走固定键集回退。
 	Reporter *reporter.Client
 
-	RunsRoot      string // out_dir = RunsRoot/<task_id>
-	AgentVersion  string
-	ClientID      string            // 上报 upload-requests 用(差距 #8);与心跳的 client_id 一致
-	DeviceWorkdir string            // 设备 df 探测路径;空 → reporter.DefaultDeviceWorkdir
-	SOCAliases    map[string]string // 平台代号 → SoC 型号(如 trinket→QCM6125)
-	Capabilities  []string          // 设备能力声明(如 hexagon),调度子集匹配用
-	HTTP          *http.Client      // executor 下载用;nil → http.DefaultClient
+	RunsRoot           string // out_dir = RunsRoot/<task_id>
+	AgentVersion       string
+	ClientID           string              // 上报 upload-requests 用(差距 #8);与心跳的 client_id 一致
+	DeviceWorkdir      string              // 设备 df 探测路径;空 → reporter.DefaultDeviceWorkdir
+	SOCAliases         map[string]string   // 平台代号 → SoC 型号(如 trinket→QCM6125)
+	Capabilities       []string            // 旧版单设备能力声明
+	DeviceCapabilities map[string][]string // serial/SoC → 能力
+	HTTP               *http.Client        // executor 下载用;nil → http.DefaultClient
 
 	DiagnosticsMaxBytes int // 诊断输出截断上限;0 → DefaultDiagnosticsMaxBytes
 

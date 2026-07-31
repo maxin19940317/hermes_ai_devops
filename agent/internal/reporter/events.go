@@ -37,14 +37,14 @@ func (r *EventReporter) logf(format string, args ...any) {
 }
 
 // OnTransition 是与 executor 迁移钩子兼容的回调(由调用方适配器补齐
-// taskID/from/detail)。落盘失败或即发失败都只记日志——事件已在
-// store 中(或任务状态本身异常),不阻塞执行流水线。
-func (r *EventReporter) OnTransition(taskID string, from, to executor.Status, detail string) {
+// taskID/from/detail)。返回值只反映状态/事件落盘是否成功;即发失败仍由
+// 后台补报处理,不作为迁移失败返回。
+func (r *EventReporter) OnTransition(taskID string, from, to executor.Status, detail string) error {
 	ctx := context.Background()
 	seq, err := r.Store.Transition(ctx, taskID, store.State(from), store.State(to), detail)
 	if err != nil {
 		r.logf("event: persist transition %s %s->%s: %v", taskID, from, to, err)
-		return
+		return err
 	}
 	ev := TaskEvent{
 		TaskID: taskID,
@@ -57,7 +57,7 @@ func (r *EventReporter) OnTransition(taskID string, from, to executor.Status, de
 	key, err := r.idempotencyKey(ctx, taskID)
 	if err != nil {
 		r.logf("event: %s seq=%d 待发(取幂等键失败: %v)", taskID, seq, err)
-		return
+		return nil
 	}
 	ev.IdempotencyKey = key
 	// 乱序防线:本任务尚有未上报事件时不可即发——即发会越过补报
@@ -70,17 +70,18 @@ func (r *EventReporter) OnTransition(taskID string, from, to executor.Status, de
 		for _, e := range pending {
 			if e.TaskID == taskID && e.Seq < seq {
 				r.logf("event: %s seq=%d 存在更早未上报事件(seq=%d),留待有序补报", taskID, seq, e.Seq)
-				return
+				return nil
 			}
 		}
 	}
 	if err := r.Client.ReportEvent(ctx, ev); err != nil {
 		r.logf("event: %s seq=%d 即发失败,待后台补报: %v", taskID, seq, err)
-		return
+		return nil
 	}
 	if err := r.Store.MarkEventReported(ctx, taskID, seq); err != nil {
 		r.logf("event: mark reported %s seq=%d: %v", taskID, seq, err)
 	}
+	return nil
 }
 
 // Run 启动补报循环,阻塞至 ctx 取消(返回 nil)。每轮按 (task_id, seq)

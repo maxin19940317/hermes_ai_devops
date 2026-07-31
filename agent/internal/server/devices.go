@@ -19,11 +19,12 @@ func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
 
 	busy := reporter.BusySerials(ctx, s.cfg.Store, s.cfg.Logf)
 	prober := &reporter.Prober{
-		Runner:        s.cfg.Runner,
-		Logf:          s.cfg.Logf,
-		DeviceWorkdir: s.cfg.DeviceWorkdir,
-		SOCAliases:    s.cfg.SOCAliases,
-		Capabilities:  s.cfg.Capabilities,
+		Runner:             s.cfg.Runner,
+		Logf:               s.cfg.Logf,
+		DeviceWorkdir:      s.cfg.DeviceWorkdir,
+		SOCAliases:         s.cfg.SOCAliases,
+		Capabilities:       s.cfg.Capabilities,
+		DeviceCapabilities: s.cfg.DeviceCapabilities,
 	}
 	devices := prober.ProbeDevices(ctx, busy)
 	writeJSON(w, http.StatusOK, devices)

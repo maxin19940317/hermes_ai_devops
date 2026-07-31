@@ -35,11 +35,12 @@ type Heartbeat struct {
 	AgentVersion string
 	BaseURL      string // 本 Agent 的 API 基地址,Runtime 派单用
 
-	Interval      time.Duration     // 心跳周期;0 → DefaultHeartbeatInterval
-	MaxWait       time.Duration     // 失败后退避上限;0 → DefaultHeartbeatMaxWait
-	DeviceWorkdir string            // df 探测路径;空 → DefaultDeviceWorkdir
-	SOCAliases    map[string]string // 平台代号 → SoC 型号(如 trinket→QCM6125)
-	Capabilities  []string          // 设备能力声明(如 hexagon),调度子集匹配用
+	Interval           time.Duration       // 心跳周期;0 → DefaultHeartbeatInterval
+	MaxWait            time.Duration       // 失败后退避上限;0 → DefaultHeartbeatMaxWait
+	DeviceWorkdir      string              // df 探测路径;空 → DefaultDeviceWorkdir
+	SOCAliases         map[string]string   // 平台代号 → SoC 型号(如 trinket→QCM6125)
+	Capabilities       []string            // 旧版单设备能力声明
+	DeviceCapabilities map[string][]string // serial/SoC → 能力
 
 	// lastDevices 记录上次心跳的设备 serial 集合,用于 diff 日志(设备上下线感知)。
 	// nil 表示首次心跳,输出当前可寻址设备作为基线。
@@ -75,7 +76,7 @@ func (h *Heartbeat) logf(format string, args ...any) {
 
 // prober 组装共享设备探测器(与 server 的 /api/v1/devices 同一逻辑)。
 func (h *Heartbeat) prober() *Prober {
-	return &Prober{Runner: h.Runner, Logf: h.Logf, DeviceWorkdir: h.deviceWorkdir(), SOCAliases: h.SOCAliases, Capabilities: h.Capabilities}
+	return &Prober{Runner: h.Runner, Logf: h.Logf, DeviceWorkdir: h.deviceWorkdir(), SOCAliases: h.SOCAliases, Capabilities: h.Capabilities, DeviceCapabilities: h.DeviceCapabilities}
 }
 
 // Run 启动心跳循环,阻塞至 ctx 取消(返回 nil,属正常停止)。

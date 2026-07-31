@@ -106,9 +106,10 @@ type heartbeatReq struct {
 	AgentVersion string `json:"agent_version"`
 	BaseURL      string `json:"base_url"` // 契约新增可选字段(见 openapi CONTRACT-ISSUE)
 	Devices      []struct {
-		Serial string `json:"serial"`
-		State  string `json:"state"`
-		Props  struct {
+		Serial      string `json:"serial"`
+		DisplayName string `json:"display_name"`
+		State       string `json:"state"`
+		Props       struct {
 			SOC          string   `json:"soc"`
 			ABI          string   `json:"abi"`
 			Capabilities []string `json:"capabilities"`
@@ -144,8 +145,8 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	devs := make([]store.Device, 0, len(req.Devices))
 	for _, d := range req.Devices {
 		devs = append(devs, store.Device{
-			DeviceID: d.Serial, Serial: d.Serial, ClientID: req.ClientID,
-			SOC: d.Props.SOC, ABI: d.Props.ABI, Capabilities: d.Props.Capabilities,
+			DeviceID: d.Serial, Serial: d.Serial, DisplayName: d.DisplayName, ClientID: req.ClientID,
+			ReportedState: d.State, SOC: d.Props.SOC, ABI: d.Props.ABI, Capabilities: d.Props.Capabilities,
 		})
 	}
 	if err := h.store.UpsertClientDevices(r.Context(), store.Client{

@@ -46,6 +46,12 @@ func GetProp(serial, prop string) []string {
 	return withSerial(serial, "shell", "/system/bin/getprop", prop)
 }
 
+// DeviceTreeCompatible 读取 Linux 设备的只读硬件兼容串。该命令无外部参数,
+// 仅用于识别非 Android ADB 设备,不构成任意 shell 接口。
+func DeviceTreeCompatible(serial string) []string {
+	return withSerial(serial, "shell", "/bin/cat", "/proc/device-tree/compatible")
+}
+
 func DiskFreeKB(serial, path string) []string {
 	return withSerial(serial, "shell", "/system/bin/df", "-k", path)
 }

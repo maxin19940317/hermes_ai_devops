@@ -170,6 +170,36 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 	})
 
+	t.Run("HeartbeatReconcilesOfflineAndMissingDevices", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		if err := s.UpsertClientDevices(ctx, Client{ClientID: "c1"}, []Device{{
+			DeviceID: "513cd3de", Serial: "513cd3de", ClientID: "c1", ReportedState: DeviceOffline,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		if l, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t-offline", 120); l != nil {
+			t.Errorf("OFFLINE device was leased: %+v", l)
+		}
+		if err := s.UpsertClientDevices(ctx, Client{ClientID: "c1"}, []Device{{
+			DeviceID: "513cd3de", Serial: "513cd3de", ClientID: "c1", ReportedState: DeviceIdle,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		if l, _ := s.AcquireDevice(ctx, wf.DeviceSelector{}, "t-online", 120); l == nil {
+			t.Error("device reported IDLE should become leasable")
+		}
+
+		s2 := newStore(t)
+		seed(t, s2)
+		if err := s2.UpsertClientDevices(ctx, Client{ClientID: "c1"}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if l, _ := s2.AcquireDevice(ctx, wf.DeviceSelector{}, "t-missing", 120); l != nil {
+			t.Errorf("missing device was leased: %+v", l)
+		}
+	})
+
 	// clients.fail_streak 的姊妹陷阱(差距 #10):心跳只应刷新设备属性,
 	// 不得顺带清空 client 级计数器——否则 client 侧的连续失败永远数不到 2。
 	t.Run("HeartbeatMustNotResetClientFailStreak", func(t *testing.T) {

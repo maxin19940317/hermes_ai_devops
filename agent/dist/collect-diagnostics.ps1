@@ -75,6 +75,6 @@ foreach ($d in $dirs) {
 
 Section "4. Environment snapshot"
 Write-Host ("adb: " + $env:AGENT_ADB_PATH)
-Write-Host ("soc aliases: " + $env:AGENT_SOC_ALIASES + " | caps: " + $env:AGENT_DEVICE_CAPABILITIES)
+Write-Host ("soc aliases: " + $env:AGENT_SOC_ALIASES + " | caps map: " + $env:AGENT_DEVICE_CAPABILITIES_MAP + " | legacy caps: " + $env:AGENT_DEVICE_CAPABILITIES)
 & $env:AGENT_ADB_PATH devices -l
 Write-Host "`nDone. Paste all output above back for analysis."

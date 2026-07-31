@@ -26,10 +26,10 @@ type Prober struct {
 	// 的调度约束用 SoC 型号;没有别名时 SNPE 变体永远匹配不到设备。
 	SOCAliases map[string]string
 
-	// Capabilities 声明本 Client 全部设备的能力(如 hexagon/rknpu),
-	// 用于调度约束子集匹配。adb 没有可靠的通用能力探测手段,
-	// 由运维按设备实际配置显式声明(同 SOCAliases 的显式原则)。
+	// Capabilities 是旧版单设备 Client 的能力声明;发现多台设备时忽略。
 	Capabilities []string
+	// DeviceCapabilities 按 serial 或最终 SoC(大小写不敏感)声明设备能力。
+	DeviceCapabilities map[string][]string
 }
 
 func (p *Prober) deviceWorkdir() string {
@@ -74,7 +74,7 @@ func (p *Prober) ProbeDevices(ctx context.Context, busy map[string]bool) []Devic
 			}
 			p.logf("probe: transport '?' resolved to serial %s", serial)
 		}
-		devices = append(devices, p.probeDevice(ctx, transport, serial, busy[serial]))
+		devices = append(devices, p.probeDevice(ctx, transport, serial, busy[serial], len(transports) == 1))
 	}
 	return devices
 }
@@ -82,17 +82,23 @@ func (p *Prober) ProbeDevices(ctx context.Context, busy map[string]bool) []Devic
 // probeDevice 探测单台设备。getprop 属性集与 executor 预检一致
 // (ro.product.cpu.abi / ro.build.version.release / ro.board.platform,
 // platform 取不到时回退 ro.product.board)。
-func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBusy bool) DeviceInfo {
+func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBusy, allowLegacyCaps bool) DeviceInfo {
 	state := DeviceIdle
 	if isBusy {
 		state = DeviceBusy
 	}
-	dev := DeviceInfo{Serial: serial, State: state}
+	dev := DeviceInfo{Serial: serial, DisplayName: "UNKNOWN-" + serial, State: state}
 
 	abi, err := p.getprop(ctx, transport, "ro.product.cpu.abi")
 	if err != nil {
 		dev.State = DeviceOffline
-		p.logf("probe: %s unreachable: %v", serial, err)
+		if soc := p.linuxSOC(ctx, transport); soc != "" {
+			dev.Props = &DeviceProps{SOC: soc}
+			dev.DisplayName = strings.ToUpper(soc) + "-" + serial
+			p.logf("probe: %s is non-Android (%s); reporting OFFLINE", serial, soc)
+			return dev
+		}
+		p.logf("probe: %s unreachable or unsupported: %v", serial, err)
 		return dev
 	}
 	props := &DeviceProps{ABI: abi}
@@ -108,9 +114,10 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		soc = alias
 	}
 	props.SOC = soc
-	if len(p.Capabilities) > 0 {
-		props.Capabilities = append([]string(nil), p.Capabilities...)
+	if soc != "" {
+		dev.DisplayName = strings.ToUpper(soc) + "-" + serial
 	}
+	props.Capabilities = p.capabilitiesFor(serial, soc, allowLegacyCaps)
 	dev.Props = props
 
 	if res, err := p.Runner.Run(ctx, adb.DiskFreeKB(transport, p.deviceWorkdir())); err == nil && res.ExitCode == 0 {
@@ -120,6 +127,34 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		}
 	}
 	return dev
+}
+
+func (p *Prober) capabilitiesFor(serial, soc string, allowLegacy bool) []string {
+	for _, key := range []string{serial, soc} {
+		if caps, ok := p.DeviceCapabilities[strings.ToLower(key)]; ok {
+			return append([]string(nil), caps...)
+		}
+	}
+	if allowLegacy {
+		return append([]string(nil), p.Capabilities...)
+	}
+	return nil
+}
+
+func (p *Prober) linuxSOC(ctx context.Context, transport string) string {
+	res, err := p.Runner.Run(ctx, adb.DeviceTreeCompatible(transport))
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	var soc string
+	for _, compatible := range strings.FieldsFunc(res.Stdout, func(r rune) bool {
+		return r == '\x00' || r == '\n' || r == '\r'
+	}) {
+		if _, suffix, ok := strings.Cut(compatible, ","); ok && suffix != "" {
+			soc = suffix
+		}
+	}
+	return soc
 }
 
 // getprop 取单个属性;非零退出码(设备掉线/unauthorized)视为不可达。

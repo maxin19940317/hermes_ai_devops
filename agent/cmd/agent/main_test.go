@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"hermes-devops/agent/internal/store"
 )
 
 func envOf(pairs ...string) func(string) string {
@@ -118,5 +120,29 @@ func TestParseSOCAliases(t *testing.T) {
 				t.Errorf("parseSOCAliases(%q)[%q] = %q, want %q", c.raw, k, got[k], v)
 			}
 		}
+	}
+}
+
+func TestParseDeviceCapabilities(t *testing.T) {
+	got, err := parseDeviceCapabilities(`{"QCM6125":["hexagon"],"513CD3DE":["camera"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["qcm6125"][0] != "hexagon" || got["513cd3de"][0] != "camera" {
+		t.Fatalf("capabilities = %v", got)
+	}
+	if _, err := parseDeviceCapabilities(`not-json`); err == nil {
+		t.Fatal("invalid capability map must fail")
+	}
+}
+
+func TestWriteSyntheticSummaryReportsFilesystemFailure(t *testing.T) {
+	root := t.TempDir()
+	blockingFile := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(blockingFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSyntheticSummary(store.Task{TaskID: "t1", OutDir: blockingFile}); err == nil {
+		t.Fatal("filesystem failure must be returned")
 	}
 }

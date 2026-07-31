@@ -261,6 +261,9 @@ components:
       required: [serial, state]
       properties:
         serial: { type: string }
+        display_name:
+          type: string
+          description: 展示名,统一为 `{SOC}-{serial}`;不可作为设备唯一键
         state: { enum: [IDLE, BUSY, OFFLINE] }
         props:
           type: object

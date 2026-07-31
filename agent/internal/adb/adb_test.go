@@ -11,6 +11,7 @@ const serial = "R5CT10XXXXX"
 func TestBuildersAlwaysPinSerial(t *testing.T) {
 	cases := [][]string{
 		GetProp(serial, "ro.product.cpu.abi"),
+		DeviceTreeCompatible(serial),
 		DiskFreeKB(serial, "/data/local/tmp"),
 		Push(serial, "/tmp/a", "/data/local/tmp/a"),
 		Pull(serial, "/data/local/tmp/r", "/tmp/r"),
@@ -39,6 +40,8 @@ func TestBuilderArgv(t *testing.T) {
 	}{
 		{"getprop", GetProp(serial, "ro.product.cpu.abi"),
 			[]string{"-s", serial, "shell", "/system/bin/getprop", "ro.product.cpu.abi"}},
+		{"device tree compatible", DeviceTreeCompatible(serial),
+			[]string{"-s", serial, "shell", "/bin/cat", "/proc/device-tree/compatible"}},
 		{"df", DiskFreeKB(serial, "/data/local/tmp"),
 			[]string{"-s", serial, "shell", "/system/bin/df", "-k", "/data/local/tmp"}},
 		{"push", Push(serial, "/tmp/a", "/data/local/tmp/a"),

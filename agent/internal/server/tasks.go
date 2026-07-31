@@ -196,8 +196,14 @@ func (s *Server) cancelRunning(taskID string) {
 // 取消相同的清理路径;executor 随后把任务迁移到 CANCELED 终态,自动离开
 // 心跳的 inflight 集合。未知/已终态任务幂等空转。
 func (s *Server) StopTask(taskID string) {
-	t, err := s.cfg.Store.GetTask(context.Background(), taskID)
-	if err != nil || store.IsTerminal(t.State) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	t, err := s.cfg.Store.GetTask(ctx, taskID)
+	if err != nil {
+		s.logf("task %s: lease-loss lookup failed: %v", taskID, err)
+		return
+	}
+	if store.IsTerminal(t.State) {
 		return
 	}
 	s.logf("task %s: lease not owned by runtime, canceling local execution", taskID)
