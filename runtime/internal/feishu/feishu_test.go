@@ -23,6 +23,7 @@ type fakeOpenAPI struct {
 	messageMethods []string
 	messagePaths   []string
 	messageQueries []string
+	messageAuth    []string
 	tokenBodies    []map[string]any
 	messageReplies []string // 依次消费;耗尽后默认 {"code":0}
 }
@@ -45,6 +46,7 @@ func (f *fakeOpenAPI) server(t *testing.T) *httptest.Server {
 			f.messageMethods = append(f.messageMethods, r.Method)
 			f.messagePaths = append(f.messagePaths, r.URL.EscapedPath())
 			f.messageQueries = append(f.messageQueries, r.URL.RawQuery)
+			f.messageAuth = append(f.messageAuth, r.Header.Get("Authorization"))
 			var b map[string]any
 			_ = json.Unmarshal(body, &b)
 			f.messageBodies = append(f.messageBodies, b)
@@ -90,6 +92,12 @@ func (f *fakeOpenAPI) lastMessageRequest() (method, path string, body map[string
 	}
 	last := len(f.messageBodies) - 1
 	return f.messageMethods[last], f.messagePaths[last], f.messageBodies[last]
+}
+
+func (f *fakeOpenAPI) messageAuthorizations() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.messageAuth...)
 }
 
 func (f *fakeOpenAPI) lastTokenReq() map[string]any {
@@ -420,6 +428,11 @@ func TestAppSenderPatchCardRefreshesExpiredTokenOnce(t *testing.T) {
 	tokenCalls, messageCalls := f.counts()
 	if tokenCalls != 2 || messageCalls != 2 {
 		t.Fatalf("calls token/message = %d/%d, want 2/2", tokenCalls, messageCalls)
+	}
+	if got := f.messageAuthorizations(); !reflect.DeepEqual(got, []string{
+		"Bearer tok-1", "Bearer tok-2",
+	}) {
+		t.Fatalf("PATCH authorizations = %v, want refreshed token on retry", got)
 	}
 }
 
