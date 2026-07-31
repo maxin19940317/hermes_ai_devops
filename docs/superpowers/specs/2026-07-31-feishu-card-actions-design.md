@@ -1,7 +1,7 @@
 # 飞书终态卡片按钮设计（重试 / 忽略）
 
 **日期：** 2026-07-31
-**状态：** 待评审（v4）
+**状态：** 待评审（v5）
 **范围：** 三轮交互能力的第二轮。终态通知卡片上加两个**卡片级**按钮——「重试失败变体」「忽略」。
 不含 NL 确认/取消按钮（第三轮）、隔离按钮、证据链接、卡片模板化。
 
@@ -19,6 +19,9 @@
 | v2 → v3 | inbox 消费与 `processed` 不原子，重跑会写重复审计 | 接受/拒绝各收敛为**一个** store 事务（§5、§6） |
 | v3 → v4 | inbox 被 acquire 两次，租约未过期使第二次必为零行，动作**永不完成** | 拆成 `ClaimInbox` → `Resolve` → `Complete*`，**Complete 只 fencing 不 acquire**（§5.1） |
 | v3 → v4 | 卡片 PATCH 要求完整原卡 JSON，而回调不携带、legacy 路径也无法从 Temporal 重建 | 新增 `card_action_snapshots`，`NotifyCard` 发可点击卡片**之前**落盘（§3.4） |
+| v4 → v5 | `rejected` inbox 行按默认 `received` 插入必撞 `inbox_rejected_is_terminal`，`23514` | 首次 INSERT 即写 `processed` + `processed_at`（§6.1） |
+| v4 → v5 | `Complete*` 只校验 owner，租约过期的持有者仍能提交失效结果 | 所有 completion 增加 `lease_expires_at > now()`（§5.2 第 0 条） |
+| v4 → v5 | 卡片 completion 缺 revision fencing，旧 worker 会把新 revision 标成 succeeded 而永久吞掉 | claim 钉住 `desired_revision`，completion 双重 fencing（§8.3 第 0 条） |
 
 实证过的事实（不再重新论证）：
 
@@ -108,6 +111,12 @@ CREATE INDEX IF NOT EXISTS card_action_inbox_sweep_idx
 
 **没有指向 `workflow_runs` 或 `card_actions` 的外键**——同步段还没做权威校验，此时唯一确定的
 事实是"一个形态合法、身份获授权的点击到达过"。
+
+> **`disposition='rejected'` 的行必须在第一条 INSERT 里就写成终态**：
+> `state='processed', processed_at=now()`。CHECK 立即生效（与 §3.2 同一条实证事实），
+> 先按默认 `received` 插入、再 UPDATE 成 `processed` 的写法会在 **INSERT 当场** 撞
+> `inbox_rejected_is_terminal` 拿到 `23514`。`state` 的 `DEFAULT 'received'` 只服务
+> `accepted` 分支。
 
 `event_id` 主键承担三件事：跨进程去重、跨重启去重（进程内 `dedupCache` 重启即失效）、
 以及**同步应答重放**——重投读出既有行返回同一条 `ack_toast`，既满足"三次相同 toast"，
@@ -366,7 +375,9 @@ CHECK 不可延迟，所以顺序是**先锁、再算、最后一次性插入完
 ```text
 BEGIN
   SELECT * FROM card_action_inbox
-   WHERE event_id=$e AND state='received' AND owner=$token FOR UPDATE
+   WHERE event_id=$e AND state='received'
+     AND owner=$token AND lease_expires_at > now()   -- 租约必须仍然有效
+   FOR UPDATE
     └ 0 行 → 租约已被接管或已处理,直接返回,不做任何业务写入
 
   SELECT 1 FROM workflow_runs WHERE workflow_id=$w FOR UPDATE
@@ -411,7 +422,13 @@ artifacts 水位**恰好推进一次**、其余全部 `rejected.conflict`。
 
 ### 5.2 三条 fencing 规则
 
-1. **finalize 必须带 fencing**：`UPDATE ... WHERE workflow_id=? AND state='pending' AND owner=?`。
+0. **completion 必须同时校验 owner 与租约有效性。** 只比对 `owner=$token` 不够：
+   租约到期到下一个 worker 重新 claim 之间存在窗口，期间**过期的持有者仍然握着匹配的
+   token**，可以把一份早已失效的解析结果提交进去。所有 `Complete*` 与 finalize
+   都必须带 `AND lease_expires_at > now()`，且该判定在 `FOR UPDATE` 行锁内完成——
+   新的 claim 会阻塞在同一把锁上，因此不存在"检查通过后瞬间被抢走"的漏洞。
+1. **finalize 必须带 fencing**：
+   `UPDATE ... WHERE workflow_id=? AND state='pending' AND owner=? AND lease_expires_at > now()`。
 2. **恢复与 `failed → pending` 一律复用原 `attempt` / `target_workflow_id` / `target_input`，
    绝不推进水位、绝不重新 Resolve。** 水位推进只发生在首次接受的事务里。
 3. **租约只管活性，不管正确性。** 正确性来自"钉死 + CAS"：重复执行只会用同一个 workflow ID
@@ -433,7 +450,7 @@ artifacts 水位**恰好推进一次**、其余全部 `rejected.conflict`。
 
 每一次对用户可见的状态变化，都在同一事务内 `revision + 1` 并把该 workflow 全部
 `card_action_messages` 置 `update_state='pending'`、`desired_revision = 新 revision`、
-**清空自己持有的 owner**（见 §8.3 关于"不得抹掉新 owner"）。触发点恰好四个：
+**无条件清空 owner 与租约**。触发点恰好四个：
 
 | 变化 | revision |
 |---|---|
@@ -444,6 +461,11 @@ artifacts 水位**恰好推进一次**、其余全部 `rejected.conflict`。
 
 重排时**必须同时清空 `reconcile_after`**（§8.3）：新状态应当立即可更新，
 不该被上一轮的延迟复核窗口压住。
+
+这里可以**无条件**清 owner，而 §8.3 第 2 条要求"不得抹掉新 owner"——两者不矛盾：
+revision 推进由 §8.3 第 0 条的 `desired_revision` fencing 兜底，任何在途写方的 completion
+都会因 revision 不匹配而影响 0 行，清掉它的 owner 不会造成丢更新。
+§8.3 第 2 条约束的是**失去租约的写方自己**去改行时不得越权，是另一个场景。
 
 ### 5.5 target_input 的完整性断言
 
@@ -474,10 +496,18 @@ Version、RuleVersion、Packages、SourceWorkflowID。因此
 同步段**只做无 I/O 校验 + 一次 inbox 写入**，整体带**固定 2 秒 deadline**：
 
 1. §6.2 的来源与载荷校验、身份、白名单、readiness（全部无 I/O）。
-2. `INSERT card_action_inbox (...) ON CONFLICT (event_id) DO NOTHING`：
-   - **影响 0 行（重投）** → 读出既有行，**原样重放 `ack_toast`**，不写审计、不重复处理；
-   - **插入成功且 `disposition='rejected'`** → 同事务写拒绝审计并置 `processed`，返回精确 toast；
-   - **插入成功且 `disposition='accepted'`** → 返回 toast「已收到，正在处理」，交异步段。
+2. 单事务写 inbox，**两个分支的 INSERT 形态不同**：
+   ```text
+   rejected: INSERT ... (disposition='rejected', state='processed', processed_at=now(), ...)
+             ON CONFLICT (event_id) DO NOTHING
+             ↳ 插入成功 → 同事务 INSERT 拒绝审计(inbox_event_id=$e) → 返回精确 toast
+   accepted: INSERT ... (disposition='accepted', state='received', ...)   -- 用列默认值
+             ON CONFLICT (event_id) DO NOTHING
+             ↳ 插入成功 → 返回 toast「已收到，正在处理」,交异步段
+   ```
+   - **影响 0 行（重投）** → 读出既有行，**原样重放 `ack_toast`**，不写审计、不重复处理。
+
+   `rejected` 行**绝不能先插 `received` 再 UPDATE**——CHECK 立即生效，INSERT 当场 `23514`。
 3. 拿不到 `event_id` 的畸形事件：拒绝 + 只记日志，**不写审计**（无法去重的审计在重投下无界增长）。
 
 **inbox 持久化失败（含 2 秒超时）必须向 SDK 返回 error，不得返回成功 toast。**
@@ -521,7 +551,9 @@ Version、RuleVersion、Packages、SourceWorkflowID。因此
 ```text
 BEGIN
   SELECT * FROM card_action_inbox
-   WHERE event_id=$e AND state='received' AND owner=$token FOR UPDATE
+   WHERE event_id=$e AND state='received'
+     AND owner=$token AND lease_expires_at > now()   -- 租约必须仍然有效
+   FOR UPDATE
     └ 0 行 → 直接返回,不做任何业务写入
   INSERT audit_log(card.<action>.rejected.<code>, inbox_event_id=$e, card_action_workflow_id=NULL)
   INSERT card_action_messages(..., render_kind='rejection', rejection_reason=<渲染文案>,
@@ -752,7 +784,24 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 > 此后 A 的旧请求才在飞书端生效。系统**永远不会收到 A 的结果**，数据库却认为已收敛，
 > 而卡片显示的是旧内容。
 
-对此**不承诺严格收敛**（§2.3 已把权威性交给数据库），只做三件事：
+对此**不承诺严格收敛**（§2.3 已把权威性交给数据库），只做四件事：
+
+0. **claim 时钉住 revision，completion 双重 fencing。** 卡片 sweep 取得 owner 时把当时的
+   `desired_revision` 一并钉住，记为 `r`，渲染的就是 `r` 对应的卡片；PATCH 之后的更新必须
+   同时匹配 owner、租约有效性**与 `r`**：
+
+   ```sql
+   UPDATE card_action_messages
+      SET rendered_revision = $r, update_state = 'succeeded', reconcile_after = NULL
+    WHERE workflow_id = ? AND open_message_id = ?
+      AND owner = $token AND lease_expires_at > now()
+      AND desired_revision = $r          -- ← 缺它会吞掉新状态
+   ```
+
+   **`desired_revision = $r` 不可省。** 只比对 owner 时，若 PATCH rev1 期间动作推进到 rev2
+   （§5.4 已把该行重置为 `pending`、`desired_revision=2`），旧 worker 仍能凭 owner 把它标成
+   `succeeded`，**rev2 从此不再被 sweep 选中**，卡片永久停在 rev1。
+   同一条 fencing 也用于超时路径的 `reconcile_after` 写入。
 
 1. **明确超时 ≠ 失败。** PATCH 返回超时或不确定错误时，**不得**直接标 `succeeded` 或
    `abandoned`；保持 `update_state='pending'` 并写入 `reconcile_after = now() + 60s`，
@@ -798,6 +847,10 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 - **`ClaimInbox` → `Complete*` 全路径**：Complete 在**租约仍然有效**时必须成功
   （v3 的"再 acquire 一次"写法会在这里零行，是 v4 阻断 1 的回归测试）；
   token 不匹配时 Complete 影响 0 行且不做任何业务写入；
+- **租约过期后 Complete 必须失败**：token 正确但 `lease_expires_at` 已过期 → 影响 0 行、
+  零业务写入（v5 第 2 条回归；只比对 owner 的实现会在这里放过一份失效的解析结果）；
+- **`rejected` 行首次 INSERT 即为 `processed` + `processed_at`**；
+  先插 `received` 再 UPDATE 的写法必须撞 `23514`（v5 第 1 条回归）；
 - §5.3 三种归宿逐行覆盖；`failed → pending` 复用原三字段且不重新 Resolve；
 - finalize fencing：owner 不匹配影响 0 行；
 - 恢复不推进水位（断言 artifacts 计数器不变）；
@@ -873,7 +926,10 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
   **`reconcile_after` 未到期时 sweep 选不中该行**（谓词生效的机械证明，v4 阻断 6 回归），
   到期后重渲染一次；
 - 新 revision 重排**清空 `reconcile_after`**，新状态立即可更新；
-- 失去租约的写方**不清除他人 owner**。
+- 失去租约的写方**不清除他人 owner**；
+- **revision fencing**：claim 钉住 rev1 → PATCH 期间动作推进到 rev2 → 旧 worker 的
+  completion **影响 0 行**，该行仍为 `pending` 且 `desired_revision=2`，随后被 sweep 选中
+  并渲染 rev2（v5 第 3 条回归；只比对 owner 的实现会把它标成 `succeeded` 从而永久吞掉 rev2）。
 
 ### 10.7 workflow 侧不变性（关键）
 
