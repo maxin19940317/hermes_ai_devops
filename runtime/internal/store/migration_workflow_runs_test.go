@@ -225,7 +225,9 @@ func TestWorkflowRunsMigrationUpgradesLegacyArtifactKey(t *testing.T) {
 	assertFreshWorkflowRunsShape(t, fresh)
 
 	for _, statement := range []string{
-		`DROP TABLE workflow_runs`,
+		// CASCADE: card_actions.workflow_id REFERENCES workflow_runs(workflow_id)
+		// (2026-08-01-card-actions.sql) now depends on this table too.
+		`DROP TABLE workflow_runs CASCADE`,
 		`ALTER TABLE artifacts DROP CONSTRAINT artifacts_project_key`,
 		`ALTER TABLE artifacts ADD CONSTRAINT artifacts_commit_sha_pipeline_id_variant_key
 			UNIQUE (commit_sha, pipeline_id, variant)`,
