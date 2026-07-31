@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -86,5 +87,54 @@ func TestResolvedEnvReplacesWorkdirPlaceholder(t *testing.T) {
 	// 原始 map 不得被修改
 	if m.Deploy.Env["LD_LIBRARY_PATH"] != "{workdir}/lib" {
 		t.Errorf("original env mutated: %q", m.Deploy.Env["LD_LIBRARY_PATH"])
+	}
+}
+
+// KnownFields 第二轮反序列化必须拒绝 Schema 未声明的字段,防止 Manifest
+// struct 扩展时意外接受未声明数据(审查 #2 回归测试)。
+func TestKnownFieldsRejectsUndeclaredFields(t *testing.T) {
+	// 构造一个 Schema 合法但含未声明字段的 manifest
+	yaml := `manifest_version: 1
+artifact:
+  project: test
+  commit: abc1234
+  pipeline_id: 1
+  platform: aarch64_Android_SNPE_2.21
+  build_type: Release
+requirements:
+  os: android
+  abi: arm64-v8a
+deploy:
+  workdir: /data/local/tmp/test
+  files:
+    - src: run.sh
+      dst: run.sh
+      mode: "0755"
+      sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+test:
+  entry: ./run.sh
+  timeout_sec: 300
+  success:
+    exit_code: 0
+collect:
+  - results/*.json
+cleanup:
+  remove_workdir: true
+undeclared_field: should_be_rejected
+`
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "manifest.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatalf("write test manifest: %v", err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected KnownFields rejection for undeclared_field, got nil")
+	}
+	// 错误信息应包含 "unknown field" 或 "undeclared" 关键词
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "unknown field") && !strings.Contains(errMsg, "undeclared") {
+		t.Errorf("err = %v, want mention of unknown/undeclared field", err)
 	}
 }

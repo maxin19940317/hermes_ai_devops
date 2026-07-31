@@ -49,6 +49,10 @@ func (a *Auth) apply(req *http.Request) error {
 // 必须在写盘前拒绝,防止耗尽 Client 磁盘(审查 #1)。
 const DefaultMaxDownloadSize int64 = 2 << 30 // 2 GiB
 
+// maxDownloadSize 是运行时使用的下载大小上限;测试可临时覆盖为小值
+// 以验证超限路径,结束后必须还原(回归测试 TestDownloadRejectsOversizedResponse)。
+var maxDownloadSize = DefaultMaxDownloadSize
+
 // ErrDownloadTooLarge 标记下载超出大小上限;调用方可据此区分下载失败原因。
 var ErrDownloadTooLarge = fmt.Errorf("download exceeds max size (%d bytes)", DefaultMaxDownloadSize)
 
@@ -79,15 +83,15 @@ func Download(ctx context.Context, client *http.Client, url string, auth *Auth, 
 		return fmt.Errorf("create temp: %w", err)
 	}
 	defer os.Remove(tmp.Name())
-	// LimitReader 在读取 DefaultMaxDownloadSize+1 字节时返回 EOF=false
-	// 但 io.Copy 会读到 n > DefaultMaxDownloadSize,据此判定超限。
-	limited := io.LimitReader(resp.Body, DefaultMaxDownloadSize+1)
+	// LimitReader 在读取 maxDownloadSize+1 字节时返回 EOF=false
+	// 但 io.Copy 会读到 n > maxDownloadSize,据此判定超限。
+	limited := io.LimitReader(resp.Body, maxDownloadSize+1)
 	written, err := io.Copy(tmp, limited)
 	if err != nil {
 		tmp.Close()
 		return fmt.Errorf("write body: %w", err)
 	}
-	if written > DefaultMaxDownloadSize {
+	if written > maxDownloadSize {
 		tmp.Close()
 		return fmt.Errorf("download %s: %w (wrote %d bytes)", url, ErrDownloadTooLarge, written)
 	}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -184,5 +185,32 @@ func TestExtractTarGzRejectsTraversal(t *testing.T) {
 				t.Fatalf("expected traversal rejection for %q", entry)
 			}
 		})
+	}
+}
+
+// 下载超过 maxDownloadSize 字节必须中止,不留残档,且错误可 errors.Is 分类。
+func TestDownloadRejectsOversizedResponse(t *testing.T) {
+	// 临时把上限压到 16 字节,避免测试生成 GiB 级数据
+	orig := maxDownloadSize
+	maxDownloadSize = 16
+	defer func() { maxDownloadSize = orig }()
+
+	payload := make([]byte, 64) // 64 > 16,必然超限
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(payload)
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "oversized.tar.gz")
+	err := Download(context.Background(), srv.Client(), srv.URL, nil, dest)
+	if err == nil {
+		t.Fatal("expected oversize rejection, got nil")
+	}
+	if !errors.Is(err, ErrDownloadTooLarge) {
+		t.Errorf("err = %v, want errors.Is(ErrDownloadTooLarge)", err)
+	}
+	// 失败路径不得留下目标文件
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Errorf("oversize download must not leave target file, stat: %v", statErr)
 	}
 }
