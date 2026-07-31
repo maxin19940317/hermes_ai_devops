@@ -58,6 +58,9 @@ type fullStore interface {
 	RecentRuns(ctx context.Context, limit int) ([]RecentRun, error)
 	RecordWorkflowRun(ctx context.Context, run WorkflowRun) error
 	GetWorkflowRun(ctx context.Context, workflowID string) (*WorkflowRun, error)
+	PutInbox(ctx context.Context, row InboxRow, auditOnReject *AuditRow) (*InboxRow, bool, error)
+	GetInbox(ctx context.Context, eventID string) (*InboxRow, error)
+	ClaimInbox(ctx context.Context, eventID, token string, lease time.Duration) (*InboxRow, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -131,6 +134,46 @@ func artifactAttempts(t *testing.T, s fullStore) map[string]int {
 		t.Fatalf("unsupported store type %T", s)
 	}
 	return out
+}
+
+// mustGetInbox 是 s.GetInbox 的测试便捷包装:找不到即 Fatal,省得每个用例
+// 重复写错误处理。
+func mustGetInbox(t *testing.T, s fullStore, eventID string) *InboxRow {
+	t.Helper()
+	row, err := s.GetInbox(ctx, eventID)
+	if err != nil {
+		t.Fatalf("GetInbox(%s): %v", eventID, err)
+	}
+	return row
+}
+
+// countAudit 统计 audit_log 中 inbox_event_id = eventID 的行数,用来断言
+// "一个 inbox 事件恰好一条审计"(§3.5)。audit_log 目前只服务测试可见性,
+// 没有生产 API,所以像 artifactAttempts 一样按具体类型直接查底层存储。
+func countAudit(t *testing.T, s fullStore, eventID string) int {
+	t.Helper()
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		n := 0
+		for _, a := range st.auditLog {
+			if a.InboxEventID == eventID {
+				n++
+			}
+		}
+		return n
+	case *PGStore:
+		var n int
+		if err := st.DB.QueryRowContext(ctx,
+			`SELECT count(*) FROM audit_log WHERE inbox_event_id = $1`, eventID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	default:
+		t.Fatalf("unsupported store type %T", s)
+		return 0
+	}
 }
 
 // runConformance 对一个空 store 实例跑全部行为断言;
@@ -2051,6 +2094,84 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if second[0].Project != "p" || second[0].Verdict != "" {
 			t.Fatalf("stored result mutated through caller slice: %#v", second[0])
+		}
+	})
+
+	t.Run("RejectedInboxIsTerminalOnInsert", func(t *testing.T) {
+		s := newStore(t)
+		// rejected 行必须首次 INSERT 即为 processed。先插 received 再 UPDATE 会撞 23514。
+		row := InboxRow{EventID: "e1", Disposition: "rejected", AckToast: "无权限",
+			Action: "retry", WorkflowID: "wf1", ActorOpenID: "ou_x", State: "processed"}
+		audit := &AuditRow{Actor: "feishu:ou_x", Action: "card.retry.rejected.unauthorized",
+			Target: "wf1", InboxEventID: "e1"}
+		if _, inserted, err := s.PutInbox(ctx, row, audit); err != nil || !inserted {
+			t.Fatalf("PutInbox = (%v, %v)", inserted, err)
+		}
+		got := mustGetInbox(t, s, "e1")
+		if got.State != "processed" || got.ProcessedAt == nil {
+			t.Fatalf("rejected 行必须落库即终态: %#v", got)
+		}
+	})
+
+	t.Run("RejectedInboxRollsBackWhenAuditFails", func(t *testing.T) {
+		s := newStore(t)
+		// 审计写不进去时整笔回滚:否则该 event 被永久当作"已处理",审计里却查无此人。
+		//
+		// 故障注入用**非法审计行**(actor 为空,撞 audit_log 的 CHECK),
+		// 而不是在生产结构体上加 ForceFailForTest 之类的测试开关——
+		// 那种接缝会永久留在生产类型里,而且 MemStore 与 PGStore 各写一份必然漂移。
+		bad := &AuditRow{Actor: "", Action: "card.retry.rejected.unauthorized",
+			Target: "wf1", InboxEventID: "e1"}
+		if _, _, err := s.PutInbox(ctx, InboxRow{EventID: "e1", Disposition: "rejected",
+			AckToast: "x", State: "processed"}, bad); err == nil {
+			t.Fatal("审计失败时 PutInbox 必须返回错误")
+		}
+		if _, err := s.GetInbox(ctx, "e1"); !errors.Is(err, ErrInboxNotFound) {
+			t.Fatalf("整笔必须回滚,inbox 不得留行: %v", err)
+		}
+	})
+
+	t.Run("DuplicateRejectedEventReplaysToast", func(t *testing.T) {
+		s := newStore(t)
+		row := InboxRow{EventID: "e1", Disposition: "rejected", AckToast: "按钮已停用",
+			Action: "retry", WorkflowID: "wf1", State: "processed"}
+		audit := &AuditRow{Actor: "feishu:ou_x", Action: "card.retry.rejected.disabled",
+			Target: "wf1", InboxEventID: "e1"}
+		for i := 0; i < 3; i++ {
+			existing, inserted, err := s.PutInbox(ctx, row, audit)
+			if err != nil {
+				t.Fatalf("第 %d 次: %v", i, err)
+			}
+			if i == 0 && !inserted {
+				t.Fatal("首次必须插入")
+			}
+			if i > 0 {
+				if inserted {
+					t.Fatalf("第 %d 次不应插入", i)
+				}
+				if existing.AckToast != "按钮已停用" {
+					t.Fatalf("toast 必须原样重放,got %q", existing.AckToast)
+				}
+			}
+		}
+		if n := countAudit(t, s, "e1"); n != 1 {
+			t.Fatalf("审计行数 = %d, want 1", n)
+		}
+	})
+
+	t.Run("ClaimInboxTakesLeaseOnce", func(t *testing.T) {
+		s := newStore(t)
+		_, _, _ = s.PutInbox(ctx, InboxRow{EventID: "e1", Disposition: "accepted",
+			AckToast: "已收到，正在处理", Action: "retry", WorkflowID: "wf1",
+			ActorOpenID: "ou_x", OpenMessageID: "om_1", State: "received"}, nil)
+
+		got, err := s.ClaimInbox(ctx, "e1", "tokA", 120*time.Second)
+		if err != nil || got == nil {
+			t.Fatalf("首次 claim 失败: %v", err)
+		}
+		// 租约未过期时第二个 worker 抢不到
+		if _, err := s.ClaimInbox(ctx, "e1", "tokB", 120*time.Second); !errors.Is(err, ErrInboxNotClaimable) {
+			t.Fatalf("租约有效期内第二次 claim 应失败, got %v", err)
 		}
 	})
 }
