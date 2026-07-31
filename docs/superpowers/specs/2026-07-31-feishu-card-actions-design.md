@@ -818,16 +818,22 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 
    写方失去持有权有**三种**状态，三种都收敛，**不能只说其中一种**：
 
-   | 状态 | 行的当下形态 | 谁来完成 | 命中 §8.1 谓词的哪一支 |
+   | 状态 | 行的当下形态 | 谁来完成 | 何时可被重新 claim |
    |---|---|---|---|
-   | ① 租约已过期，**尚未**被接管 | 旧 owner 仍在、租约已过期 | 尚无人；行立即可被重新 claim | `lease_expires_at < now()` |
-   | ② 已被别的 worker 重新 claim | 新 owner、租约有效 | 新 owner 渲染当前 `desired_revision`；它若也失败则退回 ① | 不命中（正被持有） |
-   | ③ §5.4 的 revision 重排**无条件清空了 owner** | **ownerless、`pending`、租约为 NULL** | 尚无人；行立即可被重新 claim | `lease_expires_at IS NULL` |
+   | ① 租约已过期，**尚未**被接管 | 旧 owner 仍在、租约已过期 | 尚无人 | 命中租约子句 `lease_expires_at < now()`；**卡片 sweep 还须满足 `reconcile_after IS NULL OR reconcile_after <= now()`**——见下 |
+   | ② 已被别的 worker 重新 claim | 新 owner、租约有效 | 新 owner 渲染当前 `desired_revision` | 不命中（正被持有）；**其租约到期即回到 ①**，无论它是失败、卡住还是进程消失 |
+   | ③ §5.4 的 revision 重排**无条件清空了 owner** | **ownerless、`pending`、租约为 NULL**，且 `reconcile_after` 已被清空 | 尚无人 | 两个子句同时满足（`lease_expires_at IS NULL`），**立即**可 claim |
+
+   **① 不等于"立即"可 claim。** 卡片 sweep 的谓词是两个合取子句（§8.1），而合法持有者完全
+   可能在**租约仍然有效时**先写入一个未来的 `reconcile_after`（§8.3 第 1 条的超时路径），
+   随后租约才到期。此时租约子句已满足、复核子句尚未满足，该行必须**等到复核时间到期**
+   才被选中。这是有意的：那 60 秒窗口正是为"PATCH 结果未知"留的观察期，不该被一次租约
+   过期抹掉。inbox 与动作 sweep 没有复核子句，① 对它们才是立即可 claim。
 
    ① 是租约到期后的**第一现场**——过期先于接管发生，写方察觉失租时多半还停在这里；
-   ③ 则是常态而非例外，动作每推进一次版本就会清一次 owner。两者都**没有"新持有者"**，
-   却都立即可被 sweep 重新 claim。因此
-   **收敛依赖的是"行始终可被重新 claim"，而不是"总有一个新持有者接手"，
+   ③ 则是常态而非例外，动作每推进一次版本就会清一次 owner（并清掉 `reconcile_after`，
+   所以 ③ 没有 ① 那个等待）。①③ 都**没有"新持有者"**。因此
+   **收敛依赖的是"行始终会重新变得可 claim"，而不是"总有一个新持有者接手"，
    更不是"每个写方都要留下痕迹"。**
 
    `owner` 因此是**不可复用随机 token**（§3.5）：可复用的 owner 会让失租者的写入伪装成
