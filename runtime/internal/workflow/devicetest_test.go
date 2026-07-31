@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -933,6 +934,47 @@ func TestBuildNotificationCardHeaderColor(t *testing.T) {
 	}
 }
 
+// TestWorkflowCardSerializationUnchangedByActionField 锁住"第二段无需 Temporal 版本门"的前提:
+// workflow 产出的卡片里 Actions 恒为 nil,omitempty 使其不出现在 JSON 中,
+// 因此 NotifyCard 的 activity input 逐字节不变,旧 history 重放不会失配。
+func TestWorkflowCardSerializationUnchangedByActionField(t *testing.T) {
+	in := DeviceTestInput{Project: "grp/p", Commit: "abcd1234", PipelineID: 42, Version: "1.2.3"}
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v1", Verdict: "TEST_FAILED", Category: "CODE", Attempt: 1, Reason: "boom"},
+		{Variant: "v2", Verdict: "PASSED", Attempt: 1, CasesTotal: 3, DurationSec: 1.5},
+	}}
+	card := buildNotificationCard(in, out)
+
+	// 1) 每个元素的 Actions 必须为 nil —— workflow 永不构造交互元素
+	for i, el := range card.Elements {
+		if el.Actions != nil {
+			t.Fatalf("elements[%d].Actions = %#v, workflow 侧必须恒为 nil", i, el.Actions)
+		}
+	}
+	// 2) 序列化后不得出现 actions 键
+	raw, err := json.Marshal(card)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(raw, []byte(`"actions"`)) {
+		t.Fatalf("workflow 产出的卡片不应含 actions 键: %s", raw)
+	}
+}
+
+// TestCardConfigCarriesUpdateMulti:飞书 PATCH 要求原卡带 config.update_multi=true,
+// 否则消息不可更新,整个按钮轮的权威反馈层无从谈起。
+func TestCardConfigCarriesUpdateMulti(t *testing.T) {
+	card := buildNotificationCard(DeviceTestInput{Project: "p", Commit: "c", PipelineID: 1, Version: "v"},
+		&DeviceTestOutput{Tasks: []TaskSummary{{Variant: "v1", Verdict: "PASSED"}}})
+	if !card.Config.UpdateMulti {
+		t.Fatal("config.update_multi 必须为 true")
+	}
+	raw, _ := json.Marshal(card)
+	if !bytes.Contains(raw, []byte(`"update_multi":true`)) {
+		t.Fatalf("序列化后缺 update_multi: %s", raw)
+	}
+}
+
 // out.Tasks 为空时,正文必须是与纯文本同款的提示,而不是什么都不放。
 func TestBuildNotificationCardEmptyTasks(t *testing.T) {
 	card := buildNotificationCard(DeviceTestInput{Project: "p"}, &DeviceTestOutput{})
@@ -947,14 +989,18 @@ func TestBuildNotificationCardEmptyTasks(t *testing.T) {
 }
 
 var allowedCardKeys = map[string]bool{
-	"config": true, "wide_screen_mode": true, "header": true, "title": true,
-	"template": true, "elements": true, "tag": true, "text": true, "content": true,
+	"config": true, "wide_screen_mode": true, "update_multi": true,
+	"header": true, "title": true, "template": true,
+	"elements": true, "tag": true, "text": true, "content": true,
+	"actions": true, "type": true, "value": true,
+	"action": true, "source_workflow_id": true,
 }
 
-// walkCard 按 NotificationCard/CardConfig/CardHeader/CardElement/CardText
-// 五种 DTO 节点逐层校验允许键、必需键、值类型与 div/hr 的 Text 配对。
-// 只做全局九键白名单不够:它会放过合法 key 出现在错误节点、标量 text,
-// 以及缺 tag/content 的 CardText。
+// walkCard 按 NotificationCard/CardConfig/CardHeader/CardElement/CardButton/
+// CardActionValue/CardText 七种 DTO 节点逐层校验允许键、必需键、值类型,
+// 以及 div/hr/action 三种 CardElement 形态各自的 Text/Actions 配对。
+// 只做全局白名单不够:它会放过合法 key 出现在错误节点(如 div 带 actions、
+// action 带 text)、标量 text,以及缺 tag/content 的 CardText。
 func walkCard(t *testing.T, v any) []string {
 	t.Helper()
 	var bad []string
@@ -1004,11 +1050,16 @@ func walkCard(t *testing.T, v any) []string {
 		return bad
 	}
 
-	configKeys := map[string]bool{"wide_screen_mode": true}
-	if config, ok := checkObject(root["config"], "$.config", "CardConfig", configKeys, "wide_screen_mode"); ok {
+	configKeys := map[string]bool{"wide_screen_mode": true, "update_multi": true}
+	if config, ok := checkObject(root["config"], "$.config", "CardConfig", configKeys,
+		"wide_screen_mode", "update_multi"); ok {
 		if _, ok := config["wide_screen_mode"].(bool); !ok {
 			bad = append(bad, fmt.Sprintf("$.config.wide_screen_mode: 必须是 bool, got %T",
 				config["wide_screen_mode"]))
+		}
+		if _, ok := config["update_multi"].(bool); !ok {
+			bad = append(bad, fmt.Sprintf("$.config.update_multi: 必须是 bool, got %T",
+				config["update_multi"]))
 		}
 	}
 
@@ -1028,16 +1079,66 @@ func walkCard(t *testing.T, v any) []string {
 		bad = append(bad, fmt.Sprintf("$.elements: 必须是 array, got %T", root["elements"]))
 		return bad
 	}
-	elementKeys := map[string]bool{"tag": true, "text": true}
+	buttonKeys := map[string]bool{"tag": true, "text": true, "type": true, "value": true}
+	valueKeys := map[string]bool{"action": true, "source_workflow_id": true}
+	validateButton := func(node any, path string) {
+		btn, ok := checkObject(node, path, "CardButton", buttonKeys, "tag", "text", "type", "value")
+		if !ok {
+			return
+		}
+		if tag, ok := btn["tag"].(string); !ok || tag != "button" {
+			bad = append(bad, fmt.Sprintf("%s.tag: got %v,want \"button\"", path, btn["tag"]))
+		}
+		validateText(btn["text"], path+".text")
+		if typ, ok := btn["type"].(string); !ok || (typ != "primary" && typ != "default") {
+			bad = append(bad, fmt.Sprintf("%s.type: got %v,want primary|default", path, btn["type"]))
+		}
+		// value 序列化后必须恰好是 {action, source_workflow_id} 两个键——checkObject
+		// 的全局白名单会拒任何第三个键(不论叫 extra 还是 variant),这就是"恰好"的来源。
+		if value, ok := checkObject(btn["value"], path+".value", "CardActionValue", valueKeys,
+			"action", "source_workflow_id"); ok {
+			if _, ok := value["action"].(string); !ok {
+				bad = append(bad, fmt.Sprintf("%s.value.action: 必须是 string, got %T", path, value["action"]))
+			}
+			if _, ok := value["source_workflow_id"].(string); !ok {
+				bad = append(bad, fmt.Sprintf("%s.value.source_workflow_id: 必须是 string, got %T",
+					path, value["source_workflow_id"]))
+			}
+		}
+	}
+
+	// elementKeysByTag: 允许键集合由 tag 决定,而不是三种形态的并集——
+	// 并集会放过"div 带 actions"/"action 带 text"这类跨形态污染,
+	// 这正是本轮要补的两条规则(设计歧义澄清)。
+	elementKeysByTag := map[string]map[string]bool{
+		"div":    {"tag": true, "text": true},
+		"hr":     {"tag": true},
+		"action": {"tag": true, "actions": true},
+	}
+	requiredByTag := map[string][]string{
+		"div":    {"tag", "text"},
+		"hr":     {"tag"},
+		"action": {"tag", "actions"},
+	}
 	for i, node := range elements {
 		path := fmt.Sprintf("$.elements[%d]", i)
-		element, ok := checkObject(node, path, "CardElement", elementKeys, "tag")
+		peek, ok := node.(map[string]any)
 		if !ok {
+			bad = append(bad, fmt.Sprintf("%s: CardElement 必须是 object, got %T", path, node))
 			continue
 		}
-		tag, stringOK := element["tag"].(string)
+		tag, stringOK := peek["tag"].(string)
 		if !stringOK {
-			bad = append(bad, fmt.Sprintf("%s.tag: 必须是 string, got %T", path, element["tag"]))
+			bad = append(bad, fmt.Sprintf("%s.tag: 必须是 string, got %T", path, peek["tag"]))
+			continue
+		}
+		allowed, known := elementKeysByTag[tag]
+		if !known {
+			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want div|hr|action", path, tag))
+			continue
+		}
+		element, ok := checkObject(node, path, fmt.Sprintf("CardElement(%s)", tag), allowed, requiredByTag[tag]...)
+		if !ok {
 			continue
 		}
 		switch tag {
@@ -1052,8 +1153,18 @@ func walkCard(t *testing.T, v any) []string {
 			if text, exists := element["text"]; exists && text != nil {
 				bad = append(bad, fmt.Sprintf("%s: hr 的 text 必须为 nil", path))
 			}
-		default:
-			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want div|hr", path, tag))
+		case "action":
+			actions, ok := element["actions"].([]any)
+			if !ok {
+				bad = append(bad, fmt.Sprintf("%s.actions: 必须是 array, got %T", path, element["actions"]))
+				continue
+			}
+			if len(actions) == 0 {
+				bad = append(bad, fmt.Sprintf("%s.actions: action 元素的 actions 必须非空", path))
+			}
+			for j, btnNode := range actions {
+				validateButton(btnNode, fmt.Sprintf("%s.actions[%d]", path, j))
+			}
 		}
 	}
 	return bad
@@ -1103,6 +1214,12 @@ func TestCardClosedStructureCatchesViolations(t *testing.T) {
 		{"text 缺 tag", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"content":"x"}}]}`},
 		{"text 缺 content", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text"}}]}`},
 		{"合法 key 放错节点", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"template":"red"}]}`},
+		{"带 behaviors", `{"config":{"wide_screen_mode":true,"update_multi":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"behaviors":[]}]}`},
+		{"按钮带 url", `{"config":{"wide_screen_mode":true,"update_multi":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"action","actions":[{"tag":"button","text":{"tag":"plain_text","content":"b"},"type":"primary","url":"http://x","value":{"action":"retry","source_workflow_id":"w"}}]}]}`},
+		{"按钮带 multi_url", `{"config":{"wide_screen_mode":true,"update_multi":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"action","actions":[{"tag":"button","text":{"tag":"plain_text","content":"b"},"type":"primary","multi_url":{},"value":{"action":"retry","source_workflow_id":"w"}}]}]}`},
+		{"value 含第三个键", `{"config":{"wide_screen_mode":true,"update_multi":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"action","actions":[{"tag":"button","text":{"tag":"plain_text","content":"b"},"type":"primary","value":{"action":"retry","source_workflow_id":"w","extra":"x"}}]}]}`},
+		{"value 含 variant", `{"config":{"wide_screen_mode":true,"update_multi":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"action","actions":[{"tag":"button","text":{"tag":"plain_text","content":"b"},"type":"primary","value":{"action":"retry","source_workflow_id":"w","variant":"v1"}}]}]}`},
+		{"div 同时带 actions", `{"config":{"wide_screen_mode":true,"update_multi":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"actions":[]}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

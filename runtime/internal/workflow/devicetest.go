@@ -765,8 +765,8 @@ func buildNotification(in DeviceTestInput, out *DeviceTestOutput) string {
 // ---- 通知卡片(Phase 2,设计文档 §4.4)----
 
 // NotificationCard 是终态通知卡片的封闭结构(本轮范围门禁)。
-// 它不含任何可表达交互的字段——没有 actions、没有 behaviors、没有 value——
-// 因此按钮不可能在不修改本类型(进而不修改 spec)的前提下漏进展示卡片。
+// CardElement 从本 task 起可以携带 Actions,但 workflow 侧永不赋值(见其 godoc)——
+// 按钮只由后续的 NotifyCard 活动构造,当前 workflow 产出的卡片仍不含任何交互内容。
 type NotificationCard struct {
 	Config   CardConfig    `json:"config"`
 	Header   CardHeader    `json:"header"`
@@ -775,6 +775,11 @@ type NotificationCard struct {
 
 type CardConfig struct {
 	WideScreenMode bool `json:"wide_screen_mode"`
+	// UpdateMulti 恒为 true。飞书 PATCH /open-apis/im/v1/messages/:message_id
+	// 要求原卡带 config.update_multi=true,否则消息不可更新(设计 §7.2)——
+	// 这是按钮回调能"改回已有消息"而非"再发一条"的前提,提前声明以免第二段
+	// 上线时还要再动一次已发出去的卡片结构。
+	UpdateMulti bool `json:"update_multi"`
 }
 
 type CardHeader struct {
@@ -782,10 +787,34 @@ type CardHeader struct {
 	Template string   `json:"template"` // 只允许 green | red | orange(§4.1)
 }
 
-// CardElement 只有两种形态:文本块(tag=div,Text 非空)与分隔线(tag=hr,Text 为 nil)。
+// CardElement 是封闭的 tagged union,三种形态互斥:
+//
+//	tag=div    → Text 非空, Actions 为 nil
+//	tag=hr     → 两者皆 nil
+//	tag=action → Text 为 nil, Actions 非空
+//
+// **Actions 只由 NotifyCard 活动构造,workflow 永不赋值**——omitempty 使
+// workflow 产出的卡片序列化逐字节不变,这是第二段部署无需 Temporal 版本门的依据(设计 §7.1)。
 type CardElement struct {
-	Tag  string    `json:"tag"`            // 只允许 div | hr
-	Text *CardText `json:"text,omitempty"` // tag=hr 时必须为 nil
+	Tag     string       `json:"tag"`            // 只允许 div | hr | action
+	Text    *CardText    `json:"text,omitempty"` // tag=hr|action 时必须为 nil
+	Actions []CardButton `json:"actions,omitempty"`
+}
+
+// CardButton 没有 behaviors、没有 url、没有 multi_url——按钮只能回调,
+// 不可能变成跳转或表单(设计 §7.2)。
+type CardButton struct {
+	Tag   string          `json:"tag"`  // 恒为 "button"
+	Text  CardText        `json:"text"` // 恒为 plain_text
+	Type  string          `json:"type"` // primary | default
+	Value CardActionValue `json:"value"`
+}
+
+// CardActionValue 序列化后恰好两个键。用固定字段而非 map[string]string:
+// map 不是封闭 DTO,"恰好两个键"的断言无从谈起(设计 §7.2)。
+type CardActionValue struct {
+	Action           string `json:"action"` // retry | ignore
+	SourceWorkflowID string `json:"source_workflow_id"`
 }
 
 // CardText 的 Tag 恒为 plain_text(§4.5),没有 lark_md 这个选项。
@@ -949,7 +978,7 @@ func cardOmittedNotice(n int) CardElement {
 func buildNotificationCard(in DeviceTestInput, out *DeviceTestOutput) NotificationCard {
 	title := fmt.Sprintf("[hermes-devops] %s g%s p%d (v%s)", in.Project, in.Commit, in.PipelineID, in.Version)
 	card := NotificationCard{
-		Config: CardConfig{WideScreenMode: true},
+		Config: CardConfig{WideScreenMode: true, UpdateMulti: true},
 		Header: CardHeader{
 			Title:    CardText{Tag: "plain_text", Content: title},
 			Template: cardHeaderTemplate(out.Tasks),
