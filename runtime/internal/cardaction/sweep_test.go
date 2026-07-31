@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +31,7 @@ type sweepTestStore struct {
 	inboxClaimErr    error
 	actionClaimErr   error
 	cardClaimErr     error
+	claimTrace       []string
 	claimTokens      []string
 	claimLeases      []time.Duration
 
@@ -61,8 +61,7 @@ type sweepTestStore struct {
 	abandonOK    bool
 	abandonErr   error
 
-	passDone chan struct{}
-	passOnce sync.Once
+	passNotify chan struct{}
 }
 
 func newSweepTestStore() *sweepTestStore {
@@ -81,6 +80,7 @@ func (s *sweepTestStore) ClaimStaleInbox(
 	ctx context.Context, token string, lease time.Duration,
 ) (*store.InboxRow, error) {
 	s.inboxSweepCalls++
+	s.claimTrace = append(s.claimTrace, "inbox")
 	s.recordClaim(token, lease)
 	if s.inboxClaimErr != nil {
 		return nil, s.inboxClaimErr
@@ -92,6 +92,7 @@ func (s *sweepTestStore) ClaimStaleAction(
 	_ context.Context, token string, lease time.Duration,
 ) (*store.CardAction, error) {
 	s.actionSweepCalls++
+	s.claimTrace = append(s.claimTrace, "action")
 	s.recordClaim(token, lease)
 	if s.actionClaimErr != nil {
 		return nil, s.actionClaimErr
@@ -117,9 +118,10 @@ func (s *sweepTestStore) ClaimMessage(
 	_ context.Context, token string, lease time.Duration,
 ) (*store.MessageClaim, error) {
 	s.cardSweepCalls++
+	s.claimTrace = append(s.claimTrace, "card")
 	s.recordClaim(token, lease)
-	if s.passDone != nil {
-		s.passOnce.Do(func() { close(s.passDone) })
+	if s.passNotify != nil {
+		s.passNotify <- struct{}{}
 	}
 	if s.cardClaimErr != nil {
 		return nil, s.cardClaimErr
@@ -190,37 +192,55 @@ func (u *fakeCardUpdater) PatchCard(_ context.Context, messageID string, card an
 	return u.err
 }
 
-func TestRunOnceUsesFreshTokensAndRunsAllSweepsAfterFailure(t *testing.T) {
-	st := newSweepTestStore()
-	st.inboxClaimErr = errors.New("inbox database down")
-	s := &Sweeper{Store: st}
+func TestRunOnceOrdersAndContinuesAllSweepsAfterEachClaimFailure(t *testing.T) {
+	tests := []struct {
+		name   string
+		pass   string
+		setErr func(*sweepTestStore, error)
+	}{
+		{
+			name: "inbox",
+			pass: "inbox",
+			setErr: func(st *sweepTestStore, err error) {
+				st.inboxClaimErr = err
+			},
+		},
+		{
+			name: "action",
+			pass: "action",
+			setErr: func(st *sweepTestStore, err error) {
+				st.actionClaimErr = err
+			},
+		},
+		{
+			name: "card",
+			pass: "card",
+			setErr: func(st *sweepTestStore, err error) {
+				st.cardClaimErr = err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newSweepTestStore()
+			passErr := errors.New(tt.pass + " database down")
+			tt.setErr(st, passErr)
+			s := &Sweeper{Store: st}
 
-	err := s.RunOnce(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "inbox sweep") {
-		t.Fatalf("RunOnce error = %v, want contextual inbox error", err)
-	}
-	if st.inboxSweepCalls != 1 || st.actionSweepCalls != 1 || st.cardSweepCalls != 1 {
-		t.Fatalf("sweep calls = inbox:%d action:%d card:%d, want 1 each",
-			st.inboxSweepCalls, st.actionSweepCalls, st.cardSweepCalls)
-	}
-	if len(st.claimTokens) != 3 || len(st.claimLeases) != 3 {
-		t.Fatalf("claims = tokens:%d leases:%d, want 3 each",
-			len(st.claimTokens), len(st.claimLeases))
-	}
-	seen := make(map[string]bool)
-	for i, token := range st.claimTokens {
-		raw, decodeErr := hex.DecodeString(token)
-		if decodeErr != nil || len(raw) != 16 {
-			t.Fatalf("claim %d token %q = %x, %v; want unpredictable 128-bit hex",
-				i, token, raw, decodeErr)
-		}
-		if seen[token] {
-			t.Fatalf("fencing token reused: %q", token)
-		}
-		seen[token] = true
-		if st.claimLeases[i] != 120*time.Second {
-			t.Fatalf("claim %d lease = %s, want 120s", i, st.claimLeases[i])
-		}
+			err := s.RunOnce(context.Background())
+			if err == nil || !errors.Is(err, passErr) ||
+				!strings.Contains(err.Error(), tt.pass+" sweep") {
+				t.Fatalf("RunOnce error = %v, want joined contextual %s error", err, tt.pass)
+			}
+			if !reflect.DeepEqual(st.claimTrace, []string{"inbox", "action", "card"}) {
+				t.Fatalf("claim trace = %v, want [inbox action card]", st.claimTrace)
+			}
+			if st.inboxSweepCalls != 1 || st.actionSweepCalls != 1 || st.cardSweepCalls != 1 {
+				t.Fatalf("sweep calls = inbox:%d action:%d card:%d, want 1 each",
+					st.inboxSweepCalls, st.actionSweepCalls, st.cardSweepCalls)
+			}
+			assertFreshSweepClaims(t, st.claimTokens, st.claimLeases)
+		})
 	}
 }
 
@@ -435,51 +455,115 @@ func TestCardRecoveryMissingOrInvalidSnapshotNeverPatches(t *testing.T) {
 	}
 }
 
-func TestCardRecoveryPatchSuccessCompletesOriginalClaim(t *testing.T) {
-	st := newSweepTestStore()
-	claim := messageClaimForSweep()
-	st.messageClaim = claim
-	updater := &fakeCardUpdater{}
-	s := &Sweeper{Store: st, Updater: updater}
+func TestCardRecoveryCompletionsForwardExactClaimAndThirdToken(t *testing.T) {
+	ambiguousErr := fmt.Errorf("patch timed out: %w", context.DeadlineExceeded)
+	tests := []struct {
+		name          string
+		claim         func() store.MessageClaim
+		updater       func(*testing.T) feishu.CardUpdater
+		wantRunErr    error
+		wantComplete  int
+		wantDefer     int
+		wantAbandon   int
+		wantLastError string
+	}{
+		{
+			name:         "success completes",
+			claim:        richMessageClaimForSweep,
+			updater:      func(*testing.T) feishu.CardUpdater { return &fakeCardUpdater{} },
+			wantComplete: 1,
+		},
+		{
+			name: "ambiguous defers",
+			claim: func() store.MessageClaim {
+				claim := rejectionClaim("workflow 尚未结束 exact snapshot", "both")
+				claim.DesiredRevision = 7
+				return claim
+			},
+			updater: func(*testing.T) feishu.CardUpdater {
+				return &fakeCardUpdater{err: ambiguousErr}
+			},
+			wantRunErr:    context.DeadlineExceeded,
+			wantDefer:     1,
+			wantLastError: ambiguousErr.Error(),
+		},
+		{
+			name:  "permanent abandons",
+			claim: richMessageClaimForSweep,
+			updater: func(t *testing.T) feishu.CardUpdater {
+				return realPatchUpdater(
+					t, http.StatusBadRequest,
+					`{"code":230001,"msg":"message not found"}`,
+				)
+			},
+			wantAbandon:   1,
+			wantLastError: "feishu api: code 230001: message not found",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newSweepTestStore()
+			claim := tt.claim()
+			st.messageClaim = &claim
+			original := copyMessageClaim(claim)
+			updater := tt.updater(t)
+			s := &Sweeper{Store: st, Updater: updater}
 
-	if err := s.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
-	}
-	if updater.calls != 1 || !reflect.DeepEqual(updater.messageIDs, []string{"om_1"}) {
-		t.Fatalf("patch calls=%d message IDs=%v", updater.calls, updater.messageIDs)
-	}
-	raw, ok := updater.cards[0].(json.RawMessage)
-	if !ok || !json.Valid(raw) {
-		t.Fatalf("PatchCard payload = %#v, want complete JSON RawMessage", updater.cards[0])
-	}
-	if st.completeCalls != 1 || st.deferCalls != 0 || st.abandonCalls != 0 {
-		t.Fatalf("complete=%d defer=%d abandon=%d", st.completeCalls, st.deferCalls, st.abandonCalls)
-	}
-	if !reflect.DeepEqual(st.completeClaim, *claim) {
-		t.Fatalf("completion claim changed:\ngot=%#v\nwant=%#v", st.completeClaim, *claim)
-	}
-	if st.completeToken == "" {
-		t.Fatal("completion did not use claim token")
-	}
-}
-
-func TestCardRecoveryTimeoutDefersForSixtySeconds(t *testing.T) {
-	st := newSweepTestStore()
-	st.messageClaim = messageClaimForSweep()
-	updater := &fakeCardUpdater{err: fmt.Errorf("patch timed out: %w", context.DeadlineExceeded)}
-	s := &Sweeper{Store: st, Updater: updater}
-
-	err := s.RunOnce(context.Background())
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("RunOnce error = %v, want wrapped deadline", err)
-	}
-	if st.deferCalls != 1 || st.deferAfter != 60*time.Second ||
-		st.completeCalls != 0 || st.abandonCalls != 0 {
-		t.Fatalf("defer=%d after=%s complete=%d abandon=%d",
-			st.deferCalls, st.deferAfter, st.completeCalls, st.abandonCalls)
-	}
-	if !strings.Contains(st.deferError, context.DeadlineExceeded.Error()) {
-		t.Fatalf("defer last error = %q", st.deferError)
+			err := s.RunOnce(context.Background())
+			if tt.wantRunErr == nil && err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			if tt.wantRunErr != nil && !errors.Is(err, tt.wantRunErr) {
+				t.Fatalf("RunOnce error = %v, want %v", err, tt.wantRunErr)
+			}
+			if st.completeCalls != tt.wantComplete ||
+				st.deferCalls != tt.wantDefer ||
+				st.abandonCalls != tt.wantAbandon {
+				t.Fatalf("complete/defer/abandon = %d/%d/%d, want %d/%d/%d",
+					st.completeCalls, st.deferCalls, st.abandonCalls,
+					tt.wantComplete, tt.wantDefer, tt.wantAbandon)
+			}
+			if len(st.claimTokens) != 3 {
+				t.Fatalf("claim tokens = %v, want exactly three", st.claimTokens)
+			}
+			token := st.claimTokens[2]
+			switch {
+			case tt.wantComplete == 1:
+				fake := updater.(*fakeCardUpdater)
+				if fake.calls != 1 ||
+					!reflect.DeepEqual(fake.messageIDs, []string{"om_1"}) {
+					t.Fatalf("patch calls=%d message IDs=%v", fake.calls, fake.messageIDs)
+				}
+				raw, ok := fake.cards[0].(json.RawMessage)
+				if !ok || !json.Valid(raw) {
+					t.Fatalf("PatchCard payload = %#v, want complete JSON RawMessage",
+						fake.cards[0])
+				}
+				assertExactMessageCompletion(
+					t, st.completeClaim, st.completeToken, original, token,
+				)
+			case tt.wantDefer == 1:
+				assertExactMessageCompletion(
+					t, st.deferClaim, st.deferToken, original, token,
+				)
+				if st.deferAfter != 60*time.Second {
+					t.Fatalf("defer after = %s, want 60s", st.deferAfter)
+				}
+				if st.deferError != tt.wantLastError {
+					t.Fatalf("defer error = %q, want %q", st.deferError, tt.wantLastError)
+				}
+			case tt.wantAbandon == 1:
+				assertExactMessageCompletion(
+					t, st.abandonClaim, st.abandonToken, original, token,
+				)
+				if st.abandonError != tt.wantLastError {
+					t.Fatalf("abandon error = %q, want %q", st.abandonError, tt.wantLastError)
+				}
+			}
+			if !reflect.DeepEqual(claim, original) {
+				t.Fatalf("claimed snapshot mutated:\ngot=%#v\nwant=%#v", claim, original)
+			}
+		})
 	}
 }
 
@@ -491,12 +575,28 @@ func TestCardRecoveryClassifiesRealFeishuPatchErrors(t *testing.T) {
 		wantAbandon   int
 		wantRunErr    bool
 		wantTransient bool
+		wantLastError string
 	}{
 		{
-			name:        "message missing business error is permanent",
-			status:      http.StatusBadRequest,
-			body:        `{"code":230001,"msg":"message not found"}`,
-			wantAbandon: 1,
+			name:          "message missing business error is permanent",
+			status:        http.StatusBadRequest,
+			body:          `{"code":230001,"msg":"message not found"}`,
+			wantAbandon:   1,
+			wantLastError: "feishu api: code 230001: message not found",
+		},
+		{
+			name:          "permission denied business error is permanent",
+			status:        http.StatusForbidden,
+			body:          `{"code":230027,"msg":"permission denied"}`,
+			wantAbandon:   1,
+			wantLastError: "feishu api: code 230027: permission denied",
+		},
+		{
+			name:          "message outside update window is permanent",
+			status:        http.StatusBadRequest,
+			body:          `{"code":230031,"msg":"message older than 14 days"}`,
+			wantAbandon:   1,
+			wantLastError: "feishu api: code 230031: message older than 14 days",
 		},
 		{
 			name:          "business rate limit is transient",
@@ -513,6 +613,13 @@ func TestCardRecoveryClassifiesRealFeishuPatchErrors(t *testing.T) {
 			wantTransient: true,
 		},
 		{
+			name:          "unknown business error is transient",
+			status:        http.StatusBadRequest,
+			body:          `{"code":239999,"msg":"unknown business failure"}`,
+			wantRunErr:    true,
+			wantTransient: true,
+		},
+		{
 			name:          "HTTP 5xx is transient",
 			status:        http.StatusServiceUnavailable,
 			body:          `{"code":230001,"msg":"stale intermediary body"}`,
@@ -523,7 +630,9 @@ func TestCardRecoveryClassifiesRealFeishuPatchErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			st := newSweepTestStore()
-			st.messageClaim = messageClaimForSweep()
+			claim := richMessageClaimForSweep()
+			st.messageClaim = &claim
+			original := copyMessageClaim(claim)
 			updater := realPatchUpdater(t, tt.status, tt.body)
 			s := &Sweeper{Store: st, Updater: updater}
 
@@ -533,6 +642,18 @@ func TestCardRecoveryClassifiesRealFeishuPatchErrors(t *testing.T) {
 			}
 			if st.abandonCalls != tt.wantAbandon {
 				t.Fatalf("abandon calls = %d, want %d", st.abandonCalls, tt.wantAbandon)
+			}
+			if tt.wantAbandon == 1 {
+				if st.completeCalls != 0 || st.deferCalls != 0 {
+					t.Fatalf("permanent result wrote complete/defer = %d/%d",
+						st.completeCalls, st.deferCalls)
+				}
+				assertExactMessageCompletion(
+					t, st.abandonClaim, st.abandonToken, original, st.claimTokens[2],
+				)
+				if st.abandonError != tt.wantLastError {
+					t.Fatalf("abandon error = %q, want %q", st.abandonError, tt.wantLastError)
+				}
 			}
 			if tt.wantTransient &&
 				(st.completeCalls != 0 || st.deferCalls != 0 || st.abandonCalls != 0) {
@@ -557,18 +678,94 @@ func TestCardRecoveryUnknownErrorIsTransient(t *testing.T) {
 	}
 }
 
-func TestCardRecoveryLostCompletionDoesNotFallback(t *testing.T) {
-	st := newSweepTestStore()
-	st.messageClaim = messageClaimForSweep()
-	st.completeOK = false
-	s := &Sweeper{Store: st, Updater: &fakeCardUpdater{}}
-
-	if err := s.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
+func TestCardRecoveryLostFencingNeverFallsBackOrMutatesAction(t *testing.T) {
+	ambiguousErr := fmt.Errorf("patch timed out: %w", context.DeadlineExceeded)
+	tests := []struct {
+		name         string
+		updater      func(*testing.T) feishu.CardUpdater
+		loseFence    func(*sweepTestStore)
+		wantRunErr   error
+		wantComplete int
+		wantDefer    int
+		wantAbandon  int
+	}{
+		{
+			name:    "complete",
+			updater: func(*testing.T) feishu.CardUpdater { return &fakeCardUpdater{} },
+			loseFence: func(st *sweepTestStore) {
+				st.completeOK = false
+			},
+			wantComplete: 1,
+		},
+		{
+			name: "defer",
+			updater: func(*testing.T) feishu.CardUpdater {
+				return &fakeCardUpdater{err: ambiguousErr}
+			},
+			loseFence: func(st *sweepTestStore) {
+				st.deferOK = false
+			},
+			wantRunErr: context.DeadlineExceeded,
+			wantDefer:  1,
+		},
+		{
+			name: "abandon",
+			updater: func(t *testing.T) feishu.CardUpdater {
+				return realPatchUpdater(
+					t, http.StatusForbidden,
+					`{"code":230027,"msg":"permission denied"}`,
+				)
+			},
+			loseFence: func(st *sweepTestStore) {
+				st.abandonOK = false
+			},
+			wantAbandon: 1,
+		},
 	}
-	if st.completeCalls != 1 || st.deferCalls != 0 || st.abandonCalls != 0 {
-		t.Fatalf("complete=%d defer=%d abandon=%d, want 1/0/0",
-			st.completeCalls, st.deferCalls, st.abandonCalls)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newSweepTestStore()
+			claim := richMessageClaimForSweep()
+			st.messageClaim = &claim
+			before := copyMessageClaim(claim)
+			tt.loseFence(st)
+			s := &Sweeper{Store: st, Updater: tt.updater(t)}
+
+			err := s.RunOnce(context.Background())
+			if tt.wantRunErr == nil && err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			if tt.wantRunErr != nil && !errors.Is(err, tt.wantRunErr) {
+				t.Fatalf("RunOnce error = %v, want %v", err, tt.wantRunErr)
+			}
+			if st.completeCalls != tt.wantComplete ||
+				st.deferCalls != tt.wantDefer ||
+				st.abandonCalls != tt.wantAbandon {
+				t.Fatalf("complete/defer/abandon = %d/%d/%d, want %d/%d/%d",
+					st.completeCalls, st.deferCalls, st.abandonCalls,
+					tt.wantComplete, tt.wantDefer, tt.wantAbandon)
+			}
+			if st.finalizeCalls != 0 {
+				t.Fatalf("lost message fence finalized action %d times", st.finalizeCalls)
+			}
+			var gotClaim store.MessageClaim
+			var gotToken string
+			switch {
+			case tt.wantComplete == 1:
+				gotClaim, gotToken = st.completeClaim, st.completeToken
+			case tt.wantDefer == 1:
+				gotClaim, gotToken = st.deferClaim, st.deferToken
+			case tt.wantAbandon == 1:
+				gotClaim, gotToken = st.abandonClaim, st.abandonToken
+			}
+			assertExactMessageCompletion(
+				t, gotClaim, gotToken, before, st.claimTokens[2],
+			)
+			if !reflect.DeepEqual(claim, before) {
+				t.Fatalf("lost message fence mutated action:\ngot=%#v\nwant=%#v",
+					claim, before)
+			}
+		})
 	}
 }
 
@@ -576,12 +773,17 @@ func TestCardRecoveryNeverMutatesActionState(t *testing.T) {
 	st := newSweepTestStore()
 	claim := succeededRetryClaim("ou_1", "wf-target")
 	st.messageClaim = &claim
+	beforeClaim := copyMessageClaim(claim)
 	before := *claim.Action
 	before.TargetInput = append([]byte(nil), claim.Action.TargetInput...)
 	s := &Sweeper{Store: st, Updater: &fakeCardUpdater{}}
 
 	if err := s.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
+	}
+	if !reflect.DeepEqual(st.completeClaim, beforeClaim) {
+		t.Fatalf("card patch completion mutated action:\ngot=%#v\nwant=%#v",
+			st.completeClaim, beforeClaim)
 	}
 	if !reflect.DeepEqual(*claim.Action, before) {
 		t.Fatalf("card patch mutated action:\ngot=%#v\nwant=%#v", *claim.Action, before)
@@ -591,31 +793,43 @@ func TestCardRecoveryNeverMutatesActionState(t *testing.T) {
 	}
 }
 
-func TestRunStartsImmediatelyAndStopsOnCancellation(t *testing.T) {
+func TestSweeperRunIntervalDefaultsToThirtySeconds(t *testing.T) {
+	if got := (&Sweeper{}).runInterval(); got != 30*time.Second {
+		t.Fatalf("default run interval = %s, want 30s", got)
+	}
+	if got := (&Sweeper{interval: 7 * time.Millisecond}).runInterval(); got != 7*time.Millisecond {
+		t.Fatalf("configured run interval = %s, want 7ms", got)
+	}
+}
+
+func TestRunRepeatsAfterErrorsAndStopsPromptlyOnCancellation(t *testing.T) {
 	st := newSweepTestStore()
-	st.passDone = make(chan struct{})
+	st.inboxClaimErr = errors.New("inbox database remains unavailable")
+	st.passNotify = make(chan struct{}, 4)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	s := &Sweeper{Store: st}
+	s := &Sweeper{Store: st, interval: 500 * time.Millisecond}
 	go func() {
 		defer close(done)
 		s.Run(ctx)
 	}()
 
-	select {
-	case <-st.passDone:
-	case <-time.After(time.Second):
-		t.Fatal("Run did not execute an immediate startup pass")
-	}
+	waitForSweepPass(t, st.passNotify, "immediate", 250*time.Millisecond)
+	waitForSweepPass(t, st.passNotify, "timed", 2*time.Second)
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(250 * time.Millisecond):
 		t.Fatal("Run did not return after context cancellation")
 	}
-	if st.inboxSweepCalls != 1 || st.actionSweepCalls != 1 || st.cardSweepCalls != 1 {
-		t.Fatalf("startup sweep calls = %d/%d/%d, want 1/1/1",
+	if st.inboxSweepCalls < 2 || st.actionSweepCalls < 2 || st.cardSweepCalls < 2 {
+		t.Fatalf("sweep calls = %d/%d/%d, want at least two complete passes",
 			st.inboxSweepCalls, st.actionSweepCalls, st.cardSweepCalls)
+	}
+	wantPrefix := []string{"inbox", "action", "card", "inbox", "action", "card"}
+	if len(st.claimTrace) < len(wantPrefix) ||
+		!reflect.DeepEqual(st.claimTrace[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("claim trace prefix = %v, want %v", st.claimTrace, wantPrefix)
 	}
 }
 
@@ -636,6 +850,18 @@ func messageClaimForSweep() *store.MessageClaim {
 	return &claim
 }
 
+func richMessageClaimForSweep() store.MessageClaim {
+	claim := succeededRetryClaim("ou_exact_actor", "wf-target-exact")
+	claim.DesiredRevision = 7
+	claim.Action.Revision = 7
+	claim.Action.Owner = "persisted-action-owner"
+	claim.Action.Attempt = 9
+	claim.Action.TargetInput = []byte(
+		`{"source_workflow_id":"wf-source","attempt":9,"nested":{"variant":"android"}}`,
+	)
+	return claim
+}
+
 func cloneMessageClaim(claim *store.MessageClaim) *store.MessageClaim {
 	if claim == nil {
 		return nil
@@ -651,6 +877,55 @@ func copyMessageClaim(claim store.MessageClaim) store.MessageClaim {
 		claim.Action = &action
 	}
 	return claim
+}
+
+func assertFreshSweepClaims(t *testing.T, tokens []string, leases []time.Duration) {
+	t.Helper()
+	if len(tokens) != 3 || len(leases) != 3 {
+		t.Fatalf("claims = tokens:%d leases:%d, want 3 each", len(tokens), len(leases))
+	}
+	seen := make(map[string]bool)
+	for i, token := range tokens {
+		raw, decodeErr := hex.DecodeString(token)
+		if decodeErr != nil || len(raw) != 16 {
+			t.Fatalf("claim %d token %q = %x, %v; want unpredictable 128-bit hex",
+				i, token, raw, decodeErr)
+		}
+		if seen[token] {
+			t.Fatalf("fencing token reused: %q", token)
+		}
+		seen[token] = true
+		if leases[i] != 120*time.Second {
+			t.Fatalf("claim %d lease = %s, want 120s", i, leases[i])
+		}
+	}
+}
+
+func assertExactMessageCompletion(
+	t *testing.T,
+	gotClaim store.MessageClaim,
+	gotToken string,
+	wantClaim store.MessageClaim,
+	wantToken string,
+) {
+	t.Helper()
+	if !reflect.DeepEqual(gotClaim, wantClaim) {
+		t.Fatalf("completion claim changed:\ngot=%#v\nwant=%#v", gotClaim, wantClaim)
+	}
+	if gotToken != wantToken {
+		t.Fatalf("completion token = %q, want exact third claim token %q", gotToken, wantToken)
+	}
+}
+
+func waitForSweepPass(
+	t *testing.T, passes <-chan struct{}, name string, timeout time.Duration,
+) {
+	t.Helper()
+	select {
+	case <-passes:
+	case <-time.After(timeout):
+		t.Fatalf("Run did not complete %s sweep pass", name)
+	}
 }
 
 func mustMarshal(t *testing.T, value any) []byte {

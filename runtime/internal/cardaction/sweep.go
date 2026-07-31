@@ -54,6 +54,7 @@ type Sweeper struct {
 	Starter  trigger.WorkflowStarter
 	Updater  feishu.CardUpdater
 	Log      *zerolog.Logger
+	interval time.Duration
 }
 
 // RunOnce performs one inbox, action, and card sweep in deterministic order.
@@ -82,7 +83,7 @@ func (s *Sweeper) Run(ctx context.Context) {
 		ctx = context.Background()
 	}
 	s.runAndLog(ctx)
-	ticker := time.NewTicker(sweepInterval)
+	ticker := time.NewTicker(s.runInterval())
 	defer ticker.Stop()
 	for {
 		select {
@@ -92,6 +93,13 @@ func (s *Sweeper) Run(ctx context.Context) {
 			s.runAndLog(ctx)
 		}
 	}
+}
+
+func (s *Sweeper) runInterval() time.Duration {
+	if s != nil && s.interval > 0 {
+		return s.interval
+	}
+	return sweepInterval
 }
 
 func (s *Sweeper) runAndLog(ctx context.Context) {
