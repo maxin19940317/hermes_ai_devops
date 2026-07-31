@@ -81,7 +81,21 @@ type Listener struct {
 // Run 阻塞运行长连接,直到 ctx 取消(SDK 自带自动重连;
 // Start 返回的错误上抛,由调用方记日志)。
 func (l *Listener) Run(ctx context.Context) error {
-	defer l.Readiness.SetWS(false)
+	var lifecycleMu sync.Mutex
+	active := true
+	setWS := func(up bool) {
+		lifecycleMu.Lock()
+		defer lifecycleMu.Unlock()
+		if active {
+			l.Readiness.SetWS(up)
+		}
+	}
+	defer func() {
+		lifecycleMu.Lock()
+		active = false
+		l.Readiness.SetWS(false)
+		lifecycleMu.Unlock()
+	}()
 	if l.dedup == nil {
 		l.dedup = newDedupCache(10*time.Minute, 1000)
 	}
@@ -113,11 +127,11 @@ func (l *Listener) Run(ctx context.Context) error {
 	}
 	cli := factory(l.AppID, l.AppSecret, listenerClientConfig{
 		Handler:        handler,
-		OnReady:        func() { l.Readiness.SetWS(true) },
-		OnReconnected:  func() { l.Readiness.SetWS(true) },
-		OnReconnecting: func() { l.Readiness.SetWS(false) },
-		OnDisconnected: func() { l.Readiness.SetWS(false) },
-		OnError:        func(error) { l.Readiness.SetWS(false) },
+		OnReady:        func() { setWS(true) },
+		OnReconnected:  func() { setWS(true) },
+		OnReconnecting: func() { setWS(false) },
+		OnDisconnected: func() { setWS(false) },
+		OnError:        func(error) { setWS(false) },
 		LogLevel:       listenerLogLevelError,
 		AutoReconnect:  true,
 	})

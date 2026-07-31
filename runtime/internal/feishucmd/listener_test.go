@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -222,6 +223,98 @@ func TestListenerRunExitClearsReadiness(t *testing.T) {
 				t.Fatal("Run exit must clear WebSocket readiness")
 			}
 		})
+	}
+}
+
+func TestListenerLateLifecycleHooksCannotRestoreReadinessAfterExit(t *testing.T) {
+	readiness := listenerReadiness()
+	stopErr := errors.New("stop")
+	var captured listenerClientConfig
+	l := &Listener{
+		Exec:      &Executor{Whitelist: map[string]bool{}},
+		Readiness: readiness,
+	}
+	l.newClient = func(_, _ string, cfg listenerClientConfig) listenerClient {
+		captured = cfg
+		return fakeListenerClient{start: func(context.Context) error {
+			cfg.OnReady()
+			return stopErr
+		}}
+	}
+
+	if err := l.Run(context.Background()); !errors.Is(err, stopErr) {
+		t.Fatalf("Run error = %v, want %v", err, stopErr)
+	}
+	if readiness.Ready() {
+		t.Fatal("Run exit must clear WebSocket readiness")
+	}
+
+	for name, hook := range map[string]func(){
+		"ready":       captured.OnReady,
+		"reconnected": captured.OnReconnected,
+	} {
+		t.Run(name, func(t *testing.T) {
+			hook()
+			if readiness.Ready() {
+				t.Fatal("late lifecycle hook restored readiness after Run exited")
+			}
+		})
+	}
+}
+
+func TestListenerLifecycleHooksConcurrentWithExitStayInactive(t *testing.T) {
+	readiness := listenerReadiness()
+	stopErr := errors.New("stop")
+	started := make(chan struct{})
+	exit := make(chan struct{})
+	var captured listenerClientConfig
+	l := &Listener{
+		Exec:      &Executor{Whitelist: map[string]bool{}},
+		Readiness: readiness,
+	}
+	l.newClient = func(_, _ string, cfg listenerClientConfig) listenerClient {
+		captured = cfg
+		return fakeListenerClient{start: func(context.Context) error {
+			cfg.OnReady()
+			close(started)
+			<-exit
+			return stopErr
+		}}
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- l.Run(context.Background())
+	}()
+	<-started
+
+	hooks := []func(){
+		captured.OnReady,
+		captured.OnReconnected,
+		captured.OnReconnecting,
+		captured.OnDisconnected,
+		func() { captured.OnError(errors.New("socket")) },
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				hooks[(offset+j)%len(hooks)]()
+			}
+		}(i)
+	}
+	close(exit)
+	if err := <-runDone; !errors.Is(err, stopErr) {
+		t.Fatalf("Run error = %v, want %v", err, stopErr)
+	}
+	wg.Wait()
+
+	captured.OnReady()
+	captured.OnReconnected()
+	if readiness.Ready() {
+		t.Fatal("lifecycle callbacks restored readiness after concurrent Run exit")
 	}
 }
 
