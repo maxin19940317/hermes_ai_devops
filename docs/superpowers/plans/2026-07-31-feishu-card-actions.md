@@ -815,10 +815,16 @@ is worse than a failed write."
   type AcceptRequest struct {
       EventID, Token, WorkflowID, Action, ActorOpenID, OpenMessageID, PayloadDigest string
       ActionToken string             // 接受成功后写入 card_actions.owner
-      TargetInput []byte             // retry 专用
-      TargetWorkflowID string        // retry 专用
       Project, CommitSHA string      // retry 专用,用于水位分配
       PipelineID int
+      // BuildTarget 只在 retry 分支、事务内分配到水位 N 之后调用,
+      // 返回 (canonical target_input JSON, target_workflow_id, error)。
+      //
+      // **它必须是回调而不能是预先算好的 []byte**:target_input 含 Attempt,
+      // 而 Attempt 只有在事务内推进水位后才知道;同时 CHECK 不可延迟,
+      // 完整行必须一次性 INSERT。§5.5 的逐字段断言在这个回调里完成。
+      // 两个约束共同逼出这个形状,不是可选设计。
+      BuildTarget func(attempt int) (targetInput []byte, targetWorkflowID string, err error)
   }
   type AcceptOutcome struct {
       Kind string // accepted | resumed | conflict | legacy
@@ -860,24 +866,34 @@ t.Run("AcceptIsSerializedAndBumpsWaterlineOnce", func(t *testing.T) {
 	seedRunAndArtifacts(t, s, "wf1", "grp/p", "abcd1234", 42, "v1", "v2")
 	before := artifactAttempts(t, s)
 
+	// claim 在 goroutine **之外**完成:claimForTest 内部会 t.Fatalf,
+	// 而从非测试 goroutine 调 t.Fatal 是未定义行为(go vet 会报)。
 	const n = 8
+	toks := make([]string, n)
+	for i := 0; i < n; i++ {
+		toks[i] = claimForTest(t, s, fmt.Sprintf("e%d", i), "wf1", "retry")
+	}
+
 	kinds := make(chan string, n)
+	errs := make(chan error, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			eid := fmt.Sprintf("e%d", i)
-			tok := claimForTest(t, s, eid, "wf1", "retry")
-			out, err := s.CompleteAccept(ctx, acceptReq(eid, tok, "wf1", "retry"))
+			out, err := s.CompleteAccept(ctx, acceptReq(fmt.Sprintf("e%d", i), toks[i], "wf1", "retry"))
 			if err != nil {
-				t.Errorf("accept %d: %v", i, err)
+				errs <- err
 				return
 			}
 			kinds <- out.Kind
 		}(i)
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent accept: %v", err)
+	}
 	close(kinds)
 	accepted := 0
 	for k := range kinds {
@@ -1648,12 +1664,19 @@ func (c *Consumer) ConsumeOne(ctx context.Context, eventID string) error {
 	if err != nil {
 		return c.reject(ctx, row, token, err)
 	}
-	// 构造完整 DeviceTestInput,并逐字段断言它来自 res(§5.5)
-	in := buildTargetInput(res, attempt)   // attempt 由 CompleteAccept 在事务内分配
-	if err := assertTargetInput(in, res); err != nil {
-		return fmt.Errorf("target input mismatch (实现缺陷): %w", err)
+	// target_input 含 Attempt,而 Attempt 只有在事务内推进水位后才知道,
+	// 所以构造与逐字段断言都在回调里、事务内完成(§5.5)。
+	var built wf.DeviceTestInput
+	req := acceptReq(row, token)
+	req.BuildTarget = func(attempt int) ([]byte, string, error) {
+		built = buildTargetInput(res, attempt)
+		if err := assertTargetInput(built, res, attempt); err != nil {
+			return nil, "", fmt.Errorf("target input mismatch (实现缺陷): %w", err)
+		}
+		raw, err := canonicalJSON(built)
+		return raw, built.WorkflowID(), err
 	}
-	out, err := c.Store.CompleteAccept(ctx, acceptReq(row, token, in))
+	out, err := c.Store.CompleteAccept(ctx, req)
 	...
 	// 执行:started=false 是幂等成功
 	_, started, err := c.Starter.StartDeviceTest(ctx, in)
