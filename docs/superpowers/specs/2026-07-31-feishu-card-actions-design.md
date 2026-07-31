@@ -913,6 +913,9 @@ activity 注入、打开 `FEISHU_CARD_ACTIONS_ENABLED`。因为 workflow 侧无�
 - 一次点击 = 一次 claim = 一行 accepted 审计，与回调到达次数无关；
 - ACK 之后进程退出，动作仍由 inbox sweep 完成，不丢失；
 - 接受与业务拒绝各是**一个事务**，重跑不产生重复审计；
+- inbox 只 acquire 一次：`Complete*` 在租约有效期内必须成功（不再自我阻塞）；
+- 可点击卡片必有快照；**快照写不进去就不带按钮发出**；
+- `ignore` 不因 artifact 缺失而失败；
 - 重试的 attempt / target / **完整输入**在接受事务内一次性写入，恢复逐字段复用，
   永不推进水位、永不重新 Resolve；
 - **卡片是 best-effort 最终呈现，数据库动作状态是权威**——不承诺卡片严格收敛（§8.3）；
