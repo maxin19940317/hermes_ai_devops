@@ -53,8 +53,28 @@ func (p *Prober) ProbeDevices(ctx context.Context, busy map[string]bool) []Devic
 		p.logf("probe: adb devices: %v", err)
 		return devices
 	}
-	for _, serial := range adb.ParseDevices(res.Stdout) {
-		devices = append(devices, p.probeDevice(ctx, serial, busy[serial]))
+	transports := adb.ParseTransports(res.Stdout)
+	unknownCount := 0
+	for _, transport := range transports {
+		if transport == "?" {
+			unknownCount++
+		}
+	}
+	for _, transport := range transports {
+		serial := transport
+		if transport == "?" {
+			if unknownCount != 1 {
+				p.logf("probe: %d devices have unusable serial '?'; cannot resolve unambiguously", unknownCount)
+				continue
+			}
+			serial, err = p.getprop(ctx, transport, "ro.serialno")
+			if err != nil || serial == "" || serial == "?" {
+				p.logf("probe: cannot resolve device serial '?' via ro.serialno: %v", err)
+				continue
+			}
+			p.logf("probe: transport '?' resolved to serial %s", serial)
+		}
+		devices = append(devices, p.probeDevice(ctx, transport, serial, busy[serial]))
 	}
 	return devices
 }
@@ -62,26 +82,26 @@ func (p *Prober) ProbeDevices(ctx context.Context, busy map[string]bool) []Devic
 // probeDevice 探测单台设备。getprop 属性集与 executor 预检一致
 // (ro.product.cpu.abi / ro.build.version.release / ro.board.platform,
 // platform 取不到时回退 ro.product.board)。
-func (p *Prober) probeDevice(ctx context.Context, serial string, isBusy bool) DeviceInfo {
+func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBusy bool) DeviceInfo {
 	state := DeviceIdle
 	if isBusy {
 		state = DeviceBusy
 	}
 	dev := DeviceInfo{Serial: serial, State: state}
 
-	abi, err := p.getprop(ctx, serial, "ro.product.cpu.abi")
+	abi, err := p.getprop(ctx, transport, "ro.product.cpu.abi")
 	if err != nil {
 		dev.State = DeviceOffline
 		p.logf("probe: %s unreachable: %v", serial, err)
 		return dev
 	}
 	props := &DeviceProps{ABI: abi}
-	if release, err := p.getprop(ctx, serial, "ro.build.version.release"); err == nil {
+	if release, err := p.getprop(ctx, transport, "ro.build.version.release"); err == nil {
 		props.Android = release
 	}
-	soc, _ := p.getprop(ctx, serial, "ro.board.platform")
+	soc, _ := p.getprop(ctx, transport, "ro.board.platform")
 	if soc == "" {
-		soc, _ = p.getprop(ctx, serial, "ro.product.board")
+		soc, _ = p.getprop(ctx, transport, "ro.product.board")
 	}
 	if alias, ok := p.SOCAliases[soc]; ok {
 		p.logf("probe: %s soc %s -> %s (alias)", serial, soc, alias)
@@ -93,7 +113,7 @@ func (p *Prober) probeDevice(ctx context.Context, serial string, isBusy bool) De
 	}
 	dev.Props = props
 
-	if res, err := p.Runner.Run(ctx, adb.DiskFreeKB(serial, p.deviceWorkdir())); err == nil && res.ExitCode == 0 {
+	if res, err := p.Runner.Run(ctx, adb.DiskFreeKB(transport, p.deviceWorkdir())); err == nil && res.ExitCode == 0 {
 		if kb, err := ParseDFAvailableKB(res.Stdout); err == nil && kb >= 0 {
 			mb := kb / 1024
 			dev.WorkdirFreeMB = &mb

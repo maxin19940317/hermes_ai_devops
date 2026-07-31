@@ -31,9 +31,14 @@ $env:ANDROID_ADB_SERVER_PORT = "5137"
 & $ADB start-server 2>$null | Out-Null
 & $ADB devices -l
 $deviceLines = @(& $ADB devices | Select-String "`tdevice$")
-$usableLines = @($deviceLines | Where-Object { ($_ -split "`t")[0] -ne "?" })
-if ($deviceLines.Count -gt $usableLines.Count) {
-  Write-Host "!! device serial '?' is not addressable and will be ignored; configure USB iSerial, then replug" -ForegroundColor Yellow
+$addressableLines = @($deviceLines | Where-Object { ($_ -split "`t")[0] -ne "?" })
+$unknownLines = @($deviceLines | Where-Object { ($_ -split "`t")[0] -eq "?" })
+$usableLines = @($addressableLines)
+if ($unknownLines.Count -eq 1) {
+  $usableLines += $unknownLines
+  Write-Host "!! one device has transport serial '?'; agent will resolve its logical serial via ro.serialno" -ForegroundColor Yellow
+} elseif ($unknownLines.Count -gt 1) {
+  Write-Host "!! multiple devices have transport serial '?'; they are ambiguous and will be ignored" -ForegroundColor Yellow
 }
 if ($usableLines.Count -lt 1) {
   Write-Host "!! no usable device on 5137; plug in the board / accept authorization, then rerun" -ForegroundColor Red

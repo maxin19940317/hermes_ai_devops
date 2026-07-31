@@ -3,6 +3,8 @@ package reporter
 import (
 	"context"
 	"testing"
+
+	"hermes-devops/agent/internal/adb"
 )
 
 // 设备固件只暴露平台代号(trinket),调度约束用 SoC 型号(QCM6125):
@@ -64,5 +66,29 @@ func TestProbeDevicesCapabilities(t *testing.T) {
 		if len(d.Props.Capabilities) != 0 {
 			t.Errorf("no caps configured, got %v", d.Props.Capabilities)
 		}
+	}
+}
+
+func TestProbeDevicesResolvesQuestionMarkTransport(t *testing.T) {
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\n? device product:trinket transport_id:28\n"},
+		"-s ? shell /system/bin/getprop ro.serialno":              {Stdout: "513cd3de\n"},
+		"-s ? shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-s ? shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
+		"-s ? shell /system/bin/getprop ro.board.platform":        {Stdout: "trinket\n"},
+		"-s ? shell /system/bin/df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+			"/dev/block/dm-0 10000000 100 1000000 1% /data\n"},
+	}}
+	p := &Prober{Runner: runner, SOCAliases: map[string]string{"trinket": "QCM6125"}}
+
+	devices := p.ProbeDevices(context.Background(), map[string]bool{"513cd3de": true})
+	if len(devices) != 1 {
+		t.Fatalf("devices = %+v, want one resolved device", devices)
+	}
+	if devices[0].Serial != "513cd3de" || devices[0].State != DeviceBusy {
+		t.Errorf("resolved device = %+v, want serial 513cd3de and BUSY", devices[0])
+	}
+	if devices[0].Props == nil || devices[0].Props.SOC != "QCM6125" {
+		t.Errorf("resolved props = %+v, want aliased QCM6125", devices[0].Props)
 	}
 }

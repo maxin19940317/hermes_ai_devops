@@ -142,7 +142,9 @@ agent-cli run --package-file smoke-pkg-ok.tar.gz --sha256 <打印的sha256> `
 ## 实机踩坑记录(2026-07-17,trinket/QCM6125 板)
 
 - **USB 传输层 serial 可能为 `?`**:板子的 USB gadget 未设置 iSerial 描述符,
-  `adb devices` 显示 `?`,`-s` 无法寻址(`ro.serialno` 是系统属性,与此无关)。
+  `adb devices` 显示 `?`。仅有一台此类设备时 Agent 会通过
+  `/system/bin/getprop ro.serialno` 取得逻辑 serial,用于心跳上报与上下线日志,
+  ADB 命令仍以 `-s ?` 寻址;多台 `?` 无法消歧时拒绝使用。
   修复:`adb root` 后
   `echo 513cd3de > /config/usb_gadget/g1/strings/0x409/serialnumber`,拔插 USB 生效。
   **重启后丢失**,长期需 init 脚本持久化。启示:设备注册不能假设 USB serial 总是可用。
