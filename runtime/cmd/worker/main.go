@@ -25,6 +25,7 @@
 //	FEISHU_RECEIVE_ID       可选;接收方 open_id(个人单聊)或 chat_id(群)
 //	FEISHU_RECEIVE_ID_TYPE  可选;chat_id|open_id,缺省 chat_id
 //	FEISHU_CMD_WHITELIST    可选;指令 listener 白名单(逗号分隔 open_id),空 = 不启动
+//	FEISHU_CARD_ACTIONS_ENABLED 可选;仅精确 true 启用新按钮,缺省 false
 //	FEISHU_CMD_NL           可选;飞书指令自然语言翻译旁路总开关,缺省 false(灰度)。
 //	                        启用需三者合取:=true && HERMES_ENDPOINT 非空 && FEISHU_CMD_WHITELIST 非空
 //	FEISHU_CMD_NL_TIMEOUT_SEC 可选;/translate 调用超时,缺省 60(不复用 HERMES_TIMEOUT_SEC)
@@ -62,7 +63,6 @@ import (
 	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/presign"
 	"hermes-devops/runtime/internal/store"
-	"hermes-devops/runtime/internal/trigger"
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -85,11 +85,7 @@ func main() {
 	defer stop()
 
 	// ---- store:有 DATABASE_URL 用 Postgres,否则内存(仅开发) ----
-	var st interface {
-		activity.Store
-		callbacks.Store
-		feishucmd.Store
-	}
+	var st workerStore
 	if cfg.DatabaseURL != "" {
 		pg, err := store.OpenPG(ctx, cfg.DatabaseURL)
 		if err != nil {
@@ -145,16 +141,18 @@ func main() {
 	acts.Feishu = feishuSender
 	log.Info().Str("mode", feishuMode).Msg("feishu notify mode")
 
+	cardActions := assembleCardActions(
+		ctx, cfg, st, tc, feishuSender, feishuMode, acts, &log,
+	)
+	cardActions.startSweeper(ctx)
+
 	// ---- 飞书指令 listener:白名单(FEISHU_CMD_WHITELIST)非空才启动;
 	// 需要 app 凭据(与通知共用)——长连接事件订阅只收白名单 open_id 的单聊指令 ----
-	if wl := feishucmd.ParseWhitelist(cfg.Activity.FeishuCmdWhitelist); len(wl) > 0 {
+	if wl := cardActions.Whitelist; len(wl) > 0 {
 		if cfg.Activity.FeishuAppID == "" || cfg.Activity.FeishuAppSecret == "" {
 			log.Warn().Msg("FEISHU_CMD_WHITELIST 已配置但缺 FEISHU_APP_ID/SECRET,listener=disabled")
 		} else {
-			exec := &feishucmd.Executor{
-				Store: st, Sender: feishuSender, Log: &log, Whitelist: wl,
-				Starter: &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
-			}
+			exec := cardActions.Executor
 			// 自然语言翻译旁路(设计文档 §3.1):三个条件合取才启用——
 			// 开关打开、bridge 端点已配、指令 listener 本身已启用。
 			nlReason := ""
@@ -181,9 +179,7 @@ func main() {
 			} else {
 				log.Info().Str("reason", nlReason).Msg("feishu cmd nl=disabled")
 			}
-			listener := &feishucmd.Listener{
-				AppID: cfg.Activity.FeishuAppID, AppSecret: cfg.Activity.FeishuAppSecret, Exec: exec,
-			}
+			listener := cardActions.Listener
 			go func() {
 				if err := listener.Run(ctx); err != nil && ctx.Err() == nil {
 					log.Error().Err(err).Msg("feishu cmd listener exited")

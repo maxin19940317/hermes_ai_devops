@@ -11,13 +11,14 @@ import (
 // Config 是 worker 进程装配所需的全部参数,由环境变量派生(§12.6)。
 // 缺省值取 CLAUDE.md §10;必填项缺失时 fail fast(不吞错误静默用错误配置启动)。
 type Config struct {
-	TemporalAddress    string
-	TemporalTaskQueue  string
-	DatabaseURL        string // 空 → 内存 store(仅开发,重启即失)
-	CallbacksAddr      string
-	VariantsConfigPath string
-	Activity           activity.Config
-	SpecDefaults       activity.SpecDefaults
+	TemporalAddress          string
+	TemporalTaskQueue        string
+	DatabaseURL              string // 空 → 内存 store(仅开发,重启即失)
+	CallbacksAddr            string
+	VariantsConfigPath       string
+	FeishuCardActionsEnabled bool
+	Activity                 activity.Config
+	SpecDefaults             activity.SpecDefaults
 }
 
 // loadConfig 从 getenv(通常是 os.Getenv)派生 Config;
@@ -106,11 +107,12 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	}
 
 	return Config{
-		TemporalAddress:    env("TEMPORAL_ADDRESS", "127.0.0.1:7233"),
-		TemporalTaskQueue:  env("TEMPORAL_TASK_QUEUE", "device-test"), // 须与 trigger 缺省一致
-		DatabaseURL:        getenv("DATABASE_URL"),
-		CallbacksAddr:      env("WORKER_CALLBACKS_ADDR", ":8091"),
-		VariantsConfigPath: variantsPath,
+		TemporalAddress:          env("TEMPORAL_ADDRESS", "127.0.0.1:7233"),
+		TemporalTaskQueue:        env("TEMPORAL_TASK_QUEUE", "device-test"), // 须与 trigger 缺省一致
+		DatabaseURL:              getenv("DATABASE_URL"),
+		CallbacksAddr:            env("WORKER_CALLBACKS_ADDR", ":8091"),
+		VariantsConfigPath:       variantsPath,
+		FeishuCardActionsEnabled: getenv("FEISHU_CARD_ACTIONS_ENABLED") == "true",
 		Activity: activity.Config{
 			LeaseSeconds:         leaseSeconds,
 			QuarantineAfter:      quarantineAfter,

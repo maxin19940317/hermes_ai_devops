@@ -49,6 +49,9 @@ func TestLoadConfigAppliesDefaults(t *testing.T) {
 		cfg.Activity.FeishuReceiveID != "" || cfg.Activity.FeishuReceiveIDType != "" {
 		t.Errorf("飞书应用凭据缺省应为空: %+v", cfg.Activity)
 	}
+	if cfg.FeishuCardActionsEnabled {
+		t.Error("FEISHU_CARD_ACTIONS_ENABLED must default to false")
+	}
 	// §12 Phase 2:HERMES_ENDPOINT 缺省为空 → Analyzer 禁用,规则引擎保底
 	if cfg.Activity.HermesEndpoint != "" {
 		t.Errorf("HermesEndpoint = %q, want empty(禁用 Analyzer)", cfg.Activity.HermesEndpoint)
@@ -68,24 +71,25 @@ func TestLoadConfigAppliesDefaults(t *testing.T) {
 
 func TestLoadConfigOverridesFromEnv(t *testing.T) {
 	cfg, err := loadConfig(lookup(map[string]string{
-		"VARIANTS_CONFIG":        "v.yaml",
-		"CALLBACK_BASE_URL":      "https://runtime.example",
-		"TEMPORAL_ADDRESS":       "temporal.internal:7233",
-		"TEMPORAL_TASK_QUEUE":    "custom-queue",
-		"DATABASE_URL":           "postgres://x/y",
-		"WORKER_CALLBACKS_ADDR":  ":9999",
-		"LEASE_SECONDS":          "60",
-		"QUARANTINE_AFTER":       "5",
-		"MAX_INFRA_RETRIES":      "1",
-		"ARTIFACT_AUTH_TYPE":     "basic",
-		"ARTIFACT_AUTH_TOKEN":    "secret-tok",
-		"ARTIFACT_AUTH_USERNAME": "deploy-user",
-		"FEISHU_WEBHOOK_URL":     "https://open.feishu.cn/hook/x",
-		"FEISHU_APP_ID":          "cli_a1",
-		"FEISHU_APP_SECRET":      "app-sec",
-		"FEISHU_RECEIVE_ID":      "ou_user1",
-		"FEISHU_RECEIVE_ID_TYPE": "open_id",
-		"FEISHU_CMD_WHITELIST":   "ou_a,ou_b",
+		"VARIANTS_CONFIG":             "v.yaml",
+		"CALLBACK_BASE_URL":           "https://runtime.example",
+		"TEMPORAL_ADDRESS":            "temporal.internal:7233",
+		"TEMPORAL_TASK_QUEUE":         "custom-queue",
+		"DATABASE_URL":                "postgres://x/y",
+		"WORKER_CALLBACKS_ADDR":       ":9999",
+		"LEASE_SECONDS":               "60",
+		"QUARANTINE_AFTER":            "5",
+		"MAX_INFRA_RETRIES":           "1",
+		"ARTIFACT_AUTH_TYPE":          "basic",
+		"ARTIFACT_AUTH_TOKEN":         "secret-tok",
+		"ARTIFACT_AUTH_USERNAME":      "deploy-user",
+		"FEISHU_WEBHOOK_URL":          "https://open.feishu.cn/hook/x",
+		"FEISHU_APP_ID":               "cli_a1",
+		"FEISHU_APP_SECRET":           "app-sec",
+		"FEISHU_RECEIVE_ID":           "ou_user1",
+		"FEISHU_RECEIVE_ID_TYPE":      "open_id",
+		"FEISHU_CMD_WHITELIST":        "ou_a,ou_b",
+		"FEISHU_CARD_ACTIONS_ENABLED": "true",
 	}))
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
@@ -124,6 +128,27 @@ func TestLoadConfigOverridesFromEnv(t *testing.T) {
 		cfg.Activity.FeishuReceiveID != "ou_user1" || cfg.Activity.FeishuReceiveIDType != "open_id" ||
 		cfg.Activity.FeishuCmdWhitelist != "ou_a,ou_b" {
 		t.Errorf("feishu app creds = %+v", cfg.Activity)
+	}
+	if !cfg.FeishuCardActionsEnabled {
+		t.Error("FEISHU_CARD_ACTIONS_ENABLED=true must enable card actions")
+	}
+}
+
+func TestFeishuCardActionsEnabledRequiresExactTrue(t *testing.T) {
+	for _, value := range []string{"TRUE", "1", "yes", "false"} {
+		t.Run(value, func(t *testing.T) {
+			cfg, err := loadConfig(lookup(map[string]string{
+				"VARIANTS_CONFIG":             "v.yaml",
+				"CALLBACK_BASE_URL":           "https://runtime.example",
+				"FEISHU_CARD_ACTIONS_ENABLED": value,
+			}))
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if cfg.FeishuCardActionsEnabled {
+				t.Fatalf("value %q must not enable card actions", value)
+			}
+		})
 	}
 }
 

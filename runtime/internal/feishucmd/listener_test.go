@@ -1,10 +1,261 @@
 package feishucmd
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
+
+	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+
+	"hermes-devops/runtime/internal/cardaction"
+	"hermes-devops/runtime/internal/store"
 )
+
+type fakeListenerClient struct {
+	start func(context.Context) error
+}
+
+func (c fakeListenerClient) Start(ctx context.Context) error {
+	return c.start(ctx)
+}
+
+func listenerReadiness() *cardaction.Readiness {
+	return cardaction.NewReadiness(cardaction.ReadinessConfig{
+		Enabled:           true,
+		WhitelistNonEmpty: true,
+		SenderIsApp:       true,
+		HandlerWired:      true,
+	})
+}
+
+func listenerCardPayload(t *testing.T) []byte {
+	t.Helper()
+	tenant := "tenant_a"
+	raw, err := json.Marshal(&callback.CardActionTriggerEvent{
+		EventV2Base: &larkevent.EventV2Base{
+			Schema: "2.0",
+			Header: &larkevent.EventHeader{
+				EventID:   "evt_listener",
+				EventType: "card.action.trigger",
+				AppID:     "cli_a",
+				TenantKey: tenant,
+			},
+		},
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{TenantKey: &tenant, OpenID: "ou_allowed"},
+			Action: &callback.CallBackAction{
+				Tag: "button",
+				Value: map[string]any{
+					"action":             "retry",
+					"source_workflow_id": "wf_source",
+				},
+			},
+			Host:    "im_message",
+			Context: &callback.Context{OpenMessageID: "om_1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal card event: %v", err)
+	}
+	return raw
+}
+
+func listenerEventPayload(t *testing.T, eventType string) []byte {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"schema": "2.0",
+		"header": map[string]any{"event_type": eventType},
+		"event":  map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("marshal %s event: %v", eventType, err)
+	}
+	return raw
+}
+
+func TestListenerRegistersCardAndMessageHandlers(t *testing.T) {
+	st := store.NewMemStore()
+	readiness := listenerReadiness()
+	card := &cardaction.Handler{
+		Store:     st,
+		Readiness: readiness,
+		Whitelist: map[string]bool{"ou_allowed": true},
+		AppID:     "cli_a",
+	}
+	startErr := errors.New("listener stopped")
+	l := &Listener{
+		AppID:     "cli_a",
+		AppSecret: "secret",
+		Exec:      &Executor{Whitelist: map[string]bool{}},
+		Card:      card,
+		Readiness: readiness,
+	}
+	l.newClient = func(appID, appSecret string, cfg listenerClientConfig) listenerClient {
+		if appID != "cli_a" || appSecret != "secret" {
+			t.Fatalf("credentials = %q/%q", appID, appSecret)
+		}
+		return fakeListenerClient{start: func(ctx context.Context) error {
+			cfg.OnReady()
+			got, err := cfg.Handler.Do(ctx, listenerCardPayload(t))
+			if err != nil {
+				t.Fatalf("dispatch card action: %v", err)
+			}
+			resp, ok := got.(*callback.CardActionTriggerResponse)
+			if !ok || resp.Toast == nil || resp.Toast.Content != "已收到，正在处理" {
+				t.Fatalf("card response = %#v", got)
+			}
+			for _, eventType := range []string{
+				"im.message.receive_v1",
+				"im.message.message_read_v1",
+			} {
+				if _, err := cfg.Handler.Do(ctx, listenerEventPayload(t, eventType)); err != nil {
+					t.Fatalf("dispatch %s: %v", eventType, err)
+				}
+			}
+			return startErr
+		}}
+	}
+
+	if err := l.Run(context.Background()); !errors.Is(err, startErr) {
+		t.Fatalf("Run error = %v, want %v", err, startErr)
+	}
+	row, err := st.GetInbox(context.Background(), "evt_listener")
+	if err != nil {
+		t.Fatalf("GetInbox: %v", err)
+	}
+	if row.Disposition != "accepted" || row.State != "received" {
+		t.Fatalf("persisted inbox = %#v", row)
+	}
+}
+
+func TestListenerLifecycleHooksUpdateReadiness(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+		call func(listenerClientConfig)
+	}{
+		{name: "ready", want: true, call: func(c listenerClientConfig) { c.OnReady() }},
+		{name: "reconnected", want: true, call: func(c listenerClientConfig) { c.OnReconnected() }},
+		{name: "reconnecting", call: func(c listenerClientConfig) { c.OnReconnecting() }},
+		{name: "disconnected", call: func(c listenerClientConfig) { c.OnDisconnected() }},
+		{name: "error", call: func(c listenerClientConfig) { c.OnError(errors.New("socket")) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			readiness := listenerReadiness()
+			if !tt.want {
+				readiness.SetWS(true)
+			}
+			stopErr := errors.New("stop")
+			observed := false
+			l := &Listener{
+				Exec:      &Executor{Whitelist: map[string]bool{}},
+				Readiness: readiness,
+			}
+			l.newClient = func(_, _ string, cfg listenerClientConfig) listenerClient {
+				return fakeListenerClient{start: func(context.Context) error {
+					tt.call(cfg)
+					observed = readiness.Ready()
+					return stopErr
+				}}
+			}
+			if err := l.Run(context.Background()); !errors.Is(err, stopErr) {
+				t.Fatalf("Run error = %v", err)
+			}
+			if observed != tt.want {
+				t.Fatalf("readiness in %s hook = %v, want %v", tt.name, observed, tt.want)
+			}
+		})
+	}
+}
+
+func TestListenerRunExitClearsReadiness(t *testing.T) {
+	tests := []struct {
+		name  string
+		start func(context.Context, listenerClientConfig) error
+	}{
+		{
+			name: "start error",
+			start: func(_ context.Context, cfg listenerClientConfig) error {
+				cfg.OnReady()
+				return errors.New("start failed")
+			},
+		},
+		{
+			name: "cancellation",
+			start: func(ctx context.Context, cfg listenerClientConfig) error {
+				cfg.OnReady()
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			readiness := listenerReadiness()
+			ctx, cancel := context.WithCancel(context.Background())
+			if tt.name == "cancellation" {
+				cancel()
+			} else {
+				defer cancel()
+			}
+			l := &Listener{
+				Exec:      &Executor{Whitelist: map[string]bool{}},
+				Readiness: readiness,
+			}
+			l.newClient = func(_, _ string, cfg listenerClientConfig) listenerClient {
+				return fakeListenerClient{start: func(ctx context.Context) error {
+					err := tt.start(ctx, cfg)
+					if !readiness.Ready() {
+						t.Fatal("readiness should be true before Start exits")
+					}
+					return err
+				}}
+			}
+			_ = l.Run(ctx)
+			if readiness.Ready() {
+				t.Fatal("Run exit must clear WebSocket readiness")
+			}
+		})
+	}
+}
+
+func TestListenerNilCardAndReadinessPreserveMessageListener(t *testing.T) {
+	stopErr := errors.New("stop")
+	l := &Listener{Exec: &Executor{Whitelist: map[string]bool{}}}
+	l.newClient = func(_, _ string, cfg listenerClientConfig) listenerClient {
+		return fakeListenerClient{start: func(ctx context.Context) error {
+			cfg.OnReady()
+			cfg.OnReconnected()
+			cfg.OnReconnecting()
+			cfg.OnDisconnected()
+			cfg.OnError(errors.New("socket"))
+			for _, eventType := range []string{
+				"im.message.receive_v1",
+				"im.message.message_read_v1",
+			} {
+				if _, err := cfg.Handler.Do(ctx, listenerEventPayload(t, eventType)); err != nil {
+					t.Fatalf("dispatch %s: %v", eventType, err)
+				}
+			}
+			if _, err := cfg.Handler.Do(ctx, listenerCardPayload(t)); err == nil {
+				t.Fatal("nil Card must not register card.action.trigger")
+			}
+			if cfg.LogLevel != listenerLogLevelError || !cfg.AutoReconnect {
+				t.Fatalf("client config = %+v", cfg)
+			}
+			return stopErr
+		}}
+	}
+	if err := l.Run(context.Background()); !errors.Is(err, stopErr) {
+		t.Fatalf("Run error = %v, want %v", err, stopErr)
+	}
+}
 
 func TestDedupCache(t *testing.T) {
 	now := time.Date(2026, 7, 29, 1, 40, 0, 0, time.UTC)

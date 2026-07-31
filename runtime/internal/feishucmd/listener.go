@@ -10,22 +10,78 @@ import (
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
+
+	"hermes-devops/runtime/internal/cardaction"
 )
 
-// Listener 是飞书长连接(WebSocket)事件接收的最薄封装(不可单测,
-// 逻辑全在 Executor):im.message.receive_v1 事件 → 提取 sender open_id
-// 与文本 → Executor.HandleMessage。
+const listenerLogLevelError = larkcore.LogLevelError
+
+type listenerClient interface {
+	Start(context.Context) error
+}
+
+type listenerClientConfig struct {
+	Handler        *dispatcher.EventDispatcher
+	OnReady        func()
+	OnError        func(error)
+	OnReconnecting func()
+	OnReconnected  func()
+	OnDisconnected func()
+	LogLevel       larkcore.LogLevel
+	AutoReconnect  bool
+}
+
+type sdkListenerClient struct {
+	client *larkws.Client
+}
+
+func (c *sdkListenerClient) Start(ctx context.Context) error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.client.Start(ctx)
+	}()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		c.client.Close()
+		return ctx.Err()
+	}
+}
+
+func newListenerClient(
+	appID, appSecret string,
+	cfg listenerClientConfig,
+) listenerClient {
+	return &sdkListenerClient{client: larkws.NewClient(appID, appSecret,
+		larkws.WithEventHandler(cfg.Handler),
+		larkws.WithOnReady(cfg.OnReady),
+		larkws.WithOnError(cfg.OnError),
+		larkws.WithOnReconnecting(cfg.OnReconnecting),
+		larkws.WithOnReconnected(cfg.OnReconnected),
+		larkws.WithOnDisconnected(cfg.OnDisconnected),
+		larkws.WithLogLevel(cfg.LogLevel),
+		larkws.WithAutoReconnect(cfg.AutoReconnect),
+	)}
+}
+
+// Listener 是飞书长连接(WebSocket)事件接收的最薄封装:
+// 普通消息交给 Executor,卡片按钮交给持久化 Handler。
 type Listener struct {
 	AppID     string
 	AppSecret string
 	Exec      *Executor
+	Card      *cardaction.Handler
+	Readiness *cardaction.Readiness
 
-	dedup *dedupCache
+	dedup     *dedupCache
+	newClient func(appID, appSecret string, cfg listenerClientConfig) listenerClient
 }
 
 // Run 阻塞运行长连接,直到 ctx 取消(SDK 自带自动重连;
 // Start 返回的错误上抛,由调用方记日志)。
 func (l *Listener) Run(ctx context.Context) error {
+	defer l.Readiness.SetWS(false)
 	if l.dedup == nil {
 		l.dedup = newDedupCache(10*time.Minute, 1000)
 	}
@@ -44,14 +100,27 @@ func (l *Listener) Run(ctx context.Context) error {
 			// 用 Run 的生命周期 ctx 而非回调 ctx(回调返回即取消)。
 			go l.Exec.HandleMessage(ctx, openID, text)
 			return nil
-		}).
-		// 消息已读回执:无业务用途,注册空操作避免 SDK 刷 "not found handler" 错误日志。
+		})
+	if l.Card != nil {
+		handler.OnP2CardActionTrigger(l.Card.OnCardAction)
+	}
+	// 消息已读回执:无业务用途,注册空操作避免 SDK 刷 "not found handler" 错误日志。
+	handler.
 		OnP2MessageReadV1(func(_ context.Context, _ *larkim.P2MessageReadV1) error { return nil })
-	cli := larkws.NewClient(l.AppID, l.AppSecret,
-		larkws.WithEventHandler(handler),
-		larkws.WithLogLevel(larkcore.LogLevelError),
-		larkws.WithAutoReconnect(true),
-	)
+	factory := l.newClient
+	if factory == nil {
+		factory = newListenerClient
+	}
+	cli := factory(l.AppID, l.AppSecret, listenerClientConfig{
+		Handler:        handler,
+		OnReady:        func() { l.Readiness.SetWS(true) },
+		OnReconnected:  func() { l.Readiness.SetWS(true) },
+		OnReconnecting: func() { l.Readiness.SetWS(false) },
+		OnDisconnected: func() { l.Readiness.SetWS(false) },
+		OnError:        func(error) { l.Readiness.SetWS(false) },
+		LogLevel:       listenerLogLevelError,
+		AutoReconnect:  true,
+	})
 	return cli.Start(ctx)
 }
 
