@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,7 +14,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"hermes-devops/runtime/internal/feishu"
-	"hermes-devops/runtime/internal/rules"
+	"hermes-devops/runtime/internal/rerun"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -337,78 +336,44 @@ func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
 	}
 
 	workflowID := args[0]
-	source, err := e.Store.GetWorkflowRun(ctx, workflowID)
-	if errors.Is(err, store.ErrWorkflowRunNotFound) {
-		return fmt.Sprintf("查无权威 workflow 运行记录: %s", workflowID), nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("get workflow run %s: %w", workflowID, err)
-	}
-	closed, err := e.Starter.WorkflowClosed(ctx, workflowID)
-	if err != nil {
-		return fmt.Sprintf("检查 workflow 状态失败: %v", err), nil
-	}
-	if !closed {
-		return fmt.Sprintf("workflow 尚未结束: %s", workflowID), nil
-	}
-
 	explicit := len(args) == 2
-	targets := []string{}
+	variant := ""
 	if explicit {
-		targets = append(targets, args[1])
-	} else {
-		out, err := e.Starter.WorkflowResult(ctx, workflowID)
-		if err != nil {
-			return fmt.Sprintf("读取 workflow 结果失败: %v", err), nil
-		}
-		seen := make(map[string]struct{})
-		for _, summary := range out.Tasks {
-			if summary.Verdict == string(rules.VerdictPassed) || summary.Verdict == wf.VerdictSkipped ||
-				summary.Variant == "" {
-				continue
-			}
-			seen[summary.Variant] = struct{}{}
-		}
-		for variant := range seen {
-			targets = append(targets, variant)
-		}
-		sort.Strings(targets)
-		if len(targets) == 0 {
-			return fmt.Sprintf("workflow 没有失败变体: %s", workflowID), nil
-		}
+		variant = args[1]
 	}
 
-	arts, err := e.Store.ListArtifacts(ctx, source.Project, source.CommitSHA, source.PipelineID)
+	resolver := rerun.Resolver{Store: e.Store, Starter: e.Starter}
+	res, err := resolver.ResolveRetry(ctx, workflowID, variant)
 	if err != nil {
+		var reason *rerun.RejectReason
+		if errors.As(err, &reason) {
+			switch reason.Code {
+			case "NotAuthoritative":
+				return fmt.Sprintf("查无权威 workflow 运行记录: %s", reason.WorkflowID), nil
+			case "StillRunning":
+				return fmt.Sprintf("workflow 尚未结束: %s", reason.WorkflowID), nil
+			case "CheckFailed":
+				return fmt.Sprintf("检查 workflow 状态失败: %s", reason.WorkflowID), nil
+			case "ResultUnreadable":
+				return fmt.Sprintf("读取 workflow 结果失败: %s", reason.WorkflowID), nil
+			case "NoFailedVariants":
+				return fmt.Sprintf("workflow 没有失败变体: %s", reason.WorkflowID), nil
+			case "VariantNotMember":
+				return fmt.Sprintf("变体 %s 不属于源 workflow %s", reason.Variant, reason.WorkflowID), nil
+			case "ArtifactMissing":
+				return fmt.Sprintf("变体 %s 的 artifact 数量为 %d，要求恰好 1 个", reason.Variant, reason.Count), nil
+			}
+		}
 		return "", err
 	}
-	sourceVariants := make(map[string]struct{}, len(source.Variants))
-	for _, variant := range source.Variants {
-		sourceVariants[variant] = struct{}{}
-	}
-	byVariant := make(map[string][]store.Artifact, len(arts))
-	for _, art := range arts {
-		byVariant[art.Variant] = append(byVariant[art.Variant], art)
-	}
-	packages := make([]wf.PackageRef, 0, len(targets))
-	for _, variant := range targets {
-		if _, ok := sourceVariants[variant]; !ok {
-			return fmt.Sprintf("变体 %s 不属于源 workflow %s", variant, workflowID), nil
-		}
-		matches := byVariant[variant]
-		if len(matches) != 1 {
-			return fmt.Sprintf("变体 %s 的 artifact 数量为 %d，要求恰好 1 个", variant, len(matches)), nil
-		}
-		packages = append(packages, pkgRef(matches[0]))
-	}
+	source := res.Run
 
 	in := wf.DeviceTestInput{
 		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
 		Version: source.Version, RuleVersion: source.RuleVersion,
-		SourceWorkflowID: source.WorkflowID, Packages: packages,
+		SourceWorkflowID: source.WorkflowID, Packages: res.Packages,
 	}
 	if explicit {
-		variant := targets[0]
 		n, err := e.Store.NextWorkflowAttempt(
 			ctx, source.Project, source.CommitSHA, source.PipelineID, variant,
 		)
@@ -445,13 +410,6 @@ func isPositiveInt(s string) bool {
 func validRerunArg(s string) bool {
 	return s != "" && utf8.ValidString(s) && utf8.RuneCountInString(s) <= 512 &&
 		strings.IndexFunc(s, unicode.IsSpace) < 0
-}
-
-func pkgRef(a store.Artifact) wf.PackageRef {
-	return wf.PackageRef{
-		Variant: a.Variant, URL: a.URL, SHA256: a.SHA256,
-		Size: a.Size, ManifestDigest: a.ManifestDigest,
-	}
 }
 
 // unquarantine [device_id]:不带 id 时单台直接操作,多台列出要求指定。
