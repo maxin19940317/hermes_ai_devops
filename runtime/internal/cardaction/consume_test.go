@@ -1,0 +1,479 @@
+package cardaction
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"testing"
+	"time"
+
+	"go.temporal.io/api/serviceerror"
+
+	"hermes-devops/runtime/internal/rerun"
+	"hermes-devops/runtime/internal/store"
+	wf "hermes-devops/runtime/internal/workflow"
+)
+
+type consumerTestStore struct {
+	inbox          map[string]store.InboxRow
+	actions        map[string]store.CardAction
+	messages       map[string]store.MessageClaim
+	claimTokens    []string
+	acceptCalls    int
+	rejectCalls    int
+	finalizeCalls  int
+	businessWrites int
+	attemptCalls   int
+	acceptKind     string
+	finalizeOK     bool
+	finalizeErr    error
+}
+
+func newConsumerTestStore(action string) *consumerTestStore {
+	return &consumerTestStore{
+		inbox: map[string]store.InboxRow{
+			"e1": {
+				EventID: "e1", Disposition: "accepted", AckToast: "已收到，正在处理",
+				Action: action, WorkflowID: "wf1", ActorOpenID: "ou_1",
+				OpenMessageID: "om_1", PayloadDigest: "digest", State: "received",
+			},
+		},
+		actions:    make(map[string]store.CardAction),
+		messages:   make(map[string]store.MessageClaim),
+		acceptKind: "accepted",
+		finalizeOK: true,
+	}
+}
+
+func (s *consumerTestStore) ClaimInbox(
+	_ context.Context, eventID, token string, lease time.Duration,
+) (*store.InboxRow, error) {
+	s.claimTokens = append(s.claimTokens, token)
+	row, ok := s.inbox[eventID]
+	if !ok || row.State != "received" || row.Owner != "" || lease <= 0 {
+		return nil, fmt.Errorf("%w: %s", store.ErrInboxNotClaimable, eventID)
+	}
+	now := time.Now().UTC()
+	expires := now.Add(lease)
+	row.Owner = token
+	row.LeaseExpiresAt = &expires
+	row.Attempts++
+	s.inbox[eventID] = row
+	copy := row
+	return &copy, nil
+}
+
+func (s *consumerTestStore) CompleteAccept(
+	_ context.Context, req store.AcceptRequest,
+) (*store.AcceptOutcome, error) {
+	s.acceptCalls++
+	row, ok := s.inbox[req.EventID]
+	if !ok || row.Owner != req.Token {
+		return &store.AcceptOutcome{Kind: "lost"}, nil
+	}
+	if s.acceptKind != "accepted" {
+		row.State = "processed"
+		s.inbox[req.EventID] = row
+		action := s.actions[req.WorkflowID]
+		return &store.AcceptOutcome{
+			Kind: s.acceptKind, ActionToken: req.ActionToken, Attempt: action.Attempt,
+		}, nil
+	}
+
+	action := store.CardAction{
+		WorkflowID: req.WorkflowID, Action: req.Action, ActorOpenID: req.ActorOpenID,
+		State: "succeeded", Revision: 1,
+	}
+	out := &store.AcceptOutcome{Kind: "accepted"}
+	if req.Action == "retry" {
+		s.attemptCalls++
+		raw, targetID, err := req.BuildTarget(1)
+		if err != nil {
+			return nil, err
+		}
+		action.State = "pending"
+		action.Owner = req.ActionToken
+		action.TargetInput = append([]byte(nil), raw...)
+		action.TargetWorkflowID = targetID
+		action.Attempt = 1
+		out.ActionToken = req.ActionToken
+		out.Attempt = 1
+	}
+	s.actions[req.WorkflowID] = action
+	s.messages[req.WorkflowID+"\x00"+req.OpenMessageID] = store.MessageClaim{
+		WorkflowID: req.WorkflowID, OpenMessageID: req.OpenMessageID,
+		RenderKind: "action", ButtonsMode: "none", DesiredRevision: 1,
+	}
+	row.State = "processed"
+	s.inbox[req.EventID] = row
+	s.businessWrites++
+	return out, nil
+}
+
+func (s *consumerTestStore) CompleteReject(
+	_ context.Context, eventID, token string, render store.RejectRender,
+) error {
+	s.rejectCalls++
+	row, ok := s.inbox[eventID]
+	if !ok || row.Owner != token {
+		return nil
+	}
+	buttons := map[string]string{
+		"StillRunning":     "both",
+		"ResultUnreadable": "both",
+		"ArtifactMissing":  "both",
+		"NotAuthoritative": "none",
+		"NoFailedVariants": "none",
+	}[render.Code]
+	if buttons == "" {
+		return fmt.Errorf("unsupported reject code %q", render.Code)
+	}
+	s.messages[row.WorkflowID+"\x00"+row.OpenMessageID] = store.MessageClaim{
+		WorkflowID: row.WorkflowID, OpenMessageID: row.OpenMessageID,
+		RenderKind: "rejection", RejectionReason: render.RejectionReason,
+		ButtonsMode: buttons, DesiredRevision: 1,
+	}
+	row.State = "processed"
+	s.inbox[eventID] = row
+	s.businessWrites++
+	return nil
+}
+
+func (s *consumerTestStore) FinalizeAction(
+	_ context.Context, workflowID, token, state, lastErr string,
+) (bool, error) {
+	s.finalizeCalls++
+	if s.finalizeErr != nil {
+		return false, s.finalizeErr
+	}
+	if !s.finalizeOK {
+		return false, nil
+	}
+	action := s.actions[workflowID]
+	if action.Owner != token || action.State != "pending" {
+		return false, nil
+	}
+	action.State = state
+	action.LastError = lastErr
+	action.Owner = ""
+	s.actions[workflowID] = action
+	return true, nil
+}
+
+type fakeConsumerResolver struct {
+	resolution        *rerun.Resolution
+	failureRun        *rerun.FailureRun
+	err               error
+	failureRunCalls   int
+	resolveRetryCalls int
+}
+
+func (r *fakeConsumerResolver) ResolveFailureRun(
+	_ context.Context, _ string,
+) (*rerun.FailureRun, error) {
+	r.failureRunCalls++
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.failureRun, nil
+}
+
+func (r *fakeConsumerResolver) ResolveRetry(
+	_ context.Context, _ string, variant string,
+) (*rerun.Resolution, error) {
+	r.resolveRetryCalls++
+	if variant != "" {
+		return nil, fmt.Errorf("variant = %q, want empty", variant)
+	}
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.resolution, nil
+}
+
+type fakeConsumerStarter struct {
+	started    bool
+	err        error
+	startCalls int
+	inputs     []wf.DeviceTestInput
+}
+
+func (s *fakeConsumerStarter) StartDeviceTest(
+	_ context.Context, in wf.DeviceTestInput,
+) (string, bool, error) {
+	s.startCalls++
+	s.inputs = append(s.inputs, in)
+	if s.err != nil {
+		return "", false, s.err
+	}
+	return in.WorkflowID(), s.started, nil
+}
+
+func fullResolution() *rerun.Resolution {
+	return &rerun.Resolution{
+		Run: store.WorkflowRun{
+			WorkflowID: "wf1", Project: "grp/p", CommitSHA: "abcd1234",
+			PipelineID: 42, Version: "1.2.3", RuleVersion: "rules-v1",
+			Scope: "failed", Variants: []string{"v1"},
+		},
+		Targets: []string{"v1"},
+		Packages: []wf.PackageRef{{
+			Variant: "v1", PackageFile: "v1.tar.gz", URL: "https://registry/v1",
+			SHA256: "sha-v1", Size: 7, ManifestDigest: "manifest-v1",
+		}},
+		Scope: "failed",
+	}
+}
+
+func newTestConsumer(action string) (*Consumer, *consumerTestStore, *fakeConsumerResolver, *fakeConsumerStarter) {
+	st := newConsumerTestStore(action)
+	resolution := fullResolution()
+	resolver := &fakeConsumerResolver{
+		resolution: resolution,
+		failureRun: &rerun.FailureRun{Run: resolution.Run, Targets: resolution.Targets},
+	}
+	starter := &fakeConsumerStarter{started: true}
+	return &Consumer{Store: st, Resolver: resolver, Starter: starter}, st, resolver, starter
+}
+
+func TestTargetInputAssertedFieldByField(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*wf.DeviceTestInput)
+	}{
+		{"Version", func(in *wf.DeviceTestInput) { in.Version = "" }},
+		{"RuleVersion", func(in *wf.DeviceTestInput) { in.RuleVersion = "" }},
+		{"Packages", func(in *wf.DeviceTestInput) { in.Packages = nil }},
+		{"SourceWorkflowID", func(in *wf.DeviceTestInput) { in.SourceWorkflowID = "" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, st, _, starter := newTestConsumer("retry")
+			c.mutateInput = tt.mutate
+
+			err := c.ConsumeOne(context.Background(), "e1")
+			if err == nil {
+				t.Fatalf("缺 %s 的 target_input 必须被拒", tt.name)
+			}
+			if len(st.actions) != 0 || st.businessWrites != 0 {
+				t.Fatalf("断言失败后业务写入: actions=%d writes=%d", len(st.actions), st.businessWrites)
+			}
+			if starter.startCalls != 0 {
+				t.Fatalf("StartDeviceTest calls = %d, want 0", starter.startCalls)
+			}
+		})
+	}
+}
+
+func TestResolutionSourceMustMatchClaimedInbox(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("retry")
+	resolver.resolution.Run.WorkflowID = "wf_other"
+	err := c.ConsumeOne(context.Background(), "e1")
+	if err == nil {
+		t.Fatal("mismatched resolver source must be rejected")
+	}
+	if len(st.actions) != 0 || st.businessWrites != 0 || starter.startCalls != 0 {
+		t.Fatalf(
+			"source mismatch wrote actions=%d writes=%d starts=%d",
+			len(st.actions), st.businessWrites, starter.startCalls,
+		)
+	}
+}
+
+func TestStartedFalseIsIdempotentSuccess(t *testing.T) {
+	c, st, _, starter := newTestConsumer("retry")
+	starter.started = false
+
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("ConsumeOne: %v", err)
+	}
+	if got := st.actions["wf1"].State; got != "succeeded" {
+		t.Fatalf("state = %q, want succeeded", got)
+	}
+	if st.finalizeCalls != 1 {
+		t.Fatalf("FinalizeAction calls = %d, want 1", st.finalizeCalls)
+	}
+}
+
+func TestCrashBetweenAckAndClaimIsRecovered(t *testing.T) {
+	c, st, _, _ := newTestConsumer("retry")
+	if row := st.inbox["e1"]; row.State != "received" || row.Owner != "" {
+		t.Fatalf("precondition inbox = %#v", row)
+	}
+
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("sweep 接管后必须能完成: %v", err)
+	}
+	if st.actions["wf1"].State != "succeeded" {
+		t.Fatalf("动作丢失: %#v", st.actions["wf1"])
+	}
+}
+
+func TestRejectionRendersOnCard(t *testing.T) {
+	for _, code := range []string{"NotAuthoritative", "StillRunning", "NoFailedVariants"} {
+		t.Run(code, func(t *testing.T) {
+			c, st, resolver, starter := newTestConsumer("retry")
+			resolver.err = &rerun.RejectReason{Code: code, WorkflowID: "wf1"}
+
+			if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+				t.Fatalf("ConsumeOne: %v", err)
+			}
+			if st.attemptCalls != 0 || starter.startCalls != 0 {
+				t.Fatalf("拒绝路径调用 attempt=%d start=%d", st.attemptCalls, starter.startCalls)
+			}
+			message := st.messages["wf1\x00om_1"]
+			if message.RenderKind != "rejection" || message.RejectionReason == "" {
+				t.Fatalf("message = %#v", message)
+			}
+			if st.rejectCalls != 1 || st.acceptCalls != 0 {
+				t.Fatalf("complete calls: reject=%d accept=%d", st.rejectCalls, st.acceptCalls)
+			}
+		})
+	}
+}
+
+func TestButtonsModeByReason(t *testing.T) {
+	tests := []struct {
+		code string
+		want string
+	}{
+		{"StillRunning", "both"},
+		{"ResultUnreadable", "both"},
+		{"ArtifactMissing", "both"},
+		{"NotAuthoritative", "none"},
+		{"NoFailedVariants", "none"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.code, func(t *testing.T) {
+			c, st, resolver, _ := newTestConsumer("retry")
+			resolver.err = &rerun.RejectReason{
+				Code: tt.code, WorkflowID: "wf1", Variant: "v1", Count: 0,
+				Err: errors.New("unreadable"),
+			}
+			if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+				t.Fatalf("ConsumeOne: %v", err)
+			}
+			if got := st.messages["wf1\x00om_1"].ButtonsMode; got != tt.want {
+				t.Fatalf("buttons_mode = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIgnoreUsesFailureRunOnlyAndDoesNotStart(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("ignore")
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("ConsumeOne: %v", err)
+	}
+	if resolver.failureRunCalls != 1 || resolver.resolveRetryCalls != 0 {
+		t.Fatalf("resolver calls failure=%d retry=%d", resolver.failureRunCalls, resolver.resolveRetryCalls)
+	}
+	if starter.startCalls != 0 || st.attemptCalls != 0 {
+		t.Fatalf("ignore calls start=%d attempt=%d", starter.startCalls, st.attemptCalls)
+	}
+	if action := st.actions["wf1"]; action.State != "succeeded" ||
+		action.TargetWorkflowID != "" || len(action.TargetInput) != 0 {
+		t.Fatalf("ignore action = %#v", action)
+	}
+}
+
+func TestRetryStartsExactPinnedInput(t *testing.T) {
+	c, st, _, starter := newTestConsumer("retry")
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("ConsumeOne: %v", err)
+	}
+	if len(starter.inputs) != 1 {
+		t.Fatalf("start inputs = %d, want 1", len(starter.inputs))
+	}
+	var pinned wf.DeviceTestInput
+	if err := json.Unmarshal(st.actions["wf1"].TargetInput, &pinned); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(starter.inputs[0], pinned) {
+		t.Fatalf("started input = %#v, pinned = %#v", starter.inputs[0], pinned)
+	}
+}
+
+func TestClaimUsesFresh128BitHexToken(t *testing.T) {
+	c1, st1, _, _ := newTestConsumer("ignore")
+	c2, st2, _, _ := newTestConsumer("ignore")
+	if err := c1.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatal(err)
+	}
+	tokens := []string{st1.claimTokens[0], st2.claimTokens[0]}
+	for _, token := range tokens {
+		raw, err := hex.DecodeString(token)
+		if err != nil || len(raw) != 16 {
+			t.Fatalf("token %q = %x, %v; want 128-bit hex", token, raw, err)
+		}
+	}
+	if tokens[0] == tokens[1] {
+		t.Fatalf("fencing token reused: %q", tokens[0])
+	}
+}
+
+func TestNonClaimableIsBenignNoop(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("retry")
+	row := st.inbox["e1"]
+	row.State = "processed"
+	st.inbox["e1"] = row
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("ConsumeOne: %v", err)
+	}
+	if resolver.resolveRetryCalls != 0 || starter.startCalls != 0 || st.acceptCalls != 0 {
+		t.Fatal("non-claimable event must have no downstream side effects")
+	}
+}
+
+func TestNonExecutingAcceptOutcomesDoNotStart(t *testing.T) {
+	for _, kind := range []string{"conflict", "legacy", "lost"} {
+		t.Run(kind, func(t *testing.T) {
+			c, st, _, starter := newTestConsumer("retry")
+			st.acceptKind = kind
+			if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+				t.Fatalf("ConsumeOne: %v", err)
+			}
+			if starter.startCalls != 0 || st.finalizeCalls != 0 {
+				t.Fatalf("%s calls start=%d finalize=%d", kind, starter.startCalls, st.finalizeCalls)
+			}
+		})
+	}
+}
+
+func TestTemporaryStarterErrorLeavesActionPending(t *testing.T) {
+	c, st, _, starter := newTestConsumer("retry")
+	starter.err = serviceerror.NewUnavailable("temporal unavailable")
+	err := c.ConsumeOne(context.Background(), "e1")
+	if err == nil {
+		t.Fatal("temporary starter error must propagate")
+	}
+	if st.actions["wf1"].State != "pending" || st.finalizeCalls != 0 {
+		t.Fatalf("action=%#v finalizeCalls=%d", st.actions["wf1"], st.finalizeCalls)
+	}
+}
+
+func TestPermanentStarterErrorFinalizesFailed(t *testing.T) {
+	c, st, _, starter := newTestConsumer("retry")
+	starter.err = serviceerror.NewInvalidArgument("invalid input")
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("ConsumeOne: %v", err)
+	}
+	action := st.actions["wf1"]
+	if action.State != "failed" || action.LastError == "" || st.finalizeCalls != 1 {
+		t.Fatalf("action=%#v finalizeCalls=%d", action, st.finalizeCalls)
+	}
+}
+
+func TestFinalizeErrorPropagates(t *testing.T) {
+	c, st, _, _ := newTestConsumer("retry")
+	st.finalizeErr = errors.New("database unavailable")
+	if err := c.ConsumeOne(context.Background(), "e1"); err == nil {
+		t.Fatal("FinalizeAction error must propagate")
+	}
+}
