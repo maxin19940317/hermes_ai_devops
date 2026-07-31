@@ -1,7 +1,7 @@
 # 飞书终态卡片按钮设计（重试 / 忽略）
 
 **日期：** 2026-07-31
-**状态：** 待评审（v3）
+**状态：** 待评审（v4）
 **范围：** 三轮交互能力的第二轮。终态通知卡片上加两个**卡片级**按钮——「重试失败变体」「忽略」。
 不含 NL 确认/取消按钮（第三轮）、隔离按钮、证据链接、卡片模板化。
 
@@ -17,6 +17,8 @@
 | v1 → v2 | 同步 ACK 与异步 claim 之间无持久交接，点击会永久消失 | 新增 `card_action_inbox` |
 | v2 → v3 | 第二段部署改变 `NotifyCard` 的 activity input，需版本门与新 fixture | **改为 activity 注入按钮**，workflow 完全不参与，版本门问题消失（§7） |
 | v2 → v3 | inbox 消费与 `processed` 不原子，重跑会写重复审计 | 接受/拒绝各收敛为**一个** store 事务（§5、§6） |
+| v3 → v4 | inbox 被 acquire 两次，租约未过期使第二次必为零行，动作**永不完成** | 拆成 `ClaimInbox` → `Resolve` → `Complete*`，**Complete 只 fencing 不 acquire**（§5.1） |
+| v3 → v4 | 卡片 PATCH 要求完整原卡 JSON，而回调不携带、legacy 路径也无法从 Temporal 重建 | 新增 `card_action_snapshots`，`NotifyCard` 发可点击卡片**之前**落盘（§3.4） |
 
 实证过的事实（不再重新论证）：
 
@@ -69,7 +71,7 @@
 
 ## 3. 数据模型
 
-四张表。`schema.sql` 与独立 migration 同步。
+五张表。`schema.sql` 与独立 migration 同步。
 
 ### 3.1 card_action_inbox —— 同步段的持久交接
 
@@ -146,9 +148,10 @@ CREATE INDEX IF NOT EXISTS card_actions_sweep_idx
 **`workflow_id` 做主键**一次性消解三个问题：互斥（一次运行最多一个 claim，`action` 只是列）、
 不同点击间的竞争、legacy 隔离（FK 让没有权威行的历史运行不可能产生 claim）。
 
-**`target_input JSONB` 是 v3 新增**：`StartDeviceTest(ctx, in wf.DeviceTestInput)` 收完整输入，
+**`target_input JSONB`**：`StartDeviceTest(ctx, in wf.DeviceTestInput)` 收完整输入，
 不能按 ID 启动，所以只存 attempt/target 的恢复路径无法真正恢复。首次 claim 时持久化
-canonical 序列化的完整输入，并断言 `target_input.WorkflowID() == target_workflow_id`。
+canonical 序列化的完整输入；**完整性由 §5.5 的逐字段断言保证，不能只靠 `WorkflowID()`**
+（后者不含 Version / RuleVersion / Packages / SourceWorkflowID）。
 恢复时**逐字段复用**，不重新 Resolve。
 
 三个 CHECK 因为 PostgreSQL 的 CHECK 不可延迟（实证见修订史），把"接受动作必须一次性写入
@@ -171,6 +174,10 @@ CREATE TABLE IF NOT EXISTS card_action_messages (
     rendered_revision INTEGER     NOT NULL DEFAULT 0 CHECK (rendered_revision >= 0),
     update_state      TEXT        NOT NULL DEFAULT 'pending'
         CHECK (update_state IN ('pending','succeeded','abandoned')),
+    -- 只对 render_kind='rejection' 有意义(§7.5):拒绝原因决定该卡片还该不该留按钮。
+    -- render_kind='action' 的按钮集合由动作状态决定,不看这一列。
+    buttons_mode      TEXT        NOT NULL DEFAULT 'none'
+        CHECK (buttons_mode IN ('none','both')),
     owner             TEXT        NOT NULL DEFAULT '',
     lease_expires_at  TIMESTAMPTZ,
     reconcile_after   TIMESTAMPTZ,               -- 模糊超时后的延迟复核(§8.3)
@@ -184,9 +191,40 @@ CREATE TABLE IF NOT EXISTS card_action_messages (
 
 CREATE INDEX IF NOT EXISTS card_action_messages_sweep_idx
     ON card_action_messages(lease_expires_at) WHERE update_state = 'pending';
-CREATE INDEX IF NOT EXISTS card_action_messages_reconcile_idx
-    ON card_action_messages(reconcile_after) WHERE reconcile_after IS NOT NULL;
 ```
+
+**`rejection → action` 是单向升级。** 首次点击遇到 `StillRunning` 会写
+`render_kind='rejection'`；运行结束后再点击并成功接受时，**必须整体升级**，否则卡片会永久
+停在旧的拒绝理由上：
+
+```sql
+render_kind='action', rejection_reason='', buttons_mode='none',
+desired_revision=<action.revision>, update_state='pending', reconcile_after=NULL
+```
+
+反向不成立：**业务拒绝绝不覆盖已有的 `render_kind='action'`**——卡片应显示胜出者的动作状态，
+而不是后来者的拒绝理由。
+
+### 3.4 card_action_snapshots —— PATCH 的原卡来源
+
+飞书 IM `PATCH` 要求提交**完整的 card JSON**。回调载荷里没有原卡，`card_action_messages`
+只存渲染状态，而 legacy / 结果不可读这些路径**无法从 Temporal 重建**卡片内容。
+因此原卡必须在发送时就落盘。
+
+```sql
+CREATE TABLE IF NOT EXISTS card_action_snapshots (
+    workflow_id  TEXT PRIMARY KEY,   -- 同一 workflow 的多张卡片内容相同,按 workflow 存一份
+    card_json    JSONB       NOT NULL,   -- 规范化的**原展示卡**(不含 action 模块)
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+**写入时机与失败处置是硬约束**：`NotifyCard` 活动在发送**可点击卡片之前**持久化快照；
+**快照持久化失败则发送无按钮的展示卡片**。绝不允许"发出了能点的按钮，却存不下原卡"——
+那会让重启后的 sweep 无法兑现"其余内容不变"，只能拿一张残缺卡片去覆盖用户的通知。
+
+sweep 渲染时从快照复制，**只替换 action 模块**（追加或替换末尾的 `tag=action` /
+状态文本元素），其余元素逐字保留。
 
 **每一个通过校验的回调都登记消息实例**——包括 `conflict` 分支和业务拒绝分支，不只是首次接受。
 v2 的伪代码只在首次接受时登记，导致后来者点的那张卡片永远不更新。
@@ -194,7 +232,7 @@ v2 的伪代码只在首次接受时登记，导致后来者点的那张卡片�
 **收敛承诺收窄为**：所有**已观测到的**（即产生过回调的）message instance 收敛。
 系统无法发现从未被点击的重复通知卡片——那些 message ID 从未进入过任何回调载荷。
 
-### 3.4 audit_log
+### 3.5 audit_log
 
 CLAUDE.md §11 声明、`schema.sql` 从未建过。本轮建表并成为第一个写入方。
 
@@ -216,12 +254,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 两个 UNIQUE 是正交的两层保护：`card_action_workflow_id` 挡"同一 workflow 的第二次 accepted"，
 `inbox_event_id` 挡"同一事件被消费两次"。
 
-### 3.5 owner 是随机 fencing token
+### 3.6 owner 是随机 fencing token
 
 所有 `owner` 列存的是**每次 acquire 新生成的随机 token**（如 128 bit hex），
 **不是进程 ID 或主机名**。可复用的 owner 会让"接管后原持有者的迟到写"无法被 fencing 识别。
 
-### 3.6 decisions 不动
+### 3.7 decisions 不动
 
 **明确否决**"把 `decisions.task_id` 改成可空"——它是全局放宽，会允许 `rule` / `hermes` 的
 decision 也变成无归属；且 `decisions` 没有 `workflow_id` 列，run 级归属只能藏进 JSON。
@@ -230,11 +268,11 @@ decision 也变成无归属；且 `decisions` 没有 `workflow_id` 列，run 级
 > `workflow_id REFERENCES workflow_runs(workflow_id)` 并加
 > `CHECK ((task_id IS NULL) <> (workflow_id IS NULL))`，**不能只放宽 NOT NULL**。
 
-### 3.7 文档同步修正
+### 3.8 文档同步修正
 
 - **CLAUDE.md:37**（§3 规则 7）——终态卡片确认是 **run 级**动作，记于 `card_actions` +
   `audit_log`，不属于 task-level decision。
-- **CLAUDE.md §11**——补四张表。
+- **CLAUDE.md §11**——补五张表。
 - **`docs/device-test-sequence.md`**——终态卡片确认**不投 workflow signal、不走 outbox**。
 
 ---
@@ -244,14 +282,31 @@ decision 也变成无归属；且 `decisions` 没有 `workflow_id` 列，run 级
 文本 `rerun` 与按钮重试共用一份业务语义。新增包 `runtime/internal/rerun`
 （不放进 `feishucmd`，否则 `cardaction` 要反向依赖指令包）。
 
+### 4.0 两层,不是一层
+
+`ignore` 是纯记录动作，**不需要任何 artifact**。若两种 action 都跑完整解析，
+artifact 缺失时连"我看过了，忽略"都会失败——这是不必要的耦合。因此拆成两层：
+
 ```go
-// Resolve 只读:不分配 attempt、不写库、不启动 workflow。
-func (r *Resolver) Resolve(ctx context.Context, workflowID, variant string) (*Resolution, error)
+// ResolveFailureRun 只做:权威 run + 已关闭 + 失败 summary 集合。
+// ignore 只需要这一层。
+func (r *Resolver) ResolveFailureRun(ctx context.Context, workflowID string) (*FailureRun, error)
+
+// ResolveRetry = ResolveFailureRun + 精确 artifacts/packages 解析。
+// 只有 retry 需要这一层,ArtifactMissing 只可能从这里产生。
+func (r *Resolver) ResolveRetry(ctx context.Context, workflowID, variant string) (*Resolution, error)
 ```
+
+`ignore` 仍要求"权威 run 且已关闭且有失败变体"——否则忽略一个不存在或还在跑的运行没有意义；
+但它**不因 artifact 缺失而失败**。
+
+三层都只读：不分配 attempt、不写库、不启动 workflow。
 
 ### 4.1 两种模式的精确差异
 
 **这两条是文本 `rerun` 现有行为的规格化，不是新增语义**：
+
+`ResolveRetry` 的两种模式（`ResolveFailureRun` 恒等价于空 variant 模式的前半段）：
 
 | | 显式 variant（文本专用） | 空 variant（按钮唯一使用） |
 |---|---|---|
@@ -290,15 +345,29 @@ type RejectReason struct {
 CHECK 不可延迟，所以顺序是**先锁、再算、最后一次性插入完整行**；且 inbox 的 `processed`
 必须与业务写入同事务，否则重跑会写出重复审计。
 
-```text
-[事务外·只读] Resolve(workflow_id, "") → 目标集 + packages,或 RejectReason
+**acquire 只发生一次。** v3 在 sweep 里取过 owner，又要求接受事务里再 CAS 一次
+"lease 为空或已过期"——刚取得的租约当然没过期，第二次 UPDATE 必为零行，动作**永远无法完成**。
+固定为 claim / resolve / complete 三段，`Complete*` **不再 acquire，只做 fencing 校验**：
 
-AcceptCardAction(eventID, owner, ...)  —— 单事务
+```text
+① ClaimInbox(eventID) → 新随机 token
+      UPDATE card_action_inbox
+         SET owner=$token, lease_expires_at=now()+120s, attempts=attempts+1
+       WHERE event_id=$e AND state='received'
+         AND (lease_expires_at IS NULL OR lease_expires_at < now())
+      RETURNING *
+      └ 0 行 → 已被他人持有或已处理,本轮跳过
+
+② [事务外·只读] ResolveFailureRun / ResolveRetry(§4)→ 目标集,或 RejectReason
+
+③ CompleteAccept(eventID, token, ...) —— 单事务,不再 acquire
+```
+
+```text
 BEGIN
-  UPDATE card_action_inbox SET owner=$owner, lease_expires_at=now()+120s
-   WHERE event_id=$e AND state='received'
-     AND (lease_expires_at IS NULL OR lease_expires_at < now())
-    └ 影响 0 行 → 已被他人接管或已处理,直接返回,不做任何业务写入
+  SELECT * FROM card_action_inbox
+   WHERE event_id=$e AND state='received' AND owner=$token FOR UPDATE
+    └ 0 行 → 租约已被接管或已处理,直接返回,不做任何业务写入
 
   SELECT 1 FROM workflow_runs WHERE workflow_id=$w FOR UPDATE
     └ 无行 → 走 §6.4 的拒绝分支(同一事务内完成)
@@ -306,22 +375,27 @@ BEGIN
   SELECT * FROM card_actions WHERE workflow_id=$w      -- 已在上面的行锁保护下
     ├ 无行(首次) →
     │     retry : 推进水位得 N → Go 侧算 target_input 与 target_workflow_id
-    │             断言 target_input.WorkflowID() == target_workflow_id
-    │     INSERT card_actions(...完整行,含 attempt/target/target_input/revision=1)
-    │     INSERT audit_log(..., card_action_workflow_id=$w, inbox_event_id=$e)
-    ├ 同 action 且 state='failed' → §5.3 失败后重试(不写 accepted 审计)
-    └ 其余 → 写 rejected.conflict 审计(inbox_event_id=$e, FK 为 NULL)
+    │             按 §5.5 逐字段断言 target_input 来自 Resolution
+    │     INSERT card_actions(...完整行,含 attempt/target/target_input/revision=1,
+    │                         owner=$actionToken, lease_expires_at=now()+120s)
+    │     INSERT audit_log(card.<action>.accepted, card_action_workflow_id=$w, inbox_event_id=$e)
+    ├ 同 action 且 state='failed' → §5.3 失败后重试
+    │     CAS failed→pending,复用原三字段,取新 $actionToken 与租约,revision+1
+    │     INSERT audit_log(card.retry.resumed, card_action_workflow_id=NULL, inbox_event_id=$e)
+    └ 其余 → INSERT audit_log(card.<action>.rejected.conflict, FK=NULL, inbox_event_id=$e)
 
   INSERT card_action_messages(workflow_id, open_message_id, render_kind='action', ...)
     ON CONFLICT (workflow_id, open_message_id) DO UPDATE SET
-        update_state='pending', desired_revision = <当前 revision>
-    -- 所有分支都登记,包括 conflict
+        render_kind='action', rejection_reason='', buttons_mode='none',
+        desired_revision=<当前 revision>, update_state='pending', reconcile_after=NULL
+    -- 所有分支都登记,包括 conflict;rejection → action 是单向升级(§3.3)
 
   UPDATE card_action_inbox SET state='processed', processed_at=now() WHERE event_id=$e
 COMMIT
+  └ 返回 $actionToken 给立即执行方(首次接受与失败后重试两个分支)
 
-[事务外·幂等] retry: StartDeviceTest(target_input) → finalize succeeded / failed
-[事务外·幂等] 卡片 sweep: 渲染 → PATCH
+[事务外·幂等] retry: StartDeviceTest(target_input) → finalize(带 $actionToken fencing)
+[事务外·幂等] 卡片 sweep: 从 §3.4 快照复制 → 替换 action 模块 → PATCH
 ```
 
 `SELECT ... FOR UPDATE` 加在 `workflow_runs` 而非 `card_actions`：首次点击时 `card_actions`
@@ -368,6 +442,27 @@ artifacts 水位**恰好推进一次**、其余全部 `rejected.conflict`。
 | retry finalize → `failed` | +1 |
 | `failed → pending` | +1 |
 
+重排时**必须同时清空 `reconcile_after`**（§8.3）：新状态应当立即可更新，
+不该被上一轮的延迟复核窗口压住。
+
+### 5.5 target_input 的完整性断言
+
+`WorkflowID()` 只由 Project / Commit / PipelineID / Scope / Attempt 构成，**不包含**
+Version、RuleVersion、Packages、SourceWorkflowID。因此
+`target_input.WorkflowID() == target_workflow_id` **证明不了输入完整**，缺字段的输入照样通过。
+
+接受事务内必须**逐字段**断言 `target_input` 来自本次 `Resolution`：
+
+| 字段 | 来源 |
+|---|---|
+| `Project` / `Commit` / `PipelineID` / `Version` / `RuleVersion` | `Resolution.Run` 逐字段 |
+| `Packages` | `Resolution.Packages`，顺序与内容逐元素相等 |
+| `Scope` | `Resolution.Scope` |
+| `SourceWorkflowID` | = 源 `workflow_id` |
+| `Attempt` | = 本事务内分配的 N |
+
+任一不符即中止事务（视为实现缺陷，不是用户错误）。`WorkflowID()` 一致性作为**附加**断言保留。
+
 ---
 
 ## 6. 回调处理
@@ -413,21 +508,26 @@ artifacts 水位**恰好推进一次**、其余全部 `rejected.conflict`。
 
 ### 6.3 异步段
 
-从 inbox 消费 → `Resolve` → `AcceptCardAction`（§5.1）或 `FinalizeInboxRejection`（§6.4）→
-执行 → 卡片 sweep。用 listener 的生命周期 ctx，**不用回调 ctx**（后者在应答返回时即取消）。
+`ClaimInbox` → `ResolveFailureRun` / `ResolveRetry` → `CompleteAccept`（§5.1）或
+`CompleteReject`（§6.4）→ 执行 → 卡片 sweep。用 listener 的生命周期 ctx，
+**不用回调 ctx**（后者在应答返回时即取消）。
 
 ### 6.4 业务拒绝也是一个事务
 
-`Resolve` 返回 `RejectReason`（legacy / 仍在运行 / 结果不可读 / 无失败变体 / 缺 artifact）时，
-**不能只写审计然后各自标记**。收敛为单事务 `FinalizeInboxRejection(eventID, owner, reason)`：
+`Resolve*` 返回 `RejectReason`（legacy / 仍在运行 / 结果不可读 / 无失败变体 / 缺 artifact）时，
+**不能只写审计然后各自标记**。收敛为单事务 `CompleteReject(eventID, token, reason)`——
+与 `CompleteAccept` 一样**只做 fencing 校验，不再 acquire**：
 
 ```text
 BEGIN
-  UPDATE card_action_inbox ... 取 fencing(同 §5.1)
-  INSERT audit_log(..., inbox_event_id=$e, card_action_workflow_id=NULL)
+  SELECT * FROM card_action_inbox
+   WHERE event_id=$e AND state='received' AND owner=$token FOR UPDATE
+    └ 0 行 → 直接返回,不做任何业务写入
+  INSERT audit_log(card.<action>.rejected.<code>, inbox_event_id=$e, card_action_workflow_id=NULL)
   INSERT card_action_messages(..., render_kind='rejection', rejection_reason=<渲染文案>,
-                              update_state='pending')
-    ON CONFLICT DO UPDATE SET ...   -- 不覆盖已有的 render_kind='action'
+                              buttons_mode=<§7.5 按原因固定>, update_state='pending')
+    ON CONFLICT (workflow_id, open_message_id) DO UPDATE SET ...
+      WHERE card_action_messages.render_kind <> 'action'   -- 绝不覆盖已有的 action
   UPDATE card_action_inbox SET state='processed', processed_at=now()
 COMMIT
 ```
@@ -450,7 +550,14 @@ COMMIT
 | 来源/载荷不合法 | `card.unknown.rejected.payload` | NULL | 设置 |
 | 无权威 run / 仍在运行 / 结果不可读 / 无失败变体 / 缺 artifact | `card.<action>.rejected.<code>` | NULL | 设置 |
 | 已被占 | `card.<action>.rejected.conflict` | NULL | 设置 |
-| 失败后重试、恢复、Start、finalize、Patch | **不写审计** | — | — |
+| **失败后重试**（§5.3） | `card.retry.resumed` | **NULL** | 设置 |
+| 恢复、Start、finalize、Patch | **不写审计** | — | — |
+
+**`card.retry.resumed` 是 v4 补的。** 在失败卡片上再点一次是**一次新的真实人工操作**，
+不记录它，"审计人的点击尝试"就是不完整的。它不写第二条 `accepted`
+（`card_action_workflow_id` 的 UNIQUE 已被首次接受占用），因此 workflow FK 留 NULL、
+只设 `inbox_event_id`——这也正是"每个 inbox event 恰好一条审计"与"不重复 accepted"
+两条约束能同时成立的方式。
 
 - `actor` 固定 `feishu:<open_id>`；空身份用 `feishu:unknown`。
 - `target` = `source_workflow_id`（无法解析时空串）。
@@ -515,6 +622,25 @@ type CardActionValue struct {
 **`config.update_multi`** 恒为 `true`（飞书 `PATCH /open-apis/im/v1/messages/:message_id`
 的前置要求）。这是**唯一**的 workflow 侧 DTO 变更，随第一段部署上线（§11）。
 
+#### 注入所依据的两个事实（必须钉死）
+
+活动拿到的只有 `NotifyCardRequest`，没有 `TaskSummary` 列表，所以注入判据必须完全来自
+活动自身可信的两个来源：
+
+1. **`source_workflow_id` = `activity.GetInfo(ctx).WorkflowExecution.ID`。**
+   不从卡片正文、不从 fallback text、不从任何用户可见字符串里解析——那些是展示内容，
+   格式随时可变。ID 为空即**不注入**。
+2. **失败资格 = `Card.Header.Template ∈ {red, orange}`。**
+   展示卡片轮的 `cardHeaderTemplate` 已经定义：红 = 存在非 INFRA 失败，橙 = 失败全是 INFRA，
+   绿 = 无失败。因此 `red|orange` 恰好等价于"存在 `verdict ∉ {PASSED, SKIPPED}` 的变体"。
+   `green` 与**任何未知 template** 都不注入（fail-closed）。
+
+**禁止解析 fallback text 或正文元素**来推断上述任一事实。
+
+因为要读 `activity.GetInfo(ctx)`，注入逻辑的测试**必须跑在 Temporal 的 activity testsuite
+环境里**——`context.Background()` 缺少 activity interceptor，`GetInfo` 会 panic 或取到零值，
+用它写出来的测试证明不了生产行为。
+
 **同步影响**：展示卡片轮的递归键断言（`devicetest_test.go:1007`）把 `config` 键集合锁死为
 `{"wide_screen_mode"}`、把带 `actions` 的卡片判为非法。两处**必须同步放宽到新的封闭集合，
 而不是删除断言**——反例改为"带 `behaviors`""带 `url`""带 `multi_url`"
@@ -558,9 +684,24 @@ type CardUpdater interface {
 | retry succeeded | `已由 <open_id> 重试 → <target_workflow_id>` | 无 |
 | retry failed | `重试启动失败：<last_error>` | **只保留「重新重试」** |
 | ignore succeeded | `已由 <open_id> 忽略（仅记录，不改变判定）` | 无 |
-| 业务拒绝（`render_kind='rejection'`） | `<rejection_reason>` | 保留原按钮 |
 
 括号里"不改变判定"是 §2.2 语义的用户可见落点，不可省略。
+
+### 7.5 业务拒绝的按钮：按原因固定，不一刀切
+
+拒绝态是否留按钮取决于**该拒绝还有没有合法归宿**，因此按原因固定，并把结论持久化成
+`card_action_messages.buttons_mode` 这个封闭枚举：
+
+| 拒绝原因 | `buttons_mode` | 理由 |
+|---|---|---|
+| `StillRunning` | `both` | 运行结束后重试就会成功；也允许直接 ignore |
+| `ResultUnreadable` | `both` | 可能是暂时的 |
+| `ArtifactMissing`（retry 专有） | `both` | 补齐产物后可重试；ignore 本就不需要 artifact（§4.0） |
+| `NotAuthoritative` | `none` | legacy 运行永远不会有权威行，再点没有归宿 |
+| `NoFailedVariants` | `none` | 没有可重试的东西，ignore 也无意义 |
+
+`buttons_mode='both'` 时保留原本的两个按钮；`'none'` 时只留状态文本。
+`render_kind='action'` 的行不看这一列——它的按钮集合由上表的动作状态决定。
 
 ---
 
@@ -576,11 +717,18 @@ WHERE <state 列> = '<pending 值>'
   AND (lease_expires_at IS NULL OR lease_expires_at < now())
 ```
 
+**卡片 sweep 的谓词还要多一条**，否则 §8.3 约定的 60 秒延迟复核形同虚设——
+超时后行仍是 `pending`，30 秒的下一轮就会立刻重试：
+
+```sql
+  AND (reconcile_after IS NULL OR reconcile_after <= now())
+```
+
 | sweep | 表 | 动作 |
 |---|---|---|
-| inbox | `card_action_inbox` | CAS 取 owner → `Resolve` → `AcceptCardAction` / `FinalizeInboxRejection` |
+| inbox | `card_action_inbox` | `ClaimInbox` 取 token → `Resolve*` → `CompleteAccept` / `CompleteReject`（§5.1，**Complete 不再 acquire**） |
 | 动作 | `card_actions` | CAS 取 owner → 用**持久化的 `target_input`** 重新 `StartDeviceTest` → finalize |
-| 卡片 | `card_action_messages` | CAS 取 owner → 渲染 `desired_revision` → PATCH；另含 §8.3 的 `reconcile_after` 到期行 |
+| 卡片 | `card_action_messages` | CAS 取 owner → 从 §3.4 快照复制并替换 action 模块 → PATCH |
 
 ### 8.2 错误分类
 
@@ -607,9 +755,13 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 对此**不承诺严格收敛**（§2.3 已把权威性交给数据库），只做三件事：
 
 1. **明确超时 ≠ 失败。** PATCH 返回超时或不确定错误时，**不得**直接标 `succeeded` 或
-   `abandoned`；写入 `reconcile_after = now() + 60s`，由卡片 sweep 在到期后**再渲染一次
-   当前 `desired_revision`**，然后清空 `reconcile_after`。重复渲染同一 revision 是幂等的，
-   最坏代价是多一次 PATCH。
+   `abandoned`；保持 `update_state='pending'` 并写入 `reconcile_after = now() + 60s`，
+   由卡片 sweep 在到期后**再渲染一次当前 `desired_revision`**，成功后清空 `reconcile_after`。
+   重复渲染同一 revision 是幂等的，最坏代价是多一次 PATCH。
+   该延迟**由 §8.1 的谓词强制**（`reconcile_after IS NULL OR reconcile_after <= now()`），
+   不是靠调用方自觉。
+   反过来，§5.4 的每次 revision 重排**必须清空 `reconcile_after`**——新状态比"复核旧状态"
+   更值得立即呈现，压着它没有意义。
 2. **重排不得抹掉新 owner。** 失去租约的写方只能清除**自己持有的** owner：
    `UPDATE ... SET owner='', lease_expires_at=NULL WHERE ... AND owner = <my token>`。
    owner 已换人时只设 `reconcile_after`，不碰 owner——否则会把新持有者踢掉，形成互相抢占。
@@ -624,7 +776,7 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 |---|---|
 | `runtime/internal/rerun`（新） | 只读 `Resolver`，被 `feishucmd` 与 `cardaction` 共用 |
 | `runtime/internal/cardaction`（新） | 回调 handler、异步消费、三个 sweep、卡片渲染与注入 |
-| `runtime/internal/store` | 四张表访问层；`AcceptCardAction` / `FinalizeInboxRejection` 各是**一个**方法，事务边界不外泄 |
+| `runtime/internal/store` | 五张表访问层；`ClaimInbox` / `CompleteAccept` / `CompleteReject` 各是**一个**方法，事务边界不外泄 |
 | `runtime/internal/feishucmd/listener.go` | 增注册 `OnP2CardActionTrigger` 与五个生命周期钩子；不含业务逻辑 |
 | `runtime/internal/feishu` | 新增独立接口 `CardUpdater`，只由 app sender 实现 |
 | `runtime/internal/activity/notify_card.go` | readiness 判定与按钮注入 |
@@ -640,7 +792,12 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 - **`retry` 分两步写入必被拒**（先插默认值再 UPDATE → `23514`）；
 - `ignore` 行 attempt=0、target 空、target_input NULL、state 恒为 `succeeded`
   （`card_actions_ignore_terminal` 的机械证明）；
-- `target_input.WorkflowID() == target_workflow_id` 断言；
+- **`target_input` 逐字段断言**（§5.5）：缺 `Version` / `RuleVersion` / `Packages` /
+  `SourceWorkflowID` 任一字段的输入必须被拒——**只断言 `WorkflowID()` 相等的实现会放过它们**，
+  测试要能证明这一点；
+- **`ClaimInbox` → `Complete*` 全路径**：Complete 在**租约仍然有效**时必须成功
+  （v3 的"再 acquire 一次"写法会在这里零行，是 v4 阻断 1 的回归测试）；
+  token 不匹配时 Complete 影响 0 行且不做任何业务写入；
 - §5.3 三种归宿逐行覆盖；`failed → pending` 复用原三字段且不重新 Resolve；
 - finalize fencing：owner 不匹配影响 0 行；
 - 恢复不推进水位（断言 artifacts 计数器不变）；
@@ -659,7 +816,7 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 
 - 同一 event ID 重投 3 次 → 一次 claim、**一行审计**、**三次相同 toast**（inbox 重放）；
 - **ACK 之后、claim 之前进程退出** → inbox 留 `received`，sweep 接管后动作完成（v1 阻断 2 回归）；
-- **AcceptCardAction 提交后、标 processed 前崩溃不可能发生**（同事务），
+- **`CompleteAccept` 提交后、标 processed 前崩溃不可能发生**（同事务），
   以"重跑同一 event 不产生第二行审计"机械证明（v2 阻断 2 回归）；
 - **Start 成功、finalize 前崩溃** → 恢复用持久化的 `target_input` 逐字段相同地重提，
   `started=false` → 收敛为 `succeeded`；
@@ -672,14 +829,36 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 - 非白名单 → 同步 toast + `rejected.unauthorized`，且 `SendText` **零调用**（机械断言）；
 - readiness 五项各自为假 → `rejected.disabled`，不进 claim；
 - 无失败变体 / legacy / 源仍在运行 → `NextWorkflowAttempt*` 与 `StartDeviceTest` **零调用**，
-  且经 `FinalizeInboxRejection` 在卡片上留下结论。
+  且经 `CompleteReject` 在卡片上留下结论。
+
+### 10.4a 卡片快照与升级（v4 新增）
+
+- `NotifyCard` 发**可点击**卡片前必先写入 `card_action_snapshots`；
+  **快照写入失败 → 发送无按钮展示卡片**（机械断言：注入路径零调用）；
+- sweep 从快照渲染：除 action 模块外**所有元素与快照逐字节相同**；
+- 无快照时不可能进入 PATCH 路径（断言）；
+- **`rejection → action` 单向升级**：先 `StillRunning` 写 rejection，运行结束后再点击成功，
+  卡片必须显示动作状态而非旧拒绝理由（v4 阻断 5 回归）；
+- 反向：已有 `render_kind='action'` 时业务拒绝**不覆盖**；
+- `buttons_mode`：§7.5 表格逐行覆盖，`none` 的两种原因不留按钮，`both` 的三种保留两个按钮。
+
+### 10.4b activity 注入（必须在 Temporal activity testsuite 中执行）
+
+- `source_workflow_id` 取自 `activity.GetInfo(ctx).WorkflowExecution.ID`；
+- header `red` / `orange` 注入，`green` 与**未知 template** 不注入（fail-closed）；
+- 空 workflow ID 不注入；
+- **断言注入逻辑不读取 `FallbackText` 与正文元素**（可用只改正文、不改 header 的用例证明
+  注入结果不变）；
+- 用 `context.Background()` 写的测试不算数——`GetInfo` 在其中取不到真实值。
 
 ### 10.5 Resolver 兼容
 
 - **`feishucmd/executor_test.go` 既有全部 rerun 用例一行不改即通过**；
 - 显式 variant 模式 **`WorkflowResult` 零调用**，且允许 PASSED / SKIPPED；
 - 空 variant 模式忽略空 `Variant` 的 summary，去重并按字典序排序；
-- `ArtifactMissing` 携带 `Count`，文案 `变体 %s 的 artifact 数量为 %d，要求恰好 1 个` 逐字复现。
+- `ArtifactMissing` 携带 `Count`，文案 `变体 %s 的 artifact 数量为 %d，要求恰好 1 个` 逐字复现；
+- **artifact 全缺时 `ignore` 仍能成功**（只跑 `ResolveFailureRun`），
+  而同一场景下 `retry` 被 `ArtifactMissing` 拒绝——两者不再耦合（v4 阻断 4 回归）。
 
 ### 10.6 卡片
 
@@ -690,7 +869,10 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 - 注入按钮后超预算 → **发送原展示卡片，不降级纯文本**（机械断言 `SendText` 零调用）；
 - §7.4 五种状态文本逐字匹配，失败态**只有一个按钮**；
 - 同一 workflow 多张已观测卡片 → 全部收敛；
-- PATCH 超时 → 不标 `succeeded`，设 `reconcile_after`，到期重渲染一次；
+- PATCH 超时 → 不标 `succeeded`，设 `reconcile_after`；
+  **`reconcile_after` 未到期时 sweep 选不中该行**（谓词生效的机械证明，v4 阻断 6 回归），
+  到期后重渲染一次；
+- 新 revision 重排**清空 `reconcile_after`**，新状态立即可更新；
 - 失去租约的写方**不清除他人 owner**。
 
 ### 10.7 workflow 侧不变性（关键）
@@ -705,7 +887,7 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 
 - 独立幂等 migration，**连续执行两次结果相同**；
 - fresh `schema.sql` 与 upgraded 库最终约束一致（复用 `migration_workflow_runs_test.go` 模式）；
-- `pgtest` 的 TRUNCATE 清单补入四张表；
+- `pgtest` 的 TRUNCATE 清单补入五张表；
 - **前置检查**：断言 `workflow_runs` 已存在，未完成 workflow_runs 生产迁移时明确失败。
 
 ---
@@ -716,7 +898,7 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 `CardElement.Actions` 字段声明（workflow 永不设值，序列化不变），以及对应的断言放宽。
 卡片仍无按钮，行为不变，但此后发出的卡片**具备被更新的能力**。
 
-**第二段——`workflow-runs` rollout 稳定之后**：迁移四张新表、部署 `cardaction` 与
+**第二段——`workflow-runs` rollout 稳定之后**：迁移五张新表、部署 `cardaction` 与
 activity 注入、打开 `FEISHU_CARD_ACTIONS_ENABLED`。因为 workflow 侧无改动，
 **第二段不含任何 Temporal 版本门与 fixture 录制**。
 
