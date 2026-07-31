@@ -1,5 +1,9 @@
 #!/system/bin/sh
 
+# USB unbind drops the originating adb shell. Ignore HUP so detached/manual
+# execution can still write the serial and rebind the gadget.
+trap '' HUP
+
 TAG="hermes-usb-serial"
 GADGET="/config/usb_gadget/g1"
 SERIAL_FILE="${GADGET}/strings/0x409/serialnumber"

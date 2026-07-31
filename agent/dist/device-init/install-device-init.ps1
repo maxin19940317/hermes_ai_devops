@@ -30,6 +30,14 @@ Start-Sleep -Seconds 2
 Invoke-Adb -s $transport wait-for-device
 Invoke-Adb -s $transport remount
 
+$mounts = (& $AdbPath -s $transport shell mount) -join "`n"
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to inspect device mounts after adb remount."
+}
+if ($mounts -match '(?m)^overlay on /vendor ') {
+    throw "Vendor uses a late overlay. Android init will not parse a newly added .rc from it; integrate the files into the vendor image instead."
+}
+
 $scriptDir = $PSScriptRoot
 Invoke-Adb -s $transport push "$scriptDir\hermes-usb-serial.sh" /vendor/bin/hermes-usb-serial.sh
 Invoke-Adb -s $transport push "$scriptDir\hermes-usb-serial.rc" /vendor/etc/init/hermes-usb-serial.rc
