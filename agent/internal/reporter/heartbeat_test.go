@@ -2,6 +2,7 @@ package reporter
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -268,5 +269,72 @@ func TestHeartbeatNotOwnedStopsTask(t *testing.T) {
 	h.StopTask = nil
 	if err := h.once(context.Background()); err != nil {
 		t.Fatalf("once without StopTask: %v", err)
+	}
+}
+
+func TestHeartbeatDeviceDiffLogging(t *testing.T) {
+	var logs []string
+	logf := func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	// 场景1: 首次心跳,不输出 diff
+	h1 := &Heartbeat{
+		ClientID: "test-client",
+		Logf:     logf,
+	}
+	devs1 := []DeviceInfo{
+		{Serial: "SERIAL1"},
+		{Serial: "SERIAL2"},
+	}
+	h1.diffDevices(devs1)
+	if len(logs) != 0 {
+		t.Errorf("首次心跳不应输出 diff, got %v", logs)
+	}
+	if h1.lastDevices == nil || !h1.lastDevices["SERIAL1"] || !h1.lastDevices["SERIAL2"] {
+		t.Errorf("lastDevices 未正确初始化: %v", h1.lastDevices)
+	}
+
+	// 场景2: 设备移除
+	logs = nil
+	devs2 := []DeviceInfo{{Serial: "SERIAL1"}}
+	h1.diffDevices(devs2)
+	if len(logs) != 1 || logs[0] != "device removed: SERIAL2" {
+		t.Errorf("移除设备日志错误, got %v", logs)
+	}
+
+	// 场景3: 设备新增
+	logs = nil
+	devs3 := []DeviceInfo{{Serial: "SERIAL1"}, {Serial: "SERIAL3"}}
+	h1.diffDevices(devs3)
+	if len(logs) != 1 || logs[0] != "device added: SERIAL3" {
+		t.Errorf("新增设备日志错误, got %v", logs)
+	}
+
+	// 场景4: 同时新增和移除
+	logs = nil
+	devs4 := []DeviceInfo{{Serial: "SERIAL3"}, {Serial: "SERIAL4"}}
+	h1.diffDevices(devs4)
+	// 顺序不确定,检查内容
+	hasRemoved := false
+	hasAdded := false
+	for _, l := range logs {
+		if l == "device removed: SERIAL1" {
+			hasRemoved = true
+		}
+		if l == "device added: SERIAL4" {
+			hasAdded = true
+		}
+	}
+	if !hasRemoved || !hasAdded || len(logs) != 2 {
+		t.Errorf("同时新增移除设备日志错误, got %v", logs)
+	}
+
+	// 场景5: 无变化
+	logs = nil
+	devs5 := []DeviceInfo{{Serial: "SERIAL3"}, {Serial: "SERIAL4"}}
+	h1.diffDevices(devs5)
+	if len(logs) != 0 {
+		t.Errorf("无变化时不应输出日志, got %v", logs)
 	}
 }

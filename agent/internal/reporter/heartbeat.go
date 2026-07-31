@@ -40,6 +40,10 @@ type Heartbeat struct {
 	DeviceWorkdir string            // df 探测路径;空 → DefaultDeviceWorkdir
 	SOCAliases    map[string]string // 平台代号 → SoC 型号(如 trinket→QCM6125)
 	Capabilities  []string          // 设备能力声明(如 hexagon),调度子集匹配用
+
+	// lastDevices 记录上次心跳的设备 serial 集合,用于 diff 日志(设备上下线感知)。
+	// nil 表示首次心跳,不输出 diff。
+	lastDevices map[string]bool
 }
 
 func (h *Heartbeat) interval() time.Duration {
@@ -115,6 +119,11 @@ func (h *Heartbeat) once(ctx context.Context) error {
 
 	activeIDs, busySerials := h.inflight(ctx)
 	devices := h.prober().ProbeDevices(ctx, busySerials)
+
+	// 设备变化 diff 日志:与上次心跳对比,输出新增/移除的设备 serial。
+	// 首次心跳(lastDevices == nil)跳过 diff,只初始化基线。
+	h.diffDevices(devices)
+
 	req := HeartbeatRequest{
 		ClientID:      h.ClientID,
 		BaseURL:       h.BaseURL,
@@ -191,4 +200,35 @@ func attemptFromTaskID(taskID string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+// diffDevices 对比本次探测到的设备与上次心跳的基线，输出新增/移除日志。
+// 首次调用（lastDevices == nil）仅初始化基线，不输出 diff。
+func (h *Heartbeat) diffDevices(devices []DeviceInfo) {
+	now := make(map[string]bool, len(devices))
+	for _, d := range devices {
+		now[d.Serial] = true
+	}
+
+	if h.lastDevices == nil {
+		// 首次心跳：初始化基线，不输出 diff
+		h.lastDevices = now
+		return
+	}
+
+	// 检查新增设备
+	for serial := range now {
+		if !h.lastDevices[serial] {
+			h.logf("device added: %s", serial)
+		}
+	}
+
+	// 检查移除设备
+	for serial := range h.lastDevices {
+		if !now[serial] {
+			h.logf("device removed: %s", serial)
+		}
+	}
+
+	h.lastDevices = now
 }
