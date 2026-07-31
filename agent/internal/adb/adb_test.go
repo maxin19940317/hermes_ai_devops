@@ -38,9 +38,9 @@ func TestBuilderArgv(t *testing.T) {
 		want []string
 	}{
 		{"getprop", GetProp(serial, "ro.product.cpu.abi"),
-			[]string{"-s", serial, "shell", "getprop", "ro.product.cpu.abi"}},
+			[]string{"-s", serial, "shell", "/system/bin/getprop", "ro.product.cpu.abi"}},
 		{"df", DiskFreeKB(serial, "/data/local/tmp"),
-			[]string{"-s", serial, "shell", "df", "-k", "/data/local/tmp"}},
+			[]string{"-s", serial, "shell", "/system/bin/df", "-k", "/data/local/tmp"}},
 		{"push", Push(serial, "/tmp/a", "/data/local/tmp/a"),
 			[]string{"-s", serial, "push", "/tmp/a", "/data/local/tmp/a"}},
 		{"pull", Pull(serial, "/data/local/tmp/r", "/tmp/r"),

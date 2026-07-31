@@ -146,9 +146,9 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 	case "shell":
 		s := args[3]
 		switch {
-		case s == "getprop" && len(args) == 5:
+		case filepath.Base(s) == "getprop" && len(args) == 5:
 			return adb.Result{Stdout: f.props[args[4]] + "\n"}, nil
-		case s == "df" && len(args) == 6:
+		case filepath.Base(s) == "df" && len(args) == 6:
 			return adb.Result{Stdout: fmt.Sprintf(
 				"Filesystem 1K-blocks Used Available Use%% Mounted on\n/dev/block/dm-0 10000000 100 %d 1%% /data\n",
 				f.dfAvailKB)}, nil

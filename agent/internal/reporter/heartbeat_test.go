@@ -18,17 +18,17 @@ func heartbeatRunner() *fakeRunner {
 			"SERIAL2 device product:p2 model:m2 device:d2 transport_id:2\n" +
 			"SERIAL3 device product:p3 model:m3 device:d3 transport_id:3\n" +
 			"DEAD0  offline transport_id:4\n"}, // offline 条目被 ParseDevices 过滤
-		"-s SERIAL1 shell getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
-		"-s SERIAL1 shell getprop ro.build.version.release": {Stdout: "13\n"},
-		"-s SERIAL1 shell getprop ro.board.platform":        {Stdout: "trinket\n"},
-		"-s SERIAL1 shell df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+		"-s SERIAL1 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-s SERIAL1 shell /system/bin/getprop ro.build.version.release": {Stdout: "13\n"},
+		"-s SERIAL1 shell /system/bin/getprop ro.board.platform":        {Stdout: "trinket\n"},
+		"-s SERIAL1 shell /system/bin/df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
 			"/dev/block/dm-4 11585580 6435440 5150140 56% /data\n"},
-		"-s SERIAL2 shell getprop ro.product.cpu.abi":       {Stdout: "armeabi-v7a\n"},
-		"-s SERIAL2 shell getprop ro.build.version.release": {Stdout: "12\n"},
-		"-s SERIAL2 shell getprop ro.board.platform":        {Stdout: "\n"}, // 空 → 回退 board
-		"-s SERIAL2 shell getprop ro.product.board":         {Stdout: "msm8937\n"},
+		"-s SERIAL2 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "armeabi-v7a\n"},
+		"-s SERIAL2 shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
+		"-s SERIAL2 shell /system/bin/getprop ro.board.platform":        {Stdout: "\n"}, // 空 → 回退 board
+		"-s SERIAL2 shell /system/bin/getprop ro.product.board":         {Stdout: "msm8937\n"},
 		// SERIAL2 的 df 未登记:探测失败时 workdir_free_mb 应省略
-		"-s SERIAL3 shell getprop ro.product.cpu.abi": {ExitCode: 1, Stderr: "error: device offline"},
+		"-s SERIAL3 shell /system/bin/getprop ro.product.cpu.abi": {ExitCode: 1, Stderr: "error: device offline"},
 	}}
 }
 
@@ -278,7 +278,7 @@ func TestHeartbeatDeviceDiffLogging(t *testing.T) {
 		logs = append(logs, fmt.Sprintf(format, args...))
 	}
 
-	// 场景1: 首次心跳,不输出 diff
+	// 场景1: 首次心跳,输出设备列表确认(不输出 diff)
 	h1 := &Heartbeat{
 		ClientID: "test-client",
 		Logf:     logf,
@@ -288,8 +288,8 @@ func TestHeartbeatDeviceDiffLogging(t *testing.T) {
 		{Serial: "SERIAL2"},
 	}
 	h1.diffDevices(devs1)
-	if len(logs) != 0 {
-		t.Errorf("首次心跳不应输出 diff, got %v", logs)
+	if len(logs) != 1 {
+		t.Errorf("首次心跳应输出 1 条设备列表, got %d: %v", len(logs), logs)
 	}
 	if h1.lastDevices == nil || !h1.lastDevices["SERIAL1"] || !h1.lastDevices["SERIAL2"] {
 		t.Errorf("lastDevices 未正确初始化: %v", h1.lastDevices)

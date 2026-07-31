@@ -41,11 +41,13 @@ func withSerial(serial string, rest ...string) []string {
 // ---- 白名单命令构造器(纯函数,唯一合法的命令来源) ----
 
 func GetProp(serial, prop string) []string {
-	return withSerial(serial, "shell", "getprop", prop)
+	// 绝对路径:部分设备(Nexus 4 等)的 adb shell 走 /bin/bash,
+	// /system/bin 不在 PATH 里,裸命令名 getprop 报 command not found。
+	return withSerial(serial, "shell", "/system/bin/getprop", prop)
 }
 
 func DiskFreeKB(serial, path string) []string {
-	return withSerial(serial, "shell", "df", "-k", path)
+	return withSerial(serial, "shell", "/system/bin/df", "-k", path)
 }
 
 func Push(serial, local, remote string) []string {

@@ -30,16 +30,20 @@ Remove-Item Env:ANDROID_ADB_SERVER_PORT -ErrorAction SilentlyContinue
 $env:ANDROID_ADB_SERVER_PORT = "5137"
 & $ADB start-server 2>$null | Out-Null
 & $ADB devices -l
-$online = & $ADB devices | Select-String "`tdevice$" | Measure-Object
-if ($online.Count -lt 1) {
+$deviceLines = @(& $ADB devices | Select-String "`tdevice$")
+$usableLines = @($deviceLines | Where-Object { ($_ -split "`t")[0] -ne "?" })
+if ($deviceLines.Count -gt $usableLines.Count) {
+  Write-Host "!! device serial '?' is not addressable and will be ignored; configure USB iSerial, then replug" -ForegroundColor Yellow
+}
+if ($usableLines.Count -lt 1) {
   Write-Host "!! no usable device on 5137; plug in the board / accept authorization, then rerun" -ForegroundColor Red
   exit 1
 }
 
 Write-Host "`n==> 2/4 Device property self-check" -ForegroundColor Cyan
-$serial = (& $ADB devices | Select-String "`tdevice$" | Select-Object -First 1) -split "`t" | Select-Object -First 1
-& $ADB -s $serial shell getprop ro.product.cpu.abi
-& $ADB -s $serial shell getprop ro.board.platform
+$serial = ($usableLines | Select-Object -First 1) -split "`t" | Select-Object -First 1
+& $ADB -s $serial shell /system/bin/getprop ro.product.cpu.abi
+& $ADB -s $serial shell /system/bin/getprop ro.board.platform
 
 Write-Host "`n==> 3/4 Server connectivity" -ForegroundColor Cyan
 try {

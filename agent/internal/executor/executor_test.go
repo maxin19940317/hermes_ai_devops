@@ -124,14 +124,14 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 
 	cmd := args[2]
 	switch {
-	case cmd == "shell" && len(args) == 5 && args[3] == "getprop":
+	case cmd == "shell" && len(args) == 5 && filepath.Base(args[3]) == "getprop":
 		if args[4] == "ro.serialno" {
 			if v, ok := f.serialnoByTransport[args[1]]; ok {
 				return adb.Result{Stdout: v + "\n"}, nil
 			}
 		}
 		return adb.Result{Stdout: f.props[args[4]] + "\n"}, nil
-	case cmd == "shell" && len(args) == 6 && args[3] == "df":
+	case cmd == "shell" && len(args) == 6 && filepath.Base(args[3]) == "df":
 		out := fmt.Sprintf("Filesystem 1K-blocks Used Available Use%% Mounted on\n/dev/block/dm-0 10000000 100 %d 1%% /data\n", f.dfAvailKB)
 		return adb.Result{Stdout: out}, nil
 	case cmd == "push" || cmd == "logcat":
