@@ -68,6 +68,7 @@ type fullStore interface {
 	PutInbox(ctx context.Context, row InboxRow, auditOnReject *AuditRow) (*InboxRow, bool, error)
 	GetInbox(ctx context.Context, eventID string) (*InboxRow, error)
 	ClaimInbox(ctx context.Context, eventID, token string, lease time.Duration) (*InboxRow, error)
+	GetCardAction(ctx context.Context, workflowID string) (*CardAction, error)
 	CompleteAccept(ctx context.Context, req AcceptRequest) (*AcceptOutcome, error)
 	CompleteReject(ctx context.Context, eventID, token string, r RejectRender) error
 	FinalizeAction(ctx context.Context, workflowID, token, state, lastErr string) (bool, error)
@@ -3227,6 +3228,14 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if got.Attempt != out.Attempt || got.TargetWorkflowID == "" || len(got.TargetInput) == 0 {
 			t.Fatalf("retry 行必须落库即钉死: %#v", got)
 		}
+		if out.TargetWorkflowID != got.TargetWorkflowID ||
+			!bytes.Equal(out.TargetInput, got.TargetInput) {
+			t.Fatalf("accepted outcome pins=%#v, persisted=%#v", out, got)
+		}
+		out.TargetInput[0] ^= 0xff
+		if again := mustGetAction(t, s, "wf1"); !bytes.Equal(again.TargetInput, got.TargetInput) {
+			t.Fatal("mutating accepted outcome target_input changed persisted action")
+		}
 		var target wf.DeviceTestInput
 		if err := json.Unmarshal(got.TargetInput, &target); err != nil {
 			t.Fatalf("target_input: %v", err)
@@ -3702,6 +3711,10 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if err != nil || out == nil || out.Kind != "resumed" {
 			t.Fatalf("CompleteAccept=(%#v,%v), want resumed", out, err)
 		}
+		if out.TargetWorkflowID != before.TargetWorkflowID ||
+			!bytes.Equal(out.TargetInput, before.TargetInput) {
+			t.Fatalf("resumed outcome pins=%#v, persisted=%#v", out, before)
+		}
 		after := mustGetAction(t, s, "wf1")
 		if after.Attempt != before.Attempt || after.TargetWorkflowID != before.TargetWorkflowID ||
 			!bytes.Equal(after.TargetInput, before.TargetInput) {
@@ -3717,6 +3730,10 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if countAuditByAction(t, s, "card.retry.accepted") != 1 ||
 			countAuditByAction(t, s, "card.retry.resumed") != 1 {
 			t.Fatal("resume 不得重复 accepted 审计,且必须写 resumed 审计")
+		}
+		out.TargetInput[0] ^= 0xff
+		if again := mustGetAction(t, s, "wf1"); !bytes.Equal(again.TargetInput, before.TargetInput) {
+			t.Fatal("mutating resumed outcome target_input changed persisted action")
 		}
 		for _, messageID := range []string{"om_shared", "om_second", "om_third"} {
 			msg := mustGetActionMessage(t, s, "wf1", messageID)
@@ -4077,6 +4094,31 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		got, err := s.ClaimMessage(ctx, "tokN", 120*time.Second)
 		if err != nil || got == nil || got.DesiredRevision != 2 {
 			t.Fatalf("revision 重排必须清 defer 并立即可 claim: (%#v, %v)", got, err)
+		}
+	})
+
+	t.Run("GetCardActionReturnsDefensiveCopyAndTypedNotFound", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.GetCardAction(ctx, "missing"); !errors.Is(err, ErrCardActionNotFound) {
+			t.Fatalf("GetCardAction missing error = %v, want ErrCardActionNotFound", err)
+		}
+		seedAcceptedRetry(t, s, "wf1", "tokA")
+		first, err := s.GetCardAction(ctx, "wf1")
+		if err != nil || first == nil || first.LeaseExpiresAt == nil || len(first.TargetInput) == 0 {
+			t.Fatalf("GetCardAction first = (%#v, %v)", first, err)
+		}
+		storedInput := append([]byte(nil), first.TargetInput...)
+		storedLease := *first.LeaseExpiresAt
+		first.TargetInput[0] ^= 0xff
+		*first.LeaseExpiresAt = first.LeaseExpiresAt.Add(24 * time.Hour)
+
+		again, err := s.GetCardAction(ctx, "wf1")
+		if err != nil {
+			t.Fatalf("GetCardAction again: %v", err)
+		}
+		if !bytes.Equal(again.TargetInput, storedInput) ||
+			again.LeaseExpiresAt == nil || !again.LeaseExpiresAt.Equal(storedLease) {
+			t.Fatalf("GetCardAction leaked caller mutation: %#v", again)
 		}
 	})
 

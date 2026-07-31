@@ -24,6 +24,7 @@ const consumerLeaseTTL = 120 * time.Second
 // ConsumerStore is the asynchronous card action consumer's persistence surface.
 type ConsumerStore interface {
 	ClaimInbox(ctx context.Context, eventID, token string, lease time.Duration) (*store.InboxRow, error)
+	GetCardAction(ctx context.Context, workflowID string) (*store.CardAction, error)
 	CompleteAccept(ctx context.Context, req store.AcceptRequest) (*store.AcceptOutcome, error)
 	CompleteReject(ctx context.Context, eventID, token string, render store.RejectRender) error
 	FinalizeAction(ctx context.Context, workflowID, token, state, lastErr string) (bool, error)
@@ -103,45 +104,60 @@ func (c *Consumer) consumeIgnore(ctx context.Context, row *store.InboxRow, token
 }
 
 func (c *Consumer) consumeRetry(ctx context.Context, row *store.InboxRow, token string) error {
-	resolution, err := c.Resolver.ResolveRetry(ctx, row.WorkflowID, "")
-	if err != nil {
-		return c.completeRejection(ctx, row, token, err)
-	}
-	if resolution == nil {
-		return fmt.Errorf("consume card action %s: retry resolver returned nil resolution", row.EventID)
-	}
-	if resolution.Run.WorkflowID != row.WorkflowID {
+	existing, err := c.Store.GetCardAction(ctx, row.WorkflowID)
+	firstAccept := errors.Is(err, store.ErrCardActionNotFound)
+	if err != nil && !firstAccept {
 		return fmt.Errorf(
-			"consume card action %s: resolver source workflow %q does not match claimed inbox %q",
-			row.EventID, resolution.Run.WorkflowID, row.WorkflowID,
+			"consume card action %s: get existing retry action: %w",
+			row.EventID, err,
 		)
 	}
-	if c.Starter == nil {
-		return fmt.Errorf("consume card action %s: starter is nil", row.EventID)
+	if err == nil && existing == nil {
+		return fmt.Errorf(
+			"consume card action %s: get existing retry action returned nil",
+			row.EventID,
+		)
 	}
 
 	actionToken, err := newFencingToken()
 	if err != nil {
 		return fmt.Errorf("consume card action %s: create action fencing token: %w", row.EventID, err)
 	}
-	var built wf.DeviceTestInput
 	req := acceptRequest(row, token, actionToken)
-	req.Project = resolution.Run.Project
-	req.CommitSHA = resolution.Run.CommitSHA
-	req.PipelineID = resolution.Run.PipelineID
-	req.BuildTarget = func(attempt int) ([]byte, string, error) {
-		built = buildTargetInput(resolution, attempt)
-		if c.mutateInput != nil {
-			c.mutateInput(&built)
-		}
-		if err := assertTargetInput(built, resolution, attempt); err != nil {
-			return nil, "", fmt.Errorf("target input mismatch (implementation defect): %w", err)
-		}
-		raw, err := json.Marshal(built)
+	if firstAccept {
+		resolution, err := c.Resolver.ResolveRetry(ctx, row.WorkflowID, "")
 		if err != nil {
-			return nil, "", fmt.Errorf("marshal target input: %w", err)
+			return c.completeRejection(ctx, row, token, err)
 		}
-		return raw, built.WorkflowID(), nil
+		if resolution == nil {
+			return fmt.Errorf("consume card action %s: retry resolver returned nil resolution", row.EventID)
+		}
+		if resolution.Run.WorkflowID != row.WorkflowID {
+			return fmt.Errorf(
+				"consume card action %s: resolver source workflow %q does not match claimed inbox %q",
+				row.EventID, resolution.Run.WorkflowID, row.WorkflowID,
+			)
+		}
+		req.Project = resolution.Run.Project
+		req.CommitSHA = resolution.Run.CommitSHA
+		req.PipelineID = resolution.Run.PipelineID
+		req.BuildTarget = func(attempt int) ([]byte, string, error) {
+			built := buildTargetInput(resolution, attempt)
+			if c.mutateInput != nil {
+				c.mutateInput(&built)
+			}
+			if err := assertTargetInput(built, resolution, attempt); err != nil {
+				return nil, "", fmt.Errorf("target input mismatch (implementation defect): %w", err)
+			}
+			raw, err := json.Marshal(built)
+			if err != nil {
+				return nil, "", fmt.Errorf("marshal target input: %w", err)
+			}
+			return raw, built.WorkflowID(), nil
+		}
+	}
+	if c.Starter == nil {
+		return fmt.Errorf("consume card action %s: starter is nil", row.EventID)
 	}
 
 	out, err := c.Store.CompleteAccept(ctx, req)
@@ -154,23 +170,19 @@ func (c *Consumer) consumeRetry(ctx context.Context, row *store.InboxRow, token 
 	switch out.Kind {
 	case "conflict", "legacy", "lost":
 		return nil
-	case "accepted":
-		if built.Attempt == 0 || built.Attempt != out.Attempt {
-			return fmt.Errorf(
-				"consume card action %s: accepted outcome attempt %d does not match built input %d",
-				row.EventID, out.Attempt, built.Attempt,
-			)
-		}
-	case "resumed":
-		built = buildTargetInput(resolution, out.Attempt)
-		if err := assertTargetInput(built, resolution, out.Attempt); err != nil {
-			return fmt.Errorf("consume card action %s: rebuild resumed target: %w", row.EventID, err)
-		}
+	case "accepted", "resumed":
 	default:
 		return fmt.Errorf("consume card action %s: unexpected retry outcome %q", row.EventID, out.Kind)
 	}
 
-	_, _, startErr := c.Starter.StartDeviceTest(ctx, built)
+	input, err := retryInputFromOutcome(row, out)
+	if err != nil {
+		return fmt.Errorf(
+			"consume card action %s: invalid %s store outcome: %w",
+			row.EventID, out.Kind, err,
+		)
+	}
+	_, _, startErr := c.Starter.StartDeviceTest(ctx, input)
 	state, lastErr := "succeeded", ""
 	if startErr != nil {
 		if !isPermanentStartError(startErr) {
@@ -191,6 +203,46 @@ func (c *Consumer) consumeRetry(ctx context.Context, row *store.InboxRow, token 
 			Msg("finalize card action lost fencing; sweep will take over")
 	}
 	return nil
+}
+
+func retryInputFromOutcome(
+	row *store.InboxRow, out *store.AcceptOutcome,
+) (wf.DeviceTestInput, error) {
+	if out.ActionToken == "" {
+		return wf.DeviceTestInput{}, errors.New("action token is empty")
+	}
+	if out.Attempt <= 0 {
+		return wf.DeviceTestInput{}, fmt.Errorf("attempt = %d, want positive", out.Attempt)
+	}
+	if out.TargetWorkflowID == "" {
+		return wf.DeviceTestInput{}, errors.New("target workflow id is empty")
+	}
+	if len(out.TargetInput) == 0 {
+		return wf.DeviceTestInput{}, errors.New("target input is empty")
+	}
+	var input wf.DeviceTestInput
+	if err := json.Unmarshal(out.TargetInput, &input); err != nil {
+		return wf.DeviceTestInput{}, fmt.Errorf("decode target input: %w", err)
+	}
+	if input.Attempt != out.Attempt {
+		return wf.DeviceTestInput{}, fmt.Errorf(
+			"target input attempt = %d, outcome attempt = %d",
+			input.Attempt, out.Attempt,
+		)
+	}
+	if got := input.WorkflowID(); got != out.TargetWorkflowID {
+		return wf.DeviceTestInput{}, fmt.Errorf(
+			"target input workflow id = %q, outcome target = %q",
+			got, out.TargetWorkflowID,
+		)
+	}
+	if input.SourceWorkflowID != row.WorkflowID {
+		return wf.DeviceTestInput{}, fmt.Errorf(
+			"target input source workflow = %q, claimed source = %q",
+			input.SourceWorkflowID, row.WorkflowID,
+		)
+	}
+	return input, nil
 }
 
 func (c *Consumer) completeRejection(

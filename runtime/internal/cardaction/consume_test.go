@@ -18,18 +18,22 @@ import (
 )
 
 type consumerTestStore struct {
-	inbox          map[string]store.InboxRow
-	actions        map[string]store.CardAction
-	messages       map[string]store.MessageClaim
-	claimTokens    []string
-	acceptCalls    int
-	rejectCalls    int
-	finalizeCalls  int
-	businessWrites int
-	attemptCalls   int
-	acceptKind     string
-	finalizeOK     bool
-	finalizeErr    error
+	inbox               map[string]store.InboxRow
+	actions             map[string]store.CardAction
+	messages            map[string]store.MessageClaim
+	claimTokens         []string
+	getActionCalls      int
+	getActionErr        error
+	acceptCalls         int
+	rejectCalls         int
+	finalizeCalls       int
+	businessWrites      int
+	attemptCalls        int
+	acceptKind          string
+	finalizeOK          bool
+	finalizeErr         error
+	acceptedPinsMutator func(*wf.DeviceTestInput)
+	outcomeMutator      func(*store.AcceptOutcome)
 }
 
 func newConsumerTestStore(action string) *consumerTestStore {
@@ -66,6 +70,25 @@ func (s *consumerTestStore) ClaimInbox(
 	return &copy, nil
 }
 
+func (s *consumerTestStore) GetCardAction(
+	_ context.Context, workflowID string,
+) (*store.CardAction, error) {
+	s.getActionCalls++
+	if s.getActionErr != nil {
+		return nil, s.getActionErr
+	}
+	action, ok := s.actions[workflowID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", store.ErrCardActionNotFound, workflowID)
+	}
+	action.TargetInput = append([]byte(nil), action.TargetInput...)
+	if action.LeaseExpiresAt != nil {
+		lease := *action.LeaseExpiresAt
+		action.LeaseExpiresAt = &lease
+	}
+	return &action, nil
+}
+
 func (s *consumerTestStore) CompleteAccept(
 	_ context.Context, req store.AcceptRequest,
 ) (*store.AcceptOutcome, error) {
@@ -78,9 +101,22 @@ func (s *consumerTestStore) CompleteAccept(
 		row.State = "processed"
 		s.inbox[req.EventID] = row
 		action := s.actions[req.WorkflowID]
-		return &store.AcceptOutcome{
+		out := &store.AcceptOutcome{
 			Kind: s.acceptKind, ActionToken: req.ActionToken, Attempt: action.Attempt,
-		}, nil
+		}
+		if s.acceptKind == "resumed" {
+			action.State = "pending"
+			action.Owner = req.ActionToken
+			action.LastError = ""
+			action.Revision++
+			s.actions[req.WorkflowID] = action
+			out.TargetWorkflowID = action.TargetWorkflowID
+			out.TargetInput = append([]byte(nil), action.TargetInput...)
+		}
+		if s.outcomeMutator != nil {
+			s.outcomeMutator(out)
+		}
+		return out, nil
 	}
 
 	action := store.CardAction{
@@ -94,6 +130,18 @@ func (s *consumerTestStore) CompleteAccept(
 		if err != nil {
 			return nil, err
 		}
+		if s.acceptedPinsMutator != nil {
+			var authoritative wf.DeviceTestInput
+			if err := json.Unmarshal(raw, &authoritative); err != nil {
+				return nil, err
+			}
+			s.acceptedPinsMutator(&authoritative)
+			raw, err = json.Marshal(authoritative)
+			if err != nil {
+				return nil, err
+			}
+			targetID = authoritative.WorkflowID()
+		}
 		action.State = "pending"
 		action.Owner = req.ActionToken
 		action.TargetInput = append([]byte(nil), raw...)
@@ -101,6 +149,8 @@ func (s *consumerTestStore) CompleteAccept(
 		action.Attempt = 1
 		out.ActionToken = req.ActionToken
 		out.Attempt = 1
+		out.TargetWorkflowID = targetID
+		out.TargetInput = append([]byte(nil), raw...)
 	}
 	s.actions[req.WorkflowID] = action
 	s.messages[req.WorkflowID+"\x00"+req.OpenMessageID] = store.MessageClaim{
@@ -110,6 +160,9 @@ func (s *consumerTestStore) CompleteAccept(
 	row.State = "processed"
 	s.inbox[req.EventID] = row
 	s.businessWrites++
+	if s.outcomeMutator != nil {
+		s.outcomeMutator(out)
+	}
 	return out, nil
 }
 
@@ -381,7 +434,10 @@ func TestIgnoreUsesFailureRunOnlyAndDoesNotStart(t *testing.T) {
 }
 
 func TestRetryStartsExactPinnedInput(t *testing.T) {
-	c, st, _, starter := newTestConsumer("retry")
+	c, st, resolver, starter := newTestConsumer("retry")
+	st.acceptedPinsMutator = func(in *wf.DeviceTestInput) {
+		in.Packages[0].URL = "https://registry/authoritative-persisted-v1"
+	}
 	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
 		t.Fatalf("ConsumeOne: %v", err)
 	}
@@ -394,6 +450,100 @@ func TestRetryStartsExactPinnedInput(t *testing.T) {
 	}
 	if !reflect.DeepEqual(starter.inputs[0], pinned) {
 		t.Fatalf("started input = %#v, pinned = %#v", starter.inputs[0], pinned)
+	}
+	if resolver.resolveRetryCalls != 1 {
+		t.Fatalf("ResolveRetry calls = %d, want 1", resolver.resolveRetryCalls)
+	}
+}
+
+func TestFailedRetryResumesFromPersistedPinsWithoutResolving(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("retry")
+	persisted := buildTargetInput(fullResolution(), 7)
+	persisted.Packages[0].URL = "https://registry/persisted-old-v1"
+	raw, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.actions["wf1"] = store.CardAction{
+		WorkflowID: "wf1", Action: "retry", ActorOpenID: "ou_1",
+		State: "failed", Attempt: persisted.Attempt, Revision: 2,
+		TargetWorkflowID: persisted.WorkflowID(), TargetInput: raw,
+		LastError: "previous temporal failure",
+	}
+	st.acceptKind = "resumed"
+	resolver.err = &rerun.RejectReason{
+		Code: "ArtifactMissing", WorkflowID: "wf1", Variant: "v1", Count: 0,
+	}
+
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("ConsumeOne: %v", err)
+	}
+	if resolver.resolveRetryCalls != 0 {
+		t.Fatalf("ResolveRetry calls = %d, want 0", resolver.resolveRetryCalls)
+	}
+	if st.getActionCalls != 1 {
+		t.Fatalf("GetCardAction calls = %d, want 1", st.getActionCalls)
+	}
+	if st.attemptCalls != 0 {
+		t.Fatalf("BuildTarget calls = %d, want 0", st.attemptCalls)
+	}
+	if starter.startCalls != 1 || len(starter.inputs) != 1 {
+		t.Fatalf("StartDeviceTest calls = %d inputs=%d, want 1", starter.startCalls, len(starter.inputs))
+	}
+	if !reflect.DeepEqual(starter.inputs[0], persisted) {
+		t.Fatalf("started input = %#v, persisted = %#v", starter.inputs[0], persisted)
+	}
+	if action := st.actions["wf1"]; action.State != "succeeded" ||
+		action.Attempt != persisted.Attempt || action.TargetWorkflowID != persisted.WorkflowID() ||
+		!reflect.DeepEqual(action.TargetInput, raw) {
+		t.Fatalf("resumed action = %#v", action)
+	}
+}
+
+func TestRetryDoesNotStartInvalidAuthoritativePins(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *store.AcceptOutcome)
+	}{
+		{"invalid JSON", func(_ *testing.T, out *store.AcceptOutcome) {
+			out.TargetInput = []byte("{")
+		}},
+		{"attempt mismatch", func(_ *testing.T, out *store.AcceptOutcome) {
+			out.Attempt++
+		}},
+		{"target workflow mismatch", func(_ *testing.T, out *store.AcceptOutcome) {
+			out.TargetWorkflowID += "-other"
+		}},
+		{"source workflow mismatch", func(t *testing.T, out *store.AcceptOutcome) {
+			var input wf.DeviceTestInput
+			if err := json.Unmarshal(out.TargetInput, &input); err != nil {
+				t.Fatal(err)
+			}
+			input.SourceWorkflowID = "wf-other"
+			raw, err := json.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out.TargetInput = raw
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, st, _, starter := newTestConsumer("retry")
+			st.outcomeMutator = func(out *store.AcceptOutcome) {
+				tt.mutate(t, out)
+			}
+
+			if err := c.ConsumeOne(context.Background(), "e1"); err == nil {
+				t.Fatal("invalid authoritative pins must fail")
+			}
+			if starter.startCalls != 0 || st.finalizeCalls != 0 {
+				t.Fatalf(
+					"invalid pins called start=%d finalize=%d",
+					starter.startCalls, st.finalizeCalls,
+				)
+			}
+		})
 	}
 }
 
@@ -443,6 +593,55 @@ func TestNonExecutingAcceptOutcomesDoNotStart(t *testing.T) {
 				t.Fatalf("%s calls start=%d finalize=%d", kind, starter.startCalls, st.finalizeCalls)
 			}
 		})
+	}
+}
+
+func TestExistingPendingRetryDoesNotResolveOrStart(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("retry")
+	persisted := buildTargetInput(fullResolution(), 3)
+	raw, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.actions["wf1"] = store.CardAction{
+		WorkflowID: "wf1", Action: "retry", ActorOpenID: "ou_1",
+		State: "pending", Owner: "existing-owner", Attempt: persisted.Attempt, Revision: 1,
+		TargetWorkflowID: persisted.WorkflowID(), TargetInput: raw,
+	}
+	st.acceptKind = "conflict"
+	resolver.err = &rerun.RejectReason{
+		Code: "ArtifactMissing", WorkflowID: "wf1", Variant: "v1", Count: 0,
+	}
+
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("ConsumeOne: %v", err)
+	}
+	if resolver.resolveRetryCalls != 0 {
+		t.Fatalf("ResolveRetry calls = %d, want 0", resolver.resolveRetryCalls)
+	}
+	if st.acceptCalls != 1 || starter.startCalls != 0 || st.finalizeCalls != 0 {
+		t.Fatalf(
+			"calls accept=%d start=%d finalize=%d, want 1/0/0",
+			st.acceptCalls, starter.startCalls, st.finalizeCalls,
+		)
+	}
+}
+
+func TestRetryActionLookupErrorPropagates(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("retry")
+	lookupErr := errors.New("database unavailable")
+	st.getActionErr = lookupErr
+
+	err := c.ConsumeOne(context.Background(), "e1")
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("ConsumeOne error = %v, want wrapped lookup error", err)
+	}
+	if resolver.resolveRetryCalls != 0 || st.acceptCalls != 0 ||
+		starter.startCalls != 0 || st.finalizeCalls != 0 {
+		t.Fatalf(
+			"lookup error calls resolve=%d accept=%d start=%d finalize=%d",
+			resolver.resolveRetryCalls, st.acceptCalls, starter.startCalls, st.finalizeCalls,
+		)
 	}
 }
 

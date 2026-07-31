@@ -158,6 +158,21 @@ const cardActionColumns = `
 	workflow_id, action, actor_open_id, state, owner, lease_expires_at,
 	target_workflow_id, attempt, target_input, last_error, revision`
 
+// GetCardAction 按 source workflow_id 查询权威动作；未知 workflow 返回
+// ErrCardActionNotFound。scanCardAction 会复制 target_input 与可空租约。
+func (s *PGStore) GetCardAction(ctx context.Context, workflowID string) (*CardAction, error) {
+	action, err := scanCardAction(s.DB.QueryRowContext(ctx,
+		`SELECT `+cardActionColumns+` FROM card_actions WHERE workflow_id=$1`,
+		workflowID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s", ErrCardActionNotFound, workflowID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get card action %s: %w", workflowID, err)
+	}
+	return &action, nil
+}
+
 // CompleteAccept 只完成已经 ClaimInbox 的 live claim，不会重新 acquire。
 // 首次接受通过 workflow_runs 父行锁串行化，attempt 分配、BuildTarget、
 // 完整 action 插入、审计、消息登记与 inbox processed 同属一个事务。
@@ -263,19 +278,25 @@ func (s *PGStore) CompleteAccept(
 			if err := validateTargetPins(targetInput, targetWorkflowID); err != nil {
 				return nil, fmt.Errorf("complete accept: build target: %w", err)
 			}
-			if _, err := tx.ExecContext(ctx, `
+			var persistedTargetWorkflowID string
+			var persistedTargetInput []byte
+			if err := tx.QueryRowContext(ctx, `
 				INSERT INTO card_actions
 					(workflow_id, action, actor_open_id, state, owner, lease_expires_at,
 					 target_workflow_id, attempt, target_input, revision)
 				VALUES ($1,$2,$3,'pending',$4,
 				        clock_timestamp()+make_interval(secs => $5),
-				        $6,$7,$8::jsonb,1)`,
+				        $6,$7,$8::jsonb,1)
+				RETURNING target_workflow_id, target_input`,
 				req.WorkflowID, req.Action, req.ActorOpenID, req.ActionToken,
-				cardActionLease.Seconds(), targetWorkflowID, attempt, string(targetInput)); err != nil {
+				cardActionLease.Seconds(), targetWorkflowID, attempt, string(targetInput)).
+				Scan(&persistedTargetWorkflowID, &persistedTargetInput); err != nil {
 				return nil, fmt.Errorf("complete accept %s: insert retry action: %w", req.EventID, err)
 			}
 			outcome = AcceptOutcome{
 				Kind: "accepted", ActionToken: req.ActionToken, Attempt: attempt,
+				TargetWorkflowID: persistedTargetWorkflowID,
+				TargetInput:      append([]byte(nil), persistedTargetInput...),
 			}
 		case "ignore":
 			if _, err := tx.ExecContext(ctx, `
@@ -313,6 +334,8 @@ func (s *PGStore) CompleteAccept(
 		}
 		outcome = AcceptOutcome{
 			Kind: "resumed", ActionToken: req.ActionToken, Attempt: action.Attempt,
+			TargetWorkflowID: action.TargetWorkflowID,
+			TargetInput:      append([]byte(nil), action.TargetInput...),
 		}
 	default:
 		revision = action.Revision

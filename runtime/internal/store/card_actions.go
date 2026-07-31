@@ -24,6 +24,8 @@ var (
 	ErrInboxNotClaimable = errors.New("card action inbox event not claimable")
 	// ErrCardSnapshotNotFound 表示 workflow 尚未持久化原展示卡。
 	ErrCardSnapshotNotFound = errors.New("card action snapshot not found")
+	// ErrCardActionNotFound 表示 workflow 尚未持久化任何按钮动作。
+	ErrCardActionNotFound = errors.New("card action not found")
 )
 
 // InboxRow 对应 card_action_inbox 一行(schema.sql,设计文档 §3.1)。
@@ -101,11 +103,14 @@ type AcceptRequest struct {
 	BuildTarget   func(attempt int) (targetInput []byte, targetWorkflowID string, err error)
 }
 
-// AcceptOutcome 描述 CompleteAccept 的权威归宿。
+// AcceptOutcome 描述 CompleteAccept 的权威归宿。retry 的 accepted/resumed
+// 会返回事务内实际持久化或加载的 pins；其他 outcome 不携带 pins。
 type AcceptOutcome struct {
-	Kind        string // accepted|resumed|conflict|legacy|lost
-	ActionToken string
-	Attempt     int
+	Kind             string // accepted|resumed|conflict|legacy|lost
+	ActionToken      string
+	Attempt          int
+	TargetWorkflowID string
+	TargetInput      []byte
 }
 
 // RejectRender 是业务拒绝的持久化渲染输入。ButtonsMode 不由调用方传入，
@@ -223,6 +228,20 @@ func (s *MemStore) ClaimInbox(_ context.Context, eventID, token string, lease ti
 	return &out, nil
 }
 
+// GetCardAction 按 source workflow_id 查询权威动作；未知 workflow 返回
+// ErrCardActionNotFound。返回值与内存存储不共享 target_input 或租约指针。
+func (s *MemStore) GetCardAction(_ context.Context, workflowID string) (*CardAction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	action, ok := s.cardActions[workflowID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrCardActionNotFound, workflowID)
+	}
+	out := cloneCardAction(action)
+	return &out, nil
+}
+
 // CompleteAccept 只完成已经 ClaimInbox 的 live claim，不会重新 acquire。
 // owner 或租约不匹配时返回 lost，且不写任何业务状态。
 func (s *MemStore) CompleteAccept(_ context.Context, req AcceptRequest) (*AcceptOutcome, error) {
@@ -297,7 +316,11 @@ func (s *MemStore) CompleteAccept(_ context.Context, req AcceptRequest) (*Accept
 				TargetInput: append([]byte(nil), targetInput...), Revision: 1,
 			}
 			s.setWorkflowAttemptAllLocked(req.Project, req.CommitSHA, req.PipelineID, attempt)
-			outcome = AcceptOutcome{Kind: "accepted", ActionToken: req.ActionToken, Attempt: attempt}
+			outcome = AcceptOutcome{
+				Kind: "accepted", ActionToken: req.ActionToken, Attempt: attempt,
+				TargetWorkflowID: targetWorkflowID,
+				TargetInput:      append([]byte(nil), targetInput...),
+			}
 		case "ignore":
 			if !liveInboxClaim(inbox, req.Token) {
 				return &AcceptOutcome{Kind: "lost"}, nil
@@ -331,6 +354,8 @@ func (s *MemStore) CompleteAccept(_ context.Context, req AcceptRequest) (*Accept
 		})
 		outcome = AcceptOutcome{
 			Kind: "resumed", ActionToken: req.ActionToken, Attempt: action.Attempt,
+			TargetWorkflowID: action.TargetWorkflowID,
+			TargetInput:      append([]byte(nil), action.TargetInput...),
 		}
 		revision = action.Revision
 	default:
