@@ -7,6 +7,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"hermes-devops/runtime/internal/cardaction"
 	"hermes-devops/runtime/internal/feishu"
 	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/store"
@@ -26,6 +27,7 @@ type Store interface {
 	GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error)
 	SaveEvidenceSnapshot(ctx context.Context, snap store.EvidenceSnapshot) error
 	RecordWorkflowRun(ctx context.Context, run store.WorkflowRun) error
+	PutCardSnapshot(ctx context.Context, workflowID string, cardJSON []byte) error
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).
@@ -79,6 +81,8 @@ type Acts struct {
 	SpecCfg *SpecConfig
 	Log     *zerolog.Logger     // optional; nil-safe (tests may leave unset)
 	Hermes  hermesclient.Client // Phase 2 Analyzer;nil = 禁用,规则引擎保底(§12)
+	// CardActions gates button injection on complete runtime readiness.
+	CardActions *cardaction.Readiness
 	// Feishu 通知发送方(feishu.NewSender 构造:app 优先,webhook 兜底);
 	// nil = 未配置,Notify 静默成功(开发模式)。
 	Feishu feishu.Sender
