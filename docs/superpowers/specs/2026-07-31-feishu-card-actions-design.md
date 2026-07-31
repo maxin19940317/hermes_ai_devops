@@ -1,7 +1,7 @@
 # 飞书终态卡片按钮设计（重试 / 忽略）
 
 **日期：** 2026-07-31
-**状态：** 待评审（v5）
+**状态：** 待评审（v6）
 **范围：** 三轮交互能力的第二轮。终态通知卡片上加两个**卡片级**按钮——「重试失败变体」「忽略」。
 不含 NL 确认/取消按钮（第三轮）、隔离按钮、证据链接、卡片模板化。
 
@@ -22,6 +22,7 @@
 | v4 → v5 | `rejected` inbox 行按默认 `received` 插入必撞 `inbox_rejected_is_terminal`，`23514` | 首次 INSERT 即写 `processed` + `processed_at`（§6.1） |
 | v4 → v5 | `Complete*` 只校验 owner，租约过期的持有者仍能提交失效结果 | 所有 completion 增加 `lease_expires_at > now()`（§5.2 第 0 条） |
 | v4 → v5 | 卡片 completion 缺 revision fencing，旧 worker 会把新 revision 标成 succeeded 而永久吞掉 | claim 钉住 `desired_revision`，completion 双重 fencing（§8.3 第 0 条） |
+| v5 → v6 | §8.3 允许失租写方仍写 `reconcile_after`，与三重 fencing 自相矛盾 | 失租写方**零写入**，只记日志（§8.3 第 2 条） |
 
 实证过的事实（不再重新论证）：
 
@@ -462,10 +463,10 @@ artifacts 水位**恰好推进一次**、其余全部 `rejected.conflict`。
 重排时**必须同时清空 `reconcile_after`**（§8.3）：新状态应当立即可更新，
 不该被上一轮的延迟复核窗口压住。
 
-这里可以**无条件**清 owner，而 §8.3 第 2 条要求"不得抹掉新 owner"——两者不矛盾：
-revision 推进由 §8.3 第 0 条的 `desired_revision` fencing 兜底，任何在途写方的 completion
-都会因 revision 不匹配而影响 0 行，清掉它的 owner 不会造成丢更新。
-§8.3 第 2 条约束的是**失去租约的写方自己**去改行时不得越权，是另一个场景。
+这里可以**无条件**清 owner：revision 推进由 §8.3 第 0 条的 `desired_revision` fencing 兜底，
+任何在途写方的 completion 都会因 revision 不匹配而影响 0 行，清掉它的 owner 不会丢更新。
+与 §8.3 第 2 条（失租写方零写入）不矛盾——那条约束的是**已失去持有权的写方**，
+本条是**持有权威状态的动作事务**在推进版本，两者角色相反。
 
 ### 5.5 target_input 的完整性断言
 
@@ -811,10 +812,16 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
    不是靠调用方自觉。
    反过来，§5.4 的每次 revision 重排**必须清空 `reconcile_after`**——新状态比"复核旧状态"
    更值得立即呈现，压着它没有意义。
-2. **重排不得抹掉新 owner。** 失去租约的写方只能清除**自己持有的** owner：
-   `UPDATE ... SET owner='', lease_expires_at=NULL WHERE ... AND owner = <my token>`。
-   owner 已换人时只设 `reconcile_after`，不碰 owner——否则会把新持有者踢掉，形成互相抢占。
-   这也是 §3.5 要求 owner 是**不可复用随机 token** 的原因。
+2. **失去租约的写方零写入。** 三重 fencing 一旦确立，"失租后还能改点什么"就不再成立——
+   连 `reconcile_after` 也不行：那同样是对一行自己已无权处置的记录做写入，
+   会覆盖新持有者刚设的复核窗口。失租的写方**只记日志，一个字段都不碰**。
+
+   这不影响收敛：该行此刻由新持有者持有，它会渲染当前 `desired_revision`；
+   若它也失败，租约到期后 sweep 会再次选中该行。**收敛依赖的是"行始终可被重新 claim"，
+   而不是"每个写方都要留下痕迹"。**
+
+   `owner` 因此是**不可复用随机 token**（§3.5）：可复用的 owner 会让失租者的写入伪装成
+   合法持有者的写入，正是这条规则要杜绝的。
 3. **文档写明。** 用户可见文档与 §12 都必须写明"卡片是最终呈现、数据库是权威"。
 
 ---
@@ -847,10 +854,30 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
 - **`ClaimInbox` → `Complete*` 全路径**：Complete 在**租约仍然有效**时必须成功
   （v3 的"再 acquire 一次"写法会在这里零行，是 v4 阻断 1 的回归测试）；
   token 不匹配时 Complete 影响 0 行且不做任何业务写入；
-- **租约过期后 Complete 必须失败**：token 正确但 `lease_expires_at` 已过期 → 影响 0 行、
-  零业务写入（v5 第 2 条回归；只比对 owner 的实现会在这里放过一份失效的解析结果）；
+- **租约过期后所有 completion 必须零写入**（v5 第 2 条回归）。**逐个 completion 入口覆盖**，
+  每个都用"token 正确、`lease_expires_at` 已过期"构造，断言影响 0 行且**该行任何字段未变**：
+
+  | completion 入口 | 断言 |
+  |---|---|
+  | `CompleteAccept` | inbox 仍 `received`；无 `card_actions` / `audit_log` / message 写入 |
+  | `CompleteReject` | 同上 |
+  | action finalize → `succeeded` | `card_actions` 仍 `pending`，`revision` 未变 |
+  | action finalize → `failed` | 同上，`last_error` 未被写入 |
+  | 卡片 completion → `succeeded` | `rendered_revision` / `update_state` 未变 |
+  | 卡片 timeout → 写 `reconcile_after` | `reconcile_after` **未被写入**（§8.3 第 2 条） |
+  | 卡片 → `abandoned` | `update_state` 未变 |
+
+  只比对 owner 的实现会在这七条里放过失效写入；只在 `Complete*` 上加租约判定的实现
+  会漏掉后五条。
 - **`rejected` 行首次 INSERT 即为 `processed` + `processed_at`**；
   先插 `received` 再 UPDATE 的写法必须撞 `23514`（v5 第 1 条回归）；
+- **`rejected` 同步事务的原子性**（v5 第 3 条；现有"三次重投"用例走的是 `accepted` 分支，
+  那条要 claim，覆盖不到这里）：
+  - **审计写入失败 → 整笔回滚**：注入 `audit_log` 写入错误后，`card_action_inbox`
+    **不得留下任何行**——否则该 event 会被永久当作"已处理"，而审计里查无此人；
+  - **重复 `rejected` event**：同一 `event_id` 连投 3 次 → 恰好 **1 行 inbox、1 行审计**，
+    且三次同步应答的 toast **与首次逐字节相同**（走 `ON CONFLICT DO NOTHING` + `ack_toast` 重放，
+    不经 claim、不经异步段）；
 - §5.3 三种归宿逐行覆盖；`failed → pending` 复用原三字段且不重新 Resolve；
 - finalize fencing：owner 不匹配影响 0 行；
 - 恢复不推进水位（断言 artifacts 计数器不变）；
@@ -926,7 +953,8 @@ target 已钉死，说明该 workflow 已在运行，finalize 为 `succeeded`。
   **`reconcile_after` 未到期时 sweep 选不中该行**（谓词生效的机械证明，v4 阻断 6 回归），
   到期后重渲染一次；
 - 新 revision 重排**清空 `reconcile_after`**，新状态立即可更新；
-- 失去租约的写方**不清除他人 owner**；
+- 失去租约的写方**零写入**：断言该行所有字段（含 `owner`、`reconcile_after`、
+  `update_state`、`attempts`、`last_error`）逐一未变；
 - **revision fencing**：claim 钉住 rev1 → PATCH 期间动作推进到 rev2 → 旧 worker 的
   completion **影响 0 行**，该行仍为 `pending` 且 `desired_revision=2`，随后被 sweep 选中
   并渲染 rev2（v5 第 3 条回归；只比对 owner 的实现会把它标成 `succeeded` 从而永久吞掉 rev2）。
