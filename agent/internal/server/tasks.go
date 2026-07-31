@@ -422,11 +422,14 @@ func (s *Server) uploadOnDemand(ctx context.Context, d Dispatch, outDir string, 
 // uploadFixedSet 按 dispatch.presigned_uploads 直传收集到的固定键集文件;
 // 键不在映射内或文件缺失均降级跳过(uploader 语义,设计 §3.4)。这是按需签发
 // (uploadOnDemand)不可用时的回退路径(设计 §5.2)。
+//
+// object_key 匹配用 filepath.Base(取最后一段文件名)做 wellKnownFiles 查找,
+// 不依赖 "runs/{task_id}/" 前缀。若 Runtime 未来调整键结构(如加 attempt 段),
+// 前缀匹配会静默跳过所有项;后缀匹配则天然兼容任何前缀变更(审查 #4)。
 func (s *Server) uploadFixedSet(ctx context.Context, d Dispatch, outDir string) []reporter.Attachment {
 	if s.cfg.Uploader == nil || len(d.PresignedUploads) == 0 {
 		return nil
 	}
-	prefix := "runs/" + d.TaskID + "/"
 	presigned := make([]uploader.PresignedUpload, 0, len(d.PresignedUploads))
 	files := map[string]string{}
 	for _, p := range d.PresignedUploads {
@@ -439,7 +442,7 @@ func (s *Server) uploadFixedSet(ctx context.Context, d Dispatch, outDir string) 
 			}
 		}
 		presigned = append(presigned, pu)
-		name := strings.TrimPrefix(p.ObjectKey, prefix)
+		name := filepath.Base(p.ObjectKey)
 		if rel, ok := wellKnownFiles[name]; ok {
 			files[p.ObjectKey] = filepath.Join(outDir, filepath.FromSlash(rel))
 		} else {

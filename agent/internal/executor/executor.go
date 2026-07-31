@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -454,12 +455,23 @@ func (e *Executor) run(ctx context.Context, serial string, m *manifest.Manifest,
 	return canceled, timedOut, res, duration, err
 }
 
+// collectPatternOK 是 collect pattern 的字符白名单:只允许文件名常用字符
+// 与 glob 通配符。Pattern 来自 Manifest collect 字段,虽经 Schema 校验,但
+// Schema 无法表达字符级正则——此处是纵深防御,防止恶意 manifest 注入任意
+// shell(审查 #3)。
+var collectPatternOK = regexp.MustCompile(`^[A-Za-z0-9._*/-]+$`)
+
 // collect 按 Manifest collect 列表拉取产物,单项失败只记日志不中断;
 // 多个 pattern 命中同一文件只拉取一次。
 func (e *Executor) collect(ctx context.Context, serial string, m *manifest.Manifest, deviceDir string) []string {
 	collected := []string{}
 	seen := map[string]bool{}
 	for _, pattern := range m.Collect {
+		// 纵深防御:Schema 已限定字符集,此处再次校验防止 Schema 漂移或绕过
+		if !collectPatternOK.MatchString(pattern) {
+			e.logf("collect %q: pattern contains disallowed characters, skipping", pattern)
+			continue
+		}
 		res, err := e.Runner.Run(ctx, adb.ShellListGlob(serial, m.Deploy.Workdir, pattern))
 		if err != nil || res.ExitCode != 0 {
 			e.logf("collect %q: no match (exit=%d)", pattern, res.ExitCode)

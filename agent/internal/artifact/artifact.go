@@ -44,7 +44,16 @@ func (a *Auth) apply(req *http.Request) error {
 	return nil
 }
 
+// DefaultMaxDownloadSize 是单次下载的大小上限(2 GiB)。Phase 1 的包通常
+// 在几十 MB 级;超出此上限大概率是异常响应(端点错误、恶意服务端等),
+// 必须在写盘前拒绝,防止耗尽 Client 磁盘(审查 #1)。
+const DefaultMaxDownloadSize int64 = 2 << 30 // 2 GiB
+
+// ErrDownloadTooLarge 标记下载超出大小上限;调用方可据此区分下载失败原因。
+var ErrDownloadTooLarge = fmt.Errorf("download exceeds max size (%d bytes)", DefaultMaxDownloadSize)
+
 // Download 下载 url 到 dest(原子写:先临时文件后 rename,失败不留残档)。
+// 写入超过 DefaultMaxDownloadSize 字节后立即中止,不留残档。
 func Download(ctx context.Context, client *http.Client, url string, auth *Auth, dest string) error {
 	if client == nil {
 		client = http.DefaultClient
@@ -70,9 +79,17 @@ func Download(ctx context.Context, client *http.Client, url string, auth *Auth, 
 		return fmt.Errorf("create temp: %w", err)
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	// LimitReader 在读取 DefaultMaxDownloadSize+1 字节时返回 EOF=false
+	// 但 io.Copy 会读到 n > DefaultMaxDownloadSize,据此判定超限。
+	limited := io.LimitReader(resp.Body, DefaultMaxDownloadSize+1)
+	written, err := io.Copy(tmp, limited)
+	if err != nil {
 		tmp.Close()
 		return fmt.Errorf("write body: %w", err)
+	}
+	if written > DefaultMaxDownloadSize {
+		tmp.Close()
+		return fmt.Errorf("download %s: %w (wrote %d bytes)", url, ErrDownloadTooLarge, written)
 	}
 	if err := tmp.Close(); err != nil {
 		return err

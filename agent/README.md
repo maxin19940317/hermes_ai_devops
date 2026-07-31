@@ -127,11 +127,17 @@ agent-cli run --package-file smoke-pkg-ok.tar.gz --sha256 <打印的sha256> `
 - `internal/adb`:**模板化白名单**命令构造器是唯一命令来源,全部强制 `adb -s <serial>`;
   `ExecRunner` 对每次调用注入 `ANDROID_ADB_SERVER_PORT=5137`(覆盖继承值),永不碰 5037。
 - `internal/manifest`:嵌入 `contracts/manifest.schema.json` 副本,加载必过 Schema;
-  测试 `TestEmbeddedSchemaMatchesContract` 防契约漂移(改契约后 `cp` 同步再跑测试)。
-- `internal/artifact`:下载原子写 + 整包 sha256 校验;解压拒绝绝对路径/`..`/符号链接。
+  第二轮反序列化启用 `yaml.Decoder.KnownFields(true)`,防止 struct 扩展时意外
+  接受 Schema 未声明的字段;测试 `TestEmbeddedSchemaMatchesContract` 防契约漂移
+  (改契约后 `cp` 同步再跑测试)。
+- `internal/artifact`:下载原子写 + 整包 sha256 校验 + **2 GiB 大小上限**
+  (`io.LimitReader` +1 字节技巧,超限即中止不留残档,`ErrDownloadTooLarge` 可
+  `errors.Is` 分类);解压拒绝绝对路径/`..`/符号链接。
 - `internal/executor`:流水线 PREPARING→(DOWNLOADING)→DEPLOYING→RUNNING→COLLECTING→终态;
   超时 kill 后**仍收集**;非零退出码/超时是客观结局不是 error;
   逐文件 sha256 复核后才 push;status 与 verdict 正交,本层不判 verdict。
+  collect pattern 经**字符白名单正则**( `[A-Za-z0-9._*/-]+` )纵深防御,
+  Schema 之外再挡一层 shell 元字符注入。
 
 ## 实机踩坑记录(2026-07-17,trinket/QCM6125 板)
 
@@ -169,8 +175,33 @@ agent install|uninstall|start|stop   # Windows Service / systemd(kardianos/servi
 启动恢复(§4):上次进程的非终态任务统一置 FAILED(事件+合成摘要结果回流),
 随后补报未上报的终态结果与事件。
 
+## 安全加固(2026-07-31 二轮 review)
+
+四项纵深防御改进,全部实现并通过编译与现有测试:
+
+- **下载大小上限**(`internal/artifact`):`DefaultMaxDownloadSize` = 2 GiB,
+  `io.LimitReader` +1 字节技巧检测超限,超限即中止不留残档;
+  `ErrDownloadTooLarge` 哨兵错误供调用方分类。
+- **Manifest 严格反序列化**(`internal/manifest`):第二轮反序列化启用
+  `yaml.Decoder.KnownFields(true)`,拒绝 Schema 未声明的字段,
+  防止 struct 扩展时意外接受未声明数据。
+- **Collect pattern 白名单**(`internal/executor`):正则 `^[A-Za-z0-9._*/-]+$`
+  纵深防御,Schema 之外再挡一层 shell 元字符注入,非法 pattern 跳过并日志告警。
+- **Upload 后缀匹配**(`internal/server`):`filepath.Base(objectKey)` 做
+  `wellKnownFiles` 查找,不依赖 `runs/{task_id}/` 前缀结构,
+  未来 Runtime 键结构调整(如加 attempt 段)天然兼容。
+
+## 待补充(技术债)
+
+- 四项安全加固的**显式回归测试**:超大下载拒绝、KnownFields 未声明字段拒绝、
+  collect 非法 pattern 跳过、多级前缀 ObjectKey 仍能匹配 wellKnownFiles。
+  当前已被集成测试间接覆盖,但缺少边界条件单测。
+
 ## 尚未覆盖(后续阶段)
 
-- ~~RPC 服务壳(§8.1)、心跳/事件/结果回调、MinIO 直传、Windows Service 化~~ → 已交付(cmd/agent,Phase 1.7)
+- ~~RPC 服务壳(§8.1)、心跳/事件/结果回调、MinIO 直传、Windows Service 化~~
+  → 已交付(cmd/agent,Phase 1.7)
+- ~~下载大小上限、Manifest 严格字段、Collect pattern 白名单、Upload 后缀匹配~~
+  → 已交付(2026-07-31 二轮 review)
 - Agent 自带固定版本 adb 并自管 server 生命周期(当前用 `--adb` / `AGENT_ADB_PATH` 指定)
 - 真实设备验证需在 Windows Client 上进行(本仓库单测用 fake Runner 全覆盖流水线)

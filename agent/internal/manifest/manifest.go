@@ -96,8 +96,12 @@ func Load(path string) (*Manifest, error) {
 	if err := compiledSchema.Validate(doc); err != nil {
 		return nil, fmt.Errorf("manifest schema validation: %w", err)
 	}
+	// 第二轮反序列化启用 KnownFields,防止 Manifest 结构体新增 interface{}
+	// 字段时意外接受 Schema 未声明的数据(审查 #2)。
 	var m Manifest
-	if err := yaml.Unmarshal(raw, &m); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&m); err != nil {
 		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
 	return &m, nil
