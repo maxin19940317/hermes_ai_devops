@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -295,6 +296,39 @@ func TestPayloadValidationPrecedesReadinessAndWhitelist(t *testing.T) {
 	}
 }
 
+func TestValidationPhaseOrderIsSourcePayloadIdentityReadinessWhitelist(t *testing.T) {
+	h := newHandler(newFakeStore(), NewReadiness(ReadinessConfig{}))
+	h.Whitelist = map[string]bool{}
+	ev := validEvent()
+	ev.EventV2Base.Header.AppID = "cli_other"
+	ev.Event.Action.Value["extra"] = "x"
+	ev.Event.Operator.OpenID = ""
+
+	if _, got := h.validate(ev, "evt_1"); got != "source" {
+		t.Fatalf("all phases invalid: reason = %q, want source", got)
+	}
+	ev.EventV2Base.Header.AppID = testAppID
+	if _, got := h.validate(ev, "evt_1"); got != "payload" {
+		t.Fatalf("source valid: reason = %q, want payload", got)
+	}
+	delete(ev.Event.Action.Value, "extra")
+	if _, got := h.validate(ev, "evt_1"); got != "identity" {
+		t.Fatalf("payload valid: reason = %q, want identity", got)
+	}
+	ev.Event.Operator.OpenID = testOpenID
+	if _, got := h.validate(ev, "evt_1"); got != "disabled" {
+		t.Fatalf("identity valid: reason = %q, want disabled", got)
+	}
+	h.Readiness = readyAll()
+	if _, got := h.validate(ev, "evt_1"); got != "unauthorized" {
+		t.Fatalf("readiness valid: reason = %q, want unauthorized", got)
+	}
+	h.Whitelist[testOpenID] = true
+	if _, got := h.validate(ev, "evt_1"); got != "" {
+		t.Fatalf("whitelist valid: reason = %q, want accepted", got)
+	}
+}
+
 func TestMalformedAuditPreservesObservableActorTargetAndDigest(t *testing.T) {
 	st := newFakeStore()
 	h := newHandler(st, readyAll())
@@ -316,6 +350,70 @@ func TestMalformedAuditPreservesObservableActorTargetAndDigest(t *testing.T) {
 	))
 	if want := hex.EncodeToString(sum[:]); audit.PayloadDigest != want {
 		t.Fatalf("audit payload digest = %q, want %q", audit.PayloadDigest, want)
+	}
+}
+
+func TestOversizedOrUnencodablePayloadPreservesBoundedObservableTarget(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "oversized extra",
+			mutate: func(value map[string]any) {
+				value["extra"] = strings.Repeat("x", maxPayloadBytes)
+			},
+		},
+		{
+			name: "unencodable extra",
+			mutate: func(value map[string]any) {
+				value["extra"] = make(chan int)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newFakeStore()
+			h := newHandler(st, readyAll())
+			ev := validEvent()
+			tt.mutate(ev.Event.Action.Value)
+
+			if _, err := h.OnCardAction(context.Background(), ev); err != nil {
+				t.Fatal(err)
+			}
+			row := st.rows["evt_1"]
+			if row.WorkflowID != testWorkflow || row.PayloadDigest != "" {
+				t.Fatalf("rejected row = %+v", row)
+			}
+			audit := st.audits[0]
+			if audit.Target != testWorkflow || audit.PayloadDigest != "" {
+				t.Fatalf("audit = %+v", audit)
+			}
+		})
+	}
+}
+
+func TestEarlyPayloadRejectionDoesNotPersistOversizedObservableTarget(t *testing.T) {
+	st := newFakeStore()
+	h := newHandler(st, readyAll())
+	ev := validEvent()
+	ev.Event.Action.Tag = "select_static"
+	ev.Event.Action.Value["source_workflow_id"] = strings.Repeat("w", maxPayloadBytes+1)
+
+	if _, reason := h.validate(ev, "evt_1"); reason != "payload" {
+		t.Fatalf("reason = %q, want payload", reason)
+	}
+	if _, err := h.OnCardAction(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	row := st.rows["evt_1"]
+	if row.WorkflowID != "" || row.PayloadDigest != "" {
+		t.Fatalf("rejected row persisted oversized payload data: %+v", row)
+	}
+	audit := st.audits[0]
+	if audit.Target != "" || audit.PayloadDigest != "" {
+		t.Fatalf("audit persisted oversized payload data: %+v", audit)
 	}
 }
 
@@ -382,13 +480,14 @@ func TestUnauthorizedIsRejectedWithSynchronousToast(t *testing.T) {
 
 func TestAcceptedEventPersistsCanonicalDataThenConsumesOnce(t *testing.T) {
 	st := newFakeStore()
-	consumed := make([]string, 0, 1)
+	consumed := make(chan string, 2)
 	h := newHandler(st, readyAll())
 	h.Consume = func(eventID string) {
 		if _, ok := st.rows[eventID]; !ok {
-			t.Fatal("Consume called before PutInbox completed")
+			consumed <- "before-persist:" + eventID
+			return
 		}
-		consumed = append(consumed, eventID)
+		consumed <- eventID
 	}
 
 	resp, err := h.OnCardAction(context.Background(), validEvent())
@@ -412,8 +511,13 @@ func TestAcceptedEventPersistsCanonicalDataThenConsumesOnce(t *testing.T) {
 	if len(st.audits) != 0 {
 		t.Fatalf("accepted synchronous path wrote %d audits", len(st.audits))
 	}
-	if len(consumed) != 1 || consumed[0] != "evt_1" {
-		t.Fatalf("consumed = %v", consumed)
+	select {
+	case got := <-consumed:
+		if got != "evt_1" {
+			t.Fatalf("consumed = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted event was not handed to Consume")
 	}
 
 	st.rows["evt_1"] = store.InboxRow{
@@ -429,9 +533,40 @@ func TestAcceptedEventPersistsCanonicalDataThenConsumesOnce(t *testing.T) {
 	if got := toastContent(t, resp); got != "首次精确应答" {
 		t.Fatalf("duplicate toast = %q", got)
 	}
-	if len(consumed) != 1 {
-		t.Fatalf("duplicate consumed = %v", consumed)
+	select {
+	case got := <-consumed:
+		t.Fatalf("duplicate consumed = %q", got)
+	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+func TestAcceptedEventDoesNotWaitForConsumer(t *testing.T) {
+	st := newFakeStore()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h := newHandler(st, readyAll())
+	h.Consume = func(string) {
+		close(started)
+		<-release
+	}
+
+	start := time.Now()
+	resp, err := h.OnCardAction(context.Background(), validEvent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := toastContent(t, resp); got != ackAccepted {
+		t.Fatalf("toast = %q", got)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("handler waited %s for consumer", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("consumer did not start")
+	}
+	close(release)
 }
 
 func TestAcceptedEventAllowsNilConsume(t *testing.T) {
@@ -477,8 +612,8 @@ func TestEventWithoutUsableEventIDRejectsAndLogsOnly(t *testing.T) {
 			h.Log = &logger
 			ev := validEvent()
 			ev.EventV2Base.Header.EventID = eventID
-			consumed := 0
-			h.Consume = func(string) { consumed++ }
+			var consumed atomic.Int32
+			h.Consume = func(string) { consumed.Add(1) }
 
 			resp, err := h.OnCardAction(context.Background(), ev)
 			if err != nil {
@@ -487,8 +622,8 @@ func TestEventWithoutUsableEventIDRejectsAndLogsOnly(t *testing.T) {
 			if got := toastContent(t, resp); got != "请求无效" {
 				t.Fatalf("toast = %q", got)
 			}
-			if st.putCalls != 0 || len(st.audits) != 0 || consumed != 0 {
-				t.Fatalf("put=%d audits=%d consumed=%d", st.putCalls, len(st.audits), consumed)
+			if st.putCalls != 0 || len(st.audits) != 0 || consumed.Load() != 0 {
+				t.Fatalf("put=%d audits=%d consumed=%d", st.putCalls, len(st.audits), consumed.Load())
 			}
 			if !strings.Contains(logs.String(), "event_id") {
 				t.Fatalf("missing event ID was not logged: %s", logs.String())
@@ -502,9 +637,9 @@ func TestInboxWriteFailureReturnsErrorWithoutToastOrConsume(t *testing.T) {
 	st.put = func(context.Context, store.InboxRow, *store.AuditRow) (*store.InboxRow, bool, error) {
 		return nil, false, errors.New("db down")
 	}
-	consumed := 0
+	var consumed atomic.Int32
 	h := newHandler(st, readyAll())
-	h.Consume = func(string) { consumed++ }
+	h.Consume = func(string) { consumed.Add(1) }
 
 	resp, err := h.OnCardAction(context.Background(), validEvent())
 	if err == nil || !strings.Contains(err.Error(), "db down") {
@@ -513,8 +648,8 @@ func TestInboxWriteFailureReturnsErrorWithoutToastOrConsume(t *testing.T) {
 	if resp != nil {
 		t.Fatalf("failure response = %#v, want nil", resp)
 	}
-	if consumed != 0 {
-		t.Fatalf("Consume calls = %d", consumed)
+	if consumed.Load() != 0 {
+		t.Fatalf("Consume calls = %d", consumed.Load())
 	}
 }
 

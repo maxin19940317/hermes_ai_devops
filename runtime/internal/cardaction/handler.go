@@ -83,10 +83,10 @@ func (h *Handler) validate(
 	ev *callback.CardActionTriggerEvent,
 	eventID string,
 ) (validatedAction, string) {
-	out := observe(ev, eventID)
+	out := validatedAction{eventID: eventID}
 	if ev == nil || ev.EventV2Base == nil || ev.EventV2Base.Header == nil ||
 		h.AppID == "" || ev.EventV2Base.Header.AppID != h.AppID {
-		return out, "payload"
+		return observe(ev, eventID), "source"
 	}
 
 	req := ev.Event
@@ -95,21 +95,28 @@ func (h *Handler) validate(
 		strings.TrimSpace(headerTenant) == "" ||
 		strings.TrimSpace(*req.Operator.TenantKey) == "" ||
 		headerTenant != *req.Operator.TenantKey {
-		return out, "payload"
+		return observe(ev, eventID), "source"
 	}
 	if req.Action == nil || req.Action.Tag != "button" {
-		return out, "payload"
+		return observe(ev, eventID), "payload"
 	}
 	if req.Context == nil || strings.TrimSpace(req.Context.OpenMessageID) == "" {
-		return out, "payload"
+		return observe(ev, eventID), "payload"
 	}
 	if req.Host != "im_message" {
-		return out, "payload"
-	}
-	if strings.TrimSpace(req.Operator.OpenID) == "" {
-		return out, "payload"
+		return observe(ev, eventID), "payload"
 	}
 
+	out.actorOpenID = req.Operator.OpenID
+	out.openMessageID = req.Context.OpenMessageID
+	if action, ok := req.Action.Value["action"].(string); ok &&
+		(action == "retry" || action == "ignore") {
+		out.action = action
+	}
+	if workflowID, ok := req.Action.Value["source_workflow_id"].(string); ok &&
+		len(workflowID) <= maxPayloadBytes {
+		out.workflowID = workflowID
+	}
 	payload, err := json.Marshal(req.Action.Value)
 	if err != nil || len(payload) > maxPayloadBytes {
 		return out, "payload"
@@ -120,19 +127,16 @@ func (h *Handler) validate(
 	if len(req.Action.Value) != 2 {
 		return out, "payload"
 	}
-	action, ok := req.Action.Value["action"].(string)
-	if !ok || (action != "retry" && action != "ignore") {
+	if out.action != "retry" && out.action != "ignore" {
 		return out, "payload"
 	}
-	workflowID, ok := req.Action.Value["source_workflow_id"].(string)
-	if !ok || strings.TrimSpace(workflowID) == "" {
+	if strings.TrimSpace(out.workflowID) == "" {
 		return out, "payload"
 	}
 
-	out.action = action
-	out.workflowID = workflowID
-	out.actorOpenID = req.Operator.OpenID
-	out.openMessageID = req.Context.OpenMessageID
+	if strings.TrimSpace(req.Operator.OpenID) == "" {
+		return out, "identity"
+	}
 	if h.Readiness == nil || !h.Readiness.Ready() {
 		return out, "disabled"
 	}
@@ -157,7 +161,12 @@ func observe(ev *callback.CardActionTriggerEvent, eventID string) validatedActio
 	if req.Action == nil {
 		return out
 	}
-	if workflowID, ok := req.Action.Value["source_workflow_id"].(string); ok {
+	if action, ok := req.Action.Value["action"].(string); ok &&
+		(action == "retry" || action == "ignore") {
+		out.action = action
+	}
+	if workflowID, ok := req.Action.Value["source_workflow_id"].(string); ok &&
+		len(workflowID) <= maxPayloadBytes {
 		out.workflowID = workflowID
 	}
 	payload, err := json.Marshal(req.Action.Value)
@@ -221,7 +230,7 @@ func (h *Handler) persistAccepted(
 		return nil, err
 	}
 	if inserted && h.Consume != nil {
-		h.Consume(action.eventID)
+		go h.Consume(action.eventID)
 	}
 	return toast(stored.AckToast), nil
 }
@@ -250,6 +259,8 @@ func rejection(reason, action string) (string, string) {
 		return ackDisabled, "card." + action + ".rejected.disabled"
 	case "unauthorized":
 		return ackUnauthorized, "card." + action + ".rejected.unauthorized"
+	case "source", "payload", "identity":
+		return ackInvalid, "card.unknown.rejected.payload"
 	default:
 		return ackInvalid, "card.unknown.rejected.payload"
 	}
