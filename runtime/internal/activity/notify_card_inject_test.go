@@ -44,6 +44,21 @@ func (s *snapshotStore) PutCardSnapshot(_ context.Context, workflowID string, ra
 	return s.err
 }
 
+type readinessDroppingSnapshotStore struct {
+	snapshotStore
+	readiness *cardaction.Readiness
+}
+
+func (s *readinessDroppingSnapshotStore) PutCardSnapshot(
+	ctx context.Context,
+	workflowID string,
+	raw []byte,
+) error {
+	err := s.snapshotStore.PutCardSnapshot(ctx, workflowID, raw)
+	s.readiness.SetWS(false)
+	return err
+}
+
 type injectCardSender struct {
 	fakeSender
 	cards   []wf.NotificationCard
@@ -414,6 +429,42 @@ func TestSnapshotWrittenBeforeSendAndContainsOriginal(t *testing.T) {
 		t.Fatalf("snapshot contains injected action: %#v", snap.Elements)
 	}
 	trailingAction(t, sender.cards[0], workflowID)
+}
+
+func TestReadinessDropsDuringSnapshotShipsOriginalCardWithoutButtons(t *testing.T) {
+	req := injectRequest("orange")
+	originalRaw := marshalCard(t, req.Card)
+	readiness := readyCardActions()
+	if !readiness.Ready() {
+		t.Fatal("test setup must start with all readiness factors true")
+	}
+	st := &readinessDroppingSnapshotStore{readiness: readiness}
+	sender := &injectCardSender{}
+	acts := &Acts{Store: st, Feishu: sender, CardActions: readiness}
+
+	runNotifyCardInActivity(t, acts, req, true, nil)
+
+	if readiness.Ready() {
+		t.Fatal("snapshot store must drop WebSocket readiness before returning")
+	}
+	if len(st.writes) != 1 {
+		t.Fatalf("snapshot writes = %d, want 1", len(st.writes))
+	}
+	if !bytes.Equal(st.writes[0].raw, originalRaw) {
+		t.Fatalf("snapshot raw = %s, want exact original %s", st.writes[0].raw, originalRaw)
+	}
+	if len(sender.cards) != 1 {
+		t.Fatalf("SendCard calls = %d, want 1", len(sender.cards))
+	}
+	if !reflect.DeepEqual(sender.cards[0], req.Card) || hasAction(sender.cards[0]) {
+		t.Fatalf("sent card = %#v, want original without buttons %#v", sender.cards[0], req.Card)
+	}
+	if len(sender.texts) != 0 {
+		t.Fatalf("fallback texts = %#v, want none", sender.texts)
+	}
+	if got := marshalCard(t, req.Card); !bytes.Equal(got, originalRaw) {
+		t.Fatalf("caller card changed: got %s, want %s", got, originalRaw)
+	}
 }
 
 func injectCardOfExactSize(t *testing.T, n int) wf.NotificationCard {

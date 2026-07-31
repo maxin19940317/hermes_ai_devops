@@ -27,6 +27,7 @@ func (a *Acts) NotifyCard(ctx context.Context, req wf.NotifyCardRequest) error {
 	displayCard := req.Card
 	sendCard := displayCard
 	injected := false
+	var originalRaw []byte
 
 	// 失败资格只看 header 底色。正文与 fallback 都是可变的展示内容,
 	// 不能作为 workflow 身份或失败资格的权威来源。
@@ -36,6 +37,7 @@ func (a *Acts) NotifyCard(ctx context.Context, req wf.NotifyCardRequest) error {
 		if workflowID != "" {
 			raw, err := json.Marshal(displayCard)
 			if err == nil {
+				originalRaw = raw
 				if a.Store == nil {
 					err = fmt.Errorf("card snapshot store is nil")
 				} else {
@@ -52,17 +54,25 @@ func (a *Acts) NotifyCard(ctx context.Context, req wf.NotifyCardRequest) error {
 		}
 	}
 
-	raw, err := json.Marshal(sendCard)
+	var raw []byte
+	var err error
+	if injected || originalRaw == nil {
+		raw, err = json.Marshal(sendCard)
+	} else {
+		raw = originalRaw
+	}
 	if err == nil && injected && len(raw) > cardSizeBudget {
 		// 按钮让卡片超预算时宁可丢按钮,不能丢报告。
-		displayRaw, displayErr := json.Marshal(displayCard)
-		if displayErr == nil && len(displayRaw) <= cardSizeBudget {
-			sendCard = displayCard
-			raw = displayRaw
-		} else {
-			err = displayErr
-			raw = displayRaw
-		}
+		sendCard = displayCard
+		raw = originalRaw
+		injected = false
+	}
+	if injected && !a.CardActions.Ready() {
+		// 快照持久化和序列化都可能耗时。发送前再次 fail closed,
+		// 尽量避免发出到达用户时已经不可用的按钮。
+		sendCard = displayCard
+		raw = originalRaw
+		injected = false
 	}
 	if err != nil || len(raw) > cardSizeBudget {
 		// 超预算不调 SendCard(设计 §5.2 第 3 步):执行路径唯一,可机械断言
