@@ -191,17 +191,11 @@ agent install|uninstall|start|stop   # Windows Service / systemd(kardianos/servi
   `wellKnownFiles` 查找,不依赖 `runs/{task_id}/` 前缀结构,
   未来 Runtime 键结构调整(如加 attempt 段)天然兼容。
 
-## 待补充(技术债)
-
-- 四项安全加固的**显式回归测试**:超大下载拒绝、KnownFields 未声明字段拒绝、
-  collect 非法 pattern 跳过、多级前缀 ObjectKey 仍能匹配 wellKnownFiles。
-  当前已被集成测试间接覆盖,但缺少边界条件单测。
-
 ## 尚未覆盖(后续阶段)
 
 - ~~RPC 服务壳(§8.1)、心跳/事件/结果回调、MinIO 直传、Windows Service 化~~
   → 已交付(cmd/agent,Phase 1.7)
 - ~~下载大小上限、Manifest 严格字段、Collect pattern 白名单、Upload 后缀匹配~~
-  → 已交付(2026-07-31 二轮 review)
+  → 已交付(2026-07-31 二轮 review + 回归测试)
 - Agent 自带固定版本 adb 并自管 server 生命周期(当前用 `--adb` / `AGENT_ADB_PATH` 指定)
 - 真实设备验证需在 Windows Client 上进行(本仓库单测用 fake Runner 全覆盖流水线)
