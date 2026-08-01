@@ -226,7 +226,7 @@ func TestRunOnceOrdersAndContinuesAllSweepsAfterEachClaimFailure(t *testing.T) {
 			st := newSweepTestStore()
 			passErr := errors.New(tt.pass + " database down")
 			tt.setErr(st, passErr)
-			s := &Sweeper{Store: st}
+			s := &Sweeper{Store: st, Updater: &fakeCardUpdater{}}
 
 			err := s.RunOnce(context.Background())
 			if err == nil || !errors.Is(err, passErr) ||
@@ -242,6 +242,24 @@ func TestRunOnceOrdersAndContinuesAllSweepsAfterEachClaimFailure(t *testing.T) {
 			}
 			assertFreshSweepClaims(t, st.claimTokens, st.claimLeases)
 		})
+	}
+}
+
+func TestSweepCardSkipsClaimWhenUpdaterIsNil(t *testing.T) {
+	st := newSweepTestStore()
+	s := &Sweeper{Store: st}
+
+	if err := s.sweepCard(context.Background()); err != nil {
+		t.Fatalf("sweepCard: %v", err)
+	}
+	if st.cardSweepCalls != 0 {
+		t.Fatalf("ClaimMessage calls = %d, want 0 when updater is nil", st.cardSweepCalls)
+	}
+	if st.snapshotGets != 0 {
+		t.Fatalf("GetCardSnapshot calls = %d, want 0 when updater is nil", st.snapshotGets)
+	}
+	if len(st.claimTrace) != 0 {
+		t.Fatalf("claim trace = %v, want no card sweep activity", st.claimTrace)
 	}
 }
 
@@ -972,7 +990,7 @@ func TestRunRepeatsAfterErrorsAndStopsPromptlyOnCancellation(t *testing.T) {
 	st.passNotify = make(chan struct{}, 4)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	s := &Sweeper{Store: st, interval: 500 * time.Millisecond}
+	s := &Sweeper{Store: st, Updater: &fakeCardUpdater{}, interval: 500 * time.Millisecond}
 	go func() {
 		defer close(done)
 		s.Run(ctx)

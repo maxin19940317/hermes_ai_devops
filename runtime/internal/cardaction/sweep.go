@@ -236,6 +236,9 @@ func (s *Sweeper) sweepCard(ctx context.Context) error {
 	if s == nil || s.Store == nil {
 		return errors.New("store is nil")
 	}
+	if s.Updater == nil {
+		return nil
+	}
 	token, err := newFencingToken()
 	if err != nil {
 		return fmt.Errorf("create fencing token: %w", err)
@@ -260,9 +263,6 @@ func (s *Sweeper) sweepCard(ctx context.Context) error {
 	if err != nil {
 		renderErr := fmt.Errorf("render message %s: %w", claim.OpenMessageID, err)
 		return s.abandonDeterministicRender(ctx, *claim, token, renderErr)
-	}
-	if s.Updater == nil {
-		return fmt.Errorf("patch message %s: updater is nil", claim.OpenMessageID)
 	}
 	patchErr := s.Updater.PatchCard(
 		ctx, claim.OpenMessageID, json.RawMessage(rendered),
