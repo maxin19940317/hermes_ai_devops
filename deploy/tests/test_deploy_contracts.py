@@ -189,6 +189,30 @@ def normalize_semantic_text(text):
     return normalize_whitespace(text).replace("`", "")
 
 
+WORKER_CARD_ACTIONS_OPT_IN_LINE = (
+    "      FEISHU_CARD_ACTIONS_ENABLED: ${FEISHU_CARD_ACTIONS_ENABLED:-false}"
+)
+
+
+def assert_worker_card_actions_opt_in(text):
+    worker = re.search(
+        r"(?ms)^  worker:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        text,
+    )
+
+    if not worker:
+        raise AssertionError("missing worker service block")
+
+    matches = re.findall(
+        rf"(?m)^{re.escape(WORKER_CARD_ACTIONS_OPT_IN_LINE)}$",
+        worker.group("body"),
+    )
+    if len(matches) != 1:
+        raise AssertionError(
+            "missing exact FEISHU_CARD_ACTIONS_ENABLED=false worker mapping"
+        )
+
+
 def build_valid_card_actions_rollout_doc(
     *,
     preamble_extra_lines=(),
@@ -279,7 +303,7 @@ def parse_card_actions_rollout_sections(text):
 
 def assert_card_actions_rollout_contract(text):
     rollout = parse_card_actions_rollout_sections(text)
-    preamble = normalize_whitespace(rollout["preamble"])
+    preamble = normalize_semantic_text(rollout["preamble"])
     stage1 = normalize_semantic_text(rollout["stage1"])
     stage2 = normalize_semantic_text(rollout["stage2"])
     stage2_intro = normalize_semantic_text(rollout["stage2_intro"])
@@ -291,6 +315,9 @@ def assert_card_actions_rollout_contract(text):
         if marker not in stage1:
             raise AssertionError(f"missing Stage 1 marker: {marker}")
 
+    for forbidden in CARD_ACTIONS_STAGE2_ONLY_MARKERS:
+        if forbidden in preamble:
+            raise AssertionError(f"Preamble must not contain {forbidden}")
     for forbidden in CARD_ACTIONS_STAGE2_ONLY_MARKERS:
         if forbidden in stage1:
             raise AssertionError(f"Stage 1 must not contain {forbidden}")
@@ -504,17 +531,33 @@ class ComposeContracts(unittest.TestCase):
         self.assertNotIn("container_name:", text)
 
     def test_worker_propagates_card_actions_opt_in_with_strict_default_off(self):
-        text = COMPOSE.read_text(encoding="utf-8")
-        worker = re.search(
-            r"(?ms)^  worker:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
-            text,
+        assert_worker_card_actions_opt_in(COMPOSE.read_text(encoding="utf-8"))
+
+    def test_worker_rejects_commented_out_card_actions_opt_in_line(self):
+        text = COMPOSE.read_text(encoding="utf-8").replace(
+            WORKER_CARD_ACTIONS_OPT_IN_LINE,
+            f"      # {WORKER_CARD_ACTIONS_OPT_IN_LINE.strip()}",
+            1,
         )
 
-        self.assertIsNotNone(worker, "missing worker service block")
-        self.assertIn(
-            "FEISHU_CARD_ACTIONS_ENABLED: ${FEISHU_CARD_ACTIONS_ENABLED:-false}",
-            worker.group("body"),
+        with self.assertRaisesRegex(
+            AssertionError,
+            "missing exact FEISHU_CARD_ACTIONS_ENABLED=false worker mapping",
+        ):
+            assert_worker_card_actions_opt_in(text)
+
+    def test_worker_rejects_wrong_card_actions_opt_in_default(self):
+        text = COMPOSE.read_text(encoding="utf-8").replace(
+            WORKER_CARD_ACTIONS_OPT_IN_LINE,
+            "      FEISHU_CARD_ACTIONS_ENABLED: ${FEISHU_CARD_ACTIONS_ENABLED:-true}",
+            1,
         )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "missing exact FEISHU_CARD_ACTIONS_ENABLED=false worker mapping",
+        ):
+            assert_worker_card_actions_opt_in(text)
 
     def test_compose_never_publishes_internal_ports(self):
         text = COMPOSE.read_text(encoding="utf-8")
@@ -881,6 +924,23 @@ class CardActionsDeploymentContracts(unittest.TestCase):
             AssertionError,
             re.escape(
                 "Stage 1 must not contain "
+                "deploy/postgres/migrations/2026-08-01-card-actions.sql"
+            ),
+        ):
+            assert_card_actions_rollout_contract(doc)
+
+    def test_rollout_section_parser_rejects_stage2_markers_in_preamble(self):
+        doc = build_valid_card_actions_rollout_doc(
+            preamble_extra_lines=(
+                "Apply `deploy/postgres/migrations/2026-08-01-card-actions.sql`.",
+                "Set `FEISHU_CARD_ACTIONS_ENABLED=true` only after the rollout.",
+            )
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            re.escape(
+                "Preamble must not contain "
                 "deploy/postgres/migrations/2026-08-01-card-actions.sql"
             ),
         ):
