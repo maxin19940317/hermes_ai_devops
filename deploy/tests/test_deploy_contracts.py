@@ -195,21 +195,74 @@ WORKER_CARD_ACTIONS_OPT_IN_LINE = (
 
 
 def assert_worker_card_actions_opt_in(text):
-    worker = re.search(
-        r"(?ms)^  worker:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
-        text,
-    )
+    lines = text.splitlines()
 
-    if not worker:
-        raise AssertionError("missing worker service block")
+    def is_active(line):
+        stripped = line.strip()
+        return bool(stripped) and not stripped.startswith("#")
 
-    matches = re.findall(
-        rf"(?m)^{re.escape(WORKER_CARD_ACTIONS_OPT_IN_LINE)}$",
-        worker.group("body"),
-    )
-    if len(matches) != 1:
+    def indentation(line):
+        return len(line) - len(line.lstrip(" "))
+
+    worker_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if is_active(line) and line == "  worker:"
+    ]
+    if len(worker_indexes) != 1:
+        raise AssertionError("expected exactly one active worker service")
+
+    worker_start = worker_indexes[0]
+    worker_end = len(lines)
+    for index in range(worker_start + 1, len(lines)):
+        line = lines[index]
+        if is_active(line) and indentation(line) <= 2:
+            worker_end = index
+            break
+
+    environment_indexes = [
+        index
+        for index in range(worker_start + 1, worker_end)
+        if is_active(lines[index]) and lines[index] == "    environment:"
+    ]
+    if len(environment_indexes) != 1:
         raise AssertionError(
-            "missing exact FEISHU_CARD_ACTIONS_ENABLED=false worker mapping"
+            "expected exactly one active worker environment mapping"
+        )
+
+    environment_start = environment_indexes[0]
+    environment_end = worker_end
+    for index in range(environment_start + 1, worker_end):
+        line = lines[index]
+        if is_active(line) and indentation(line) <= 4:
+            environment_end = index
+            break
+
+    key_pattern = re.compile(
+        r"^      FEISHU_CARD_ACTIONS_ENABLED:(?P<value>.*)$"
+    )
+    matches = []
+    for line in lines[environment_start + 1:environment_end]:
+        if not is_active(line):
+            continue
+        match = key_pattern.match(line)
+        if match:
+            matches.append(match.group("value").strip())
+
+    if not matches:
+        raise AssertionError(
+            "missing active six-space FEISHU_CARD_ACTIONS_ENABLED "
+            "worker environment key"
+        )
+    if len(matches) > 1:
+        raise AssertionError(
+            "duplicate active FEISHU_CARD_ACTIONS_ENABLED "
+            "worker environment keys"
+        )
+    if matches[0] != "${FEISHU_CARD_ACTIONS_ENABLED:-false}":
+        raise AssertionError(
+            "FEISHU_CARD_ACTIONS_ENABLED worker environment value must equal "
+            "${FEISHU_CARD_ACTIONS_ENABLED:-false}"
         )
 
 
@@ -321,6 +374,18 @@ def assert_card_actions_rollout_contract(text):
     for forbidden in CARD_ACTIONS_STAGE2_ONLY_MARKERS:
         if forbidden in stage1:
             raise AssertionError(f"Stage 1 must not contain {forbidden}")
+
+    expected_preamble = normalize_semantic_text(
+        "\n".join(CARD_ACTIONS_VALID_PREAMBLE_LINES)
+    )
+    if preamble != expected_preamble:
+        raise AssertionError("Preamble must match canonical content exactly")
+
+    expected_stage1 = normalize_semantic_text(
+        "\n".join(CARD_ACTIONS_VALID_STAGE1_LINES)
+    )
+    if stage1 != expected_stage1:
+        raise AssertionError("Stage 1 must match canonical content exactly")
 
     if stage2_intro != CARD_ACTIONS_STAGE_2_GATE:
         raise AssertionError("Stage 2 must start with the exact gate phrase")
@@ -542,7 +607,20 @@ class ComposeContracts(unittest.TestCase):
 
         with self.assertRaisesRegex(
             AssertionError,
-            "missing exact FEISHU_CARD_ACTIONS_ENABLED=false worker mapping",
+            "missing active six-space FEISHU_CARD_ACTIONS_ENABLED worker environment key",
+        ):
+            assert_worker_card_actions_opt_in(text)
+
+    def test_worker_rejects_wrongly_indented_card_actions_opt_in_line(self):
+        text = COMPOSE.read_text(encoding="utf-8").replace(
+            WORKER_CARD_ACTIONS_OPT_IN_LINE,
+            f"  {WORKER_CARD_ACTIONS_OPT_IN_LINE}",
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "missing active six-space FEISHU_CARD_ACTIONS_ENABLED worker environment key",
         ):
             assert_worker_card_actions_opt_in(text)
 
@@ -555,7 +633,49 @@ class ComposeContracts(unittest.TestCase):
 
         with self.assertRaisesRegex(
             AssertionError,
-            "missing exact FEISHU_CARD_ACTIONS_ENABLED=false worker mapping",
+            (
+                "FEISHU_CARD_ACTIONS_ENABLED worker environment value must equal "
+                r"\$\{FEISHU_CARD_ACTIONS_ENABLED:-false\}"
+            ),
+        ):
+            assert_worker_card_actions_opt_in(text)
+
+    def test_worker_rejects_duplicate_card_actions_opt_in_keys(self):
+        text = COMPOSE.read_text(encoding="utf-8").replace(
+            WORKER_CARD_ACTIONS_OPT_IN_LINE,
+            (
+                f"{WORKER_CARD_ACTIONS_OPT_IN_LINE}\n"
+                f"{WORKER_CARD_ACTIONS_OPT_IN_LINE}"
+            ),
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "duplicate active FEISHU_CARD_ACTIONS_ENABLED worker environment keys",
+        ):
+            assert_worker_card_actions_opt_in(text)
+
+    def test_worker_rejects_card_actions_opt_in_moved_under_labels(self):
+        text = COMPOSE.read_text(encoding="utf-8").replace(
+            f"{WORKER_CARD_ACTIONS_OPT_IN_LINE}\n",
+            "",
+            1,
+        ).replace(
+            "    ports:\n"
+            '      - "${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:'
+            '${WORKER_CALLBACKS_HOST_PORT:-18091}:8091"',
+            "    labels:\n"
+            f"{WORKER_CARD_ACTIONS_OPT_IN_LINE}\n"
+            "    ports:\n"
+            '      - "${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:'
+            '${WORKER_CALLBACKS_HOST_PORT:-18091}:8091"',
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "missing active six-space FEISHU_CARD_ACTIONS_ENABLED worker environment key",
         ):
             assert_worker_card_actions_opt_in(text)
 
@@ -943,6 +1063,32 @@ class CardActionsDeploymentContracts(unittest.TestCase):
                 "Preamble must not contain "
                 "deploy/postgres/migrations/2026-08-01-card-actions.sql"
             ),
+        ):
+            assert_card_actions_rollout_contract(doc)
+
+    def test_rollout_section_parser_rejects_paraphrased_operations_in_preamble(self):
+        doc = build_valid_card_actions_rollout_doc(
+            preamble_extra_lines=(
+                "Before Stage 1, apply the five-table card-action database migration and enable the feature flag.",
+            )
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Preamble must match canonical content exactly",
+        ):
+            assert_card_actions_rollout_contract(doc)
+
+    def test_rollout_section_parser_rejects_paraphrased_operations_in_stage1(self):
+        doc = build_valid_card_actions_rollout_doc(
+            stage1_extra_lines=(
+                "Configure Feishu to deliver interactive-card clicks over its persistent socket, then run the five-table database upgrade and switch on card actions.",
+            )
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Stage 1 must match canonical content exactly",
         ):
             assert_card_actions_rollout_contract(doc)
 
