@@ -367,21 +367,31 @@ def scan_semantic_atx_headings(text):
 
 def parse_card_actions_rollout_sections(text):
     headings = scan_semantic_atx_headings(text)
-    sections = [
+    candidate_sections = [
         heading
         for heading in headings
         if (
             heading.level == 3
-            and heading.title == CARD_ACTIONS_ROLLOUT_HEADING
+            and CARD_ACTIONS_ROLLOUT_HEADING in heading.title
         )
+    ]
+    if not candidate_sections:
+        raise ValueError(
+            f"missing ### {CARD_ACTIONS_ROLLOUT_HEADING} section"
+        )
+    if len(candidate_sections) > 1:
+        raise ValueError(
+            f"duplicated ### {CARD_ACTIONS_ROLLOUT_HEADING} section"
+        )
+
+    sections = [
+        heading
+        for heading in candidate_sections
+        if heading.title == CARD_ACTIONS_ROLLOUT_HEADING
     ]
     if not sections:
         raise ValueError(
             f"missing ### {CARD_ACTIONS_ROLLOUT_HEADING} section"
-        )
-    if len(sections) > 1:
-        raise ValueError(
-            f"duplicated ### {CARD_ACTIONS_ROLLOUT_HEADING} section"
         )
 
     body_start = sections[0].end
@@ -1148,8 +1158,8 @@ class CardActionsDeploymentContracts(unittest.TestCase):
 
     def test_rollout_section_parser_rejects_render_equivalent_duplicates(self):
         for duplicate_heading in (
-            "### Card-action two-stage rollout ###",
-            "   ### Card-action two-stage rollout ###",
+            "### **Card-action two-stage rollout**",
+            "### [Card-action two-stage rollout](#card-actions)",
         ):
             with self.subTest(duplicate_heading=duplicate_heading):
                 doc = build_valid_card_actions_rollout_doc() + (
@@ -1165,6 +1175,29 @@ class CardActionsDeploymentContracts(unittest.TestCase):
                     ),
                 ):
                     parse_card_actions_rollout_sections(doc)
+
+    def test_rollout_section_parser_rejects_formatted_heading_without_exact_match_as_missing_section(self):
+        doc = (
+            "\n### **Card-action two-stage rollout**\n\n"
+            "Stage 2 may begin during the workflow_runs "
+            "stop-write window.\n"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            re.escape(
+                "missing ### Card-action two-stage rollout section"
+            ),
+        ):
+            parse_card_actions_rollout_sections(doc)
+
+    def test_rollout_section_parser_ignores_unrelated_h3_headings(self):
+        doc = build_valid_card_actions_rollout_doc() + (
+            "\n### Stage 2 follow-up\n\n"
+            "This unrelated section must not count as a duplicate.\n"
+        )
+
+        assert_card_actions_rollout_contract(doc)
 
     def test_rollout_section_parser_stops_at_next_h3_and_keeps_h4_content(self):
         doc = "\n".join(
