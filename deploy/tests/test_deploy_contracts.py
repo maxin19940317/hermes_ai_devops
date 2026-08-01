@@ -266,6 +266,30 @@ def assert_worker_card_actions_opt_in(text):
         )
 
 
+def assert_card_actions_default_off_env_assignment(text):
+    assignments = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not stripped.startswith("FEISHU_CARD_ACTIONS_ENABLED="):
+            continue
+        assignments.append(stripped.split("=", 1)[1])
+
+    if not assignments:
+        raise AssertionError(
+            "missing active FEISHU_CARD_ACTIONS_ENABLED assignment"
+        )
+    if len(assignments) > 1:
+        raise AssertionError(
+            "duplicate active FEISHU_CARD_ACTIONS_ENABLED assignments"
+        )
+    if assignments[0] != "false":
+        raise AssertionError(
+            "FEISHU_CARD_ACTIONS_ENABLED value must equal false"
+        )
+
+
 def build_valid_card_actions_rollout_doc(
     *,
     preamble_extra_lines=(),
@@ -393,6 +417,12 @@ def assert_card_actions_rollout_contract(text):
     for marker in CARD_ACTIONS_STAGE2_REQUIRED_MARKERS:
         if marker not in stage2:
             raise AssertionError(f"missing Stage 2 marker: {marker}")
+
+    expected_stage2 = normalize_semantic_text(
+        "\n".join((CARD_ACTIONS_STAGE_2_GATE, *CARD_ACTIONS_VALID_STAGE2_LINES))
+    )
+    if stage2 != expected_stage2:
+        raise AssertionError("Stage 2 must match canonical content exactly")
 
     return rollout
 
@@ -1142,6 +1172,19 @@ class CardActionsDeploymentContracts(unittest.TestCase):
         ):
             assert_card_actions_rollout_contract(doc)
 
+    def test_rollout_section_parser_rejects_extra_stage2_guidance(self):
+        doc = build_valid_card_actions_rollout_doc(
+            stage2_extra_lines=(
+                "Enable the feature during the workflow_runs stop-write window.",
+            )
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Stage 2 must match canonical content exactly",
+        ):
+            assert_card_actions_rollout_contract(doc)
+
     def test_rollout_is_explicitly_ordered_and_not_merged(self):
         rollout = assert_card_actions_rollout_contract(
             DEPLOY_README.read_text(encoding="utf-8")
@@ -1200,16 +1243,59 @@ class CardActionsDeploymentContracts(unittest.TestCase):
         ):
             self.assertIn(marker, stage2)
 
+    def test_card_actions_default_off_rejects_duplicate_true_assignment(self):
+        env_example = ENV_EXAMPLE.read_text(encoding="utf-8").replace(
+            "FEISHU_CARD_ACTIONS_ENABLED=false",
+            (
+                "FEISHU_CARD_ACTIONS_ENABLED=false\n"
+                "FEISHU_CARD_ACTIONS_ENABLED=true"
+            ),
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "duplicate active FEISHU_CARD_ACTIONS_ENABLED assignments",
+        ):
+            assert_card_actions_default_off_env_assignment(env_example)
+
+    def test_card_actions_default_off_rejects_missing_commented_and_wrong_value(self):
+        cases = {
+            "missing": (
+                ENV_EXAMPLE.read_text(encoding="utf-8").replace(
+                    "FEISHU_CARD_ACTIONS_ENABLED=false\n",
+                    "",
+                    1,
+                ),
+                "missing active FEISHU_CARD_ACTIONS_ENABLED assignment",
+            ),
+            "commented only": (
+                ENV_EXAMPLE.read_text(encoding="utf-8").replace(
+                    "FEISHU_CARD_ACTIONS_ENABLED=false",
+                    "# FEISHU_CARD_ACTIONS_ENABLED=false",
+                    1,
+                ),
+                "missing active FEISHU_CARD_ACTIONS_ENABLED assignment",
+            ),
+            "wrong value": (
+                ENV_EXAMPLE.read_text(encoding="utf-8").replace(
+                    "FEISHU_CARD_ACTIONS_ENABLED=false",
+                    "FEISHU_CARD_ACTIONS_ENABLED=true",
+                    1,
+                ),
+                "FEISHU_CARD_ACTIONS_ENABLED value must equal false",
+            ),
+        }
+
+        for name, (env_example, error) in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(AssertionError, error):
+                    assert_card_actions_default_off_env_assignment(env_example)
+
     def test_card_actions_are_strictly_default_off(self):
         env_example = ENV_EXAMPLE.read_text(encoding="utf-8")
 
-        self.assertTrue(
-            re.search(
-                r"(?m)^FEISHU_CARD_ACTIONS_ENABLED=false$",
-                env_example,
-            ),
-            "missing exact FEISHU_CARD_ACTIONS_ENABLED=false default",
-        )
+        assert_card_actions_default_off_env_assignment(env_example)
 
 
 if __name__ == "__main__":
