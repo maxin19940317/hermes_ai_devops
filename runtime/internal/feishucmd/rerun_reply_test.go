@@ -3,6 +3,8 @@ package feishucmd
 import (
 	"errors"
 	"testing"
+
+	"go.temporal.io/api/serviceerror"
 )
 
 // TestRerunReplyPreservesUnderlyingError locks the literal (not merely
@@ -24,6 +26,17 @@ func TestRerunReplyPreservesUnderlyingError(t *testing.T) {
 		starter.closedErr = errors.New("context deadline exceeded")
 		got := runRerun(t, e, sourceWorkflowID)
 		want := "检查 workflow 状态失败: context deadline exceeded"
+		if got != want {
+			t.Fatalf("reply = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("CheckFailedNotFound", func(t *testing.T) {
+		_, starter, e := newRerunFixture(t)
+		starter.closed = false
+		starter.closedErr = serviceerror.NewNotFound("workflow history expired")
+		got := runRerun(t, e, sourceWorkflowID)
+		want := "检查 workflow 状态失败: workflow history expired"
 		if got != want {
 			t.Fatalf("reply = %q, want %q", got, want)
 		}

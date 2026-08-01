@@ -310,11 +310,16 @@ func (c *Consumer) completeRejection(
 	if !errors.As(cause, &reason) {
 		return fmt.Errorf("consume card action %s: resolve %s: %w", row.EventID, row.Action, cause)
 	}
-	// CONTRACT-ISSUE: rerun preserves the legacy CheckFailed distinction, while
-	// card rejection storage has a closed reason-code contract. Treat it as a
-	// transient resolution failure rather than silently renaming the reason.
 	if reason.Code == "CheckFailed" {
-		return fmt.Errorf("consume card action %s: check workflow state: %w", row.EventID, cause)
+		var notFound *serviceerror.NotFound
+		if !errors.As(cause, &notFound) {
+			return fmt.Errorf("consume card action %s: check workflow state: %w", row.EventID, cause)
+		}
+		// This card-only exception handles irrecoverable retained-history expiry
+		// while preserving shared/text-command byte-for-byte semantics.
+		localReason := *reason
+		localReason.Code = "ResultUnreadable"
+		reason = &localReason
 	}
 	render, err := renderRejectReason(reason)
 	if err != nil {

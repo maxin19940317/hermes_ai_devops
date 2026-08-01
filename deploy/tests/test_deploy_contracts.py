@@ -119,6 +119,12 @@ CARD_ACTIONS_STAGE_2_MARKER = "**Stage 2 — card actions.**"
 CARD_ACTIONS_STAGE_2_GATE = (
     "Only after the workflow_runs rollout is stable:"
 )
+TEMPORAL_NAMESPACE_UPDATE_COMMAND = (
+    'tctl --address "$(hostname -i):7233" namespace update --retention 90 default'
+)
+TEMPORAL_NAMESPACE_DESCRIBE_COMMAND = (
+    'tctl --address "$(hostname -i):7233" namespace describe default'
+)
 CARD_ACTIONS_STAGE1_REQUIRED_MARKERS = (
     "config.update_multi: true",
     "CardElement.Actions",
@@ -137,8 +143,8 @@ CARD_ACTIONS_STAGE2_REQUIRED_MARKERS = (
     "TEMPORAL_NAMESPACE_RETENTION=90d",
     "Fresh auto-setup namespaces use this environment value",
     "does not retroactively update an existing namespace",
-    'tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90',
-    'tctl --address "$(hostname -i):7233" namespace describe --namespace default',
+    TEMPORAL_NAMESPACE_UPDATE_COMMAND,
+    TEMPORAL_NAMESPACE_DESCRIBE_COMMAND,
     "default 24h retention is shorter than the terminal card action lifetime",
     "ResultUnreadable",
     "rather than retry forever",
@@ -179,8 +185,8 @@ CARD_ACTIONS_VALID_STAGE2_LINES = (
     "   the temporal container:",
     "",
     "   ```bash",
-    '   tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90',
-    '   tctl --address "$(hostname -i):7233" namespace describe --namespace default',
+    f"   {TEMPORAL_NAMESPACE_UPDATE_COMMAND}",
+    f"   {TEMPORAL_NAMESPACE_DESCRIBE_COMMAND}",
     "   ```",
     "",
     "   Verify the describe output reports 90 days before continuing. Temporal auto-setup's",
@@ -582,6 +588,11 @@ def assert_card_actions_rollout_contract(text):
 
     if stage2_intro != CARD_ACTIONS_STAGE_2_GATE:
         raise AssertionError("Stage 2 must start with the exact gate phrase")
+
+    if "--namespace default" in stage2:
+        raise AssertionError(
+            "Stage 2 tctl namespace commands must use positional namespace syntax"
+        )
 
     for marker in CARD_ACTIONS_STAGE2_REQUIRED_MARKERS:
         if marker not in stage2:
@@ -1651,6 +1662,22 @@ class CardActionsDeploymentContracts(unittest.TestCase):
         ):
             assert_card_actions_rollout_contract(doc)
 
+    def test_rollout_section_parser_rejects_global_namespace_flag(self):
+        doc = build_valid_card_actions_rollout_doc().replace(
+            TEMPORAL_NAMESPACE_UPDATE_COMMAND,
+            (
+                'tctl --address "$(hostname -i):7233" namespace update '
+                "--namespace default --retention 90"
+            ),
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Stage 2 tctl namespace commands must use positional namespace syntax",
+        ):
+            assert_card_actions_rollout_contract(doc)
+
     def test_rollout_is_explicitly_ordered_and_not_merged(self):
         rollout = assert_card_actions_rollout_contract(
             DEPLOY_README.read_text(encoding="utf-8")
@@ -1679,8 +1706,8 @@ class CardActionsDeploymentContracts(unittest.TestCase):
             "TEMPORAL_NAMESPACE_RETENTION=90d",
             "Fresh auto-setup namespaces use this environment value",
             "does not retroactively update an existing namespace",
-            'tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90',
-            'tctl --address "$(hostname -i):7233" namespace describe --namespace default',
+            TEMPORAL_NAMESPACE_UPDATE_COMMAND,
+            TEMPORAL_NAMESPACE_DESCRIBE_COMMAND,
             "default 24h retention is shorter than the terminal card action lifetime",
             "ResultUnreadable",
             "rather than retry forever",
@@ -1711,13 +1738,14 @@ class CardActionsDeploymentContracts(unittest.TestCase):
         for marker in (
             "Fresh auto-setup namespaces use this environment value",
             "does not retroactively update an existing namespace",
-            'tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90',
-            'tctl --address "$(hostname -i):7233" namespace describe --namespace default',
+            TEMPORAL_NAMESPACE_UPDATE_COMMAND,
+            TEMPORAL_NAMESPACE_DESCRIBE_COMMAND,
             "reports 90 days",
             "default 24h retention is shorter than the terminal card action lifetime",
             "terminally converge as ResultUnreadable rather than retry forever",
         ):
             self.assertIn(marker, stage2)
+        self.assertNotIn("--namespace default", stage2)
 
     def test_feishu_platform_subscription_is_an_explicit_prerequisite(self):
         rollout = assert_card_actions_rollout_contract(

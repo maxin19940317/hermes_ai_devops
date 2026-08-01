@@ -12,8 +12,6 @@ import (
 	"fmt"
 	"sort"
 
-	"go.temporal.io/api/serviceerror"
-
 	"hermes-devops/runtime/internal/rules"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
@@ -74,7 +72,7 @@ type RejectReason struct {
 	Variant    string
 	Count      int
 	// Err 携带触发本次拒绝的底层错误,仅 CheckFailed(可恢复的 WorkflowClosed
-	// 探测失败)与 ResultUnreadable(WorkflowResult 读取失败或历史已过期)两种 Code 非空。原
+	// 探测失败)与 ResultUnreadable(WorkflowResult 读取失败)两种 Code 非空。原
 	// executor.rerun 对这两种情况的回复都是 "...失败: %v"(err 原文,例如
 	// "context deadline exceeded"),丢弃它会让运维无法从回复区分超时/网络/
 	// 权限等不同故障——这是"文案逐字不变"约束的一部分,不是可选项。
@@ -111,11 +109,6 @@ func (r *Resolver) resolveRun(ctx context.Context, workflowID string) (*store.Wo
 	}
 	closed, err := r.Starter.WorkflowClosed(ctx, workflowID)
 	if err != nil {
-		var notFound *serviceerror.NotFound
-		if errors.As(err, &notFound) {
-			// Expired retained history is terminal for this click; retrying cannot restore it.
-			return nil, &RejectReason{Code: "ResultUnreadable", WorkflowID: workflowID, Err: err}
-		}
 		return nil, &RejectReason{Code: "CheckFailed", WorkflowID: workflowID, Err: err}
 	}
 	if !closed {

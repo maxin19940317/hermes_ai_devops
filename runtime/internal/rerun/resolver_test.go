@@ -242,7 +242,7 @@ func TestCheckFailedCarriesUnderlyingError(t *testing.T) {
 	}
 }
 
-func TestWorkflowClosedNotFoundIsResultUnreadable(t *testing.T) {
+func TestWorkflowClosedNotFoundRemainsCheckFailed(t *testing.T) {
 	st := newFakeStore(t, run("wf1", "grp/p", "abcd1234", 42, "v1"))
 	notFound := serviceerror.NewNotFound("workflow history expired")
 	underlying := fmt.Errorf("describe workflow: %w", notFound)
@@ -250,8 +250,8 @@ func TestWorkflowClosedNotFoundIsResultUnreadable(t *testing.T) {
 
 	_, err := r.ResolveRetry(ctx, "wf1", "")
 	var reason *RejectReason
-	if !errors.As(err, &reason) || reason.Code != "ResultUnreadable" {
-		t.Fatalf("err = %v, want RejectReason{ResultUnreadable}", err)
+	if !errors.As(err, &reason) || reason.Code != "CheckFailed" {
+		t.Fatalf("err = %v, want RejectReason{CheckFailed}", err)
 	}
 	if reason.WorkflowID != "wf1" || reason.Err != underlying {
 		t.Fatalf("reason = %#v, want workflow wf1 with original error", reason)

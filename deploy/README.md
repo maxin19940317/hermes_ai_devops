@@ -226,8 +226,8 @@ still have no buttons, behavior is unchanged, and newly sent messages become upd
    the temporal container:
 
    ```bash
-   tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90
-   tctl --address "$(hostname -i):7233" namespace describe --namespace default
+   tctl --address "$(hostname -i):7233" namespace update --retention 90 default
+   tctl --address "$(hostname -i):7233" namespace describe default
    ```
 
    Verify the describe output reports 90 days before continuing. Temporal auto-setup's
