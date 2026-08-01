@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -455,6 +457,276 @@ func TestClientHandlerErrorAcknowledgesInternalServerError(t *testing.T) {
 	h.assertNoHandlerError(t)
 }
 
+func TestClientDispatchesCompleteEventsConcurrently(t *testing.T) {
+	h := newTransportHarness(t)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	defer release()
+
+	handler := dispatcher.NewEventDispatcher("", "").
+		OnP2CardActionTrigger(func(
+			_ context.Context,
+			ev *callback.CardActionTriggerEvent,
+		) (*callback.CardActionTriggerResponse, error) {
+			workflowID, _ := ev.Event.Action.Value["source_workflow_id"].(string)
+			if workflowID == "wf_first" {
+				close(firstStarted)
+				<-releaseFirst
+			}
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{Type: "info", Content: workflowID},
+			}, nil
+		})
+	ctx, cancel := context.WithCancel(context.Background())
+	client := NewClient("cli_test", "secret_test",
+		WithDomain(h.server.URL),
+		WithLogger(discardLogger{}),
+		WithEventHandler(handler),
+	)
+	done := startClient(t, ctx, client)
+	socket := h.waitSocket(t)
+
+	writeDataFrame(t, socket.conn, "msg_first", 1, 0, cardActionPayloadForWorkflow(t, "wf_first"))
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first callback did not start")
+	}
+	writeDataFrame(t, socket.conn, "msg_second", 1, 0, cardActionPayloadForWorkflow(t, "wf_second"))
+
+	ack := readDataFrameWithTimeout(t, socket.conn, 500*time.Millisecond)
+	if got := sdkws.Headers(ack.Headers).GetString(sdkws.HeaderMessageID); got != "msg_second" {
+		t.Fatalf("first ACK message_id = %q, want msg_second while first callback is blocked", got)
+	}
+
+	release()
+	firstAck := readDataFrame(t, socket.conn)
+	if got := sdkws.Headers(firstAck.Headers).GetString(sdkws.HeaderMessageID); got != "msg_first" {
+		t.Fatalf("second ACK message_id = %q, want msg_first", got)
+	}
+
+	cancel()
+	waitStartCanceled(t, done)
+	waitSocketClosed(t, socket)
+	h.assertNoHandlerError(t)
+}
+
+func TestClientWaitsForEventHandlersDuringShutdown(t *testing.T) {
+	h := newTransportHarness(t)
+	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan struct{})
+	allowHandlerExit := make(chan struct{})
+	handlerExited := make(chan struct{})
+	handler := dispatcher.NewEventDispatcher("", "").
+		OnP2CardActionTrigger(func(
+			ctx context.Context,
+			_ *callback.CardActionTriggerEvent,
+		) (*callback.CardActionTriggerResponse, error) {
+			close(handlerStarted)
+			<-ctx.Done()
+			close(handlerCanceled)
+			<-allowHandlerExit
+			close(handlerExited)
+			return nil, ctx.Err()
+		})
+	ctx, cancel := context.WithCancel(context.Background())
+	client := NewClient("cli_test", "secret_test",
+		WithDomain(h.server.URL),
+		WithLogger(discardLogger{}),
+		WithEventHandler(handler),
+	)
+	done := startClient(t, ctx, client)
+	socket := h.waitSocket(t)
+
+	writeDataFrame(t, socket.conn, "msg_shutdown", 1, 0, cardActionPayload(t))
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("callback did not start")
+	}
+	cancel()
+	select {
+	case <-handlerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("callback did not observe connection cancellation")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Start returned before callback exited: %v", err)
+	default:
+	}
+	close(allowHandlerExit)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Start error = %v, want context canceled", err)
+		}
+		select {
+		case <-handlerExited:
+		default:
+			t.Fatal("Start returned before callback exit was recorded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after callback exited")
+	}
+	waitSocketClosed(t, socket)
+	h.assertNoHandlerError(t)
+}
+
+func TestClientBootstrapAttemptHasOwnTimeout(t *testing.T) {
+	requestStarted := make(chan struct{})
+	requestCanceled := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(requestStarted)
+		<-r.Context().Done()
+		requestCanceled <- r.Context().Err()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient("cli_test", "secret_test",
+		WithDomain(server.URL),
+		WithAutoReconnect(false),
+		WithLogger(discardLogger{}),
+	)
+	client.bootstrapTimeout = 25 * time.Millisecond
+	done := startClient(t, ctx, client)
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap request did not start")
+	}
+	var startErr error
+	safetyCanceled := false
+	select {
+	case startErr = <-done:
+	case <-time.After(500 * time.Millisecond):
+		safetyCanceled = true
+		cancel()
+		server.CloseClientConnections()
+		startErr = <-done
+	}
+	server.CloseClientConnections()
+	var requestErr error
+	select {
+	case requestErr = <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap handler did not observe request cancellation")
+	}
+	if safetyCanceled {
+		t.Fatalf("Start did not enforce a bootstrap timeout; returned only after safety cancellation: %v", startErr)
+	}
+	if !errors.Is(requestErr, context.Canceled) {
+		t.Fatalf("bootstrap request context error = %v, want canceled", requestErr)
+	}
+	if !isDeadlineError(startErr) {
+		t.Fatalf("Start error = %v, want deadline exceeded", startErr)
+	}
+}
+
+func TestClientDialAttemptHasOwnTimeout(t *testing.T) {
+	dialStarted := make(chan struct{})
+	dialCanceled := make(chan error, 1)
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	mux.HandleFunc(sdkws.GenEndpointUri, func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(&sdkws.EndpointResp{
+			Code: sdkws.OK,
+			Data: &sdkws.Endpoint{
+				Url: "ws" + strings.TrimPrefix(server.URL, "http") + "/ws",
+				ClientConfig: &sdkws.ClientConfig{
+					ReconnectCount: -1,
+					PingInterval:   60,
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/ws", func(_ http.ResponseWriter, r *http.Request) {
+		close(dialStarted)
+		<-r.Context().Done()
+		dialCanceled <- r.Context().Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient("cli_test", "secret_test",
+		WithDomain(server.URL),
+		WithAutoReconnect(false),
+		WithLogger(discardLogger{}),
+	)
+	client.bootstrapTimeout = time.Second
+	client.dialTimeout = 25 * time.Millisecond
+	done := startClient(t, ctx, client)
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket dial did not start")
+	}
+	var startErr error
+	safetyCanceled := false
+	select {
+	case startErr = <-done:
+	case <-time.After(500 * time.Millisecond):
+		safetyCanceled = true
+		cancel()
+		server.CloseClientConnections()
+		startErr = <-done
+	}
+	server.CloseClientConnections()
+	var dialErr error
+	select {
+	case dialErr = <-dialCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("dial handler did not observe request cancellation")
+	}
+	if safetyCanceled {
+		t.Fatalf("Start did not enforce a dial timeout; returned only after safety cancellation: %v", startErr)
+	}
+	if !errors.Is(dialErr, context.Canceled) {
+		t.Fatalf("dial request context error = %v, want canceled", dialErr)
+	}
+	if !isDeadlineError(startErr) {
+		t.Fatalf("Start error = %v, want deadline exceeded", startErr)
+	}
+}
+
+func TestBoundedDeadlineUsesConfiguredTimeout(t *testing.T) {
+	now := time.Date(2026, 8, 1, 6, 0, 0, 0, time.UTC)
+	got, err := boundedDeadline(context.Background(), now, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := now.Add(3 * time.Second); !got.Equal(want) {
+		t.Fatalf("deadline = %s, want %s", got, want)
+	}
+}
+
+func TestBoundedDeadlineRespectsEarlierContextDeadline(t *testing.T) {
+	now := time.Now()
+	parentDeadline := now.Add(time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), parentDeadline)
+	defer cancel()
+
+	got, err := boundedDeadline(ctx, now, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(parentDeadline) {
+		t.Fatalf("deadline = %s, want caller deadline %s", got, parentDeadline)
+	}
+}
+
+func TestBoundedDeadlineRejectsNonpositiveTimeout(t *testing.T) {
+	if _, err := boundedDeadline(context.Background(), time.Now(), 0); err == nil {
+		t.Fatal("boundedDeadline accepted a nonpositive timeout")
+	}
+}
+
 func TestClientAppliesPongPingInterval(t *testing.T) {
 	h := newTransportHarness(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -502,6 +774,10 @@ func TestClientAppliesPongPingInterval(t *testing.T) {
 }
 
 func cardActionPayload(t *testing.T) []byte {
+	return cardActionPayloadForWorkflow(t, "wf_source")
+}
+
+func cardActionPayloadForWorkflow(t *testing.T, workflowID string) []byte {
 	t.Helper()
 	tenant := "tenant_a"
 	raw, err := json.Marshal(&callback.CardActionTriggerEvent{
@@ -520,7 +796,7 @@ func cardActionPayload(t *testing.T) []byte {
 				Tag: "button",
 				Value: map[string]any{
 					"action":             "retry",
-					"source_workflow_id": "wf_source",
+					"source_workflow_id": workflowID,
 				},
 			},
 			Host:    "im_message",
@@ -531,6 +807,14 @@ func cardActionPayload(t *testing.T) []byte {
 		t.Fatalf("marshal card action: %v", err)
 	}
 	return raw
+}
+
+func isDeadlineError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func writeDataFrame(
@@ -564,7 +848,16 @@ func writeDataFrame(
 
 func readDataFrame(t *testing.T, conn *websocket.Conn) sdkws.Frame {
 	t.Helper()
-	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	return readDataFrameWithTimeout(t, conn, 2*time.Second)
+}
+
+func readDataFrameWithTimeout(
+	t *testing.T,
+	conn *websocket.Conn,
+	timeout time.Duration,
+) sdkws.Frame {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		t.Fatalf("set read deadline: %v", err)
 	}
 	for {

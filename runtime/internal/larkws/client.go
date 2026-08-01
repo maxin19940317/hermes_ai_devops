@@ -32,6 +32,9 @@ const (
 	defaultReconnectNonce    = 30
 	defaultReconnectInterval = 2 * time.Minute
 	defaultPingInterval      = 2 * time.Minute
+	defaultBootstrapTimeout  = 10 * time.Second
+	defaultDialTimeout       = 10 * time.Second
+	defaultWriteTimeout      = 5 * time.Second
 	fragmentTTL              = 5 * time.Second
 )
 
@@ -43,11 +46,12 @@ type connectionConfig struct {
 }
 
 type connection struct {
-	socket    *websocket.Conn
-	url       *url.URL
-	connID    string
-	serviceID string
-	writeMu   sync.Mutex
+	socket       *websocket.Conn
+	url          *url.URL
+	connID       string
+	serviceID    string
+	writeTimeout time.Duration
+	writeMu      sync.Mutex
 }
 
 type fragment struct {
@@ -57,17 +61,20 @@ type fragment struct {
 
 // Client owns a Feishu WebSocket connection and all transport goroutines.
 type Client struct {
-	appID         string
-	appSecret     string
-	eventHandler  *dispatcher.EventDispatcher
-	logLevel      larkcore.LogLevel
-	logger        larkcore.Logger
-	domain        string
-	headers       http.Header
-	source        string
-	autoReconnect bool
-	httpClient    *http.Client
-	dialer        *websocket.Dialer
+	appID            string
+	appSecret        string
+	eventHandler     *dispatcher.EventDispatcher
+	logLevel         larkcore.LogLevel
+	logger           larkcore.Logger
+	domain           string
+	headers          http.Header
+	source           string
+	autoReconnect    bool
+	httpClient       *http.Client
+	dialer           *websocket.Dialer
+	bootstrapTimeout time.Duration
+	dialTimeout      time.Duration
+	writeTimeout     time.Duration
 
 	onReady        func()
 	onError        func(error)
@@ -173,13 +180,16 @@ func WithOnDisconnected(callback func()) ClientOption {
 // NewClient constructs a Feishu WebSocket client.
 func NewClient(appID, appSecret string, options ...ClientOption) *Client {
 	client := &Client{
-		appID:         appID,
-		appSecret:     appSecret,
-		domain:        lark.FeishuBaseUrl,
-		autoReconnect: true,
-		httpClient:    http.DefaultClient,
-		dialer:        websocket.DefaultDialer,
-		configCh:      make(chan struct{}, 1),
+		appID:            appID,
+		appSecret:        appSecret,
+		domain:           lark.FeishuBaseUrl,
+		autoReconnect:    true,
+		httpClient:       http.DefaultClient,
+		dialer:           websocket.DefaultDialer,
+		bootstrapTimeout: defaultBootstrapTimeout,
+		dialTimeout:      defaultDialTimeout,
+		writeTimeout:     defaultWriteTimeout,
+		configCh:         make(chan struct{}, 1),
 		config: connectionConfig{
 			reconnectCount:    -1,
 			reconnectInterval: defaultReconnectInterval,
@@ -322,7 +332,16 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 }
 
 func (c *Client) connect(ctx context.Context) (*connection, error) {
-	rawURL, err := c.getConnURL(ctx)
+	bootstrapCtx, bootstrapCancel, err := attemptContext(
+		ctx,
+		c.bootstrapTimeout,
+		"bootstrap",
+	)
+	if err != nil {
+		return nil, err
+	}
+	rawURL, err := c.getConnURL(bootstrapCtx)
+	bootstrapCancel()
 	if err != nil {
 		return nil, fmt.Errorf("get connection URL: %w", err)
 	}
@@ -330,7 +349,12 @@ func (c *Client) connect(ctx context.Context) (*connection, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse connection URL: %w", err)
 	}
-	socket, response, err := c.dialer.DialContext(ctx, rawURL, nil)
+	dialCtx, dialCancel, err := attemptContext(ctx, c.dialTimeout, "WebSocket dial")
+	if err != nil {
+		return nil, err
+	}
+	socket, response, err := c.dialer.DialContext(dialCtx, rawURL, nil)
+	dialCancel()
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
 	}
@@ -341,10 +365,11 @@ func (c *Client) connect(ctx context.Context) (*connection, error) {
 		return nil, fmt.Errorf("dial WebSocket: %w", err)
 	}
 	conn := &connection{
-		socket:    socket,
-		url:       parsed,
-		connID:    parsed.Query().Get(sdkws.DeviceID),
-		serviceID: parsed.Query().Get(sdkws.ServiceID),
+		socket:       socket,
+		url:          parsed,
+		connID:       parsed.Query().Get(sdkws.DeviceID),
+		serviceID:    parsed.Query().Get(sdkws.ServiceID),
+		writeTimeout: c.writeTimeout,
 	}
 	c.logger.Info(ctx, c.logArgs(conn, "connected to %s", parsed)...)
 	return conn, nil
@@ -443,6 +468,18 @@ func (c *Client) configure(config *sdkws.ClientConfig) {
 	}
 }
 
+func attemptContext(
+	parent context.Context,
+	timeout time.Duration,
+	operation string,
+) (context.Context, context.CancelFunc, error) {
+	if timeout <= 0 {
+		return nil, nil, fmt.Errorf("%s timeout must be positive", operation)
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	return ctx, cancel, nil
+}
+
 func (c *Client) configSnapshot() connectionConfig {
 	c.configMu.RLock()
 	defer c.configMu.RUnlock()
@@ -455,9 +492,10 @@ func (c *Client) runConnection(ctx context.Context, conn *connection) error {
 
 	errCh := make(chan error, 2)
 	var workers sync.WaitGroup
+	var handlers sync.WaitGroup
 	workers.Add(2)
 	go c.runWorker(connectionCtx, &workers, errCh, func() error {
-		return c.receiveLoop(connectionCtx, conn)
+		return c.receiveLoop(connectionCtx, conn, &handlers, errCh)
 	})
 	go c.runWorker(connectionCtx, &workers, errCh, func() error {
 		return c.pingLoop(connectionCtx, conn)
@@ -472,6 +510,7 @@ func (c *Client) runConnection(ctx context.Context, conn *connection) error {
 	cancel()
 	_ = conn.socket.Close()
 	workers.Wait()
+	handlers.Wait()
 	c.logger.Info(ctx, c.logArgs(conn, "disconnected from %s", conn.url)...)
 	c.call(c.onDisconnected)
 	return runErr
@@ -513,7 +552,7 @@ func (c *Client) pingLoop(ctx context.Context, conn *connection) error {
 		if err != nil {
 			return fmt.Errorf("marshal ping: %w", err)
 		}
-		if err := conn.write(websocket.BinaryMessage, raw); err != nil {
+		if err := conn.write(ctx, websocket.BinaryMessage, raw); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -545,7 +584,12 @@ func (c *Client) waitPing(ctx context.Context) error {
 	}
 }
 
-func (c *Client) receiveLoop(ctx context.Context, conn *connection) error {
+func (c *Client) receiveLoop(
+	ctx context.Context,
+	conn *connection,
+	handlers *sync.WaitGroup,
+	errCh chan<- error,
+) error {
 	fragments := make(map[string]fragment)
 	for {
 		messageType, raw, err := conn.socket.ReadMessage()
@@ -566,7 +610,7 @@ func (c *Client) receiveLoop(ctx context.Context, conn *connection) error {
 			)
 			continue
 		}
-		if err := c.handleMessage(ctx, conn, fragments, raw); err != nil {
+		if err := c.handleMessage(ctx, conn, fragments, handlers, errCh, raw); err != nil {
 			return err
 		}
 	}
@@ -576,6 +620,8 @@ func (c *Client) handleMessage(
 	ctx context.Context,
 	conn *connection,
 	fragments map[string]fragment,
+	handlers *sync.WaitGroup,
+	errCh chan<- error,
 	raw []byte,
 ) error {
 	var frame sdkws.Frame
@@ -588,7 +634,7 @@ func (c *Client) handleMessage(
 		c.handleControlFrame(ctx, conn, frame)
 		return nil
 	case sdkws.FrameTypeData:
-		return c.handleDataFrame(ctx, conn, fragments, frame)
+		return c.handleDataFrame(ctx, conn, fragments, handlers, errCh, frame)
 	default:
 		return nil
 	}
@@ -619,6 +665,8 @@ func (c *Client) handleDataFrame(
 	ctx context.Context,
 	conn *connection,
 	fragments map[string]fragment,
+	handlers *sync.WaitGroup,
+	errCh chan<- error,
 	frame sdkws.Frame,
 ) error {
 	headers := sdkws.Headers(frame.Headers)
@@ -663,13 +711,31 @@ func (c *Client) handleDataFrame(
 	if messageType != sdkws.MessageTypeEvent {
 		return nil
 	}
+	frame.Headers = append([]sdkws.Header(nil), frame.Headers...)
+	frame.Payload = append([]byte(nil), payload...)
+	handlers.Add(1)
+	go c.runWorker(ctx, handlers, errCh, func() error {
+		return c.handleCompleteDataFrame(ctx, conn, frame)
+	})
+	return nil
+}
+
+func (c *Client) handleCompleteDataFrame(
+	ctx context.Context,
+	conn *connection,
+	frame sdkws.Frame,
+) error {
+	headers := sdkws.Headers(frame.Headers)
+	messageID := headers.GetString(sdkws.HeaderMessageID)
+	traceID := headers.GetString(sdkws.HeaderTraceID)
+	messageType := sdkws.MessageType(headers.GetString(sdkws.HeaderType))
 	started := time.Now()
 	var responseData interface{}
 	var handlerErr error
 	if c.eventHandler == nil {
 		handlerErr = errors.New("event handler is nil")
 	} else {
-		responseData, handlerErr = c.eventHandler.Do(ctx, payload)
+		responseData, handlerErr = c.eventHandler.Do(ctx, frame.Payload)
 	}
 	headers.Add(sdkws.HeaderBizRt, strconv.FormatInt(time.Since(started).Milliseconds(), 10))
 
@@ -705,7 +771,7 @@ func (c *Client) handleDataFrame(
 	if err != nil {
 		return fmt.Errorf("marshal response frame: %w", err)
 	}
-	if err := conn.write(websocket.BinaryMessage, raw); err != nil {
+	if err := conn.write(ctx, websocket.BinaryMessage, raw); err != nil {
 		return fmt.Errorf("write response: %w", err)
 	}
 	return nil
@@ -755,10 +821,66 @@ func combineFragments(
 	return combined, true, nil
 }
 
-func (conn *connection) write(messageType int, payload []byte) error {
+func boundedDeadline(
+	ctx context.Context,
+	now time.Time,
+	timeout time.Duration,
+) (time.Time, error) {
+	if ctx == nil {
+		return time.Time{}, errors.New("write context is nil")
+	}
+	if timeout <= 0 {
+		return time.Time{}, errors.New("write timeout must be positive")
+	}
+	deadline := now.Add(timeout)
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+	}
+	return deadline, nil
+}
+
+func (conn *connection) write(
+	ctx context.Context,
+	messageType int,
+	payload []byte,
+) error {
+	if ctx == nil {
+		return errors.New("write context is nil")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 	conn.writeMu.Lock()
 	defer conn.writeMu.Unlock()
-	return conn.socket.WriteMessage(messageType, payload)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	deadline, err := boundedDeadline(ctx, time.Now(), conn.writeTimeout)
+	if err != nil {
+		return err
+	}
+	if err := conn.socket.SetWriteDeadline(deadline); err != nil {
+		return fmt.Errorf("set WebSocket write deadline: %w", err)
+	}
+	writeErr := conn.socket.WriteMessage(messageType, payload)
+	clearErr := conn.socket.SetWriteDeadline(time.Time{})
+	switch {
+	case writeErr != nil && clearErr != nil:
+		return errors.Join(
+			fmt.Errorf("write WebSocket message: %w", writeErr),
+			fmt.Errorf("clear WebSocket write deadline: %w", clearErr),
+		)
+	case writeErr != nil:
+		return fmt.Errorf("write WebSocket message: %w", writeErr)
+	case clearErr != nil:
+		return fmt.Errorf("clear WebSocket write deadline: %w", clearErr)
+	default:
+		return nil
+	}
 }
 
 func (c *Client) call(callback func()) {
