@@ -365,6 +365,48 @@ func TestInjectReadinessFactorsFailClosed(t *testing.T) {
 	}
 }
 
+func TestInjectRequiresUpdateMultiCompatibilityGate(t *testing.T) {
+	tests := []struct {
+		name     string
+		template string
+	}{
+		{name: "red", template: "red"},
+		{name: "orange", template: "orange"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := injectRequest(tt.template)
+			req.Card.Config.UpdateMulti = false
+			st := &snapshotStore{}
+			sender := &injectCardSender{}
+			acts := &Acts{
+				Store:       st,
+				Feishu:      sender,
+				CardActions: readyCardActions(),
+			}
+
+			runNotifyCardInActivity(t, acts, req, true, nil)
+
+			if len(sender.cards) != 1 {
+				t.Fatalf("SendCard calls = %d, want 1", len(sender.cards))
+			}
+			if !reflect.DeepEqual(sender.cards[0], req.Card) {
+				t.Fatalf("sent card = %#v, want exact original %#v", sender.cards[0], req.Card)
+			}
+			if hasAction(sender.cards[0]) {
+				t.Fatalf("sent card unexpectedly contains action element: %#v", sender.cards[0].Elements)
+			}
+			if len(st.writes) != 0 {
+				t.Fatalf("snapshot writes = %d, want 0", len(st.writes))
+			}
+			if len(sender.texts) != 0 {
+				t.Fatalf("fallback texts = %#v, want none", sender.texts)
+			}
+		})
+	}
+}
+
 func TestSnapshotFailureShipsCardWithoutButtons(t *testing.T) {
 	req := injectRequest("red")
 	st := &snapshotStore{err: errors.New("db down")}

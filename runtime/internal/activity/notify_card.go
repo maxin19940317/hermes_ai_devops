@@ -29,9 +29,10 @@ func (a *Acts) NotifyCard(ctx context.Context, req wf.NotifyCardRequest) error {
 	injected := false
 	var originalRaw []byte
 
-	// 失败资格只看 header 底色。正文与 fallback 都是可变的展示内容,
-	// 不能作为 workflow 身份或失败资格的权威来源。
-	eligible := displayCard.Header.Template == "red" || displayCard.Header.Template == "orange"
+	// Stage-1 兼容门:旧卡(含解码老输入后的零值)没有 config.update_multi=true,
+	// Feishu 不能 PATCH,因此按钮必须 fail closed。
+	eligible := displayCard.Config.UpdateMulti &&
+		(displayCard.Header.Template == "red" || displayCard.Header.Template == "orange")
 	if eligible && a.CardActions != nil && a.CardActions.Ready() {
 		workflowID := activity.GetInfo(ctx).WorkflowExecution.ID
 		if workflowID != "" {
