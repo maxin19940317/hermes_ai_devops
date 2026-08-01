@@ -697,8 +697,11 @@ func validateRejectRender(render RejectRender) (string, error) {
 	if render.RejectionReason == "" {
 		return "", errors.New("complete reject: rejection reason is empty")
 	}
+	// CONTRACT-ISSUE: design §7.5 omitted VariantNotMember even though a no-variant
+	// card retry can emit it from inconsistent Temporal output/workflow_runs.
+	// Proposed correction: include VariantNotMember -> both.
 	switch render.Code {
-	case "StillRunning", "ResultUnreadable", "ArtifactMissing":
+	case "StillRunning", "ResultUnreadable", "ArtifactMissing", "VariantNotMember":
 		return "both", nil
 	case "NotAuthoritative", "NoFailedVariants":
 		return "none", nil
@@ -712,6 +715,7 @@ func rejectionAuditAction(action, code string) string {
 		"StillRunning":     "still_running",
 		"ResultUnreadable": "result_unreadable",
 		"ArtifactMissing":  "artifact_missing",
+		"VariantNotMember": "variant_not_member",
 		"NotAuthoritative": "not_authoritative",
 		"NoFailedVariants": "no_failed_variants",
 	}[code]

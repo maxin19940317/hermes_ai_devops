@@ -21,6 +21,7 @@ type consumerTestStore struct {
 	inbox               map[string]store.InboxRow
 	actions             map[string]store.CardAction
 	messages            map[string]store.MessageClaim
+	audits              []store.AuditRow
 	claimTokens         []string
 	claimInboxCalls     int
 	staleClaimCalls     int
@@ -220,21 +221,30 @@ func (s *consumerTestStore) CompleteReject(
 	if !ok || row.Owner != token {
 		return nil
 	}
-	buttons := map[string]string{
-		"StillRunning":     "both",
-		"ResultUnreadable": "both",
-		"ArtifactMissing":  "both",
-		"NotAuthoritative": "none",
-		"NoFailedVariants": "none",
+	policy, ok := map[string]struct {
+		buttons string
+		suffix  string
+	}{
+		"StillRunning":     {buttons: "both", suffix: "still_running"},
+		"ResultUnreadable": {buttons: "both", suffix: "result_unreadable"},
+		"ArtifactMissing":  {buttons: "both", suffix: "artifact_missing"},
+		"VariantNotMember": {buttons: "both", suffix: "variant_not_member"},
+		"NotAuthoritative": {buttons: "none", suffix: "not_authoritative"},
+		"NoFailedVariants": {buttons: "none", suffix: "no_failed_variants"},
 	}[render.Code]
-	if buttons == "" {
+	if !ok {
 		return fmt.Errorf("unsupported reject code %q", render.Code)
 	}
 	s.messages[row.WorkflowID+"\x00"+row.OpenMessageID] = store.MessageClaim{
 		WorkflowID: row.WorkflowID, OpenMessageID: row.OpenMessageID,
 		RenderKind: "rejection", RejectionReason: render.RejectionReason,
-		ButtonsMode: buttons, DesiredRevision: 1,
+		ButtonsMode: policy.buttons, DesiredRevision: 1,
 	}
+	s.audits = append(s.audits, store.AuditRow{
+		Action:       "card." + row.Action + ".rejected." + policy.suffix,
+		Target:       row.WorkflowID,
+		InboxEventID: row.EventID,
+	})
 	row.State = "processed"
 	s.inbox[eventID] = row
 	s.businessWrites++
@@ -539,6 +549,43 @@ func TestRejectionRendersOnCard(t *testing.T) {
 				t.Fatalf("complete calls: reject=%d accept=%d", st.rejectCalls, st.acceptCalls)
 			}
 		})
+	}
+}
+
+func TestVariantNotMemberRejectionCompletesTerminally(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("retry")
+	resolver.err = &rerun.RejectReason{
+		Code: "VariantNotMember", WorkflowID: "wf1", Variant: "v2",
+	}
+
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("ConsumeOne: %v", err)
+	}
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("duplicate ConsumeOne: %v", err)
+	}
+
+	inbox := st.inbox["e1"]
+	if inbox.State != "processed" || inbox.Attempts != 1 {
+		t.Fatalf("inbox = %#v, want processed exactly once", inbox)
+	}
+	message := st.messages["wf1\x00om_1"]
+	if message.RenderKind != "rejection" ||
+		message.RejectionReason != "运行结果中的变体 v2 不属于源 workflow wf1" ||
+		message.ButtonsMode != "both" {
+		t.Fatalf("message = %#v", message)
+	}
+	if len(st.audits) != 1 ||
+		st.audits[0].Action != "card.retry.rejected.variant_not_member" ||
+		st.audits[0].InboxEventID != "e1" {
+		t.Fatalf("audits = %#v", st.audits)
+	}
+	if len(st.actions) != 0 || st.acceptCalls != 0 || st.attemptCalls != 0 ||
+		starter.startCalls != 0 {
+		t.Fatalf(
+			"rejection created actions=%d accepts=%d attempts=%d starts=%d",
+			len(st.actions), st.acceptCalls, st.attemptCalls, starter.startCalls,
+		)
 	}
 }
 

@@ -311,7 +311,7 @@ func (c *Consumer) completeRejection(
 		return fmt.Errorf("consume card action %s: resolve %s: %w", row.EventID, row.Action, cause)
 	}
 	// CONTRACT-ISSUE: rerun preserves the legacy CheckFailed distinction, while
-	// card rejection storage has a closed five-code contract. Treat it as a
+	// card rejection storage has a closed reason-code contract. Treat it as a
 	// transient resolution failure rather than silently renaming the reason.
 	if reason.Code == "CheckFailed" {
 		return fmt.Errorf("consume card action %s: check workflow state: %w", row.EventID, cause)
@@ -404,6 +404,11 @@ func renderRejectReason(reason *rerun.RejectReason) (store.RejectRender, error) 
 		text = fmt.Sprintf(
 			"变体 %s 的 artifact 数量为 %d，要求恰好 1 个",
 			reason.Variant, reason.Count,
+		)
+	case "VariantNotMember":
+		text = fmt.Sprintf(
+			"运行结果中的变体 %s 不属于源 workflow %s",
+			reason.Variant, reason.WorkflowID,
 		)
 	default:
 		return store.RejectRender{}, fmt.Errorf("unsupported resolver rejection %q", reason.Code)

@@ -3514,14 +3514,18 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 	})
 
 	t.Run("ActionRejectCompletesAtomicallyAndMapsButtons", func(t *testing.T) {
-		cases := map[string]string{
-			"StillRunning":     "both",
-			"ResultUnreadable": "both",
-			"ArtifactMissing":  "both",
-			"NotAuthoritative": "none",
-			"NoFailedVariants": "none",
+		cases := map[string]struct {
+			buttons string
+			suffix  string
+		}{
+			"StillRunning":     {buttons: "both", suffix: "still_running"},
+			"ResultUnreadable": {buttons: "both", suffix: "result_unreadable"},
+			"ArtifactMissing":  {buttons: "both", suffix: "artifact_missing"},
+			"VariantNotMember": {buttons: "both", suffix: "variant_not_member"},
+			"NotAuthoritative": {buttons: "none", suffix: "not_authoritative"},
+			"NoFailedVariants": {buttons: "none", suffix: "no_failed_variants"},
 		}
-		for code, wantButtons := range cases {
+		for code, policy := range cases {
 			t.Run(code, func(t *testing.T) {
 				s := newStore(t)
 				tok := claimForTest(t, s, "e1", "wf1", "retry")
@@ -3533,14 +3537,29 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 				}
 				msg := mustGetActionMessage(t, s, "wf1", "om_shared")
 				if msg.RenderKind != "rejection" || msg.RejectionReason != "rejected: "+code ||
-					msg.ButtonsMode != wantButtons || msg.UpdateState != "pending" {
-					t.Fatalf("message=%#v, want buttons=%q", msg, wantButtons)
+					msg.ButtonsMode != policy.buttons || msg.UpdateState != "pending" {
+					t.Fatalf("message=%#v, want buttons=%q", msg, policy.buttons)
+				}
+				if err := s.CompleteReject(ctx, "e1", tok, RejectRender{
+					Code: code, RejectionReason: "duplicate: " + code,
+				}); err != nil {
+					t.Fatalf("duplicate CompleteReject: %v", err)
+				}
+				if after := mustGetActionMessage(t, s, "wf1", "om_shared"); !reflect.DeepEqual(after, msg) {
+					t.Fatalf("duplicate changed message: before=%#v after=%#v", msg, after)
 				}
 				if countAudit(t, s, "e1") != 1 {
 					t.Fatal("CompleteReject 必须恰好写一行审计")
 				}
+				wantAudit := "card.retry.rejected." + policy.suffix
+				if countAuditByAction(t, s, wantAudit) != 1 {
+					t.Fatalf("audit action %q count != 1", wantAudit)
+				}
 				if inbox := mustGetInbox(t, s, "e1"); inbox.State != "processed" || inbox.ProcessedAt == nil {
 					t.Fatalf("inbox=%#v", inbox)
+				}
+				if actionExists(t, s, "wf1") {
+					t.Fatal("rejection must not create an action row")
 				}
 			})
 		}
