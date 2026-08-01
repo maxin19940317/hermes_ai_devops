@@ -47,8 +47,9 @@ any task has a non-`INFRA_ERROR` failure (business failure takes priority even i
 `INFRA_ERROR` is also present), orange when every failure is `INFRA_ERROR`, green
 when nothing is judged a failure. If the card send fails, or the configured sender
 doesn't support cards, the worker falls back to the same plain-text message this
-version used to send unconditionally. This milestone ships display only — the
-card has no buttons or other interactive components. The worker also runs an
+version used to send unconditionally. Retry/ignore card actions are implemented but
+remain strictly default-off pending the card-action rollout below; while disabled, cards
+have no buttons and retain the existing display-only behavior. The worker also runs an
 optional command listener over the
 app's WebSocket event subscription: when `FEISHU_CMD_WHITELIST` (comma-separated
 open_ids) is set, whitelisted users can send the bot DM commands (`status`,
@@ -204,6 +205,36 @@ translation payload.
 A forward or reverse v1/v2 mismatch breaks all natural-language commands.
 Only resume command and artifact ingress after analyze_bridge and all new binaries are on v2.
 Do not combine this window with deployment of the prerequisite batch.
+
+### Card-action two-stage rollout
+
+The two stages must not be merged.
+
+**Stage 1 — workflow-runs compatibility.** With the first `workflow_runs` production
+deployment, ship only `config.update_multi: true` plus the `CardElement.Actions`
+declaration and its compatibility assertion. The workflow never sets `Actions`, cards
+still have no buttons, behavior is unchanged, and newly sent messages become updateable.
+
+**Stage 2 — card actions.** Only after the `workflow_runs` rollout is stable:
+
+1. Apply `deploy/postgres/migrations/2026-08-01-card-actions.sql`, which creates
+   `card_action_inbox`, `card_actions`, `card_action_messages`,
+   `card_action_snapshots`, and `audit_log`.
+2. Deploy the cardaction Activity/listener implementation.
+3. After every prerequisite below is ready, explicitly set
+   `FEISHU_CARD_ACTIONS_ENABLED=true`.
+
+Stage 2 must not be mixed into the workflow_runs stop-write window. That window already
+changes the artifact unique key and cuts over `analyze_bridge` v2; adding five tables
+and a new callback path makes failures unattributable and impossible to isolate.
+
+`FEISHU_CARD_ACTIONS_ENABLED` is a strict opt-in and defaults to `false`. Before enabling
+it, verify the app sender is selected and `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and
+`FEISHU_RECEIVE_ID` are configured, and keep `FEISHU_CMD_WHITELIST` nonempty so the
+WebSocket listener is running. In Feishu Open Platform, subscribe to
+`card.action.trigger` under “事件与回调 → 回调” using the long connection; no public
+callback URL is required. Runtime handler registration alone does not prove the platform
+subscription exists, so verify the subscription in the platform before enabling Stage 2.
 
 ## Verify
 

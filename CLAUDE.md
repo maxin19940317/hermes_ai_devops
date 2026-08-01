@@ -34,7 +34,7 @@
 4. Client Agent 不提供任意 Shell 接口。所有 ADB 操作走模板化白名单,一律 `adb -s <serial>`。
 5. Hermes 不可用时,已开始的确定性任务必须能继续完成——LLM 不在派单/执行/回收的关键路径上。
 6. Plan 中的声明式策略**优先于** Hermes 的临场判断。Hermes 要改策略必须走显式 `update_policy` 控制操作并留审计。
-7. 所有跨组件动作携带幂等键;所有 Hermes/人工决策落 `decisions` 表;所有操作落 `audit_log`。
+7. 所有跨组件动作携带幂等键;所有 Hermes/人工决策落 `decisions` 表(例外:终态卡片确认是 run 级动作,记于 `card_actions` + `audit_log`,不属于 task-level decision);所有操作落 `audit_log`。
 
 ## 4. 技术选型(已定稿)
 
@@ -49,7 +49,7 @@
 | 数据库 | PostgreSQL 15+(与 Temporal 共实例分库) | Client 本地用 SQLite(WAL) |
 | 附件/日志存储 | MinIO(S3 兼容),预签名 URL 直传 | 大文件不过 Runtime |
 | 产物仓库 | GitLab Generic Package Registry(现状沿用) | |
-| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 按钮尚未实现,见 §12 Phase 2 |
+| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 重试/忽略按钮已实现,严格缺省关闭,待 Stage 2 启用 |
 | 部署 | Docker Compose(服务器全套);Client 手动安装 MSI/exe | |
 | 日志 | 结构化日志(zerolog),UTC + 毫秒,全组件 NTP | |
 
@@ -255,14 +255,32 @@ results(task_id FK, exit_code, duration_sec, counts JSONB, metrics JSONB, attach
 metrics(project, variant, device_model, suite, metric_name, value, task_id, ts)  -- 基线来源
 decisions(decision_id PK, task_id, actor: hermes|human|rule, input_digest,
           model, prompt_version, output JSONB, created_at)   -- 一切裁决可回放
-audit_log(actor, action, target, payload_digest, ts)
+card_action_inbox(event_id PK, disposition, ack_toast, action, workflow_id,
+                  actor_open_id, open_message_id, payload_digest, state,
+                  owner, lease_expires_at, attempts, last_error, received_at, processed_at)
+                  -- 飞书事件持久交接,按 event_id 去重
+card_actions(workflow_id PK/FK workflow_runs, action: retry|ignore, actor_open_id,
+             state, owner, lease_expires_at, target_workflow_id, attempt,
+             target_input JSONB, last_error, revision, created_at, updated_at)
+             -- run 级动作 claim,每个源 workflow 唯一
+card_action_messages(workflow_id + open_message_id PK, render_kind, rejection_reason,
+                     desired_revision, rendered_revision, update_state, buttons_mode,
+                     owner, lease_expires_at, reconcile_after, attempts, last_error, updated_at)
+                     -- 卡片更新协调,按消息唯一
+card_action_snapshots(workflow_id PK, card_json JSONB, created_at)
+                     -- PATCH 所需的原展示卡快照
+audit_log(audit_id PK, actor, action, target, payload_digest,
+          card_action_workflow_id UNIQUE FK card_actions,
+          inbox_event_id UNIQUE FK card_action_inbox, ts)
+          -- accepted action 与 inbox event 各恰好一条审计
 ```
 
 `workflow_runs` 是新运行输入的不可变权威索引，不保存 Temporal 状态或终态输出，也不从
 legacy artifacts/tasks 回填。`RecentRuns` 中无 `workflow_runs` 身份的 legacy 行只用于
 展示，不可触发副作用。人工重跑语法固定为
 `rerun <source_workflow_id> [variant]`；每条文本指令都会分配新的 attempt，不能把
-Temporal `RejectDuplicate` 当作指令幂等。持久化 action claim 留给下一轮飞书按钮实现。
+Temporal `RejectDuplicate` 当作指令幂等。终态卡片重试/忽略已用 `card_actions` 持久化
+run 级 action claim,但严格缺省关闭,待 Stage 2 完成迁移与平台订阅后启用。
 
 Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, started_at, ...)` + `events(seq, ...)`,每次状态迁移单事务落盘,崩溃重启后据此恢复。
 
@@ -297,7 +315,7 @@ Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, star
 > 为个人实例,宜另起专用实例)、工具白名单与 Schema 输出校验在该平台上的落地方式。
 > §3 硬性边界(Hermes 只经 Runtime、结构化输入、不在执行关键路径)不因复用而放宽。
 
-Evidence Extractor 完整化(签名匹配 + 匹配处 ±50 行上下文 + junit 失败 + 指标差值 → evidence.json,几十 KB 级);Analyzer(LLM 分析 evidence → 结构化结论 → decisions 落库;Hermes 超时/不可用 → 规则引擎保底);飞书交互卡片(2026-07-30:**展示卡片已实现**;重试/忽略按钮待 `workflow_runs` 落地后单独一轮,
+Evidence Extractor 完整化(签名匹配 + 匹配处 ±50 行上下文 + junit 失败 + 指标差值 → evidence.json,几十 KB 级);Analyzer(LLM 分析 evidence → 结构化结论 → decisions 落库;Hermes 超时/不可用 → 规则引擎保底);飞书交互卡片(2026-07-30:**展示卡片已实现**;重试/忽略按钮也已实现,严格缺省关闭,待 Stage 2 完成迁移与平台订阅后启用,
 按钮回调经 WS listener 执行而非 workflow signal;隔离按钮因无设备级信号源暂不做,见差距 #10);Planner v1(自然语言 → Plan DSL,服务端 Schema 校验不过打回重试 ≤3 次)。
 **严禁把原始日志全量灌入 LLM;Hermes 按需通过 `fetch_log_range(attachment, start, end)` 工具取片段。**
 

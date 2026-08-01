@@ -18,6 +18,9 @@ Worker、Client Agent 四条开发线并行实施,并作为后续故障注入、
    它仅用于进度展示与 Workflow Query,不参与结果判定、租约判断或流程正确性,
    丢失不影响任务最终收敛;一旦未来需要根据进度事件做超时/跳转决策,
    必须先把 task-event 纳入 Outbox。
+   **明确例外:终态卡片的 retry/ignore 确认不发送 workflow signal,也不使用
+   result/human-decision outbox。**终态通知发出时源 workflow 已结束,Runtime 直接持久化
+   run 级 `card_actions` + `audit_log`;retry 启动一个新 workflow,而不是 signal 已结束的源 workflow。
 4. 产物地址应尽量精确(kick 载荷携带精确 URL/sha256),不长期依赖版本探测。
 5. Client 不长期持有高权限凭据(只读 Deploy Token 替代 PRIVATE-TOKEN);
    预签名上传 URL 按需短期签发,不在派单时一次性生成。
@@ -294,8 +297,8 @@ sequenceDiagram
 `verdict != PASSED && verdict != SKIPPED` 的变体；显式 variant 只要属于源 run 就仍可重跑，包括 PASSED 或 SKIPPED。
 每条文本命令都会原子递增分配新的 attempt，workflow ID 随后由输入确定性派生；
 `StartDeviceTest` 失败会留下 attempt 空洞。重复发送命令仍会分配不同 attempt，Temporal
-`RejectDuplicate` 不提供命令级幂等。下一轮交互按钮必须用持久化 claim 固定 attempt
-及其派生出的目标 workflow ID。
+`RejectDuplicate` 不提供命令级幂等。终态卡片 retry 已用持久化 `card_actions` claim 固定
+attempt 及其派生出的目标 workflow ID;该能力严格缺省关闭,待 Stage 2 部署后启用。
 
 ## 实施优先级(四批,按依赖排序)
 
@@ -342,7 +345,9 @@ sequenceDiagram
 - **§14 禁轮询**:workflow 等结果只收 signal;CheckLease 由租约到期时间驱动,非高频
   轮询;重复 webhook/重复回调/outbox 重复投递全部幂等去重。
 - **事件分级**:关键事件(Result/Cancel/Human Decision)必须走事务性 Outbox;
-  进度事件(TaskEvent)允许 best-effort Signal,丢失不影响收敛。
+  进度事件(TaskEvent)允许 best-effort Signal,丢失不影响收敛。终态卡片 retry/ignore
+  是明确例外:不发 workflow signal、不走 result/human-decision outbox;Runtime 持久化
+  run 级 action/audit,retry 新起 workflow。
 - **决策可回放**:evidence 快照独立持久化(evidence_snapshots + MinIO),
   decisions 只记录真正发生的决策,引用 evidence_snapshot_id。
 

@@ -568,5 +568,59 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
         self.assertIn("legacy rerun 有意 fail closed 并返回迁移提示", design)
 
 
+class CardActionsDeploymentContracts(unittest.TestCase):
+    def test_rollout_is_explicitly_ordered_and_not_merged(self):
+        documented = " ".join(
+            DEPLOY_README.read_text(encoding="utf-8").split()
+        )
+
+        stage_1 = "**Stage 1 — workflow-runs compatibility.**"
+        stage_2 = "**Stage 2 — card actions.**"
+        self.assertTrue(stage_1 in documented, "missing Stage 1 marker")
+        self.assertTrue(stage_2 in documented, "missing Stage 2 marker")
+        self.assertLess(documented.index(stage_1), documented.index(stage_2))
+        self.assertTrue(
+            "The two stages must not be merged." in documented,
+            "missing cannot-merge warning",
+        )
+        self.assertTrue(
+            "Stage 2 must not be mixed into the workflow_runs stop-write window."
+            in documented,
+            "missing workflow_runs stop-write exclusion",
+        )
+        for marker in (
+            "config.update_multi: true",
+            "CardElement.Actions",
+            "deploy/postgres/migrations/2026-08-01-card-actions.sql",
+            "FEISHU_CARD_ACTIONS_ENABLED=true",
+        ):
+            self.assertTrue(marker in documented, f"missing {marker}")
+
+    def test_feishu_platform_subscription_is_an_explicit_prerequisite(self):
+        documented = " ".join(
+            DEPLOY_README.read_text(encoding="utf-8").split()
+        )
+
+        for marker in (
+            "card.action.trigger",
+            "事件与回调 → 回调",
+            "long connection",
+            "no public callback URL",
+            "handler registration alone does not prove the platform subscription exists",
+        ):
+            self.assertTrue(marker in documented, f"missing {marker}")
+
+    def test_card_actions_are_strictly_default_off(self):
+        env_example = ENV_EXAMPLE.read_text(encoding="utf-8")
+
+        self.assertTrue(
+            re.search(
+                r"(?m)^FEISHU_CARD_ACTIONS_ENABLED=false$",
+                env_example,
+            ),
+            "missing exact FEISHU_CARD_ACTIONS_ENABLED=false default",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
