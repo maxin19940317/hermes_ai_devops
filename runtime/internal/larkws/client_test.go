@@ -192,16 +192,62 @@ func waitStartCanceled(t *testing.T, done <-chan error) {
 	}
 }
 
-func waitSocketClosed(t *testing.T, socket *testSocket) {
-	t.Helper()
+func waitSocketClosedErr(socket *testSocket) error {
 	if err := socket.conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set WebSocket read deadline: %v", err)
+		return err
 	}
 	for {
 		if _, _, err := socket.conn.ReadMessage(); err != nil {
-			socket.stop()
-			return
+			if isPeerSocketClosedErr(err) {
+				return nil
+			}
+			return err
 		}
+	}
+}
+
+func isPeerSocketClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return true
+	}
+	return strings.Contains(err.Error(), "use of closed network connection") ||
+		strings.Contains(err.Error(), "closed network connection")
+}
+
+func waitSocketClosed(t *testing.T, socket *testSocket) {
+	t.Helper()
+	if err := waitSocketClosedErr(socket); err != nil {
+		t.Fatalf("wait for WebSocket close: %v", err)
+	}
+}
+
+func TestWaitSocketClosedErrReturnsTimeoutWhenPeerStaysOpen(t *testing.T) {
+	h := newTransportHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	client := NewClient("cli_test", "secret_test",
+		WithDomain(h.server.URL),
+		WithLogger(discardLogger{}),
+	)
+	done := startClient(t, ctx, client)
+	t.Cleanup(func() {
+		cancel()
+		waitStartCanceled(t, done)
+	})
+	socket := h.waitSocket(t)
+
+	err := waitSocketClosedErr(socket)
+	if err == nil {
+		t.Fatal("waitSocketClosedErr returned nil for an open peer")
+	}
+	if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("waitSocketClosedErr error = %v, want timeout", err)
 	}
 }
 
