@@ -793,7 +793,7 @@ func (s *PGStore) ClaimStaleInbox(
 			  FROM card_action_inbox
 			 WHERE state='received'
 			   AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp())
-			 ORDER BY received_at, event_id
+			 ORDER BY attempts, received_at, event_id
 			 LIMIT 1
 			 FOR UPDATE SKIP LOCKED
 		)

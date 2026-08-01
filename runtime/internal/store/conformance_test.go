@@ -4223,4 +4223,61 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatalf("expired inbox lease 未被接管: (%#v, %v)", third, err)
 		}
 	})
+
+	t.Run("StaleInboxClaimPrioritizesNeverAttemptedRows", func(t *testing.T) {
+		s := newStore(t)
+		putInbox := func(eventID string) {
+			t.Helper()
+			if _, inserted, err := s.PutInbox(ctx, InboxRow{
+				EventID: eventID, Disposition: "accepted", AckToast: "ack",
+				Action: "retry", WorkflowID: "wf-" + eventID, ActorOpenID: "ou_x",
+				OpenMessageID: "om-" + eventID, State: "received",
+			}, nil); err != nil || !inserted {
+				t.Fatalf("PutInbox(%s) = (%v, %v)", eventID, inserted, err)
+			}
+		}
+		putInbox("e1")
+		putInbox("e2")
+
+		first, err := s.ClaimStaleInbox(ctx, "sweeper-a", 120*time.Second)
+		if err != nil || first == nil || first.EventID != "e1" ||
+			first.Owner != "sweeper-a" || first.Attempts != 1 ||
+			first.LeaseExpiresAt == nil {
+			t.Fatalf("first ClaimStaleInbox = (%#v, %v)", first, err)
+		}
+		expireInboxLease(t, s, "e1")
+
+		second, err := s.ClaimStaleInbox(ctx, "sweeper-b", 120*time.Second)
+		if err != nil || second == nil || second.EventID != "e2" ||
+			second.Owner != "sweeper-b" || second.Attempts != 1 ||
+			second.LeaseExpiresAt == nil {
+			t.Fatalf("never-attempted inbox did not outrank expired retry: (%#v, %v)", second, err)
+		}
+		if firstStored := mustGetInbox(t, s, "e1"); firstStored.Attempts != 1 ||
+			firstStored.Owner != "sweeper-a" || firstStored.LeaseExpiresAt == nil ||
+			!firstStored.LeaseExpiresAt.Before(time.Now().UTC()) {
+			t.Fatalf("skipped expired inbox changed during second claim: %#v", firstStored)
+		}
+
+		expireInboxLease(t, s, "e2")
+		putInbox("e3")
+		third, err := s.ClaimStaleInbox(ctx, "sweeper-c", 120*time.Second)
+		if err != nil || third == nil || third.EventID != "e3" ||
+			third.Owner != "sweeper-c" || third.Attempts != 1 ||
+			third.LeaseExpiresAt == nil {
+			t.Fatalf("new zero-attempt inbox did not outrank retries: (%#v, %v)", third, err)
+		}
+
+		expireInboxLease(t, s, "e3")
+		retry, err := s.ClaimStaleInbox(ctx, "sweeper-d", 120*time.Second)
+		if err != nil || retry == nil || retry.EventID != "e1" ||
+			retry.Owner != "sweeper-d" || retry.Attempts != 2 ||
+			retry.LeaseExpiresAt == nil {
+			t.Fatalf("retry tie-break or claim mutation = (%#v, %v)", retry, err)
+		}
+		if secondStored := mustGetInbox(t, s, "e2"); secondStored.Attempts != 1 ||
+			secondStored.Owner != "sweeper-b" {
+			t.Fatalf("unselected retry changed: %#v", secondStored)
+		}
+	})
 }

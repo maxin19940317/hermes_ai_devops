@@ -623,7 +623,13 @@ func (s *MemStore) ClaimStaleInbox(
 	if len(keys) == 0 {
 		return nil, nil
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := s.inbox[keys[i]], s.inbox[keys[j]]
+		if left.Attempts != right.Attempts {
+			return left.Attempts < right.Attempts
+		}
+		return keys[i] < keys[j]
+	})
 	eventID := keys[0]
 	row := s.inbox[eventID]
 	expires := time.Now().UTC().Add(lease)
