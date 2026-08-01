@@ -1,3 +1,4 @@
+import html
 import re
 import subprocess
 import unittest
@@ -365,6 +366,37 @@ def scan_semantic_atx_headings(text):
     return headings
 
 
+def markdown_heading_plain_text(title):
+    """Approximate visible text for realistic ATX heading inline markup."""
+    escaped_punctuation = []
+
+    def protect_escaped_punctuation(match):
+        escaped_punctuation.append(match.group(1))
+        return f"\x00{len(escaped_punctuation) - 1}\x00"
+
+    plain = re.sub(
+        r"""\\([!"#$%&'()*+,\-./:;<=>?@\[\]^_`{|}~])""",
+        protect_escaped_punctuation,
+        title,
+    )
+    plain = re.sub(
+        r"!?\[([^\]]*)\]\([^)\r\n]*\)",
+        r"\1",
+        plain,
+    )
+    plain = re.sub(
+        r"!?\[([^\]]*)\]\[[^\]]*\]",
+        r"\1",
+        plain,
+    )
+    plain = re.sub(r"</?[A-Za-z][^<>]*>", "", plain)
+    plain = re.sub(r"[*_~`]+", "", plain)
+    plain = html.unescape(plain)
+    for index, punctuation in enumerate(escaped_punctuation):
+        plain = plain.replace(f"\x00{index}\x00", punctuation)
+    return normalize_whitespace(plain)
+
+
 def parse_card_actions_rollout_sections(text):
     headings = scan_semantic_atx_headings(text)
     candidate_sections = [
@@ -372,7 +404,8 @@ def parse_card_actions_rollout_sections(text):
         for heading in headings
         if (
             heading.level == 3
-            and CARD_ACTIONS_ROLLOUT_HEADING in heading.title
+            and CARD_ACTIONS_ROLLOUT_HEADING
+            in markdown_heading_plain_text(heading.title)
         )
     ]
     if not candidate_sections:
@@ -1142,6 +1175,46 @@ class CardActionsDeploymentContracts(unittest.TestCase):
 
         self.assertEqual([], headings)
 
+    def test_markdown_heading_plain_text_removes_internal_emphasis(self):
+        self.assertEqual(
+            CARD_ACTIONS_ROLLOUT_HEADING,
+            markdown_heading_plain_text(
+                "*Card-action* __two-stage__ ~~rollout~~"
+            ),
+        )
+
+    def test_markdown_heading_plain_text_uses_link_and_image_labels(self):
+        self.assertEqual(
+            CARD_ACTIONS_ROLLOUT_HEADING,
+            markdown_heading_plain_text(
+                "Card-action [two-stage][stage] ![rollout](rollout.png)"
+            ),
+        )
+
+    def test_markdown_heading_plain_text_removes_code_delimiters(self):
+        self.assertEqual(
+            CARD_ACTIONS_ROLLOUT_HEADING,
+            markdown_heading_plain_text(
+                "Card-action `two-stage` rollout"
+            ),
+        )
+
+    def test_markdown_heading_plain_text_strips_html_and_unescapes_entities(self):
+        self.assertEqual(
+            "Card-action two-stage & rollout",
+            markdown_heading_plain_text(
+                "<span>Card-action</span>  two-stage &amp; rollout"
+            ),
+        )
+
+    def test_markdown_heading_plain_text_unescapes_markdown_punctuation(self):
+        self.assertEqual(
+            "Card-action two-stage rollout *",
+            markdown_heading_plain_text(
+                r"Card\-action two\-stage rollout \*"
+            ),
+        )
+
     def test_rollout_section_parser_rejects_duplicate_rollout_headings(self):
         doc = build_valid_card_actions_rollout_doc() + (
             "\n### Card-action two-stage rollout\n\n"
@@ -1160,6 +1233,9 @@ class CardActionsDeploymentContracts(unittest.TestCase):
         for duplicate_heading in (
             "### **Card-action two-stage rollout**",
             "### [Card-action two-stage rollout](#card-actions)",
+            "### Card-action **two-stage** rollout",
+            "### Card-action [two-stage](#stage) rollout",
+            "### Card-action `two-stage` rollout",
         ):
             with self.subTest(duplicate_heading=duplicate_heading):
                 doc = build_valid_card_actions_rollout_doc() + (
@@ -1193,6 +1269,8 @@ class CardActionsDeploymentContracts(unittest.TestCase):
 
     def test_rollout_section_parser_ignores_unrelated_h3_headings(self):
         doc = build_valid_card_actions_rollout_doc() + (
+            "\n### Card-action **three-stage** rollout\n\n"
+            "This formatted section must not count as a duplicate.\n"
             "\n### Stage 2 follow-up\n\n"
             "This unrelated section must not count as a duplicate.\n"
         )
