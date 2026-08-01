@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"sort"
 
+	"go.temporal.io/api/serviceerror"
+
 	"hermes-devops/runtime/internal/rules"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
@@ -61,8 +63,8 @@ type Resolution struct {
 // NotAuthoritative / StillRunning / CheckFailed / ResultUnreadable /
 // NoFailedVariants / VariantNotMember / ArtifactMissing。
 //
-// CONTRACT-ISSUE: 原 executor.rerun 对 WorkflowClosed 探测失败(不是"运行中",
-// 是探测本身出错,如 Temporal Describe 报错)有独立文案"检查 workflow 状态失败",
+// CONTRACT-ISSUE: 原 executor.rerun 对可恢复的 WorkflowClosed 探测失败(不是
+// "运行中",是探测本身出错,如 Temporal Describe 超时)有独立文案"检查 workflow 状态失败",
 // 与 WorkflowResult 读取失败的"读取 workflow 结果失败"不是一回事;这里补一个
 // 单独的 CheckFailed 分类,而不是像本任务 brief 骨架示例那样把两者都塞进
 // ResultUnreadable(那样会丢失"探测失败"与"结果读取失败"的既有文案区分)。
@@ -71,8 +73,8 @@ type RejectReason struct {
 	WorkflowID string
 	Variant    string
 	Count      int
-	// Err 携带触发本次拒绝的底层错误,仅 CheckFailed(WorkflowClosed 探测失败)
-	// 与 ResultUnreadable(WorkflowResult 读取失败)两种 Code 非空。原
+	// Err 携带触发本次拒绝的底层错误,仅 CheckFailed(可恢复的 WorkflowClosed
+	// 探测失败)与 ResultUnreadable(WorkflowResult 读取失败或历史已过期)两种 Code 非空。原
 	// executor.rerun 对这两种情况的回复都是 "...失败: %v"(err 原文,例如
 	// "context deadline exceeded"),丢弃它会让运维无法从回复区分超时/网络/
 	// 权限等不同故障——这是"文案逐字不变"约束的一部分,不是可选项。
@@ -109,6 +111,11 @@ func (r *Resolver) resolveRun(ctx context.Context, workflowID string) (*store.Wo
 	}
 	closed, err := r.Starter.WorkflowClosed(ctx, workflowID)
 	if err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			// Expired retained history is terminal for this click; retrying cannot restore it.
+			return nil, &RejectReason{Code: "ResultUnreadable", WorkflowID: workflowID, Err: err}
+		}
 		return nil, &RejectReason{Code: "CheckFailed", WorkflowID: workflowID, Err: err}
 	}
 	if !closed {

@@ -3,8 +3,11 @@ package rerun
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
+
+	"go.temporal.io/api/serviceerror"
 
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
@@ -49,12 +52,14 @@ func (s *fakeStore) ListArtifacts(
 type fakeLookup struct {
 	closed      bool
 	closedErr   error
+	closedCalls int
 	result      *wf.DeviceTestOutput
 	resultErr   error
 	resultCalls int
 }
 
 func (f *fakeLookup) WorkflowClosed(_ context.Context, _ string) (bool, error) {
+	f.closedCalls++
 	return f.closed, f.closedErr
 }
 
@@ -175,6 +180,12 @@ func TestNotAuthoritativeRejected(t *testing.T) {
 	if !errors.As(err, &reason) || reason.Code != "NotAuthoritative" {
 		t.Fatalf("err = %v, want RejectReason{NotAuthoritative}", err)
 	}
+	if lookup.closedCalls != 0 || lookup.resultCalls != 0 {
+		t.Fatalf(
+			"Temporal lookup calls closed=%d result=%d, want 0/0",
+			lookup.closedCalls, lookup.resultCalls,
+		)
+	}
 }
 
 // TestStillRunningRejected: an open workflow must reject before reading
@@ -212,7 +223,7 @@ func TestVariantNotMemberRejected(t *testing.T) {
 // through the RejectReason wrapper).
 func TestCheckFailedCarriesUnderlyingError(t *testing.T) {
 	st := newFakeStore(t, run("wf1", "grp/p", "abcd1234", 42, "v1"))
-	underlying := errors.New("context deadline exceeded")
+	underlying := fmt.Errorf("describe workflow: %w", context.DeadlineExceeded)
 	r := &Resolver{Store: st, Starter: &fakeLookup{closed: false, closedErr: underlying}}
 
 	_, err := r.ResolveRetry(ctx, "wf1", "")
@@ -225,6 +236,29 @@ func TestCheckFailedCarriesUnderlyingError(t *testing.T) {
 	}
 	if !errors.Is(err, underlying) {
 		t.Fatalf("errors.Is(err, underlying) = false, Unwrap must expose Err")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("errors.Is(err, context.DeadlineExceeded) = false")
+	}
+}
+
+func TestWorkflowClosedNotFoundIsResultUnreadable(t *testing.T) {
+	st := newFakeStore(t, run("wf1", "grp/p", "abcd1234", 42, "v1"))
+	notFound := serviceerror.NewNotFound("workflow history expired")
+	underlying := fmt.Errorf("describe workflow: %w", notFound)
+	r := &Resolver{Store: st, Starter: &fakeLookup{closedErr: underlying}}
+
+	_, err := r.ResolveRetry(ctx, "wf1", "")
+	var reason *RejectReason
+	if !errors.As(err, &reason) || reason.Code != "ResultUnreadable" {
+		t.Fatalf("err = %v, want RejectReason{ResultUnreadable}", err)
+	}
+	if reason.WorkflowID != "wf1" || reason.Err != underlying {
+		t.Fatalf("reason = %#v, want workflow wf1 with original error", reason)
+	}
+	var gotNotFound *serviceerror.NotFound
+	if !errors.As(err, &gotNotFound) {
+		t.Fatalf("errors.As(err, *serviceerror.NotFound) = false: %v", err)
 	}
 }
 

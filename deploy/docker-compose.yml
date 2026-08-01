@@ -52,6 +52,7 @@ services:
       POSTGRES_SEEDS: postgres
       DBNAME: temporal
       VISIBILITY_DBNAME: temporal_visibility
+      DEFAULT_NAMESPACE_RETENTION: ${TEMPORAL_NAMESPACE_RETENTION:-90d}
     healthcheck:
       # auto-setup binds the frontend to the container IP, not 127.0.0.1.
       test: [CMD-SHELL, "tctl --address \"$$(hostname -i):7233\" cluster health >/dev/null 2>&1"]

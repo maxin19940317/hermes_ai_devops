@@ -134,6 +134,14 @@ CARD_ACTIONS_STAGE2_REQUIRED_MARKERS = (
     "card_action_messages",
     "card_action_snapshots",
     "audit_log",
+    "TEMPORAL_NAMESPACE_RETENTION=90d",
+    "Fresh auto-setup namespaces use this environment value",
+    "does not retroactively update an existing namespace",
+    'tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90',
+    'tctl --address "$(hostname -i):7233" namespace describe --namespace default',
+    "default 24h retention is shorter than the terminal card action lifetime",
+    "ResultUnreadable",
+    "rather than retry forever",
     "Deploy the cardaction Activity/listener implementation.",
     "FEISHU_CARD_ACTIONS_ENABLED=true",
     "strict opt-in and defaults to false",
@@ -165,8 +173,21 @@ CARD_ACTIONS_VALID_STAGE2_LINES = (
     "1. Apply `deploy/postgres/migrations/2026-08-01-card-actions.sql`, which creates",
     "   `card_action_inbox`, `card_actions`, `card_action_messages`,",
     "   `card_action_snapshots`, and `audit_log`.",
-    "2. Deploy the cardaction Activity/listener implementation.",
-    "3. After every prerequisite below is ready, explicitly set",
+    "2. Set `TEMPORAL_NAMESPACE_RETENTION=90d`. Fresh auto-setup namespaces use this",
+    "   environment value, but changing it does not retroactively update an existing namespace.",
+    "   Before enabling card actions against today's existing `default` namespace, run inside",
+    "   the temporal container:",
+    "",
+    "   ```bash",
+    '   tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90',
+    '   tctl --address "$(hostname -i):7233" namespace describe --namespace default',
+    "   ```",
+    "",
+    "   Verify the describe output reports 90 days before continuing. Temporal auto-setup's",
+    "   default 24h retention is shorter than the terminal card action lifetime. Clicks after",
+    "   retained history expires terminally converge as `ResultUnreadable` rather than retry forever.",
+    "3. Deploy the cardaction Activity/listener implementation.",
+    "4. After every prerequisite below is ready, explicitly set",
     "   `FEISHU_CARD_ACTIONS_ENABLED=true`.",
     "",
     "Stage 2 must not be mixed into the workflow_runs stop-write window. That window already",
@@ -194,9 +215,13 @@ def normalize_semantic_text(text):
 WORKER_CARD_ACTIONS_OPT_IN_LINE = (
     "      FEISHU_CARD_ACTIONS_ENABLED: ${FEISHU_CARD_ACTIONS_ENABLED:-false}"
 )
+TEMPORAL_RETENTION_COMPOSE_LINE = (
+    "      DEFAULT_NAMESPACE_RETENTION: ${TEMPORAL_NAMESPACE_RETENTION:-90d}"
+)
+TEMPORAL_RETENTION_ENV_LINE = "TEMPORAL_NAMESPACE_RETENTION=90d"
 
 
-def assert_worker_card_actions_opt_in(text):
+def active_service_environment_values(text, service, key):
     lines = text.splitlines()
 
     def is_active(line):
@@ -206,42 +231,43 @@ def assert_worker_card_actions_opt_in(text):
     def indentation(line):
         return len(line) - len(line.lstrip(" "))
 
-    worker_indexes = [
+    service_line = f"  {service}:"
+    service_indexes = [
         index
         for index, line in enumerate(lines)
-        if is_active(line) and line == "  worker:"
+        if is_active(line) and line == service_line
     ]
-    if len(worker_indexes) != 1:
-        raise AssertionError("expected exactly one active worker service")
+    if len(service_indexes) != 1:
+        raise AssertionError(f"expected exactly one active {service} service")
 
-    worker_start = worker_indexes[0]
-    worker_end = len(lines)
-    for index in range(worker_start + 1, len(lines)):
+    service_start = service_indexes[0]
+    service_end = len(lines)
+    for index in range(service_start + 1, len(lines)):
         line = lines[index]
         if is_active(line) and indentation(line) <= 2:
-            worker_end = index
+            service_end = index
             break
 
     environment_indexes = [
         index
-        for index in range(worker_start + 1, worker_end)
+        for index in range(service_start + 1, service_end)
         if is_active(lines[index]) and lines[index] == "    environment:"
     ]
     if len(environment_indexes) != 1:
         raise AssertionError(
-            "expected exactly one active worker environment mapping"
+            f"expected exactly one active {service} environment mapping"
         )
 
     environment_start = environment_indexes[0]
-    environment_end = worker_end
-    for index in range(environment_start + 1, worker_end):
+    environment_end = service_end
+    for index in range(environment_start + 1, service_end):
         line = lines[index]
         if is_active(line) and indentation(line) <= 4:
             environment_end = index
             break
 
     key_pattern = re.compile(
-        r"^      FEISHU_CARD_ACTIONS_ENABLED:(?P<value>.*)$"
+        rf"^      {re.escape(key)}:(?P<value>.*)$"
     )
     matches = []
     for line in lines[environment_start + 1:environment_end]:
@@ -250,46 +276,75 @@ def assert_worker_card_actions_opt_in(text):
         match = key_pattern.match(line)
         if match:
             matches.append(match.group("value").strip())
+    return matches
 
+
+def assert_service_environment_assignment(
+    text, *, service, key, expected_value,
+):
+    matches = active_service_environment_values(text, service, key)
     if not matches:
         raise AssertionError(
-            "missing active six-space FEISHU_CARD_ACTIONS_ENABLED "
-            "worker environment key"
+            f"missing active six-space {key} {service} environment key"
         )
     if len(matches) > 1:
         raise AssertionError(
-            "duplicate active FEISHU_CARD_ACTIONS_ENABLED "
-            "worker environment keys"
+            f"duplicate active {key} {service} environment keys"
         )
-    if matches[0] != "${FEISHU_CARD_ACTIONS_ENABLED:-false}":
+    if matches[0] != expected_value:
         raise AssertionError(
-            "FEISHU_CARD_ACTIONS_ENABLED worker environment value must equal "
-            "${FEISHU_CARD_ACTIONS_ENABLED:-false}"
+            f"{key} {service} environment value must equal {expected_value}"
         )
 
 
-def assert_card_actions_default_off_env_assignment(text):
+def assert_worker_card_actions_opt_in(text):
+    assert_service_environment_assignment(
+        text,
+        service="worker",
+        key="FEISHU_CARD_ACTIONS_ENABLED",
+        expected_value="${FEISHU_CARD_ACTIONS_ENABLED:-false}",
+    )
+
+
+def assert_temporal_namespace_retention(text):
+    assert_service_environment_assignment(
+        text,
+        service="temporal",
+        key="DEFAULT_NAMESPACE_RETENTION",
+        expected_value="${TEMPORAL_NAMESPACE_RETENTION:-90d}",
+    )
+
+
+def assert_env_assignment(text, key, expected_value):
     assignments = []
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if not stripped.startswith("FEISHU_CARD_ACTIONS_ENABLED="):
+        if not stripped.startswith(f"{key}="):
             continue
         assignments.append(stripped.split("=", 1)[1])
 
     if not assignments:
         raise AssertionError(
-            "missing active FEISHU_CARD_ACTIONS_ENABLED assignment"
+            f"missing active {key} assignment"
         )
     if len(assignments) > 1:
         raise AssertionError(
-            "duplicate active FEISHU_CARD_ACTIONS_ENABLED assignments"
+            f"duplicate active {key} assignments"
         )
-    if assignments[0] != "false":
+    if assignments[0] != expected_value:
         raise AssertionError(
-            "FEISHU_CARD_ACTIONS_ENABLED value must equal false"
+            f"{key} value must equal {expected_value}"
         )
+
+
+def assert_card_actions_default_off_env_assignment(text):
+    assert_env_assignment(text, "FEISHU_CARD_ACTIONS_ENABLED", "false")
+
+
+def assert_temporal_retention_env_assignment(text):
+    assert_env_assignment(text, "TEMPORAL_NAMESPACE_RETENTION", "90d")
 
 
 def build_valid_card_actions_rollout_doc(
@@ -742,6 +797,76 @@ class ComposeContracts(unittest.TestCase):
     def test_worker_propagates_card_actions_opt_in_with_strict_default_off(self):
         assert_worker_card_actions_opt_in(COMPOSE.read_text(encoding="utf-8"))
 
+    def test_temporal_propagates_default_namespace_retention(self):
+        assert_temporal_namespace_retention(
+            COMPOSE.read_text(encoding="utf-8")
+        )
+
+    def test_temporal_retention_rejects_commented_moved_wrong_and_duplicate(self):
+        base = COMPOSE.read_text(encoding="utf-8")
+        cases = {
+            "commented": (
+                base.replace(
+                    TEMPORAL_RETENTION_COMPOSE_LINE,
+                    f"      # {TEMPORAL_RETENTION_COMPOSE_LINE.strip()}",
+                    1,
+                ),
+                "missing active six-space DEFAULT_NAMESPACE_RETENTION temporal environment key",
+            ),
+            "wrong indentation": (
+                base.replace(
+                    TEMPORAL_RETENTION_COMPOSE_LINE,
+                    f"  {TEMPORAL_RETENTION_COMPOSE_LINE}",
+                    1,
+                ),
+                "missing active six-space DEFAULT_NAMESPACE_RETENTION temporal environment key",
+            ),
+            "wrong default": (
+                base.replace(
+                    TEMPORAL_RETENTION_COMPOSE_LINE,
+                    "      DEFAULT_NAMESPACE_RETENTION: ${TEMPORAL_NAMESPACE_RETENTION:-24h}",
+                    1,
+                ),
+                (
+                    "DEFAULT_NAMESPACE_RETENTION temporal environment value must equal "
+                    r"\$\{TEMPORAL_NAMESPACE_RETENTION:-90d\}"
+                ),
+            ),
+            "duplicate": (
+                base.replace(
+                    TEMPORAL_RETENTION_COMPOSE_LINE,
+                    (
+                        f"{TEMPORAL_RETENTION_COMPOSE_LINE}\n"
+                        f"{TEMPORAL_RETENTION_COMPOSE_LINE}"
+                    ),
+                    1,
+                ),
+                "duplicate active DEFAULT_NAMESPACE_RETENTION temporal environment keys",
+            ),
+            "moved under labels": (
+                base.replace(
+                    (
+                        "      VISIBILITY_DBNAME: temporal_visibility\n"
+                        f"{TEMPORAL_RETENTION_COMPOSE_LINE}\n"
+                        "    healthcheck:\n"
+                    ),
+                    (
+                        "      VISIBILITY_DBNAME: temporal_visibility\n"
+                        "    labels:\n"
+                        f"{TEMPORAL_RETENTION_COMPOSE_LINE}\n"
+                        "    healthcheck:\n"
+                    ),
+                    1,
+                ),
+                "missing active six-space DEFAULT_NAMESPACE_RETENTION temporal environment key",
+            ),
+        }
+
+        for name, (text, error) in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(AssertionError, error):
+                    assert_temporal_namespace_retention(text)
+
     def test_worker_rejects_commented_out_card_actions_opt_in_line(self):
         text = COMPOSE.read_text(encoding="utf-8").replace(
             WORKER_CARD_ACTIONS_OPT_IN_LINE,
@@ -876,6 +1001,53 @@ class ComposeContracts(unittest.TestCase):
         # evidence/ 绝不能有过期规则——快照是 decisions 的回放依据(差距 #6)。
         self.assertNotIn('--prefix "evidence/"', init_block)
         self.assertIn("MINIO_RUNS_RETAIN_DAYS=", ENV_EXAMPLE.read_text(encoding="utf-8"))
+
+    def test_example_sets_temporal_namespace_retention_to_ninety_days(self):
+        assert_temporal_retention_env_assignment(
+            ENV_EXAMPLE.read_text(encoding="utf-8")
+        )
+
+    def test_temporal_retention_env_rejects_missing_commented_wrong_and_duplicate(self):
+        base = ENV_EXAMPLE.read_text(encoding="utf-8")
+        cases = {
+            "missing": (
+                base.replace(f"{TEMPORAL_RETENTION_ENV_LINE}\n", "", 1),
+                "missing active TEMPORAL_NAMESPACE_RETENTION assignment",
+            ),
+            "commented": (
+                base.replace(
+                    TEMPORAL_RETENTION_ENV_LINE,
+                    f"# {TEMPORAL_RETENTION_ENV_LINE}",
+                    1,
+                ),
+                "missing active TEMPORAL_NAMESPACE_RETENTION assignment",
+            ),
+            "wrong value": (
+                base.replace(
+                    TEMPORAL_RETENTION_ENV_LINE,
+                    "TEMPORAL_NAMESPACE_RETENTION=24h",
+                    1,
+                ),
+                "TEMPORAL_NAMESPACE_RETENTION value must equal 90d",
+            ),
+            "duplicate": (
+                base.replace(
+                    TEMPORAL_RETENTION_ENV_LINE,
+                    (
+                        f"{TEMPORAL_RETENTION_ENV_LINE}\n"
+                        f"{TEMPORAL_RETENTION_ENV_LINE}"
+                    ),
+                    1,
+                ),
+                "duplicate active TEMPORAL_NAMESPACE_RETENTION assignments",
+            ),
+        }
+
+        for name, (text, error) in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(AssertionError, error):
+                    assert_temporal_retention_env_assignment(text)
+
 
     def test_compose_health_chain_and_in_container_probes(self):
         text = COMPOSE.read_text(encoding="utf-8")
@@ -1504,6 +1676,14 @@ class CardActionsDeploymentContracts(unittest.TestCase):
             "card_action_messages",
             "card_action_snapshots",
             "audit_log",
+            "TEMPORAL_NAMESPACE_RETENTION=90d",
+            "Fresh auto-setup namespaces use this environment value",
+            "does not retroactively update an existing namespace",
+            'tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90',
+            'tctl --address "$(hostname -i):7233" namespace describe --namespace default',
+            "default 24h retention is shorter than the terminal card action lifetime",
+            "ResultUnreadable",
+            "rather than retry forever",
             "FEISHU_CARD_ACTIONS_ENABLED=true",
             "strict opt-in and defaults to false",
             "FEISHU_APP_ID",
@@ -1521,6 +1701,23 @@ class CardActionsDeploymentContracts(unittest.TestCase):
             "Runtime handler registration alone does not prove the platform subscription exists",
         ):
             self.assertIn(marker, normalize_semantic_text(rollout["stage2"]))
+
+    def test_stage2_documents_temporal_retention_rollout_and_terminal_convergence(self):
+        rollout = assert_card_actions_rollout_contract(
+            DEPLOY_README.read_text(encoding="utf-8")
+        )
+        stage2 = normalize_semantic_text(rollout["stage2"])
+
+        for marker in (
+            "Fresh auto-setup namespaces use this environment value",
+            "does not retroactively update an existing namespace",
+            'tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90',
+            'tctl --address "$(hostname -i):7233" namespace describe --namespace default',
+            "reports 90 days",
+            "default 24h retention is shorter than the terminal card action lifetime",
+            "terminally converge as ResultUnreadable rather than retry forever",
+        ):
+            self.assertIn(marker, stage2)
 
     def test_feishu_platform_subscription_is_an_explicit_prerequisite(self):
         rollout = assert_card_actions_rollout_contract(

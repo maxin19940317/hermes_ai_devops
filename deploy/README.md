@@ -220,8 +220,21 @@ still have no buttons, behavior is unchanged, and newly sent messages become upd
 1. Apply `deploy/postgres/migrations/2026-08-01-card-actions.sql`, which creates
    `card_action_inbox`, `card_actions`, `card_action_messages`,
    `card_action_snapshots`, and `audit_log`.
-2. Deploy the cardaction Activity/listener implementation.
-3. After every prerequisite below is ready, explicitly set
+2. Set `TEMPORAL_NAMESPACE_RETENTION=90d`. Fresh auto-setup namespaces use this
+   environment value, but changing it does not retroactively update an existing namespace.
+   Before enabling card actions against today's existing `default` namespace, run inside
+   the temporal container:
+
+   ```bash
+   tctl --address "$(hostname -i):7233" namespace update --namespace default --retention 90
+   tctl --address "$(hostname -i):7233" namespace describe --namespace default
+   ```
+
+   Verify the describe output reports 90 days before continuing. Temporal auto-setup's
+   default 24h retention is shorter than the terminal card action lifetime. Clicks after
+   retained history expires terminally converge as `ResultUnreadable` rather than retry forever.
+3. Deploy the cardaction Activity/listener implementation.
+4. After every prerequisite below is ready, explicitly set
    `FEISHU_CARD_ACTIONS_ENABLED=true`.
 
 Stage 2 must not be mixed into the workflow_runs stop-write window. That window already

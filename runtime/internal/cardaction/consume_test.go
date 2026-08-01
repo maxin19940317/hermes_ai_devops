@@ -589,6 +589,44 @@ func TestVariantNotMemberRejectionCompletesTerminally(t *testing.T) {
 	}
 }
 
+func TestResultUnreadableRejectionCompletesTerminally(t *testing.T) {
+	c, st, resolver, starter := newTestConsumer("retry")
+	resolver.err = &rerun.RejectReason{
+		Code: "ResultUnreadable", WorkflowID: "wf1",
+		Err: serviceerror.NewNotFound("workflow history expired"),
+	}
+
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("ConsumeOne: %v", err)
+	}
+	if err := c.ConsumeOne(context.Background(), "e1"); err != nil {
+		t.Fatalf("duplicate ConsumeOne: %v", err)
+	}
+
+	inbox := st.inbox["e1"]
+	if inbox.State != "processed" || inbox.Attempts != 1 {
+		t.Fatalf("inbox = %#v, want processed exactly once", inbox)
+	}
+	message := st.messages["wf1\x00om_1"]
+	if message.RenderKind != "rejection" ||
+		message.RejectionReason != "读取 workflow 结果失败: workflow history expired" ||
+		message.ButtonsMode != "both" {
+		t.Fatalf("message = %#v", message)
+	}
+	if len(st.audits) != 1 ||
+		st.audits[0].Action != "card.retry.rejected.result_unreadable" ||
+		st.audits[0].InboxEventID != "e1" {
+		t.Fatalf("audits = %#v", st.audits)
+	}
+	if len(st.actions) != 0 || st.acceptCalls != 0 || st.attemptCalls != 0 ||
+		starter.startCalls != 0 {
+		t.Fatalf(
+			"rejection created actions=%d accepts=%d attempts=%d starts=%d",
+			len(st.actions), st.acceptCalls, st.attemptCalls, starter.startCalls,
+		)
+	}
+}
+
 func TestButtonsModeByReason(t *testing.T) {
 	tests := []struct {
 		code string
