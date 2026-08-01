@@ -510,9 +510,9 @@ func (c *Client) runConnection(ctx context.Context, conn *connection) error {
 	cancel()
 	_ = conn.socket.Close()
 	workers.Wait()
-	handlers.Wait()
 	c.logger.Info(ctx, c.logArgs(conn, "disconnected from %s", conn.url)...)
 	c.call(c.onDisconnected)
+	handlers.Wait()
 	return runErr
 }
 

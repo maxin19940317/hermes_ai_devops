@@ -575,6 +575,83 @@ func TestClientWaitsForEventHandlersDuringShutdown(t *testing.T) {
 	h.assertNoHandlerError(t)
 }
 
+func TestClientDisconnectsBeforeBlockedHandlerFinishes(t *testing.T) {
+	h := newTransportHarness(t)
+	handlerStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	handlerExited := make(chan struct{})
+	disconnected := make(chan struct{}, 1)
+	var disconnectedCalls atomic.Int64
+
+	handler := dispatcher.NewEventDispatcher("", "").
+		OnP2CardActionTrigger(func(
+			_ context.Context,
+			_ *callback.CardActionTriggerEvent,
+		) (*callback.CardActionTriggerResponse, error) {
+			close(handlerStarted)
+			<-releaseHandler
+			close(handlerExited)
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{Type: "info", Content: "released"},
+			}, nil
+		})
+	ctx, cancel := context.WithCancel(context.Background())
+	client := NewClient("cli_test", "secret_test",
+		WithDomain(h.server.URL),
+		WithLogger(discardLogger{}),
+		WithEventHandler(handler),
+		WithOnDisconnected(func() {
+			disconnectedCalls.Add(1)
+			select {
+			case disconnected <- struct{}{}:
+			default:
+			}
+		}),
+	)
+	done := startClient(t, ctx, client)
+	socket := h.waitSocket(t)
+
+	writeDataFrame(t, socket.conn, "msg_shutdown", 1, 0, cardActionPayload(t))
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("callback did not start")
+	}
+
+	cancel()
+	select {
+	case <-disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("OnDisconnected did not fire before blocked handler release")
+	}
+	select {
+	case <-handlerExited:
+		t.Fatal("handler exited before release")
+	default:
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Start returned before blocked handler release: %v", err)
+	default:
+	}
+
+	waitSocketClosed(t, socket)
+
+	close(releaseHandler)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Start error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after handler release")
+	}
+	if got := disconnectedCalls.Load(); got != 1 {
+		t.Fatalf("OnDisconnected calls = %d, want 1", got)
+	}
+	h.assertNoHandlerError(t)
+}
+
 func TestClientBootstrapAttemptHasOwnTimeout(t *testing.T) {
 	requestStarted := make(chan struct{})
 	requestCanceled := make(chan error, 1)
