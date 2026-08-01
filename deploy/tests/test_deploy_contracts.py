@@ -318,17 +318,31 @@ def build_valid_card_actions_rollout_doc(
 
 
 def parse_card_actions_rollout_sections(text):
-    section = re.search(
-        rf"(?ms)^### {re.escape(CARD_ACTIONS_ROLLOUT_HEADING)}\n"
-        r"(?P<body>.*?)(?=^#{1,3}(?:[ \t]+|$)|\Z)",
-        text,
+    heading_pattern = re.compile(
+        rf"(?m)^### {re.escape(CARD_ACTIONS_ROLLOUT_HEADING)}[ \t]*$"
     )
-    if not section:
+    sections = list(heading_pattern.finditer(text))
+    if not sections:
         raise ValueError(
             f"missing ### {CARD_ACTIONS_ROLLOUT_HEADING} section"
         )
+    if len(sections) > 1:
+        raise ValueError(
+            f"duplicated ### {CARD_ACTIONS_ROLLOUT_HEADING} section"
+        )
 
-    body = section.group("body")
+    body_start = sections[0].end()
+    if text.startswith("\r\n", body_start):
+        body_start += 2
+    elif body_start < len(text) and text[body_start] in "\r\n":
+        body_start += 1
+
+    next_heading = re.search(
+        r"(?m)^#{1,3}(?:[ \t]+|$)",
+        text[body_start:],
+    )
+    body_end = body_start + next_heading.start() if next_heading else len(text)
+    body = text[body_start:body_end]
     if not body.strip():
         raise ValueError(
             f"### {CARD_ACTIONS_ROLLOUT_HEADING} section is empty"
@@ -1014,6 +1028,20 @@ class CardActionsDeploymentContracts(unittest.TestCase):
             "FEISHU_CARD_ACTIONS_ENABLED=true",
             normalize_semantic_text(rollout["stage1"]),
         )
+
+    def test_rollout_section_parser_rejects_duplicate_rollout_headings(self):
+        doc = build_valid_card_actions_rollout_doc() + (
+            "\n### Card-action two-stage rollout\n\n"
+            "Stage 2 may begin during the workflow_runs stop-write window.\n"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            re.escape(
+                "duplicated ### Card-action two-stage rollout section"
+            ),
+        ):
+            parse_card_actions_rollout_sections(doc)
 
     def test_rollout_section_parser_rejects_reversed_stages(self):
         doc = build_valid_card_actions_rollout_doc().replace(
