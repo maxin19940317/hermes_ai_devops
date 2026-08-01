@@ -109,6 +109,142 @@ def strip_sql_comments(text):
     return "".join(out)
 
 
+CARD_ACTIONS_ROLLOUT_HEADING = "Card-action two-stage rollout"
+CARD_ACTIONS_STAGE_1_MARKER = (
+    "**Stage 1 — workflow-runs compatibility.**"
+)
+CARD_ACTIONS_STAGE_2_MARKER = "**Stage 2 — card actions.**"
+
+
+def normalize_whitespace(text):
+    return " ".join(text.split())
+
+
+def normalize_semantic_text(text):
+    return normalize_whitespace(text).replace("`", "")
+
+
+def parse_card_actions_rollout_sections(text):
+    section = re.search(
+        rf"(?ms)^### {re.escape(CARD_ACTIONS_ROLLOUT_HEADING)}\n"
+        r"(?P<body>.*?)(?=^## |\Z)",
+        text,
+    )
+    if not section:
+        raise ValueError(
+            f"missing ### {CARD_ACTIONS_ROLLOUT_HEADING} section"
+        )
+
+    body = section.group("body")
+    if not body.strip():
+        raise ValueError(
+            f"### {CARD_ACTIONS_ROLLOUT_HEADING} section is empty"
+        )
+
+    lines = body.splitlines()
+
+    def find_marker(marker, label):
+        matcher = re.compile(
+            rf"^{re.escape(marker)}(?P<rest>.*)$"
+        )
+        hits = []
+        for index, line in enumerate(lines):
+            match = matcher.match(line.strip())
+            if match:
+                hits.append((index, match.group("rest").strip()))
+        if not hits:
+            raise ValueError(f"missing {label}")
+        if len(hits) > 1:
+            raise ValueError(f"duplicated {label}")
+        return hits[0]
+
+    stage_1_index, stage_1_rest = find_marker(
+        CARD_ACTIONS_STAGE_1_MARKER,
+        "Stage 1 marker",
+    )
+    stage_2_index, stage_2_rest = find_marker(
+        CARD_ACTIONS_STAGE_2_MARKER,
+        "Stage 2 marker",
+    )
+    if stage_2_index < stage_1_index:
+        raise ValueError("Stage 2 appears before Stage 1")
+
+    stage_1_lines = [stage_1_rest, *lines[stage_1_index + 1 : stage_2_index]]
+    if not any(line.strip() for line in stage_1_lines):
+        raise ValueError("Stage 1 section is empty")
+
+    stage_2_lines = [stage_2_rest, *lines[stage_2_index + 1 :]]
+    if not any(line.strip() for line in stage_2_lines):
+        raise ValueError("Stage 2 section is empty")
+
+    return {
+        "preamble": "\n".join(lines[:stage_1_index]),
+        "stage1": "\n".join(stage_1_lines),
+        "stage2": "\n".join(stage_2_lines),
+    }
+
+
+def assert_card_actions_rollout_contract(text):
+    rollout = parse_card_actions_rollout_sections(text)
+    preamble = normalize_whitespace(rollout["preamble"])
+    stage1 = normalize_semantic_text(rollout["stage1"])
+    stage2 = normalize_semantic_text(rollout["stage2"])
+
+    if "The two stages must not be merged." not in preamble:
+        raise AssertionError("missing cannot-merge warning before Stage 1")
+
+    for marker in (
+        "config.update_multi: true",
+        "CardElement.Actions",
+        "The workflow never sets Actions",
+        "cards still have no buttons",
+        "behavior is unchanged",
+        "newly sent messages become updateable",
+    ):
+        if marker not in stage1:
+            raise AssertionError(f"missing Stage 1 marker: {marker}")
+
+    for forbidden in (
+        "deploy/postgres/migrations/2026-08-01-card-actions.sql",
+        "FEISHU_CARD_ACTIONS_ENABLED=true",
+    ):
+        if forbidden in stage1:
+            raise AssertionError(f"Stage 1 must not contain {forbidden}")
+
+    if "Only after the workflow_runs rollout is stable" not in stage2:
+        raise AssertionError("Stage 2 must start with the exact gate phrase")
+
+    for marker in (
+        "deploy/postgres/migrations/2026-08-01-card-actions.sql",
+        "card_action_inbox",
+        "card_actions",
+        "card_action_messages",
+        "card_action_snapshots",
+        "audit_log",
+        "Deploy the cardaction Activity/listener implementation.",
+        "FEISHU_CARD_ACTIONS_ENABLED=true",
+        "strict opt-in and defaults to false",
+        "verify the app sender is selected",
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+        "FEISHU_RECEIVE_ID",
+        "FEISHU_CMD_WHITELIST",
+        "Stage 2 must not be mixed into the workflow_runs stop-write window.",
+        "artifact unique key",
+        "analyze_bridge v2",
+        "failures unattributable and impossible to isolate",
+        "card.action.trigger",
+        "事件与回调 → 回调",
+        "long connection",
+        "no public callback URL",
+        "Runtime handler registration alone does not prove the platform subscription exists",
+    ):
+        if marker not in stage2:
+            raise AssertionError(f"missing Stage 2 marker: {marker}")
+
+    return rollout
+
+
 class SecretExclusionContracts(unittest.TestCase):
     def test_real_deployment_state_is_ignored(self):
         gitignore = GITIGNORE.read_text(encoding="utf-8")
@@ -569,46 +705,152 @@ class WorkflowRunsDeploymentContracts(unittest.TestCase):
 
 
 class CardActionsDeploymentContracts(unittest.TestCase):
-    def test_rollout_is_explicitly_ordered_and_not_merged(self):
-        documented = " ".join(
-            DEPLOY_README.read_text(encoding="utf-8").split()
+    def test_rollout_section_parser_reads_only_the_dedicated_section(self):
+        rollout = parse_card_actions_rollout_sections(
+            DEPLOY_README.read_text(encoding="utf-8")
         )
 
-        stage_1 = "**Stage 1 — workflow-runs compatibility.**"
-        stage_2 = "**Stage 2 — card actions.**"
-        self.assertTrue(stage_1 in documented, "missing Stage 1 marker")
-        self.assertTrue(stage_2 in documented, "missing Stage 2 marker")
-        self.assertLess(documented.index(stage_1), documented.index(stage_2))
-        self.assertTrue(
-            "The two stages must not be merged." in documented,
-            "missing cannot-merge warning",
+        self.assertIn(
+            "The two stages must not be merged.",
+            normalize_whitespace(rollout["preamble"]),
         )
-        self.assertTrue(
-            "Stage 2 must not be mixed into the workflow_runs stop-write window."
-            in documented,
-            "missing workflow_runs stop-write exclusion",
+        self.assertIn(
+            "config.update_multi: true",
+            normalize_semantic_text(rollout["stage1"]),
+        )
+        self.assertIn(
+            "CardElement.Actions",
+            normalize_semantic_text(rollout["stage1"]),
+        )
+        self.assertIn(
+            "Only after the workflow_runs rollout is stable",
+            normalize_semantic_text(rollout["stage2"]),
+        )
+        self.assertIn(
+            "Apply deploy/postgres/migrations/2026-08-01-card-actions.sql",
+            normalize_semantic_text(rollout["stage2"]),
+        )
+        self.assertNotIn(
+            "deploy/postgres/migrations/2026-08-01-card-actions.sql",
+            normalize_semantic_text(rollout["stage1"]),
+        )
+        self.assertNotIn(
+            "FEISHU_CARD_ACTIONS_ENABLED=true",
+            normalize_semantic_text(rollout["stage1"]),
+        )
+
+    def test_rollout_section_parser_rejects_reversed_stages(self):
+        doc = (
+            "### Card-action two-stage rollout\n\n"
+            "The two stages must not be merged.\n\n"
+            "**Stage 2 — card actions.** Only after the workflow_runs rollout is stable:\n"
+            "Stage 2 body.\n\n"
+            "**Stage 1 — workflow-runs compatibility.** With the first `workflow_runs` production deployment.\n"
+            "Stage 1 body.\n"
+        )
+
+        with self.assertRaisesRegex(ValueError, "Stage 2 appears before Stage 1"):
+            parse_card_actions_rollout_sections(doc)
+
+    def test_rollout_section_parser_rejects_stage2_wording_changes(self):
+        doc = (
+            "### Card-action two-stage rollout\n\n"
+            "The two stages must not be merged.\n\n"
+            "**Stage 1 — workflow-runs compatibility.** With the first `workflow_runs` production deployment.\n"
+            "config.update_multi: true\n\n"
+            "**Stage 2 — card actions.** Only after workflow_runs is stable:\n"
+            "Apply `deploy/postgres/migrations/2026-08-01-card-actions.sql`.\n"
+        )
+
+        with self.assertRaises(AssertionError):
+            assert_card_actions_rollout_contract(doc)
+
+    def test_rollout_section_parser_rejects_migration_inside_stage1(self):
+        doc = (
+            "### Card-action two-stage rollout\n\n"
+            "The two stages must not be merged.\n\n"
+            "**Stage 1 — workflow-runs compatibility.** With the first `workflow_runs` production deployment.\n"
+            "config.update_multi: true\n"
+            "Apply `deploy/postgres/migrations/2026-08-01-card-actions.sql`.\n\n"
+            "**Stage 2 — card actions.** Only after the workflow_runs rollout is stable:\n"
+            "FEISHU_CARD_ACTIONS_ENABLED=true\n"
+        )
+
+        with self.assertRaises(AssertionError):
+            assert_card_actions_rollout_contract(doc)
+
+    def test_rollout_section_parser_rejects_subscription_markers_outside_stage2(self):
+        doc = (
+            "### Card-action two-stage rollout\n\n"
+            "The two stages must not be merged.\n\n"
+            "**Stage 1 — workflow-runs compatibility.** With the first `workflow_runs` production deployment.\n"
+            "config.update_multi: true\n\n"
+            "**Stage 2 — card actions.** Only after the workflow_runs rollout is stable:\n"
+            "FEISHU_CARD_ACTIONS_ENABLED=true\n\n"
+            "## Unrelated follow-up\n"
+            "Subscribe to card.action.trigger under 事件与回调 → 回调 using long connection.\n"
+        )
+
+        with self.assertRaises(AssertionError):
+            assert_card_actions_rollout_contract(doc)
+
+    def test_rollout_is_explicitly_ordered_and_not_merged(self):
+        rollout = assert_card_actions_rollout_contract(
+            DEPLOY_README.read_text(encoding="utf-8")
+        )
+
+        self.assertIn(
+            "The two stages must not be merged.",
+            normalize_whitespace(rollout["preamble"]),
         )
         for marker in (
             "config.update_multi: true",
             "CardElement.Actions",
-            "deploy/postgres/migrations/2026-08-01-card-actions.sql",
-            "FEISHU_CARD_ACTIONS_ENABLED=true",
+            "The workflow never sets Actions",
+            "cards still have no buttons",
+            "behavior is unchanged",
+            "newly sent messages become updateable",
         ):
-            self.assertTrue(marker in documented, f"missing {marker}")
+            self.assertIn(marker, normalize_semantic_text(rollout["stage1"]))
+        for marker in (
+            "deploy/postgres/migrations/2026-08-01-card-actions.sql",
+            "card_action_inbox",
+            "card_actions",
+            "card_action_messages",
+            "card_action_snapshots",
+            "audit_log",
+            "FEISHU_CARD_ACTIONS_ENABLED=true",
+            "strict opt-in and defaults to false",
+            "FEISHU_APP_ID",
+            "FEISHU_APP_SECRET",
+            "FEISHU_RECEIVE_ID",
+            "FEISHU_CMD_WHITELIST",
+            "Stage 2 must not be mixed into the workflow_runs stop-write window.",
+            "artifact unique key",
+            "analyze_bridge v2",
+            "failures unattributable and impossible to isolate",
+            "card.action.trigger",
+            "事件与回调 → 回调",
+            "long connection",
+            "no public callback URL",
+            "Runtime handler registration alone does not prove the platform subscription exists",
+        ):
+            self.assertIn(marker, normalize_semantic_text(rollout["stage2"]))
 
     def test_feishu_platform_subscription_is_an_explicit_prerequisite(self):
-        documented = " ".join(
-            DEPLOY_README.read_text(encoding="utf-8").split()
+        rollout = assert_card_actions_rollout_contract(
+            DEPLOY_README.read_text(encoding="utf-8")
         )
+        stage2 = normalize_semantic_text(rollout["stage2"])
 
         for marker in (
             "card.action.trigger",
             "事件与回调 → 回调",
             "long connection",
             "no public callback URL",
-            "handler registration alone does not prove the platform subscription exists",
+            "Runtime handler registration alone does not prove the platform subscription exists",
         ):
-            self.assertTrue(marker in documented, f"missing {marker}")
+            self.assertIn(marker, stage2)
 
     def test_card_actions_are_strictly_default_off(self):
         env_example = ENV_EXAMPLE.read_text(encoding="utf-8")
