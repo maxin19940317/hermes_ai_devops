@@ -9,9 +9,9 @@ import (
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
-	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"hermes-devops/runtime/internal/cardaction"
+	"hermes-devops/runtime/internal/larkws"
 )
 
 const listenerLogLevelError = larkcore.LogLevelError
@@ -36,17 +36,7 @@ type sdkListenerClient struct {
 }
 
 func (c *sdkListenerClient) Start(ctx context.Context) error {
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- c.client.Start(ctx)
-	}()
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		c.client.Close()
-		return ctx.Err()
-	}
+	return c.client.Start(ctx)
 }
 
 func newListenerClient(
@@ -78,7 +68,7 @@ type Listener struct {
 	newClient func(appID, appSecret string, cfg listenerClientConfig) listenerClient
 }
 
-// Run 阻塞运行长连接,直到 ctx 取消(SDK 自带自动重连;
+// Run 阻塞运行长连接,直到 ctx 取消(transport 自带自动重连;
 // Start 返回的错误上抛,由调用方记日志)。
 func (l *Listener) Run(ctx context.Context) error {
 	var lifecycleMu sync.Mutex

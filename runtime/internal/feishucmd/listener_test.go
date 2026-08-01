@@ -5,14 +5,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+	sdkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"hermes-devops/runtime/internal/cardaction"
+	"hermes-devops/runtime/internal/larkws"
 	"hermes-devops/runtime/internal/store"
 )
 
@@ -347,6 +354,112 @@ func TestListenerNilCardAndReadinessPreserveMessageListener(t *testing.T) {
 	}
 	if err := l.Run(context.Background()); !errors.Is(err, stopErr) {
 		t.Fatalf("Run error = %v, want %v", err, stopErr)
+	}
+}
+
+func TestSDKListenerClientCancellationStopsReconnectLoop(t *testing.T) {
+	var bootstrapRequests atomic.Int64
+	var startReturned atomic.Bool
+	lateError := make(chan struct{}, 1)
+	reconnecting := make(chan struct{}, 1)
+	connected := make(chan *websocket.Conn, 1)
+
+	var server *httptest.Server
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	mux := http.NewServeMux()
+	mux.HandleFunc(sdkws.GenEndpointUri, func(w http.ResponseWriter, r *http.Request) {
+		requestNumber := bootstrapRequests.Add(1)
+		var req sdkws.BootstrapRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.AppID != "cli_test" || req.AppSecret != "secret_test" {
+			http.Error(w, "unexpected credentials", http.StatusUnauthorized)
+			return
+		}
+		socketURL := "ws" + strings.TrimPrefix(server.URL, "http") +
+			"/ws?device_id=device_test&service_id=1"
+		if requestNumber > 1 {
+			socketURL = "ws://127.0.0.1:1/ws?device_id=device_test&service_id=1"
+		}
+		_ = json.NewEncoder(w).Encode(&sdkws.EndpointResp{
+			Code: sdkws.OK,
+			Data: &sdkws.Endpoint{
+				Url: socketURL,
+				ClientConfig: &sdkws.ClientConfig{
+					ReconnectCount:    -1,
+					ReconnectInterval: 0,
+					ReconnectNonce:    0,
+					PingInterval:      60,
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connected <- conn
+	})
+	server = httptest.NewServer(mux)
+	defer server.Close()
+
+	client := larkws.NewClient("cli_test", "secret_test",
+		larkws.WithDomain(server.URL),
+		larkws.WithAutoReconnect(true),
+		larkws.WithOnReconnecting(func() {
+			select {
+			case reconnecting <- struct{}{}:
+			default:
+			}
+		}),
+		larkws.WithOnError(func(error) {
+			if startReturned.Load() {
+				select {
+				case lateError <- struct{}{}:
+				default:
+				}
+			}
+		}),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- (&sdkListenerClient{client: client}).Start(ctx)
+	}()
+
+	var serverConn *websocket.Conn
+	select {
+	case serverConn = <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket did not connect")
+	}
+	if err := serverConn.Close(); err != nil {
+		t.Fatalf("close server WebSocket: %v", err)
+	}
+	select {
+	case <-reconnecting:
+	case <-time.After(time.Second):
+		t.Fatal("client did not enter reconnecting state")
+	}
+
+	cancel()
+	select {
+	case err := <-startDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Start error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return promptly after cancellation")
+	}
+	startReturned.Store(true)
+
+	select {
+	case <-lateError:
+		t.Fatal("transport reconnect loop invoked callbacks after Start returned")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
