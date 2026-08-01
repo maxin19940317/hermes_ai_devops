@@ -1,6 +1,7 @@
 import re
 import subprocess
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -317,11 +318,63 @@ def build_valid_card_actions_rollout_doc(
     return "\n".join(lines) + "\n"
 
 
+@dataclass(frozen=True)
+class SemanticATXHeading:
+    level: int
+    title: str
+    start: int
+    end: int
+
+
+def scan_semantic_atx_headings(text):
+    headings = []
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        indent = 0
+        while indent < len(line) and line[indent] == " ":
+            indent += 1
+        if indent > 3:
+            offset += len(raw_line)
+            continue
+
+        marker_end = indent
+        while marker_end < len(line) and line[marker_end] == "#":
+            marker_end += 1
+        level = marker_end - indent
+        if not 1 <= level <= 6:
+            offset += len(raw_line)
+            continue
+        if marker_end < len(line) and line[marker_end] not in " \t":
+            offset += len(raw_line)
+            continue
+
+        remainder = line[marker_end:]
+        if remainder and remainder[0] in " \t":
+            remainder = remainder.lstrip(" \t")
+        title = re.sub(r"[ \t]+#+$", "", remainder.rstrip(" \t"))
+        headings.append(
+            SemanticATXHeading(
+                level=level,
+                title=title,
+                start=offset,
+                end=offset + len(line),
+            )
+        )
+        offset += len(raw_line)
+    return headings
+
+
 def parse_card_actions_rollout_sections(text):
-    heading_pattern = re.compile(
-        rf"(?m)^### {re.escape(CARD_ACTIONS_ROLLOUT_HEADING)}[ \t]*$"
-    )
-    sections = list(heading_pattern.finditer(text))
+    headings = scan_semantic_atx_headings(text)
+    sections = [
+        heading
+        for heading in headings
+        if (
+            heading.level == 3
+            and heading.title == CARD_ACTIONS_ROLLOUT_HEADING
+        )
+    ]
     if not sections:
         raise ValueError(
             f"missing ### {CARD_ACTIONS_ROLLOUT_HEADING} section"
@@ -331,17 +384,21 @@ def parse_card_actions_rollout_sections(text):
             f"duplicated ### {CARD_ACTIONS_ROLLOUT_HEADING} section"
         )
 
-    body_start = sections[0].end()
+    body_start = sections[0].end
     if text.startswith("\r\n", body_start):
         body_start += 2
     elif body_start < len(text) and text[body_start] in "\r\n":
         body_start += 1
 
-    next_heading = re.search(
-        r"(?m)^#{1,3}(?:[ \t]+|$)",
-        text[body_start:],
+    next_heading = next(
+        (
+            heading
+            for heading in headings
+            if heading.start >= body_start and heading.level <= 3
+        ),
+        None,
     )
-    body_end = body_start + next_heading.start() if next_heading else len(text)
+    body_end = next_heading.start if next_heading else len(text)
     body = text[body_start:body_end]
     if not body.strip():
         raise ValueError(
@@ -1029,6 +1086,52 @@ class CardActionsDeploymentContracts(unittest.TestCase):
             normalize_semantic_text(rollout["stage1"]),
         )
 
+    def test_semantic_heading_scanner_normalizes_closing_hashes_and_offsets(self):
+        text = (
+            "Intro\n"
+            "### Card-action two-stage rollout ###   \n"
+            "Body\n"
+        )
+
+        headings = scan_semantic_atx_headings(text)
+
+        self.assertEqual(1, len(headings))
+        self.assertEqual(3, headings[0].level)
+        self.assertEqual(CARD_ACTIONS_ROLLOUT_HEADING, headings[0].title)
+        self.assertEqual(
+            text.index("### Card-action two-stage rollout ###"),
+            headings[0].start,
+        )
+        self.assertEqual(
+            "### Card-action two-stage rollout ###   ",
+            text[headings[0].start : headings[0].end],
+        )
+
+    def test_semantic_heading_scanner_accepts_up_to_three_leading_spaces(self):
+        for indent in range(4):
+            with self.subTest(indent=indent):
+                headings = scan_semantic_atx_headings(
+                    f"{' ' * indent}### {CARD_ACTIONS_ROLLOUT_HEADING} ###\n"
+                )
+
+                self.assertEqual(1, len(headings))
+                self.assertEqual(3, headings[0].level)
+                self.assertEqual(CARD_ACTIONS_ROLLOUT_HEADING, headings[0].title)
+
+    def test_semantic_heading_scanner_ignores_four_space_indented_lines(self):
+        headings = scan_semantic_atx_headings(
+            f"    ### {CARD_ACTIONS_ROLLOUT_HEADING} ###\n"
+        )
+
+        self.assertEqual([], headings)
+
+    def test_semantic_heading_scanner_ignores_missing_separator(self):
+        headings = scan_semantic_atx_headings(
+            f"###{CARD_ACTIONS_ROLLOUT_HEADING} ###\n"
+        )
+
+        self.assertEqual([], headings)
+
     def test_rollout_section_parser_rejects_duplicate_rollout_headings(self):
         doc = build_valid_card_actions_rollout_doc() + (
             "\n### Card-action two-stage rollout\n\n"
@@ -1042,6 +1145,58 @@ class CardActionsDeploymentContracts(unittest.TestCase):
             ),
         ):
             parse_card_actions_rollout_sections(doc)
+
+    def test_rollout_section_parser_rejects_render_equivalent_duplicates(self):
+        for duplicate_heading in (
+            "### Card-action two-stage rollout ###",
+            "   ### Card-action two-stage rollout ###",
+        ):
+            with self.subTest(duplicate_heading=duplicate_heading):
+                doc = build_valid_card_actions_rollout_doc() + (
+                    f"\n{duplicate_heading}\n\n"
+                    "Stage 2 may begin during the workflow_runs "
+                    "stop-write window.\n"
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    re.escape(
+                        "duplicated ### Card-action two-stage rollout section"
+                    ),
+                ):
+                    parse_card_actions_rollout_sections(doc)
+
+    def test_rollout_section_parser_stops_at_next_h3_and_keeps_h4_content(self):
+        doc = "\n".join(
+            (
+                f"### {CARD_ACTIONS_ROLLOUT_HEADING}",
+                "",
+                *CARD_ACTIONS_VALID_PREAMBLE_LINES,
+                "",
+                f"{CARD_ACTIONS_STAGE_1_MARKER} "
+                f"{CARD_ACTIONS_VALID_STAGE1_LINES[0]}",
+                *CARD_ACTIONS_VALID_STAGE1_LINES[1:],
+                "",
+                f"{CARD_ACTIONS_STAGE_2_MARKER} {CARD_ACTIONS_STAGE_2_GATE}",
+                *CARD_ACTIONS_VALID_STAGE2_LINES,
+                "",
+                "#### Nested follow-up",
+                "Keep this guidance inside Stage 2.",
+                "",
+                "### Sibling section",
+                "Do not include this sibling content.",
+            )
+        ) + "\n"
+
+        rollout = parse_card_actions_rollout_sections(doc)
+
+        self.assertIn("#### Nested follow-up", rollout["stage2"])
+        self.assertIn("Keep this guidance inside Stage 2.", rollout["stage2"])
+        self.assertNotIn("### Sibling section", rollout["stage2"])
+        self.assertNotIn(
+            "Do not include this sibling content.",
+            rollout["stage2"],
+        )
 
     def test_rollout_section_parser_rejects_reversed_stages(self):
         doc = build_valid_card_actions_rollout_doc().replace(
