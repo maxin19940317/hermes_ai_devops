@@ -114,6 +114,9 @@ CARD_ACTIONS_STAGE_1_MARKER = (
     "**Stage 1 — workflow-runs compatibility.**"
 )
 CARD_ACTIONS_STAGE_2_MARKER = "**Stage 2 — card actions.**"
+CARD_ACTIONS_STAGE_2_GATE = (
+    "Only after the workflow_runs rollout is stable:"
+)
 
 
 def normalize_whitespace(text):
@@ -127,7 +130,7 @@ def normalize_semantic_text(text):
 def parse_card_actions_rollout_sections(text):
     section = re.search(
         rf"(?ms)^### {re.escape(CARD_ACTIONS_ROLLOUT_HEADING)}\n"
-        r"(?P<body>.*?)(?=^## |\Z)",
+        r"(?P<body>.*?)(?=^#{1,3}(?:[ \t]+|$)|\Z)",
         text,
     )
     if not section:
@@ -181,6 +184,7 @@ def parse_card_actions_rollout_sections(text):
         "preamble": "\n".join(lines[:stage_1_index]),
         "stage1": "\n".join(stage_1_lines),
         "stage2": "\n".join(stage_2_lines),
+        "stage2_intro": stage_2_rest,
     }
 
 
@@ -189,6 +193,7 @@ def assert_card_actions_rollout_contract(text):
     preamble = normalize_whitespace(rollout["preamble"])
     stage1 = normalize_semantic_text(rollout["stage1"])
     stage2 = normalize_semantic_text(rollout["stage2"])
+    stage2_intro = normalize_semantic_text(rollout["stage2_intro"])
 
     if "The two stages must not be merged." not in preamble:
         raise AssertionError("missing cannot-merge warning before Stage 1")
@@ -211,7 +216,7 @@ def assert_card_actions_rollout_contract(text):
         if forbidden in stage1:
             raise AssertionError(f"Stage 1 must not contain {forbidden}")
 
-    if "Only after the workflow_runs rollout is stable" not in stage2:
+    if not stage2_intro.startswith(CARD_ACTIONS_STAGE_2_GATE):
         raise AssertionError("Stage 2 must start with the exact gate phrase")
 
     for marker in (
@@ -442,6 +447,19 @@ class ComposeContracts(unittest.TestCase):
         self.assertIn("TEMPORAL_TASK_QUEUE: device-test", text)
         self.assertNotIn("network_mode: host", text)
         self.assertNotIn("container_name:", text)
+
+    def test_worker_propagates_card_actions_opt_in_with_strict_default_off(self):
+        text = COMPOSE.read_text(encoding="utf-8")
+        worker = re.search(
+            r"(?ms)^  worker:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            text,
+        )
+
+        self.assertIsNotNone(worker, "missing worker service block")
+        self.assertIn(
+            "FEISHU_CARD_ACTIONS_ENABLED: ${FEISHU_CARD_ACTIONS_ENABLED:-false}",
+            worker.group("body"),
+        )
 
     def test_compose_never_publishes_internal_ports(self):
         text = COMPOSE.read_text(encoding="utf-8")
@@ -789,6 +807,36 @@ class CardActionsDeploymentContracts(unittest.TestCase):
             "FEISHU_CARD_ACTIONS_ENABLED=true\n\n"
             "## Unrelated follow-up\n"
             "Subscribe to card.action.trigger under 事件与回调 → 回调 using long connection.\n"
+        )
+
+        with self.assertRaises(AssertionError):
+            assert_card_actions_rollout_contract(doc)
+
+    def test_rollout_section_parser_rejects_subscription_markers_in_sibling_h3(self):
+        doc = DEPLOY_README.read_text(encoding="utf-8").replace(
+            "WebSocket listener is running. In Feishu Open Platform, subscribe to",
+            (
+                "WebSocket listener is running.\n\n"
+                "### Unrelated follow-up\n\n"
+                "In Feishu Open Platform, subscribe to"
+            ),
+            1,
+        )
+
+        with self.assertRaises(AssertionError):
+            assert_card_actions_rollout_contract(doc)
+
+    def test_rollout_section_parser_rejects_relocated_stability_gate(self):
+        doc = DEPLOY_README.read_text(encoding="utf-8").replace(
+            (
+                "**Stage 2 — card actions.** Only after the `workflow_runs` "
+                "rollout is stable:"
+            ),
+            (
+                "**Stage 2 — card actions.** Prepare the rollout:\n\n"
+                "Only after the `workflow_runs` rollout is stable:"
+            ),
+            1,
         )
 
         with self.assertRaises(AssertionError):

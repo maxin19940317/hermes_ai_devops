@@ -129,6 +129,7 @@ services:
       FEISHU_CMD_WHITELIST: ${FEISHU_CMD_WHITELIST:-}
       FEISHU_CMD_NL: ${FEISHU_CMD_NL:-false}
       FEISHU_CMD_NL_TIMEOUT_SEC: ${FEISHU_CMD_NL_TIMEOUT_SEC:-60}
+      FEISHU_CARD_ACTIONS_ENABLED: ${FEISHU_CARD_ACTIONS_ENABLED:-false}
       # §3.7 预签名直传;worker 不 depends_on minio——MinIO 缺失时优雅降级为空
       # presigned_uploads。签名覆盖 Host,故预签名 client 用 PUBLIC endpoint 构造。
       MINIO_ENDPOINT: minio:9000
