@@ -49,12 +49,13 @@ type SweepStore interface {
 
 // Sweeper recovers durable inbox, action, and card-render claims.
 type Sweeper struct {
-	Store    SweepStore
-	Consumer *Consumer
-	Starter  trigger.WorkflowStarter
-	Updater  feishu.CardUpdater
-	Log      *zerolog.Logger
-	interval time.Duration
+	Store       SweepStore
+	Consumer    *Consumer
+	Starter     trigger.WorkflowStarter
+	Updater     feishu.CardUpdater
+	Log         *zerolog.Logger
+	interval    time.Duration
+	passTimeout time.Duration
 }
 
 // RunOnce performs one inbox, action, and card sweep in deterministic order.
@@ -63,14 +64,19 @@ func (s *Sweeper) RunOnce(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	runPass := func(pass func(context.Context) error) error {
+		passCtx, cancel := context.WithTimeout(ctx, s.sweepPassTimeout())
+		defer cancel()
+		return pass(passCtx)
+	}
 	var joined []error
-	if err := s.sweepInbox(ctx); err != nil {
+	if err := runPass(s.sweepInbox); err != nil {
 		joined = append(joined, fmt.Errorf("inbox sweep: %w", err))
 	}
-	if err := s.sweepAction(ctx); err != nil {
+	if err := runPass(s.sweepAction); err != nil {
 		joined = append(joined, fmt.Errorf("action sweep: %w", err))
 	}
-	if err := s.sweepCard(ctx); err != nil {
+	if err := runPass(s.sweepCard); err != nil {
 		joined = append(joined, fmt.Errorf("card sweep: %w", err))
 	}
 	return errors.Join(joined...)
@@ -100,6 +106,13 @@ func (s *Sweeper) runInterval() time.Duration {
 		return s.interval
 	}
 	return sweepInterval
+}
+
+func (s *Sweeper) sweepPassTimeout() time.Duration {
+	if s != nil && s.passTimeout > 0 {
+		return s.passTimeout
+	}
+	return defaultBackgroundOperationTimeout
 }
 
 func (s *Sweeper) runAndLog(ctx context.Context) {

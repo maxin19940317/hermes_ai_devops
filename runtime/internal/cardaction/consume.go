@@ -19,7 +19,10 @@ import (
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
-const consumerLeaseTTL = 120 * time.Second
+const (
+	consumerLeaseTTL                  = 120 * time.Second
+	defaultBackgroundOperationTimeout = 90 * time.Second
+)
 
 // ConsumerStore is the asynchronous card action consumer's persistence surface.
 type ConsumerStore interface {
@@ -43,7 +46,15 @@ type Consumer struct {
 	Starter  trigger.WorkflowStarter
 	Log      *zerolog.Logger
 
-	mutateInput func(*wf.DeviceTestInput)
+	mutateInput      func(*wf.DeviceTestInput)
+	operationTimeout time.Duration
+}
+
+func (c *Consumer) backgroundTimeout() time.Duration {
+	if c != nil && c.operationTimeout > 0 {
+		return c.operationTimeout
+	}
+	return defaultBackgroundOperationTimeout
 }
 
 // ConsumeOne consumes one durable inbox event. A non-claimable event is an
@@ -58,6 +69,8 @@ func (c *Consumer) ConsumeOne(ctx context.Context, eventID string) error {
 	if c.Resolver == nil {
 		return errors.New("consume card action: resolver is nil")
 	}
+	ctx, cancel := context.WithTimeout(ctx, c.backgroundTimeout())
+	defer cancel()
 
 	token, err := newFencingToken()
 	if err != nil {

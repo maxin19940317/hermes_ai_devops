@@ -193,6 +193,117 @@ func (u *fakeCardUpdater) PatchCard(_ context.Context, messageID string, card an
 	return u.err
 }
 
+type sweepDeadlineObservation struct {
+	pass         string
+	started      time.Time
+	deadline     time.Time
+	deadlineSeen bool
+}
+
+type blockingSweepStore struct {
+	*sweepTestStore
+
+	observations []sweepDeadlineObservation
+}
+
+func (s *blockingSweepStore) block(ctx context.Context, pass string) error {
+	deadline, deadlineSeen := ctx.Deadline()
+	s.observations = append(s.observations, sweepDeadlineObservation{
+		pass: pass, started: time.Now(), deadline: deadline, deadlineSeen: deadlineSeen,
+	})
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (s *blockingSweepStore) ClaimStaleInbox(
+	ctx context.Context, _ string, _ time.Duration,
+) (*store.InboxRow, error) {
+	return nil, s.block(ctx, "inbox")
+}
+
+func (s *blockingSweepStore) ClaimStaleAction(
+	ctx context.Context, _ string, _ time.Duration,
+) (*store.CardAction, error) {
+	return nil, s.block(ctx, "action")
+}
+
+func (s *blockingSweepStore) ClaimMessage(
+	ctx context.Context, _ string, _ time.Duration,
+) (*store.MessageClaim, error) {
+	return nil, s.block(ctx, "card")
+}
+
+func TestRunOnceBoundsEachBlockingPassIndependently(t *testing.T) {
+	const (
+		passTimeout   = 25 * time.Millisecond
+		safetyTimeout = 500 * time.Millisecond
+	)
+	st := &blockingSweepStore{sweepTestStore: newSweepTestStore()}
+	s := &Sweeper{
+		Store: st, Updater: &fakeCardUpdater{},
+		passTimeout: passTimeout,
+	}
+	parent, cancel := context.WithTimeout(context.Background(), safetyTimeout)
+	defer cancel()
+
+	started := time.Now()
+	err := s.RunOnce(parent)
+	elapsed := time.Since(started)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RunOnce error = %v, want joined deadline errors", err)
+	}
+	if got := strings.Count(err.Error(), context.DeadlineExceeded.Error()); got != 3 {
+		t.Fatalf("RunOnce error = %v, want 3 joined deadline errors, got %d", err, got)
+	}
+	wantPasses := []string{"inbox", "action", "card"}
+	if len(st.observations) != len(wantPasses) {
+		t.Fatalf("pass observations = %#v, want %v", st.observations, wantPasses)
+	}
+	for i, observation := range st.observations {
+		if observation.pass != wantPasses[i] {
+			t.Fatalf("pass %d = %q, want %q", i, observation.pass, wantPasses[i])
+		}
+		if !observation.deadlineSeen {
+			t.Fatalf("%s pass context had no deadline", observation.pass)
+		}
+		if got := observation.deadline.Sub(observation.started); got <= 0 ||
+			got > 4*passTimeout {
+			t.Fatalf(
+				"%s pass deadline after invocation = %s, want within %s",
+				observation.pass, got, 4*passTimeout,
+			)
+		}
+		if !strings.Contains(err.Error(), observation.pass+" sweep") {
+			t.Fatalf("RunOnce error = %v, missing %s sweep context", err, observation.pass)
+		}
+	}
+	if elapsed >= safetyTimeout/2 {
+		t.Fatalf("RunOnce elapsed = %s, want independent pass timeouts before safety deadline", elapsed)
+	}
+}
+
+func TestSweepPassTimeoutDefaultsWithinLease(t *testing.T) {
+	if defaultBackgroundOperationTimeout <= 0 ||
+		defaultBackgroundOperationTimeout >= sweepLeaseTTL {
+		t.Fatalf(
+			"default sweep pass timeout = %s, want > 0 and < lease %s",
+			defaultBackgroundOperationTimeout, sweepLeaseTTL,
+		)
+	}
+	if got := (&Sweeper{}).sweepPassTimeout(); got != defaultBackgroundOperationTimeout {
+		t.Fatalf("zero sweep pass timeout = %s, want %s", got, defaultBackgroundOperationTimeout)
+	}
+	if got := (&Sweeper{passTimeout: -time.Second}).sweepPassTimeout(); got !=
+		defaultBackgroundOperationTimeout {
+		t.Fatalf("negative sweep pass timeout = %s, want %s", got, defaultBackgroundOperationTimeout)
+	}
+	const configured = 7 * time.Millisecond
+	if got := (&Sweeper{passTimeout: configured}).sweepPassTimeout(); got != configured {
+		t.Fatalf("configured sweep pass timeout = %s, want %s", got, configured)
+	}
+}
+
 func TestRunOnceOrdersAndContinuesAllSweepsAfterEachClaimFailure(t *testing.T) {
 	tests := []struct {
 		name   string

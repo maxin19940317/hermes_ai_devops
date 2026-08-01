@@ -15,14 +15,23 @@ import (
 
 type testContextKey string
 
+type consumerContextObservation struct {
+	err          error
+	scope        any
+	deadlineSeen bool
+}
+
 type recordingConsumerStore struct {
-	ctx chan context.Context
+	observed chan consumerContextObservation
 }
 
 func (s *recordingConsumerStore) ClaimInbox(
 	ctx context.Context, _, _ string, _ time.Duration,
 ) (*store.InboxRow, error) {
-	s.ctx <- ctx
+	_, deadlineSeen := ctx.Deadline()
+	s.observed <- consumerContextObservation{
+		err: ctx.Err(), scope: ctx.Value(testContextKey("scope")), deadlineSeen: deadlineSeen,
+	}
 	return nil, store.ErrInboxNotClaimable
 }
 
@@ -193,7 +202,7 @@ func TestHandlerConsumeUsesLifecycleContext(t *testing.T) {
 		lifecycleCtx, workerCardConfig(), store.NewMemStore(), nil,
 		&fakeAppSender{}, "app", &activity.Acts{}, nil,
 	)
-	recording := &recordingConsumerStore{ctx: make(chan context.Context, 1)}
+	recording := &recordingConsumerStore{observed: make(chan consumerContextObservation, 1)}
 	got.Consumer.Store = recording
 	got.Handler.Store = store.NewMemStore()
 	got.Readiness.SetWS(true)
@@ -208,12 +217,15 @@ func TestHandlerConsumeUsesLifecycleContext(t *testing.T) {
 		t.Fatalf("response = %#v", resp)
 	}
 	select {
-	case consumeCtx := <-recording.ctx:
-		if consumeCtx.Err() != nil {
-			t.Fatalf("consumer context already canceled: %v", consumeCtx.Err())
+	case observed := <-recording.observed:
+		if observed.err != nil {
+			t.Fatalf("consumer context already canceled: %v", observed.err)
 		}
-		if consumeCtx.Value(testContextKey("scope")) != "worker-lifecycle" {
+		if observed.scope != "worker-lifecycle" {
 			t.Fatal("consumer did not receive process/listener lifecycle context")
+		}
+		if !observed.deadlineSeen {
+			t.Fatal("consumer context had no bounded operation deadline")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Handler.Consume did not invoke Consumer.ConsumeOne")

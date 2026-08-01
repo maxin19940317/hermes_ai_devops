@@ -39,6 +39,21 @@ type consumerTestStore struct {
 	outcomeMutator      func(*store.AcceptOutcome)
 }
 
+type blockingClaimConsumerStore struct {
+	*consumerTestStore
+
+	deadline     time.Time
+	deadlineSeen bool
+}
+
+func (s *blockingClaimConsumerStore) ClaimInbox(
+	ctx context.Context, _ string, _ string, _ time.Duration,
+) (*store.InboxRow, error) {
+	s.deadline, s.deadlineSeen = ctx.Deadline()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func newConsumerTestStore(action string) *consumerTestStore {
 	return &consumerTestStore{
 		inbox: map[string]store.InboxRow{
@@ -321,6 +336,58 @@ func newTestConsumer(action string) (*Consumer, *consumerTestStore, *fakeConsume
 	}
 	starter := &fakeConsumerStarter{started: true}
 	return &Consumer{Store: st, Resolver: resolver, Starter: starter}, st, resolver, starter
+}
+
+func TestConsumeOneBoundsBlockingClaim(t *testing.T) {
+	const (
+		operationTimeout = 25 * time.Millisecond
+		safetyTimeout    = 500 * time.Millisecond
+	)
+	st := &blockingClaimConsumerStore{consumerTestStore: newConsumerTestStore("ignore")}
+	c := &Consumer{
+		Store: st, Resolver: &fakeConsumerResolver{},
+		operationTimeout: operationTimeout,
+	}
+	parent, cancel := context.WithTimeout(context.Background(), safetyTimeout)
+	defer cancel()
+
+	started := time.Now()
+	err := c.ConsumeOne(parent, "e1")
+	elapsed := time.Since(started)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ConsumeOne error = %v, want deadline exceeded", err)
+	}
+	if !st.deadlineSeen {
+		t.Fatal("ClaimInbox context had no deadline")
+	}
+	if got := st.deadline.Sub(started); got <= 0 || got > 4*operationTimeout {
+		t.Fatalf("ClaimInbox deadline after start = %s, want within %s", got, 4*operationTimeout)
+	}
+	if elapsed >= safetyTimeout/2 {
+		t.Fatalf("ConsumeOne elapsed = %s, want internal timeout before safety deadline", elapsed)
+	}
+}
+
+func TestConsumerBackgroundTimeoutDefaultsWithinLease(t *testing.T) {
+	if defaultBackgroundOperationTimeout <= 0 ||
+		defaultBackgroundOperationTimeout >= consumerLeaseTTL {
+		t.Fatalf(
+			"default background operation timeout = %s, want > 0 and < lease %s",
+			defaultBackgroundOperationTimeout, consumerLeaseTTL,
+		)
+	}
+	if got := (&Consumer{}).backgroundTimeout(); got != defaultBackgroundOperationTimeout {
+		t.Fatalf("zero consumer timeout = %s, want %s", got, defaultBackgroundOperationTimeout)
+	}
+	if got := (&Consumer{operationTimeout: -time.Second}).backgroundTimeout(); got !=
+		defaultBackgroundOperationTimeout {
+		t.Fatalf("negative consumer timeout = %s, want %s", got, defaultBackgroundOperationTimeout)
+	}
+	const configured = 7 * time.Millisecond
+	if got := (&Consumer{operationTimeout: configured}).backgroundTimeout(); got != configured {
+		t.Fatalf("configured consumer timeout = %s, want %s", got, configured)
+	}
 }
 
 func TestTargetInputAssertedFieldByField(t *testing.T) {
