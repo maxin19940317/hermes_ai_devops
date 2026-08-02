@@ -1,1 +1,1 @@
-{ "translation_version": 1, "command": "status", "args": [], "confidence": 0.95, "reason": "询问整体状态" }
+{ "translation_version": 2, "command": "status", "args": [], "confidence": 0.95, "reason": "询问整体状态" }

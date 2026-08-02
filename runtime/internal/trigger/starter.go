@@ -3,6 +3,7 @@ package trigger
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
@@ -38,4 +39,37 @@ func (s *TemporalStarter) StartDeviceTest(ctx context.Context, in wf.DeviceTestI
 		return "", false, err
 	}
 	return id, true, nil
+}
+
+func (s *TemporalStarter) WorkflowClosed(ctx context.Context, workflowID string) (bool, error) {
+	desc, err := s.Client.DescribeWorkflowExecution(ctx, workflowID, "")
+	if err != nil {
+		return false, fmt.Errorf("describe workflow %s: %w", workflowID, err)
+	}
+	status := desc.GetWorkflowExecutionInfo().GetStatus()
+	switch status {
+	case enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+		enumspb.WORKFLOW_EXECUTION_STATUS_PAUSED:
+		return false, nil
+	case enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+		enumspb.WORKFLOW_EXECUTION_STATUS_FAILED,
+		enumspb.WORKFLOW_EXECUTION_STATUS_CANCELED,
+		enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED,
+		enumspb.WORKFLOW_EXECUTION_STATUS_TIMED_OUT,
+		enumspb.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW:
+		return true, nil
+	default:
+		return false, fmt.Errorf("describe workflow %s: unknown execution status %v", workflowID, status)
+	}
+}
+
+func (s *TemporalStarter) WorkflowResult(
+	ctx context.Context,
+	workflowID string,
+) (*wf.DeviceTestOutput, error) {
+	var out wf.DeviceTestOutput
+	if err := s.Client.GetWorkflow(ctx, workflowID, "").Get(ctx, &out); err != nil {
+		return nil, fmt.Errorf("get workflow result %s: %w", workflowID, err)
+	}
+	return &out, nil
 }

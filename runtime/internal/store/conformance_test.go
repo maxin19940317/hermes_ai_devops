@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -45,16 +47,18 @@ type fullStore interface {
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
 	ListDecisions(ctx context.Context, taskID string) ([]wf.DecisionRow, error)
 	HasDecision(ctx context.Context, taskID, actor string) (bool, error)
-	NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error)
+	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	SaveEvidenceSnapshot(ctx context.Context, snap EvidenceSnapshot) error
 	GetEvidenceSnapshot(ctx context.Context, evidenceID string) (*EvidenceSnapshot, error)
 	FleetOverview(ctx context.Context) (*FleetOverview, error)
 	UnquarantineDevice(ctx context.Context, deviceID string) (bool, error)
-	ListArtifacts(ctx context.Context, commitSHA string, pipelineID int) ([]Artifact, error)
-	NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error)
+	ListArtifacts(ctx context.Context, project, commitSHA string, pipelineID int) ([]Artifact, error)
+	NextWorkflowAttemptAll(ctx context.Context, project, commitSHA string, pipelineID int) (int, error)
 	SaveCommandTranslation(ctx context.Context, row CommandTranslation) error
 	ListCommandTranslations(ctx context.Context, openID string, limit int) ([]CommandTranslation, error)
 	RecentRuns(ctx context.Context, limit int) ([]RecentRun, error)
+	RecordWorkflowRun(ctx context.Context, run WorkflowRun) error
+	GetWorkflowRun(ctx context.Context, workflowID string) (*WorkflowRun, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
@@ -63,6 +67,71 @@ func TestMemStoreConformance(t *testing.T) {
 
 func TestPGStoreConformance(t *testing.T) {
 	runConformance(t, func(t *testing.T) fullStore { return openTestPG(t) })
+}
+
+func TestPGRecentRunsUsesOneSnapshot(t *testing.T) {
+	s := openTestPG(t)
+	artifact := Artifact{
+		Project: "snapshot/project", CommitSHA: "abcd1234", PipelineID: 42,
+		Variant: "v1", URL: "u", SHA256: "s",
+	}
+	if err := s.RegisterArtifacts(ctx, []Artifact{artifact}); err != nil {
+		t.Fatalf("RegisterArtifacts: %v", err)
+	}
+
+	got, err := s.recentRuns(ctx, 1, func() error {
+		return s.RecordWorkflowRun(ctx, WorkflowRun{
+			WorkflowID: "inserted-between-recent-run-queries",
+			Project:    artifact.Project, CommitSHA: artifact.CommitSHA,
+			PipelineID: artifact.PipelineID, Version: "1.0.0",
+			RuleVersion: "rules-v1", Variants: []string{artifact.Variant},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RecentRuns: %v", err)
+	}
+	if len(got) != 1 || got[0].Authoritative ||
+		got[0].Project != artifact.Project || got[0].Variant != artifact.Variant {
+		t.Fatalf("runs = %#v, want legacy row from the call's initial snapshot", got)
+	}
+	if _, err := s.GetWorkflowRun(ctx, "inserted-between-recent-run-queries"); err != nil {
+		t.Fatalf("concurrent workflow run was not committed: %v", err)
+	}
+}
+
+func artifactAttempts(t *testing.T, s fullStore) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	switch st := s.(type) {
+	case *MemStore:
+		for _, row := range st.Artifacts() {
+			if row.CommitSHA == "abcd1234" && row.PipelineID == 42 && row.Variant == "v1" {
+				out[row.Project] = row.WorkflowAttempt
+			}
+		}
+	case *PGStore:
+		rows, err := st.DB.QueryContext(ctx, `
+			SELECT project, workflow_attempt FROM artifacts
+			WHERE commit_sha = 'abcd1234' AND pipeline_id = 42 AND variant = 'v1'`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var project string
+			var attempt int
+			if err := rows.Scan(&project, &attempt); err != nil {
+				t.Fatal(err)
+			}
+			out[project] = attempt
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unsupported store type %T", s)
+	}
+	return out
 }
 
 // runConformance 对一个空 store 实例跑全部行为断言;
@@ -80,6 +149,179 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatal(err)
 		}
 	}
+
+	workflowRunBase := func() WorkflowRun {
+		return WorkflowRun{
+			WorkflowID: "device-test-grp/p-gabcd1234-p42",
+			Project:    "grp/p", CommitSHA: "abcd1234", PipelineID: 42,
+			Version: "1.2.3", RuleVersion: "verdict-rules-v1",
+			Variants: []string{"v2", "", "v1", "v2"},
+		}
+	}
+
+	t.Run("WorkflowRunRecordGetCanonical", func(t *testing.T) {
+		s := newStore(t)
+		run := workflowRunBase()
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+		got, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatalf("GetWorkflowRun: %v", err)
+		}
+		if got == nil {
+			t.Fatal("GetWorkflowRun returned nil")
+		}
+		want := run
+		want.Variants = []string{"v1", "v2"}
+		want.CreatedAt = got.CreatedAt
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("run = %#v, want %#v", *got, want)
+		}
+		if got.CreatedAt.IsZero() {
+			t.Fatal("CreatedAt must be populated")
+		}
+		if _, err := s.GetWorkflowRun(ctx, "missing"); !errors.Is(err, ErrWorkflowRunNotFound) {
+			t.Fatalf("missing error = %v, want ErrWorkflowRunNotFound", err)
+		}
+	})
+
+	t.Run("WorkflowRunIdempotent", func(t *testing.T) {
+		s := newStore(t)
+		run := workflowRunBase()
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+		first, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replay := run
+		replay.Variants = []string{"v2", "v1", "v1"}
+		replay.CreatedAt = first.CreatedAt.Add(24 * time.Hour)
+		if err := s.RecordWorkflowRun(ctx, replay); err != nil {
+			t.Fatalf("canonical replay: %v", err)
+		}
+		got, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, first) {
+			t.Fatalf("idempotent replay changed row: got %#v, first %#v", got, first)
+		}
+
+		empty := workflowRunBase()
+		empty.WorkflowID = "empty-variants"
+		empty.Variants = nil
+		if err := s.RecordWorkflowRun(ctx, empty); err != nil {
+			t.Fatalf("record empty variants: %v", err)
+		}
+		if err := s.RecordWorkflowRun(ctx, empty); err != nil {
+			t.Fatalf("replay empty variants: %v", err)
+		}
+	})
+
+	t.Run("WorkflowRunConflictEveryField", func(t *testing.T) {
+		s := newStore(t)
+		parentA := workflowRunBase()
+		parentA.WorkflowID = "parent-a"
+		parentA.Variants = []string{"parent"}
+		parentB := parentA
+		parentB.WorkflowID = "parent-b"
+		for _, parent := range []WorkflowRun{parentA, parentB} {
+			if err := s.RecordWorkflowRun(ctx, parent); err != nil {
+				t.Fatalf("record %s: %v", parent.WorkflowID, err)
+			}
+		}
+		base := workflowRunBase()
+		base.SourceWorkflowID = parentA.WorkflowID
+		if err := s.RecordWorkflowRun(ctx, base); err != nil {
+			t.Fatalf("record base: %v", err)
+		}
+		cases := []struct {
+			name   string
+			change func(*WorkflowRun)
+		}{
+			{"Project", func(r *WorkflowRun) { r.Project = "grp/other" }},
+			{"CommitSHA", func(r *WorkflowRun) { r.CommitSHA = "deadbeef" }},
+			{"PipelineID", func(r *WorkflowRun) { r.PipelineID++ }},
+			{"Version", func(r *WorkflowRun) { r.Version = "2.0.0" }},
+			{"RuleVersion", func(r *WorkflowRun) { r.RuleVersion = "rules-v2" }},
+			{"Scope", func(r *WorkflowRun) { r.Scope = "nightly" }},
+			{"Attempt", func(r *WorkflowRun) { r.Attempt++ }},
+			{"Variants", func(r *WorkflowRun) { r.Variants = []string{"v1", "v3"} }},
+			{"SourceWorkflowID", func(r *WorkflowRun) { r.SourceWorkflowID = parentB.WorkflowID }},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				changed := base
+				changed.Variants = append([]string(nil), base.Variants...)
+				tc.change(&changed)
+				if err := s.RecordWorkflowRun(ctx, changed); !errors.Is(err, ErrWorkflowRunConflict) {
+					t.Fatalf("error = %v, want ErrWorkflowRunConflict", err)
+				}
+			})
+		}
+	})
+
+	t.Run("WorkflowRunRejectsMissingSource", func(t *testing.T) {
+		s := newStore(t)
+		run := workflowRunBase()
+		run.SourceWorkflowID = "does-not-exist"
+		if err := s.RecordWorkflowRun(ctx, run); !errors.Is(err, ErrWorkflowRunPermanent) {
+			t.Fatalf("missing source error = %v, want ErrWorkflowRunPermanent", err)
+		}
+		run.SourceWorkflowID = run.WorkflowID
+		if err := s.RecordWorkflowRun(ctx, run); !errors.Is(err, ErrWorkflowRunPermanent) {
+			t.Fatalf("self source error = %v, want ErrWorkflowRunPermanent", err)
+		}
+
+		invalid := []struct {
+			name   string
+			change func(*WorkflowRun)
+		}{
+			{"WorkflowID", func(r *WorkflowRun) { r.WorkflowID = "" }},
+			{"Project", func(r *WorkflowRun) { r.Project = "" }},
+			{"CommitSHA", func(r *WorkflowRun) { r.CommitSHA = "" }},
+			{"PipelineID", func(r *WorkflowRun) { r.PipelineID = 0 }},
+			{"Version", func(r *WorkflowRun) { r.Version = "" }},
+			{"RuleVersion", func(r *WorkflowRun) { r.RuleVersion = "" }},
+			{"Attempt", func(r *WorkflowRun) { r.Attempt = -1 }},
+		}
+		for _, tc := range invalid {
+			t.Run(tc.name, func(t *testing.T) {
+				bad := workflowRunBase()
+				tc.change(&bad)
+				if err := s.RecordWorkflowRun(ctx, bad); !errors.Is(err, ErrWorkflowRunPermanent) {
+					t.Fatalf("error = %v, want ErrWorkflowRunPermanent", err)
+				}
+			})
+		}
+	})
+
+	t.Run("WorkflowRunDefensiveCopy", func(t *testing.T) {
+		s := newStore(t)
+		run := workflowRunBase()
+		callerVariants := append([]string(nil), run.Variants...)
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(run.Variants, callerVariants) {
+			t.Fatalf("caller variants mutated: got %v, want %v", run.Variants, callerVariants)
+		}
+		first, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first.Variants[0] = "mutated"
+		second, err := s.GetWorkflowRun(ctx, run.WorkflowID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(second.Variants, []string{"v1", "v2"}) {
+			t.Fatalf("stored variants mutated through result: %v", second.Variants)
+		}
+	})
 
 	t.Run("HasCapableDeviceIgnoresStatus", func(t *testing.T) {
 		s := newStore(t)
@@ -792,12 +1034,12 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatal(err)
 		}
 		for want := 1; want <= 3; want++ {
-			n, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "v1")
+			n, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1")
 			if err != nil || n != want {
 				t.Fatalf("attempt = %d err=%v, want %d", n, err, want)
 			}
 		}
-		if _, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "ghost"); err == nil {
+		if _, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "ghost"); err == nil {
 			t.Error("未登记的键应报错")
 		}
 	})
@@ -1206,7 +1448,7 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 	})
 
 	// 飞书指令 rerun 的数据面:ListArtifacts 按逻辑键取包,
-	// NextWorkflowAttemptAll 全键递增取 max(变体行可能因 kick retry 发散)。
+	// NextWorkflowAttemptAll 把全键推进到同一个新水位(变体行可能因 kick retry 发散)。
 	t.Run("ListArtifactsAndAttemptAll", func(t *testing.T) {
 		s := newStore(t)
 		arts := []Artifact{
@@ -1216,30 +1458,166 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 				BuildType: "Release", URL: "u2", SHA256: "s2", Size: 2, ManifestDigest: "m2"},
 			{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 43, Variant: "v1",
 				BuildType: "Release", URL: "u3", SHA256: "s3", Size: 3, ManifestDigest: "m3"},
+			{Project: "grp/other", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1",
+				BuildType: "Release", URL: "other1", SHA256: "so1", Size: 4, ManifestDigest: "mo1"},
+			{Project: "grp/other", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v2",
+				BuildType: "Release", URL: "other2", SHA256: "so2", Size: 5, ManifestDigest: "mo2"},
 		}
 		if err := s.RegisterArtifacts(ctx, arts); err != nil {
 			t.Fatal(err)
 		}
-		got, err := s.ListArtifacts(ctx, "abcd1234", 42)
+		got, err := s.ListArtifacts(ctx, "grp/p", "abcd1234", 42)
 		if err != nil || len(got) != 2 {
 			t.Fatalf("list = %+v err=%v, want 2 行", got, err)
 		}
 		if got[0].Project != "grp/p" || got[0].URL == "" || got[0].ManifestDigest == "" {
 			t.Errorf("artifact 字段不全: %+v", got[0])
 		}
-		if none, _ := s.ListArtifacts(ctx, "abcd1234", 99); len(none) != 0 {
+		if none, _ := s.ListArtifacts(ctx, "grp/p", "abcd1234", 99); len(none) != 0 {
 			t.Errorf("无记录键应返回空: %+v", none)
 		}
-		// 变体级 retry 使 v1 行先发散到 1;bundle 级递增后应取 max=2
-		if n, err := s.NextWorkflowAttempt(ctx, "abcd1234", 42, "v1"); err != nil || n != 1 {
-			t.Fatalf("variant attempt = %d err=%v", n, err)
+		other, err := s.ListArtifacts(ctx, "grp/other", "abcd1234", 42)
+		if err != nil || len(other) != 2 || other[0].Project != "grp/other" {
+			t.Fatalf("other project list = %+v err=%v, want isolated rows", other, err)
 		}
-		n, err := s.NextWorkflowAttemptAll(ctx, "abcd1234", 42)
-		if err != nil || n != 2 {
-			t.Fatalf("attempt all = %d err=%v, want 2(max 发散值+1)", n, err)
+		// 变体级 retry 使 v2 行先发散到 3;全组分配必须把两行都对齐到 4。
+		for want := 1; want <= 3; want++ {
+			if n, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v2"); err != nil || n != want {
+				t.Fatalf("variant attempt = %d err=%v, want %d", n, err, want)
+			}
 		}
-		if _, err := s.NextWorkflowAttemptAll(ctx, "abcd1234", 99); err == nil {
+		n, err := s.NextWorkflowAttemptAll(ctx, "grp/p", "abcd1234", 42)
+		if err != nil || n != 4 {
+			t.Fatalf("attempt all = %d err=%v, want 4(max 发散值+1)", n, err)
+		}
+		for _, variant := range []string{"v1", "v2"} {
+			n, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, variant)
+			if err != nil || n != 5 {
+				t.Fatalf("%s attempt after all = %d err=%v, want 5", variant, n, err)
+			}
+		}
+		if n, err := s.NextWorkflowAttempt(ctx, "grp/other", "abcd1234", 42, "v1"); err != nil || n != 1 {
+			t.Fatalf("other variant attempt = %d err=%v, want 1", n, err)
+		}
+		if n, err := s.NextWorkflowAttemptAll(ctx, "grp/other", "abcd1234", 42); err != nil || n != 2 {
+			t.Fatalf("other attempt all = %d err=%v, want 2", n, err)
+		}
+		if _, err := s.NextWorkflowAttemptAll(ctx, "grp/p", "abcd1234", 99); err == nil {
 			t.Error("无记录键应报错")
+		}
+		attempts := artifactAttempts(t, s)
+		if attempts["grp/p"] != 5 {
+			t.Errorf("grp/p v1 workflow attempt = %d, want 5", attempts["grp/p"])
+		}
+		if attempts["grp/other"] != 2 {
+			t.Errorf("grp/other v1 workflow attempt = %d, want independently incremented to 2",
+				attempts["grp/other"])
+		}
+	})
+
+	t.Run("NextWorkflowAttemptAllConcurrentWaterlines", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.RegisterArtifacts(ctx, []Artifact{
+			{Project: "grp/p", CommitSHA: "feed1234", PipelineID: 7, Variant: "v1",
+				BuildType: "Release", URL: "u1", SHA256: "s1"},
+			{Project: "grp/p", CommitSHA: "feed1234", PipelineID: 7, Variant: "v2",
+				BuildType: "Release", URL: "u2", SHA256: "s2"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for want := 1; want <= 3; want++ {
+			if n, err := s.NextWorkflowAttempt(ctx, "grp/p", "feed1234", 7, "v2"); err != nil || n != want {
+				t.Fatalf("skew v2 = %d err=%v, want %d", n, err, want)
+			}
+		}
+
+		const calls = 8
+		results := make(chan int, calls)
+		errs := make(chan error, calls)
+		var wg sync.WaitGroup
+		for range calls {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				n, err := s.NextWorkflowAttemptAll(ctx, "grp/p", "feed1234", 7)
+				results <- n
+				errs <- err
+			}()
+		}
+		wg.Wait()
+		close(results)
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent attempt all: %v", err)
+			}
+		}
+		got := make([]int, 0, calls)
+		for n := range results {
+			got = append(got, n)
+		}
+		sort.Ints(got)
+		want := []int{4, 5, 6, 7, 8, 9, 10, 11}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("concurrent waterlines = %v, want %v", got, want)
+		}
+		for _, variant := range []string{"v1", "v2"} {
+			n, err := s.NextWorkflowAttempt(ctx, "grp/p", "feed1234", 7, variant)
+			if err != nil || n != 12 {
+				t.Fatalf("%s after concurrent all = %d err=%v, want 12", variant, n, err)
+			}
+		}
+	})
+
+	t.Run("NextWorkflowAttemptMixedConcurrentNamespace", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.RegisterArtifacts(ctx, []Artifact{
+			{Project: "grp/p", CommitSHA: "face1234", PipelineID: 8, Variant: "v1",
+				BuildType: "Release", URL: "u1", SHA256: "s1"},
+			{Project: "grp/p", CommitSHA: "face1234", PipelineID: 8, Variant: "v2",
+				BuildType: "Release", URL: "u2", SHA256: "s2"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		const callsPerKind = 8
+		results := make(chan int, callsPerKind*2)
+		errs := make(chan error, callsPerKind*2)
+		var wg sync.WaitGroup
+		for range callsPerKind {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				n, err := s.NextWorkflowAttemptAll(ctx, "grp/p", "face1234", 8)
+				results <- n
+				errs <- err
+			}()
+			go func() {
+				defer wg.Done()
+				n, err := s.NextWorkflowAttempt(ctx, "grp/p", "face1234", 8, "v1")
+				results <- n
+				errs <- err
+			}()
+		}
+		wg.Wait()
+		close(results)
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("mixed concurrent attempt: %v", err)
+			}
+		}
+		got := make([]int, 0, callsPerKind*2)
+		for n := range results {
+			got = append(got, n)
+		}
+		sort.Ints(got)
+		want := make([]int, callsPerKind*2)
+		for i := range want {
+			want[i] = i + 1
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("mixed shared-namespace attempts = %v, want %v", got, want)
 		}
 	})
 
@@ -1472,10 +1850,8 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 			t.Fatalf("adversary 项目名长度必须与 proj 一致才能对齐下划线位置: %d vs %d", len(advProj), len(proj))
 		}
 		advBase := wf.BaseWorkflowID(advProj, sha, iid)
-		// 复用与 proj 完全相同的 (commit, pipeline, variant) 三元组注册:
-		// artifacts 的唯一键不含 project(schema.sql: UNIQUE(commit_sha, pipeline_id,
-		// variant)),这里必然是空操作(proj 的 v1 行已占住该键),不影响下方断言,
-		// 保留调用只是如实反映"两个项目撞在同一逻辑键上"的场景。
+		// 复用与 proj 完全相同的 (commit, pipeline, variant) 三元组注册;
+		// project 已纳入 artifact identity,两个项目都必须保留独立行和结论。
 		if err := s.RegisterArtifacts(ctx, []Artifact{
 			{Project: advProj, CommitSHA: sha, PipelineID: iid, Variant: v1, URL: "adv", SHA256: "adv"},
 		}); err != nil {
@@ -1498,12 +1874,15 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		if err != nil {
 			t.Fatalf("RecentRuns after adversary: %v", err)
 		}
-		byVariant = map[string]RecentRun{}
+		byProjectVariant := map[string]RecentRun{}
 		for _, r := range runs {
-			byVariant[r.Variant] = r
+			byProjectVariant[r.Project+"|"+r.Variant] = r
 		}
-		if got := byVariant[v1].Verdict; got != "PASSED" {
+		if got := byProjectVariant[proj+"|"+v1].Verdict; got != "PASSED" {
 			t.Errorf("%s verdict = %q, want PASSED(不得被下划线位置不同的对抗项目 %s 抢走结论)", v1, got, advProj)
+		}
+		if got := byProjectVariant[advProj+"|"+v1].Verdict; got != "INFRA_ERROR" {
+			t.Errorf("%s/%s verdict = %q, want INFRA_ERROR", advProj, v1, got)
 		}
 	})
 
@@ -1536,6 +1915,190 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 				t.Errorf("runs[%d].Commit = %q, want %q(应为最近注册的 3 条,新→旧排序)",
 					i, runs[i].Commit, want)
 			}
+		}
+	})
+
+	t.Run("RecentRunsAuthoritativeFirst", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.RegisterArtifacts(ctx, []Artifact{{
+			Project: "legacy/project", CommitSHA: "legacy", PipelineID: 1,
+			Variant: "legacy-v", URL: "u", SHA256: "s",
+		}}); err != nil {
+			t.Fatalf("RegisterArtifacts: %v", err)
+		}
+		run := WorkflowRun{
+			WorkflowID: "authoritative-run", Project: "grp/project",
+			CommitSHA: "abcd1234", PipelineID: 42, Version: "1.2.3",
+			RuleVersion: "rules-v7", Scope: "bundle", Attempt: 2,
+			Variants: []string{"v2", "v1"},
+		}
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+
+		got, err := s.RecentRuns(ctx, 3)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("runs = %#v, want 3", got)
+		}
+		for i, variant := range []string{"v1", "v2"} {
+			want := RecentRun{
+				WorkflowID: "authoritative-run", Project: "grp/project",
+				Commit: "abcd1234", PipelineID: 42, Version: "1.2.3",
+				RuleVersion: "rules-v7", Variant: variant, Authoritative: true,
+			}
+			if !reflect.DeepEqual(got[i], want) {
+				t.Errorf("runs[%d] = %#v, want %#v", i, got[i], want)
+			}
+		}
+		if got[2].Project != "legacy/project" || got[2].Variant != "legacy-v" ||
+			got[2].Authoritative || got[2].WorkflowID != "" || got[2].Version != "" ||
+			got[2].RuleVersion != "" {
+			t.Errorf("legacy fallback = %#v, want non-authoritative legacy row", got[2])
+		}
+	})
+
+	t.Run("RecentRunsExpandsVariantsBeforeLimit", func(t *testing.T) {
+		s := newStore(t)
+		old := WorkflowRun{
+			WorkflowID: "run-old", Project: "p", CommitSHA: "old", PipelineID: 1,
+			Version: "1", RuleVersion: "r", Variants: []string{"old-v"},
+		}
+		newest := WorkflowRun{
+			WorkflowID: "run-new", Project: "p", CommitSHA: "new", PipelineID: 2,
+			Version: "2", RuleVersion: "r2",
+			Variants: []string{"v4", "v2", "v1", "v3"},
+		}
+		for _, run := range []WorkflowRun{old, newest} {
+			if err := s.RecordWorkflowRun(ctx, run); err != nil {
+				t.Fatalf("RecordWorkflowRun %s: %v", run.WorkflowID, err)
+			}
+		}
+
+		got, err := s.RecentRuns(ctx, 3)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("runs = %#v, want 3", got)
+		}
+		for i, variant := range []string{"v1", "v2", "v3"} {
+			if got[i].WorkflowID != newest.WorkflowID || got[i].Variant != variant ||
+				!got[i].Authoritative {
+				t.Errorf("runs[%d] = %#v, want newest/%s authoritative", i, got[i], variant)
+			}
+		}
+	})
+
+	t.Run("RecentRunsExactTaskAssociation", func(t *testing.T) {
+		s := newStore(t)
+		run := WorkflowRun{
+			WorkflowID: "run-exact", Project: "p", CommitSHA: "sha", PipelineID: 7,
+			Version: "1", RuleVersion: "r", Variants: []string{"v1", "v2"},
+		}
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+		tasks := []wf.TaskRow{
+			{TaskID: "exact-v1-a0", WorkflowID: run.WorkflowID, TestID: "v1", Attempt: 0, IdempotencyKey: "exact-v1-a0", Status: "RUNNING"},
+			{TaskID: "exact-v1-a2", WorkflowID: run.WorkflowID, TestID: "v1", Attempt: 2, IdempotencyKey: "exact-v1-a2", Status: "RUNNING"},
+			{TaskID: "exact-v2", WorkflowID: run.WorkflowID, TestID: "v2", Attempt: 0, IdempotencyKey: "exact-v2", Status: "RUNNING"},
+			{TaskID: "prefix", WorkflowID: "prefix-" + run.WorkflowID, TestID: "v1", Attempt: 99, IdempotencyKey: "prefix", Status: "RUNNING"},
+			{TaskID: "suffix", WorkflowID: run.WorkflowID + "-suffix", TestID: "v1", Attempt: 100, IdempotencyKey: "suffix", Status: "RUNNING"},
+			{TaskID: "wrong-test", WorkflowID: run.WorkflowID, TestID: "v10", Attempt: 101, IdempotencyKey: "wrong-test", Status: "RUNNING"},
+		}
+		for _, row := range tasks {
+			if err := s.CreateTask(ctx, row); err != nil {
+				t.Fatalf("CreateTask %s: %v", row.TaskID, err)
+			}
+		}
+		for taskID, verdict := range map[string]string{
+			"exact-v1-a0": "TEST_FAILED",
+			"exact-v1-a2": "PASSED",
+			"prefix":      "INFRA_ERROR",
+			"suffix":      "INFRA_ERROR",
+			"wrong-test":  "INFRA_ERROR",
+		} {
+			if err := s.FinishTask(ctx, wf.FinishRequest{
+				TaskID: taskID, Status: "COMPLETED", Verdict: verdict,
+			}); err != nil {
+				t.Fatalf("FinishTask %s: %v", taskID, err)
+			}
+		}
+
+		got, err := s.RecentRuns(ctx, 10)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("runs = %#v, want 2", got)
+		}
+		if got[0].Variant != "v1" || got[0].Verdict != "PASSED" ||
+			got[0].EndedAt.IsZero() {
+			t.Errorf("v1 = %#v, want exact workflow/test latest attempt PASSED", got[0])
+		}
+		if got[1].Variant != "v2" || got[1].Verdict != "" ||
+			!got[1].EndedAt.IsZero() {
+			t.Errorf("v2 = %#v, want running task without verdict/end", got[1])
+		}
+	})
+
+	t.Run("RecentRunsLegacyFallbackAndGlobalDedup", func(t *testing.T) {
+		s := newStore(t)
+		run := WorkflowRun{
+			WorkflowID: "registered-run", Project: "p", CommitSHA: "same", PipelineID: 1,
+			Version: "1", RuleVersion: "r", Variants: []string{"v1"},
+		}
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+		// The duplicate is deliberately newer than the unique fallback. Deduplication
+		// must happen before the fallback LIMIT or it crowds the unique row out.
+		if err := s.RegisterArtifacts(ctx, []Artifact{
+			{Project: "legacy", CommitSHA: "unique", PipelineID: 2, Variant: "v2", URL: "u", SHA256: "s"},
+			{Project: "p", CommitSHA: "same", PipelineID: 1, Variant: "v1", URL: "u", SHA256: "s"},
+		}); err != nil {
+			t.Fatalf("RegisterArtifacts: %v", err)
+		}
+
+		got, err := s.RecentRuns(ctx, 2)
+		if err != nil {
+			t.Fatalf("RecentRuns: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("runs = %#v, want authoritative plus unique fallback", got)
+		}
+		if !got[0].Authoritative || got[0].WorkflowID != run.WorkflowID {
+			t.Errorf("runs[0] = %#v, want authoritative run", got[0])
+		}
+		if got[1].Authoritative || got[1].Commit != "unique" || got[1].Variant != "v2" {
+			t.Errorf("runs[1] = %#v, want unique legacy fallback", got[1])
+		}
+	})
+
+	t.Run("RecentRunsReturnsDefensiveCopies", func(t *testing.T) {
+		s := newStore(t)
+		run := WorkflowRun{
+			WorkflowID: "defensive-run", Project: "p", CommitSHA: "sha", PipelineID: 1,
+			Version: "1", RuleVersion: "r", Variants: []string{"v1"},
+		}
+		if err := s.RecordWorkflowRun(ctx, run); err != nil {
+			t.Fatalf("RecordWorkflowRun: %v", err)
+		}
+		first, err := s.RecentRuns(ctx, 1)
+		if err != nil {
+			t.Fatalf("RecentRuns first: %v", err)
+		}
+		first[0].Project = "mutated"
+		first[0].Verdict = "mutated"
+		second, err := s.RecentRuns(ctx, 1)
+		if err != nil {
+			t.Fatalf("RecentRuns second: %v", err)
+		}
+		if second[0].Project != "p" || second[0].Verdict != "" {
+			t.Fatalf("stored result mutated through caller slice: %#v", second[0])
 		}
 	})
 }

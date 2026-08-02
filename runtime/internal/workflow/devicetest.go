@@ -3,6 +3,7 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -306,6 +307,33 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 		return nil, fmt.Errorf("device test %s: %w", in.WorkflowID(), err)
 	}
 
+	if workflow.GetVersion(
+		ctx, "record-workflow-run-v1", workflow.DefaultVersion, 1,
+	) != workflow.DefaultVersion {
+		actualID := workflow.GetInfo(ctx).WorkflowExecution.ID
+		if actualID != in.WorkflowID() {
+			return nil, fmt.Errorf(
+				"workflow execution id %q does not match input id %q",
+				actualID, in.WorkflowID(),
+			)
+		}
+		recordCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			StartToCloseTimeout: 30 * time.Second,
+			RetryPolicy: &temporal.RetryPolicy{
+				InitialInterval:    2 * time.Second,
+				BackoffCoefficient: 2,
+				MaximumInterval:    time.Minute,
+				MaximumAttempts:    0,
+			},
+		})
+		req := newRecordWorkflowRunRequest(actualID, in, ruleVersion)
+		if err := workflow.ExecuteActivity(
+			recordCtx, "RecordWorkflowRun", req,
+		).Get(recordCtx, nil); err != nil {
+			return nil, fmt.Errorf("record workflow run: %w", err)
+		}
+	}
+
 	var sel SpecSelection
 	if err := workflow.ExecuteActivity(ctx, "SelectTestSpecs", in).Get(ctx, &sel); err != nil {
 		return nil, fmt.Errorf("select test specs: %w", err)
@@ -325,11 +353,55 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 		out.Tasks = append(out.Tasks, runTest(ctx, in, spec, ruleVersion, resultCh))
 	}
 
-	text := buildNotification(in, out)
-	if err := workflow.ExecuteActivity(ctx, "Notify", text).Get(ctx, nil); err != nil {
-		workflow.GetLogger(ctx).Error("notify failed", "error", err)
+	// notify-card 版本分支(设计文档 §5):在途 workflow(重放旧 history)必须原样
+	// 发纯文本,新 workflow 一律发交互卡片。buildNotification 两个分支都要调用——
+	// 旧分支直接发送,新分支作为卡片的降级文本随载荷下发,因此不是死代码。
+	if workflow.GetVersion(ctx, "notify-card", workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+		if err := workflow.ExecuteActivity(ctx, "Notify", buildNotification(in, out)).Get(ctx, nil); err != nil {
+			workflow.GetLogger(ctx).Error("notify failed", "error", err)
+		}
+	} else {
+		req := NotifyCardRequest{
+			Card:         buildNotificationCard(in, out),
+			FallbackText: buildNotification(in, out), // 原函数,原样调用
+		}
+		if err := workflow.ExecuteActivity(ctx, "NotifyCard", req).Get(ctx, nil); err != nil {
+			workflow.GetLogger(ctx).Error("notify card failed", "error", err)
+		}
 	}
 	return out, nil
+}
+
+func newRecordWorkflowRunRequest(
+	workflowID string,
+	in DeviceTestInput,
+	ruleVersion string,
+) RecordWorkflowRunRequest {
+	variants := make([]string, 0, len(in.Packages))
+	for _, pkg := range in.Packages {
+		if pkg.Variant != "" {
+			variants = append(variants, pkg.Variant)
+		}
+	}
+	sort.Strings(variants)
+	canonical := variants[:0]
+	for _, variant := range variants {
+		if len(canonical) == 0 || canonical[len(canonical)-1] != variant {
+			canonical = append(canonical, variant)
+		}
+	}
+	return RecordWorkflowRunRequest{
+		WorkflowID:       workflowID,
+		Project:          in.Project,
+		CommitSHA:        in.Commit,
+		PipelineID:       in.PipelineID,
+		Version:          in.Version,
+		RuleVersion:      ruleVersion,
+		Scope:            in.Scope,
+		Attempt:          in.Attempt,
+		Variants:         canonical,
+		SourceWorkflowID: in.SourceWorkflowID,
+	}
 }
 
 // runTest 执行一个测试(含 INFRA 机械重试,§10 缺省 ≤2 次)。
@@ -788,4 +860,240 @@ func buildNotification(in DeviceTestInput, out *DeviceTestOutput) string {
 		}
 	}
 	return b.String()
+}
+
+// ---- 通知卡片(Phase 2,设计文档 §4.4)----
+
+// NotificationCard 是终态通知卡片的封闭结构(本轮范围门禁)。
+// 它不含任何可表达交互的字段——没有 actions、没有 behaviors、没有 value——
+// 因此按钮不可能在不修改本类型(进而不修改 spec)的前提下漏进展示卡片。
+type NotificationCard struct {
+	Config   CardConfig    `json:"config"`
+	Header   CardHeader    `json:"header"`
+	Elements []CardElement `json:"elements"`
+}
+
+type CardConfig struct {
+	WideScreenMode bool `json:"wide_screen_mode"`
+}
+
+type CardHeader struct {
+	Title    CardText `json:"title"`
+	Template string   `json:"template"` // 只允许 green | red | orange(§4.1)
+}
+
+// CardElement 只有两种形态:文本块(tag=div,Text 非空)与分隔线(tag=hr,Text 为 nil)。
+type CardElement struct {
+	Tag  string    `json:"tag"`            // 只允许 div | hr
+	Text *CardText `json:"text,omitempty"` // tag=hr 时必须为 nil
+}
+
+// CardText 的 Tag 恒为 plain_text(§4.5),没有 lark_md 这个选项。
+type CardText struct {
+	Tag     string `json:"tag"` // 恒为 "plain_text"
+	Content string `json:"content"`
+}
+
+// NotifyCardRequest 是 NotifyCard 活动的输入(进 workflow history)。
+// FallbackText 由 workflow 调既有的 buildNotification 生成并随载荷下发:
+// activity 侧**绝不自行拼文本**——两处实现同一格式必然漂移,而"降级内容与改动前
+// 逐字节相同"是本轮的验收项。
+type NotifyCardRequest struct {
+	Card         NotificationCard `json:"card"`
+	FallbackText string           `json:"fallback_text"`
+}
+
+// cardByteBudget 是卡片序列化后的总大小上限(设计 §4.5)。
+const cardByteBudget = 30 * 1024
+
+// cardReasonSummaryLimit 是单个 Reason / Analysis.Summary 的 rune 上限(设计 §4.5)。
+const cardReasonSummaryLimit = 500
+
+// cardTruncationMarker 是超长文本被截断后追加的省略标记(设计 §4.5:"截断并带省略标记")。
+// 提到包级是为了让测试直接引用这个真实值断言"标记确实出现",而不是在测试里
+// 另造一份字面量、悄悄漂离实现。
+const cardTruncationMarker = "…(已截断)"
+
+// truncateRunes 按 rune 边界截断超长文本并加省略标记(设计 §4.5)。
+// 用 []rune 切片而非 s[:n] 字节切片:中文在 UTF-8 下是多字节,按字节切会切出
+// 半个字符,导致 utf8.ValidString 为假,飞书侧可能渲染乱码甚至拒收。
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	markerRunes := []rune(cardTruncationMarker)
+	keep := max - len(markerRunes)
+	if keep < 0 {
+		keep = 0
+	}
+	return string(r[:keep]) + cardTruncationMarker
+}
+
+// plainCardDiv 构造一个 tag=div、text.tag=plain_text 的卡片行(设计 §4.5:
+// 卡片里所有文本节点一律 plain_text,不用 lark_md)。
+func plainCardDiv(content string) CardElement {
+	return CardElement{Tag: "div", Text: &CardText{Tag: "plain_text", Content: content}}
+}
+
+// cardHeaderTemplate 按设计 §4.1 判定 header 颜色。
+// 可判定失败 = verdict ∉ {PASSED, SKIPPED};业务失败优先:同时存在 INFRA_ERROR
+// 与其他失败时判红,不判橙——否则会把"代码有问题"显示成"环境有问题"。
+func cardHeaderTemplate(tasks []TaskSummary) string {
+	hasNonInfra := false
+	hasInfra := false
+	for _, tk := range tasks {
+		if tk.Verdict == string(rules.VerdictPassed) || tk.Verdict == VerdictSkipped {
+			continue
+		}
+		if tk.Verdict == string(rules.VerdictInfraError) {
+			hasInfra = true
+		} else {
+			hasNonInfra = true
+		}
+	}
+	switch {
+	case hasNonInfra:
+		return "red"
+	case hasInfra:
+		return "orange"
+	default:
+		return "green"
+	}
+}
+
+// cardVariantBlock 是单个变体在卡片里的行分组:主行(main)恒存在且不可裁剪,
+// metric 按格式表条件出现但始终保留;reason/hermes 是"该变体的详情",
+// 裁剪时按变体整体丢弃(设计 §4.5 第 1 步)。
+type cardVariantBlock struct {
+	main   CardElement
+	metric *CardElement
+	reason *CardElement
+	hermes *CardElement
+}
+
+func (b cardVariantBlock) hasDetail() bool { return b.reason != nil || b.hermes != nil }
+
+func (b *cardVariantBlock) clearDetail() {
+	b.reason = nil
+	b.hermes = nil
+}
+
+func (b cardVariantBlock) flatten() []CardElement {
+	es := []CardElement{b.main}
+	if b.metric != nil {
+		es = append(es, *b.metric)
+	}
+	if b.reason != nil {
+		es = append(es, *b.reason)
+	}
+	if b.hermes != nil {
+		es = append(es, *b.hermes)
+	}
+	return es
+}
+
+// buildCardVariantBlock 逐条对齐 buildNotification 的字段(设计 §4.3),
+// 唯一有意偏离:SKIPPED 不显示 attempt。
+func buildCardVariantBlock(tk TaskSummary) cardVariantBlock {
+	main := fmt.Sprintf("%s  %s", tk.Variant, tk.Verdict)
+	if tk.Verdict != string(rules.VerdictPassed) && tk.Category != "" {
+		main += fmt.Sprintf("(%s)", tk.Category)
+	}
+	blk := cardVariantBlock{main: plainCardDiv(main)}
+
+	var parts []string
+	if tk.CasesTotal > 0 {
+		parts = append(parts, fmt.Sprintf("%.1fs", tk.DurationSec))
+		parts = append(parts, fmt.Sprintf("cases %d/%d", tk.CasesTotal-tk.CasesFailed, tk.CasesTotal))
+	}
+	if tk.Verdict != VerdictSkipped {
+		parts = append(parts, fmt.Sprintf("attempt %d", tk.Attempt))
+	}
+	if len(parts) > 0 {
+		m := plainCardDiv(strings.Join(parts, " · "))
+		blk.metric = &m
+	}
+
+	if tk.Reason != "" {
+		r := plainCardDiv(truncateRunes(tk.Reason, cardReasonSummaryLimit))
+		blk.reason = &r
+	}
+	if tk.Analysis != nil && tk.Analysis.Summary != "" {
+		h := plainCardDiv("hermes: " + truncateRunes(tk.Analysis.Summary, cardReasonSummaryLimit))
+		blk.hermes = &h
+	}
+	return blk
+}
+
+// flattenCardBlocks 把各变体的行拼成 Elements,变体之间插 hr(首个变体前不插)。
+func flattenCardBlocks(blocks []cardVariantBlock) []CardElement {
+	var es []CardElement
+	for i, b := range blocks {
+		if i > 0 {
+			es = append(es, CardElement{Tag: "hr"})
+		}
+		es = append(es, b.flatten()...)
+	}
+	return es
+}
+
+// cardOmittedNotice 是裁剪后追加的省略标注(设计 §4.5)。格式串是契约的一部分:
+// TestBuildNotificationCardTrimsFromTail 按此串精确匹配,改措辞两边要同步改。
+func cardOmittedNotice(n int) CardElement {
+	return plainCardDiv(fmt.Sprintf("（%d 个变体的详情已省略）", n))
+}
+
+// buildNotificationCard 把 buildNotification 同源的数据渲染成飞书交互卡片
+// (设计 §4)。字段对齐见 §4.3,封闭结构见 §4.4,裁剪见 §4.5。
+func buildNotificationCard(in DeviceTestInput, out *DeviceTestOutput) NotificationCard {
+	title := fmt.Sprintf("[hermes-devops] %s g%s p%d (v%s)", in.Project, in.Commit, in.PipelineID, in.Version)
+	card := NotificationCard{
+		Config: CardConfig{WideScreenMode: true},
+		Header: CardHeader{
+			Title:    CardText{Tag: "plain_text", Content: title},
+			Template: cardHeaderTemplate(out.Tasks),
+		},
+	}
+
+	if len(out.Tasks) == 0 {
+		card.Elements = []CardElement{plainCardDiv("无可测变体(Android 包缺失或未配置)")}
+		return card
+	}
+
+	blocks := make([]cardVariantBlock, len(out.Tasks))
+	for i, tk := range out.Tasks {
+		blocks[i] = buildCardVariantBlock(tk)
+	}
+	card.Elements = flattenCardBlocks(blocks)
+
+	if raw, err := json.Marshal(card); err == nil && len(raw) <= cardByteBudget {
+		return card
+	}
+
+	// 超预算:按变体顺序从末尾丢可选行(reason/hermes),每丢一个就连同标注
+	// 重新 Marshal 测量一次——标注本身也占字节,不重测会把刚裁到边界的卡片
+	// 又推回超限(设计 §4.5 第 2 步)。
+	omitted := 0
+	for i := len(blocks) - 1; i >= 0; i-- {
+		if !blocks[i].hasDetail() {
+			continue
+		}
+		blocks[i].clearDetail()
+		omitted++
+
+		candidate := card
+		candidate.Elements = append(flattenCardBlocks(blocks), cardOmittedNotice(omitted))
+		if raw, err := json.Marshal(candidate); err == nil && len(raw) <= cardByteBudget {
+			return candidate
+		}
+	}
+
+	// 详情已丢无可丢,仍然超预算:尽力而为,最终把关在 NotifyCard 活动侧
+	// (设计 §5.2 第 3 步,重新测量后不达标直接发降级纯文本)。
+	card.Elements = flattenCardBlocks(blocks)
+	if omitted > 0 {
+		card.Elements = append(card.Elements, cardOmittedNotice(omitted))
+	}
+	return card
 }

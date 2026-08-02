@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -80,78 +79,142 @@ func (s *MemStore) UnquarantineDevice(_ context.Context, deviceID string) (bool,
 	return true, nil
 }
 
-// ListArtifacts 返回 (commit,pipeline) 逻辑键下的全部产物行(飞书指令 rerun
-// 重建 DeviceTestInput 用);无记录返回空切片。
-func (s *MemStore) ListArtifacts(_ context.Context, commitSHA string, pipelineID int) ([]Artifact, error) {
+// ListArtifacts 返回指定 project/commit/pipeline 的全部产物。
+func (s *MemStore) ListArtifacts(
+	_ context.Context, project, commitSHA string, pipelineID int,
+) ([]Artifact, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := []Artifact{}
-	prefix := commitSHA + "|" + strconv.Itoa(pipelineID) + "|"
-	for k, a := range s.rows {
-		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+	for _, a := range s.rows {
+		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
 			out = append(out, a)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Variant < out[j].Variant })
 	return out, nil
 }
 
-// NextWorkflowAttemptAll 把 (commit,pipeline) 键下全部产物行的 workflow_attempt
-// 原子 +1,返回新的最大值(bundle 级显式 rerun 的 -r{N} 后缀来源;
-// 各变体行可能被 kick retry 单独递增过,取 max 保证 ID 唯一)。
-// 键下无记录返回错误。
-func (s *MemStore) NextWorkflowAttemptAll(_ context.Context, commitSHA string, pipelineID int) (int, error) {
+// NextWorkflowAttemptAll 把指定 project/commit/pipeline 的全部变体推进到
+// 当前最大值的下一水位，确保 bundle 与变体级 retry 共用单调序号空间。
+func (s *MemStore) NextWorkflowAttemptAll(
+	_ context.Context, project, commitSHA string, pipelineID int,
+) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prefix := commitSHA + "|" + strconv.Itoa(pipelineID) + "|"
-	maxN := 0
-	for k, a := range s.rows {
-		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
-			a.WorkflowAttempt++
-			s.rows[k] = a
+	maxN := -1
+	for _, a := range s.rows {
+		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
 			if a.WorkflowAttempt > maxN {
 				maxN = a.WorkflowAttempt
 			}
 		}
 	}
-	if maxN == 0 {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d", commitSHA, pipelineID)
+	if maxN < 0 {
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d",
+			project, commitSHA, pipelineID)
 	}
-	return maxN, nil
+	target := maxN + 1
+	for k, a := range s.rows {
+		if a.Project == project && a.CommitSHA == commitSHA && a.PipelineID == pipelineID {
+			a.WorkflowAttempt = target
+			s.rows[k] = a
+		}
+	}
+	return target, nil
 }
 
 // RecentRun 是快照里的一次运行(设计文档 §4.2)。Verdict 为空表示尚无终态结论。
 type RecentRun struct {
-	Project    string
-	Commit     string
-	PipelineID int
-	Variant    string
-	Verdict    string
-	EndedAt    time.Time
+	WorkflowID    string
+	Project       string
+	Commit        string
+	PipelineID    int
+	Version       string
+	RuleVersion   string
+	Variant       string
+	Verdict       string
+	EndedAt       time.Time
+	Authoritative bool
 }
 
-// RecentRuns 返回最近 limit 条产物及其最新一次运行结论(飞书指令层翻译上下文)。
-// 关联规则(设计文档 §3.2):同一 (commit,iid,variant) 的 task 可能挂在 bundle
-// workflow(ID = base)、变体 workflow(base-variant)或两者的 -r{N} 重跑下,
-// 且 bundle 下多个变体共享同一 workflow_id——必须同时按 test_id 过滤才不串变体。
+// RecentRuns 优先返回 workflow_runs 的权威运行记录，再补充尚未被 registry
+// 覆盖的旧 artifacts。权威记录只与完全相同 workflow_id/test_id 的 task 关联。
 func (s *MemStore) RecentRuns(_ context.Context, limit int) ([]RecentRun, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	type keyed struct {
+
+	type keyedRun struct {
+		run WorkflowRun
+		seq int64
+	}
+	runs := make([]keyedRun, 0, len(s.workflowRuns))
+	excluded := make(map[string]struct{})
+	for workflowID, run := range s.workflowRuns {
+		runs = append(runs, keyedRun{run: run, seq: s.runSeq[workflowID]})
+		for _, variant := range run.Variants {
+			excluded[artifactKey(run.Project, run.CommitSHA, run.PipelineID, variant)] = struct{}{}
+		}
+	}
+	sort.Slice(runs, func(i, j int) bool {
+		if runs[i].seq != runs[j].seq {
+			return runs[i].seq > runs[j].seq
+		}
+		return runs[i].run.WorkflowID > runs[j].run.WorkflowID
+	})
+
+	out := make([]RecentRun, 0, limit)
+	for _, keyed := range runs {
+		run := keyed.run
+		for _, variant := range run.Variants {
+			var best *taskRecord
+			for _, rec := range s.tasks {
+				if rec.row.WorkflowID != run.WorkflowID || rec.row.TestID != variant {
+					continue
+				}
+				if best == nil || rec.row.Attempt > best.row.Attempt ||
+					(rec.row.Attempt == best.row.Attempt && rec.seq > best.seq) ||
+					(rec.row.Attempt == best.row.Attempt && rec.seq == best.seq &&
+						rec.row.TaskID > best.row.TaskID) {
+					best = rec
+				}
+			}
+			recent := RecentRun{
+				WorkflowID: run.WorkflowID, Project: run.Project, Commit: run.CommitSHA,
+				PipelineID: run.PipelineID, Version: run.Version, RuleVersion: run.RuleVersion,
+				Variant: variant, Authoritative: true,
+			}
+			if best != nil {
+				recent.Verdict, recent.EndedAt = best.verdict, best.endedAt
+			}
+			out = append(out, recent)
+			if len(out) == limit {
+				return out, nil
+			}
+		}
+	}
+
+	type keyedArtifact struct {
 		art Artifact
 		seq int64
 	}
-	all := make([]keyed, 0, len(s.rows))
+	all := make([]keyedArtifact, 0, len(s.rows))
 	for k, a := range s.rows {
-		all = append(all, keyed{art: a, seq: s.rowSeq[k]})
+		if _, ok := excluded[artifactKey(a.Project, a.CommitSHA, a.PipelineID, a.Variant)]; ok {
+			continue
+		}
+		all = append(all, keyedArtifact{art: a, seq: s.rowSeq[k]})
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].seq > all[j].seq })
-	if len(all) > limit {
-		all = all[:limit]
-	}
-	out := make([]RecentRun, 0, len(all))
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].seq != all[j].seq {
+			return all[i].seq > all[j].seq
+		}
+		return artifactKey(all[i].art.Project, all[i].art.CommitSHA, all[i].art.PipelineID, all[i].art.Variant) >
+			artifactKey(all[j].art.Project, all[j].art.CommitSHA, all[j].art.PipelineID, all[j].art.Variant)
+	})
 	for _, k := range all {
 		a := k.art
 		run := RecentRun{
@@ -176,6 +239,9 @@ func (s *MemStore) RecentRuns(_ context.Context, limit int) ([]RecentRun, error)
 			run.Verdict, run.EndedAt = best.verdict, best.endedAt
 		}
 		out = append(out, run)
+		if len(out) == limit {
+			break
+		}
 	}
 	return out, nil
 }

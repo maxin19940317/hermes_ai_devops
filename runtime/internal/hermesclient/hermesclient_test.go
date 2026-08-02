@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -246,7 +247,7 @@ func TestTranslateOK(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
-		_, _ = w.Write([]byte(`{"translation_version":1,"command":"devices","args":[],"confidence":0.95}`))
+		_, _ = w.Write([]byte(`{"translation_version":2,"command":"devices","args":[],"confidence":0.95}`))
 	}))
 	defer srv.Close()
 	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
@@ -267,7 +268,7 @@ func TestTranslateOK(t *testing.T) {
 func TestTranslateRejectsInvalidSchema(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// command 不在闭枚举内:必须被本地 Schema 校验挡下(跨进程边界不信任对端)
-		_, _ = w.Write([]byte(`{"translation_version":1,"command":"reboot","confidence":0.9}`))
+		_, _ = w.Write([]byte(`{"translation_version":2,"command":"reboot","confidence":0.9}`))
 	}))
 	defer srv.Close()
 	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
@@ -288,7 +289,7 @@ func TestTranslateRejectsInvalidSchema(t *testing.T) {
 func TestTranslateSchemaInvalidIncludesBodySnippet(t *testing.T) {
 	const marker = "reboot-xyz-distinctive-marker"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"translation_version":1,"command":"` + marker + `","confidence":0.9}`))
+		_, _ = w.Write([]byte(`{"translation_version":2,"command":"` + marker + `","confidence":0.9}`))
 	}))
 	defer srv.Close()
 	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
@@ -326,13 +327,60 @@ func TestTranslateNon2xx(t *testing.T) {
 // 非法。companion 的 anchor-free "not" 约束必须让两侧行为一致地拒绝它;这里独立
 // 验证 Go 侧(contracts/tests/test_command_schema.py 用同一份 fixture 验证 Python 侧)。
 func TestCommandSchemaRejectsArgTrailingNewline(t *testing.T) {
-	raw := []byte(`{"translation_version":1,"command":"unquarantine","args":["9da3b9d9\n"],"confidence":0.9}`)
+	raw := []byte(`{"translation_version":2,"command":"unquarantine","args":["9da3b9d9\n"],"confidence":0.9}`)
 	var doc any
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("unmarshal fixture: %v", err)
 	}
 	if err := commandSchema.Validate(doc); err == nil {
 		t.Fatal("want validation error for trailing-newline arg (anchor-free companion pattern should reject it), got nil")
+	}
+}
+
+func TestTranslateRejectsUnicodeWhitespaceArgs(t *testing.T) {
+	for _, whitespace := range []rune{'\u00a0', '\u2003', '\u3000'} {
+		t.Run(fmt.Sprintf("U+%04X", whitespace), func(t *testing.T) {
+			response, err := json.Marshal(Translation{
+				TranslationVersion: 2,
+				Command:            "rerun",
+				Args:               []string{"workflow" + string(whitespace) + "id"},
+				Confidence:         0.9,
+			})
+			if err != nil {
+				t.Fatalf("marshal response: %v", err)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write(response)
+			}))
+			defer srv.Close()
+
+			c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
+			_, err = c.Translate(context.Background(), TranslateRequest{RawText: "重跑"})
+			if !errors.Is(err, ErrSchemaInvalid) {
+				t.Fatalf("Translate arg containing U+%04X error = %v, want ErrSchemaInvalid", whitespace, err)
+			}
+		})
+	}
+}
+
+func TestValidateTranslationArgsDefensiveBoundaries(t *testing.T) {
+	cases := []struct {
+		name string
+		arg  string
+		ok   bool
+	}{
+		{name: "valid", arg: "device-test-grp/algo-super-sdk-g9da3b9d9-p56", ok: true},
+		{name: "empty", arg: ""},
+		{name: "invalid_utf8", arg: string([]byte{0xff})},
+		{name: "too_long", arg: strings.Repeat("界", 513)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTranslationArgs([]string{tc.arg})
+			if (err == nil) != tc.ok {
+				t.Fatalf("validateTranslationArgs(%q) error = %v, want ok=%v", tc.arg, err, tc.ok)
+			}
+		})
 	}
 }
 
@@ -343,5 +391,19 @@ func TestCommandSchemaCopyMatchesContracts(t *testing.T) {
 	}
 	if string(src) != commandSchemaJSON {
 		t.Error("command.schema.json 与 contracts/ 不一致,请同步副本")
+	}
+}
+
+func TestTranslateUsesV2PromptAndContract(t *testing.T) {
+	if PromptVersionTranslate != "cmd_translate_v2" {
+		t.Fatalf("PromptVersionTranslate = %q, want cmd_translate_v2", PromptVersionTranslate)
+	}
+	for _, want := range []string{
+		"rerun <source_workflow_id> [variant]",
+		"authoritative:true",
+	} {
+		if !strings.Contains(PromptTranslate, want) {
+			t.Errorf("PromptTranslate 缺少 %q", want)
+		}
 	}
 }

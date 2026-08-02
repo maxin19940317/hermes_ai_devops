@@ -194,7 +194,7 @@ def test_schema_copy_matches_contracts():
 # ---------------------------------------------------------------------------
 
 TRANSLATE_VALID = {
-    "translation_version": 1,
+    "translation_version": 2,
     "command": "devices",
     "args": [],
     "confidence": 0.95,
@@ -260,3 +260,13 @@ def test_command_schema_copy_matches_contracts():
     )
     dst = Path(__file__).with_name("command.schema.json").read_text(encoding="utf-8")
     assert src == dst
+
+
+def test_translate_rejects_old_translation_version(client, fake_hermes):
+    put(
+        fake_hermes,
+        "resp_default.json",
+        {**TRANSLATE_VALID, "translation_version": 1},
+    )
+    r = client.post("/translate", json=TRANSLATE_PAYLOAD, headers=auth())
+    assert r.status_code == 502

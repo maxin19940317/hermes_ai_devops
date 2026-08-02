@@ -49,7 +49,7 @@
 | 数据库 | PostgreSQL 15+(与 Temporal 共实例分库) | Client 本地用 SQLite(WAL) |
 | 附件/日志存储 | MinIO(S3 兼容),预签名 URL 直传 | 大文件不过 Runtime |
 | 产物仓库 | GitLab Generic Package Registry(现状沿用) | |
-| 通知 | 飞书机器人 + 交互卡片(按钮回调 → Runtime signal) | |
+| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 按钮尚未实现,见 §12 Phase 2 |
 | 部署 | Docker Compose(服务器全套);Client 手动安装 MSI/exe | |
 | 日志 | 结构化日志(zerolog),UTC + 毫秒,全组件 NTP | |
 
@@ -241,7 +241,8 @@ verdict (终态后判定):
 
 ```text
 plans(plan_id PK, plan_json JSONB, origin, created_by, created_at)
-workflows(workflow_id PK, plan_id FK, status, started_at, ended_at)
+workflow_runs(workflow_id PK, project, commit_sha, pipeline_id, version, rule_version,
+              scope, attempt, variants TEXT[], source_workflow_id FK, created_at)
 tasks(task_id PK, workflow_id FK, test_id, attempt, idempotency_key UNIQUE,
       client_id, device_id, status, verdict, error_category, created_at, ended_at)
 clients(client_id PK, host, version, last_heartbeat, status)
@@ -256,6 +257,12 @@ decisions(decision_id PK, task_id, actor: hermes|human|rule, input_digest,
           model, prompt_version, output JSONB, created_at)   -- 一切裁决可回放
 audit_log(actor, action, target, payload_digest, ts)
 ```
+
+`workflow_runs` 是新运行输入的不可变权威索引，不保存 Temporal 状态或终态输出，也不从
+legacy artifacts/tasks 回填。`RecentRuns` 中无 `workflow_runs` 身份的 legacy 行只用于
+展示，不可触发副作用。人工重跑语法固定为
+`rerun <source_workflow_id> [variant]`；每条文本指令都会分配新的 attempt，不能把
+Temporal `RejectDuplicate` 当作指令幂等。持久化 action claim 留给下一轮飞书按钮实现。
 
 Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, started_at, ...)` + `events(seq, ...)`,每次状态迁移单事务落盘,崩溃重启后据此恢复。
 
@@ -278,7 +285,7 @@ Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, star
    目的:Windows+USB+ADB 是最大不确定段,用 CLI 手动踩完所有坑再套服务壳。
 4. Temporal spike(1 周内 go/no-go):signal 接收、Activity 重试、杀进程后重放恢复,三个最小示例。
 5. Trigger 服务:GitLab pipeline webhook(验签、去重)→ 拉 bundle-g{sha}.json → 登记 artifacts 表 → 启动 DeviceTestWorkflow。
-6. DeviceTestWorkflow 主干:resolve_artifact → acquire_device → dispatch(POST Client,幂等键={workflow_id}:{task_id}:{attempt})→ await_result(signal,租约由心跳续期,过期按 on_infra_error)→ extract_evidence → **规则引擎**判 verdict(不接 LLM)→ release_device → 飞书纯文本通知。
+6. DeviceTestWorkflow 主干:resolve_artifact → acquire_device → dispatch(POST Client,幂等键={workflow_id}:{task_id}:{attempt})→ await_result(signal,租约由心跳续期,过期按 on_infra_error)→ extract_evidence → **规则引擎**判 verdict(不接 LLM)→ release_device → 飞书通知(2026-07-30 起为展示卡片,失败降级纯文本)。
 7. agent-cli 套 RPC 壳(§8.1 API)+ 心跳/事件/结果回调 + MinIO 预签名直传 + Windows Service 化。
 
 **Phase 1 DoD**:push 一次代码 → 15 分钟内飞书收到含 verdict 与日志链接的通知;三项故障注入(拔 USB / 杀 Agent 进程 / 重启 Runtime)均收敛到正确终态,零重复执行。
@@ -290,7 +297,8 @@ Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, star
 > 为个人实例,宜另起专用实例)、工具白名单与 Schema 输出校验在该平台上的落地方式。
 > §3 硬性边界(Hermes 只经 Runtime、结构化输入、不在执行关键路径)不因复用而放宽。
 
-Evidence Extractor 完整化(签名匹配 + 匹配处 ±50 行上下文 + junit 失败 + 指标差值 → evidence.json,几十 KB 级);Analyzer(LLM 分析 evidence → 结构化结论 → decisions 落库;Hermes 超时/不可用 → 规则引擎保底);飞书交互卡片(重试/忽略/隔离按钮 → Runtime signal);Planner v1(自然语言 → Plan DSL,服务端 Schema 校验不过打回重试 ≤3 次)。
+Evidence Extractor 完整化(签名匹配 + 匹配处 ±50 行上下文 + junit 失败 + 指标差值 → evidence.json,几十 KB 级);Analyzer(LLM 分析 evidence → 结构化结论 → decisions 落库;Hermes 超时/不可用 → 规则引擎保底);飞书交互卡片(2026-07-30:**展示卡片已实现**;重试/忽略按钮待 `workflow_runs` 落地后单独一轮,
+按钮回调经 WS listener 执行而非 workflow signal;隔离按钮因无设备级信号源暂不做,见差距 #10);Planner v1(自然语言 → Plan DSL,服务端 Schema 校验不过打回重试 ≤3 次)。
 **严禁把原始日志全量灌入 LLM;Hermes 按需通过 `fetch_log_range(attachment, start, end)` 工具取片段。**
 
 ### Phase 3 — 硬化

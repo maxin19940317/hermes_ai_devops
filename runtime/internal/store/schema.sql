@@ -14,8 +14,26 @@ CREATE TABLE IF NOT EXISTS artifacts (
     -- 普通 webhook/kick 重放绝不递增(RejectDuplicate,失败不自动重启)。
     workflow_attempt INTEGER    NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (commit_sha, pipeline_id, variant)
+    CONSTRAINT artifacts_project_key
+        UNIQUE (project, commit_sha, pipeline_id, variant)
 );
+
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    workflow_id        TEXT PRIMARY KEY,
+    project            TEXT        NOT NULL,
+    commit_sha         TEXT        NOT NULL,
+    pipeline_id        INTEGER     NOT NULL CHECK (pipeline_id > 0),
+    version            TEXT        NOT NULL,
+    rule_version       TEXT        NOT NULL,
+    scope              TEXT        NOT NULL DEFAULT '',
+    attempt            INTEGER     NOT NULL CHECK (attempt >= 0),
+    variants           TEXT[]      NOT NULL,
+    source_workflow_id TEXT        REFERENCES workflow_runs(workflow_id) ON DELETE RESTRICT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (source_workflow_id IS NULL OR source_workflow_id <> workflow_id)
+);
+CREATE INDEX IF NOT EXISTS workflow_runs_recent_idx
+    ON workflow_runs(created_at DESC, workflow_id DESC);
 
 -- CONTRACT-ISSUE: §11 clients 表还列了 status 列,承载"离线判定 3 次丢失"(§10)。
 -- 该判定逻辑(基于 last_heartbeat 的超时/丢失计数)本轮(worker 进程装配)未实现,
@@ -78,6 +96,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     ended_at        TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS tasks_run_variant_latest_idx
+    ON tasks(workflow_id, test_id, attempt DESC, created_at DESC);
 
 -- 回调可能重发;按 (task_id, seq) 去重(§8.2)。
 CREATE TABLE IF NOT EXISTS task_events (

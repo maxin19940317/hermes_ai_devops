@@ -2,6 +2,9 @@ package feishucmd
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -58,14 +61,40 @@ func TestParseWhitelist(t *testing.T) {
 // ---- executor ----
 
 type fakeStarter struct {
-	inputs  []wf.DeviceTestInput
-	started bool
-	err     error
+	inputs    []wf.DeviceTestInput
+	started   bool
+	startErr  error
+	closed    bool
+	closedErr error
+	result    *wf.DeviceTestOutput
+	resultErr error
+	calls     []string
+	trace     *[]string
 }
 
 func (f *fakeStarter) StartDeviceTest(_ context.Context, in wf.DeviceTestInput) (string, bool, error) {
+	f.calls = append(f.calls, "StartDeviceTest")
+	if f.trace != nil {
+		*f.trace = append(*f.trace, "StartDeviceTest")
+	}
 	f.inputs = append(f.inputs, in)
-	return in.WorkflowID(), f.started, f.err
+	return in.WorkflowID(), f.started, f.startErr
+}
+
+func (f *fakeStarter) WorkflowClosed(_ context.Context, workflowID string) (bool, error) {
+	f.calls = append(f.calls, "WorkflowClosed:"+workflowID)
+	if f.trace != nil {
+		*f.trace = append(*f.trace, "WorkflowClosed")
+	}
+	return f.closed, f.closedErr
+}
+
+func (f *fakeStarter) WorkflowResult(_ context.Context, workflowID string) (*wf.DeviceTestOutput, error) {
+	f.calls = append(f.calls, "WorkflowResult:"+workflowID)
+	if f.trace != nil {
+		*f.trace = append(*f.trace, "WorkflowResult")
+	}
+	return f.result, f.resultErr
 }
 
 type fakeSender struct{ texts []string }
@@ -80,7 +109,7 @@ const wlOpenID = "ou_9530871ffdd8ce6997417413c22623d9"
 func newExec(st Store, starter *fakeStarter, sender *fakeSender) *Executor {
 	return &Executor{
 		Store: st, Starter: starter, Sender: sender,
-		Whitelist: map[string]bool{wlOpenID: true}, ExpectedVariants: 2,
+		Whitelist: map[string]bool{wlOpenID: true},
 	}
 }
 
@@ -155,57 +184,462 @@ func TestUnknownCommandRepliesUsage(t *testing.T) {
 	}
 }
 
-// rerun 表驱动:无记录 / 包不齐 / 变体无记录 / 全量启动 / 单变体启动。
-func TestRerun(t *testing.T) {
-	cases := []struct {
-		name        string
-		seed        []string // 预登记变体
-		cmd         string
-		wantStarted bool
-		wantScope   string
-		wantAttempt int
-		wantPkgs    int
-		wantReply   string // 回复必须包含的片段
-	}{
-		{"查无记录", nil, "rerun abcd1234 42", false, "", 0, 0, "查无记录"},
-		{"包不齐", []string{"v1"}, "rerun abcd1234 42", false, "", 0, 0, "包不齐"},
-		{"变体无记录", []string{"v1", "v2"}, "rerun abcd1234 42 v3", false, "", 0, 0, "无记录"},
-		{"全量启动", []string{"v1", "v2"}, "rerun abcd1234 42", true, "", 1, 2, "已启动"},
-		{"单变体启动", []string{"v1", "v2"}, "rerun abcd1234 42 v1", true, "v1", 1, 1, "已启动"},
-		{"非法sha", []string{"v1", "v2"}, "rerun zz 42", false, "", 0, 0, "非法 sha"},
-		{"非法iid", []string{"v1", "v2"}, "rerun abcd1234 x", false, "", 0, 0, "非法 pipeline_iid"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			st := store.NewMemStore()
-			seedArtifacts(t, st, tc.seed...)
-			starter := &fakeStarter{started: true}
-			sender := &fakeSender{}
-			exec := newExec(st, starter, sender)
-			exec.HandleMessage(ctx, wlOpenID, tc.cmd)
+type rerunStore struct {
+	*store.MemStore
+	getErr            error
+	listErr           error
+	duplicateArtifact bool
+	calls             []string
+	trace             *[]string
+}
 
-			if len(sender.texts) != 1 || !strings.Contains(sender.texts[0], tc.wantReply) {
-				t.Fatalf("reply = %v, want 含 %q", sender.texts, tc.wantReply)
+func (s *rerunStore) GetWorkflowRun(ctx context.Context, workflowID string) (*store.WorkflowRun, error) {
+	s.calls = append(s.calls, "GetWorkflowRun:"+workflowID)
+	if s.trace != nil {
+		*s.trace = append(*s.trace, "GetWorkflowRun")
+	}
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	return s.MemStore.GetWorkflowRun(ctx, workflowID)
+}
+
+func (s *rerunStore) ListArtifacts(
+	ctx context.Context, project, commitSHA string, pipelineID int,
+) ([]store.Artifact, error) {
+	s.calls = append(s.calls, fmt.Sprintf("ListArtifacts:%s:%s:%d", project, commitSHA, pipelineID))
+	if s.trace != nil {
+		*s.trace = append(*s.trace, "ListArtifacts")
+	}
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	arts, err := s.MemStore.ListArtifacts(ctx, project, commitSHA, pipelineID)
+	if err == nil && s.duplicateArtifact && len(arts) > 0 {
+		arts = append(arts, arts[0])
+	}
+	return arts, err
+}
+
+func (s *rerunStore) NextWorkflowAttempt(
+	ctx context.Context, project, commitSHA string, pipelineID int, variant string,
+) (int, error) {
+	s.calls = append(s.calls, "NextWorkflowAttempt:"+variant)
+	if s.trace != nil {
+		*s.trace = append(*s.trace, "NextWorkflowAttempt")
+	}
+	return s.MemStore.NextWorkflowAttempt(ctx, project, commitSHA, pipelineID, variant)
+}
+
+func (s *rerunStore) NextWorkflowAttemptAll(
+	ctx context.Context, project, commitSHA string, pipelineID int,
+) (int, error) {
+	s.calls = append(s.calls, "NextWorkflowAttemptAll")
+	if s.trace != nil {
+		*s.trace = append(*s.trace, "NextWorkflowAttemptAll")
+	}
+	return s.MemStore.NextWorkflowAttemptAll(ctx, project, commitSHA, pipelineID)
+}
+
+const sourceWorkflowID = "device-test-grp/p-gabcd1234-p42-source"
+
+func authoritativeOutput() *wf.DeviceTestOutput {
+	return &wf.DeviceTestOutput{Tasks: []wf.TaskSummary{
+		{Variant: "v1", TaskID: "task-v1", Verdict: "PASSED"},
+		{Variant: "v3", TaskID: "task-v3", Verdict: "INFRA_ERROR"},
+		{Variant: "v2", TaskID: "", Verdict: "TEST_FAILED"},
+		{Variant: "v4", TaskID: "", Verdict: wf.VerdictSkipped},
+	}}
+}
+
+func newRerunFixture(t *testing.T, variants ...string) (*rerunStore, *fakeStarter, *Executor) {
+	t.Helper()
+	mem := store.NewMemStore()
+	run := store.WorkflowRun{
+		WorkflowID: sourceWorkflowID, Project: "grp/p", CommitSHA: "abcd1234",
+		PipelineID: 42, Version: "1.2.3", RuleVersion: "verdict-rules-v7",
+		Scope: "source", Variants: []string{"v4", "v2", "v1", "v3"},
+	}
+	if err := mem.RecordWorkflowRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if variants == nil {
+		variants = []string{"v1", "v2", "v3", "v4"}
+	}
+	seedArtifacts(t, mem, variants...)
+	trace := []string{}
+	st := &rerunStore{MemStore: mem, trace: &trace}
+	starter := &fakeStarter{
+		started: true, closed: true, result: authoritativeOutput(), trace: &trace,
+	}
+	return st, starter, newExec(st, starter, nil)
+}
+
+func runRerun(t *testing.T, e *Executor, args ...string) string {
+	t.Helper()
+	got, err := e.rerun(ctx, args)
+	if err != nil {
+		t.Fatalf("rerun(%v): %v", args, err)
+	}
+	return got
+}
+
+func artifactAttempt(t *testing.T, s *store.MemStore, project, variant string) int {
+	t.Helper()
+	for _, art := range s.Artifacts() {
+		if art.Project == project && art.Variant == variant {
+			return art.WorkflowAttempt
+		}
+	}
+	return -1
+}
+
+func TestRerunExactAuthoritativeContract(t *testing.T) {
+	t.Run("LegacyTwoArgsShowsMigration", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t)
+		got := runRerun(t, e, "ABCD1234", "42")
+		want := "旧 rerun 语法已停用，请使用 rerun <source_workflow_id> [variant]"
+		if got != want {
+			t.Fatalf("reply = %q, want %q", got, want)
+		}
+		if len(st.calls) != 0 || len(starter.calls) != 0 {
+			t.Fatalf("legacy syntax touched dependencies: store=%v starter=%v", st.calls, starter.calls)
+		}
+	})
+
+	t.Run("LegacyThreeArgsShowsMigration", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t)
+		got := runRerun(t, e, strings.Repeat("x", 513), "not-an-iid", "v1")
+		want := "旧 rerun 语法已停用，请使用 rerun <source_workflow_id> [variant]"
+		if got != want {
+			t.Fatalf("reply = %q, want %q", got, want)
+		}
+		if len(st.calls) != 0 || len(starter.calls) != 0 {
+			t.Fatalf("legacy syntax touched dependencies: store=%v starter=%v", st.calls, starter.calls)
+		}
+	})
+
+	t.Run("OtherArgCountsShowCurrentUsage", func(t *testing.T) {
+		for _, args := range [][]string{nil, {"a", "b", "c", "d"}} {
+			st, starter, e := newRerunFixture(t)
+			got := runRerun(t, e, args...)
+			want := "用法: rerun <source_workflow_id> [variant]"
+			if got != want {
+				t.Fatalf("rerun(%v) = %q, want %q", args, got, want)
 			}
-			if !tc.wantStarted {
-				if len(starter.inputs) != 0 {
-					t.Errorf("不应启动 workflow: %+v", starter.inputs)
-				}
-				return
+			if len(st.calls) != 0 || len(starter.calls) != 0 {
+				t.Fatalf("bad arg count touched dependencies: store=%v starter=%v",
+					st.calls, starter.calls)
 			}
-			if len(starter.inputs) != 1 {
-				t.Fatalf("inputs = %+v", starter.inputs)
+		}
+	})
+
+	t.Run("ArgumentLengthBoundary", func(t *testing.T) {
+		const validationReply = "rerun 参数必须无空白且单项不超过 512 字符"
+
+		t.Run("512CharacterWorkflowIDPassesGate", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			got := runRerun(t, e, strings.Repeat("w", 512))
+			if !strings.Contains(got, "查无权威") {
+				t.Fatalf("reply = %q, 512-character ID should reach store lookup", got)
 			}
-			in := starter.inputs[0]
-			if in.Scope != tc.wantScope || in.Attempt != tc.wantAttempt ||
-				len(in.Packages) != tc.wantPkgs || in.Project != "grp/p" {
-				t.Errorf("input = %+v", in)
-			}
-			if tc.wantAttempt > 0 && !strings.HasSuffix(in.WorkflowID(), "-r1") {
-				t.Errorf("workflow id = %q, want -r1 后缀", in.WorkflowID())
+			if len(st.calls) != 1 || len(starter.calls) != 0 {
+				t.Fatalf("calls store=%v starter=%v, want GetWorkflowRun only",
+					st.calls, starter.calls)
 			}
 		})
-	}
+
+		t.Run("513CharacterWorkflowIDRejectedBeforeDependencies", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			got := runRerun(t, e, strings.Repeat("w", 513))
+			if got != validationReply {
+				t.Fatalf("reply = %q, want %q", got, validationReply)
+			}
+			if len(st.calls) != 0 || len(starter.calls) != 0 {
+				t.Fatalf("overlong ID touched dependencies: store=%v starter=%v",
+					st.calls, starter.calls)
+			}
+		})
+
+		t.Run("512CharacterVariantPassesGate", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			variant := strings.Repeat("v", 512)
+			got := runRerun(t, e, sourceWorkflowID, variant)
+			if !strings.Contains(got, "不属于源 workflow") {
+				t.Fatalf("reply = %q, 512-character variant should reach membership validation", got)
+			}
+			if len(st.calls) != 2 || len(starter.calls) != 1 {
+				t.Fatalf("calls store=%v starter=%v, want Get/Closed/List path",
+					st.calls, starter.calls)
+			}
+		})
+
+		t.Run("513CharacterVariantRejectedBeforeDependencies", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			got := runRerun(t, e, sourceWorkflowID, strings.Repeat("v", 513))
+			if got != validationReply {
+				t.Fatalf("reply = %q, want %q", got, validationReply)
+			}
+			if len(st.calls) != 0 || len(starter.calls) != 0 {
+				t.Fatalf("overlong variant touched dependencies: store=%v starter=%v",
+					st.calls, starter.calls)
+			}
+		})
+
+		t.Run("WhitespaceArgRejectedBeforeDependencies", func(t *testing.T) {
+			st, starter, e := newRerunFixture(t)
+			got := runRerun(t, e, sourceWorkflowID, "bad variant")
+			if got != validationReply {
+				t.Fatalf("reply = %q, want %q", got, validationReply)
+			}
+			if len(st.calls) != 0 || len(starter.calls) != 0 {
+				t.Fatalf("whitespace variant touched dependencies: store=%v starter=%v",
+					st.calls, starter.calls)
+			}
+		})
+	})
+
+	t.Run("NewOneArgRerunsFailedOutputOnly", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t)
+		got := runRerun(t, e, sourceWorkflowID)
+		if !strings.Contains(got, "已启动") {
+			t.Fatalf("reply = %q", got)
+		}
+		if len(starter.inputs) != 1 {
+			t.Fatalf("inputs = %+v", starter.inputs)
+		}
+		in := starter.inputs[0]
+		variants := []string{in.Packages[0].Variant, in.Packages[1].Variant}
+		if !reflect.DeepEqual(variants, []string{"v2", "v3"}) {
+			t.Fatalf("package variants = %v, want canonical failed output v2/v3", variants)
+		}
+		wantOrder := []string{
+			"GetWorkflowRun:" + sourceWorkflowID,
+			"ListArtifacts:grp/p:abcd1234:42",
+			"NextWorkflowAttemptAll",
+		}
+		if !reflect.DeepEqual(st.calls, wantOrder) {
+			t.Fatalf("store call order = %v, want %v", st.calls, wantOrder)
+		}
+		wantStarter := []string{
+			"WorkflowClosed:" + sourceWorkflowID,
+			"WorkflowResult:" + sourceWorkflowID,
+			"StartDeviceTest",
+		}
+		if !reflect.DeepEqual(starter.calls, wantStarter) {
+			t.Fatalf("starter call order = %v, want %v", starter.calls, wantStarter)
+		}
+		wantTrace := []string{
+			"GetWorkflowRun", "WorkflowClosed", "WorkflowResult", "ListArtifacts",
+			"NextWorkflowAttemptAll", "StartDeviceTest",
+		}
+		if !reflect.DeepEqual(*st.trace, wantTrace) {
+			t.Fatalf("global call order = %v, want %v", *st.trace, wantTrace)
+		}
+	})
+
+	t.Run("VariantScopedAllThenExplicitNeverReusesWorkflowID", func(t *testing.T) {
+		mem := store.NewMemStore()
+		if err := mem.RecordWorkflowRun(ctx, store.WorkflowRun{
+			WorkflowID: sourceWorkflowID, Project: "grp/p", CommitSHA: "abcd1234",
+			PipelineID: 42, Version: "1.2.3", RuleVersion: "verdict-rules-v7",
+			Scope: "v1", Variants: []string{"v1", "v2"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		seedArtifacts(t, mem, "v1", "v2")
+		for want := 1; want <= 3; want++ {
+			if n, err := mem.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v2"); err != nil || n != want {
+				t.Fatalf("skew v2 = %d err=%v, want %d", n, err, want)
+			}
+		}
+		st := &rerunStore{MemStore: mem}
+		starter := &fakeStarter{
+			started: true, closed: true,
+			result: &wf.DeviceTestOutput{Tasks: []wf.TaskSummary{
+				{Variant: "v1", Verdict: "TEST_FAILED"},
+			}},
+		}
+		e := newExec(st, starter, nil)
+
+		runRerun(t, e, sourceWorkflowID)
+		for range 3 {
+			runRerun(t, e, sourceWorkflowID, "v1")
+		}
+		seen := make(map[string]struct{}, len(starter.inputs))
+		for _, in := range starter.inputs {
+			id := in.WorkflowID()
+			if _, exists := seen[id]; exists {
+				t.Fatalf("workflow ID reused after mixed reruns: %s; inputs=%+v", id, starter.inputs)
+			}
+			seen[id] = struct{}{}
+		}
+		if got := starter.inputs[1].Attempt; got != starter.inputs[0].Attempt+1 {
+			t.Fatalf("first explicit attempt = %d, want all waterline %d + 1",
+				got, starter.inputs[0].Attempt)
+		}
+	})
+
+	t.Run("NewTwoArgsRerunsExplicitPassedVariant", func(t *testing.T) {
+		_, starter, e := newRerunFixture(t)
+		starter.resultErr = errors.New("must not read result")
+		got := runRerun(t, e, sourceWorkflowID, "v1")
+		if !strings.Contains(got, "已启动") || len(starter.inputs) != 1 {
+			t.Fatalf("reply=%q inputs=%+v", got, starter.inputs)
+		}
+		if starter.inputs[0].Scope != "v1" || len(starter.inputs[0].Packages) != 1 ||
+			starter.inputs[0].Packages[0].Variant != "v1" {
+			t.Fatalf("input = %+v", starter.inputs[0])
+		}
+		if strings.Join(starter.calls, ",") !=
+			"WorkflowClosed:"+sourceWorkflowID+",StartDeviceTest" {
+			t.Fatalf("starter calls = %v, explicit variant must not read result", starter.calls)
+		}
+	})
+
+	t.Run("ExplicitSkippedVariantAllowed", func(t *testing.T) {
+		_, starter, e := newRerunFixture(t)
+		got := runRerun(t, e, sourceWorkflowID, "v4")
+		if !strings.Contains(got, "已启动") || starter.inputs[0].Packages[0].Variant != "v4" {
+			t.Fatalf("reply=%q input=%+v", got, starter.inputs)
+		}
+	})
+
+	t.Run("UnknownOrLegacyRunRejected", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t)
+		st.getErr = store.ErrWorkflowRunNotFound
+		got := runRerun(t, e, "unknown-workflow")
+		if !strings.Contains(got, "权威") || len(starter.calls) != 0 {
+			t.Fatalf("reply=%q starter calls=%v", got, starter.calls)
+		}
+	})
+
+	t.Run("RunningOrDescribeErrorRejected", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			err  error
+		}{
+			{name: "running"},
+			{name: "describe error", err: errors.New("describe unavailable")},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				st, starter, e := newRerunFixture(t)
+				starter.closed = false
+				starter.closedErr = tc.err
+				got := runRerun(t, e, sourceWorkflowID)
+				if tc.err == nil && !strings.Contains(got, "尚未结束") {
+					t.Fatalf("running reply = %q", got)
+				}
+				if tc.err != nil && !strings.Contains(got, "检查 workflow 状态失败") {
+					t.Fatalf("describe error reply = %q", got)
+				}
+				if len(st.calls) != 1 || len(starter.inputs) != 0 {
+					t.Fatalf("calls store=%v starter=%v", st.calls, starter.calls)
+				}
+			})
+		}
+	})
+
+	t.Run("WorkflowResultErrorRejectedWithoutVariant", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t)
+		starter.resultErr = errors.New("result unavailable")
+		got := runRerun(t, e, sourceWorkflowID)
+		if !strings.Contains(got, "读取 workflow 结果失败") || len(st.calls) != 1 {
+			t.Fatalf("reply=%q store calls=%v", got, st.calls)
+		}
+	})
+
+	t.Run("NoFailuresDoesNotAllocateAttempt", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t)
+		starter.result = &wf.DeviceTestOutput{Tasks: []wf.TaskSummary{
+			{Variant: "v1", Verdict: "PASSED"},
+			{Variant: "v4", Verdict: wf.VerdictSkipped},
+		}}
+		got := runRerun(t, e, sourceWorkflowID)
+		if !strings.Contains(got, "没有失败变体") {
+			t.Fatalf("reply = %q", got)
+		}
+		if artifactAttempt(t, st.MemStore, "grp/p", "v1") != 0 || len(starter.inputs) != 0 {
+			t.Fatalf("attempt allocated or workflow started: arts=%+v inputs=%+v",
+				st.Artifacts(), starter.inputs)
+		}
+	})
+
+	t.Run("MissingArtifactDoesNotAllocateAttempt", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t, "v1", "v2", "v4")
+		got := runRerun(t, e, sourceWorkflowID)
+		if !strings.Contains(got, "v3") || !strings.Contains(got, "artifact") {
+			t.Fatalf("reply = %q", got)
+		}
+		if artifactAttempt(t, st.MemStore, "grp/p", "v2") != 0 || len(starter.inputs) != 0 {
+			t.Fatalf("attempt allocated or workflow started: arts=%+v inputs=%+v",
+				st.Artifacts(), starter.inputs)
+		}
+	})
+
+	t.Run("DuplicateArtifactDoesNotAllocateAttempt", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t)
+		st.duplicateArtifact = true
+		got := runRerun(t, e, sourceWorkflowID, "v1")
+		if !strings.Contains(got, "artifact 数量为 2") {
+			t.Fatalf("reply = %q", got)
+		}
+		if artifactAttempt(t, st.MemStore, "grp/p", "v1") != 0 || len(starter.inputs) != 0 {
+			t.Fatalf("attempt allocated or workflow started: arts=%+v inputs=%+v",
+				st.Artifacts(), starter.inputs)
+		}
+	})
+
+	t.Run("ProjectVersionRuleAndSourceAreInherited", func(t *testing.T) {
+		_, starter, e := newRerunFixture(t)
+		runRerun(t, e, sourceWorkflowID)
+		in := starter.inputs[0]
+		if in.Project != "grp/p" || in.Commit != "abcd1234" || in.PipelineID != 42 ||
+			in.Version != "1.2.3" || in.RuleVersion != "verdict-rules-v7" ||
+			in.SourceWorkflowID != sourceWorkflowID || in.Scope != "source" {
+			t.Fatalf("input identity = %+v", in)
+		}
+	})
+
+	t.Run("PreCreateTaskFailureWithoutTaskIDIsRetried", func(t *testing.T) {
+		_, starter, e := newRerunFixture(t)
+		runRerun(t, e, sourceWorkflowID)
+		if got := starter.inputs[0].Packages[0].Variant; got != "v2" {
+			t.Fatalf("first retry variant = %q, want v2 with empty TaskID", got)
+		}
+	})
+
+	t.Run("StaleTaskTableDoesNotOverrideWorkflowOutput", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t)
+		if err := st.CreateTask(ctx, wf.TaskRow{
+			TaskID: "stale-v1", WorkflowID: sourceWorkflowID, TestID: "v1",
+			Attempt: 1, IdempotencyKey: "stale-v1", Status: "FAILED",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		runRerun(t, e, sourceWorkflowID)
+		got := []string{starter.inputs[0].Packages[0].Variant, starter.inputs[0].Packages[1].Variant}
+		if !reflect.DeepEqual(got, []string{"v2", "v3"}) {
+			t.Fatalf("variants = %v, stale task table overrode workflow output", got)
+		}
+	})
+
+	t.Run("AlreadyStartedIsReportedButNotClaimDedup", func(t *testing.T) {
+		st, starter, e := newRerunFixture(t)
+		starter.started = false
+		first := runRerun(t, e, sourceWorkflowID, "v2")
+		second := runRerun(t, e, sourceWorkflowID, "v2")
+		if !strings.Contains(first, "workflow 已存在") || !strings.Contains(second, "workflow 已存在") {
+			t.Fatalf("replies = %q / %q", first, second)
+		}
+		if len(starter.inputs) != 2 ||
+			starter.inputs[0].Attempt != 1 || starter.inputs[1].Attempt != 2 {
+			t.Fatalf("inputs = %+v, each text command must allocate a fresh attempt", starter.inputs)
+		}
+		if n := artifactAttempt(t, st.MemStore, "grp/p", "v2"); n != 2 {
+			t.Fatalf("v2 attempt = %d, want 2", n)
+		}
+	})
 }
 
 func TestUnquarantine(t *testing.T) {

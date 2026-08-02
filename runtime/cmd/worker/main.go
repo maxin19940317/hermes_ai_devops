@@ -156,8 +156,7 @@ func main() {
 		} else {
 			exec := &feishucmd.Executor{
 				Store: st, Sender: feishuSender, Log: &log, Whitelist: wl,
-				Starter:          &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
-				ExpectedVariants: specCfg.VariantCount(),
+				Starter: &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
 			}
 			// 自然语言翻译旁路(设计文档 §3.1):三个条件合取才启用——
 			// 开关打开、bridge 端点已配、指令 listener 本身已启用。

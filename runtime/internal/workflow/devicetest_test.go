@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 
 	"hermes-devops/runtime/internal/hermesclient"
@@ -25,14 +29,20 @@ type fakeActs struct {
 	skipped      []SkippedSpec // SelectTestSpecs 透传:fleet 无匹配设备/OS 未接入
 	acquires     []*Lease      // 每次 AcquireDevice 依次弹出;耗尽后返回 defaultLease
 	dispatchErrs []error       // 依次弹出;耗尽后 nil
+	recordErrs   []error
+	selectErr    error
 
 	acquireCalls  int
+	selectCalls   int
+	recordCalls   []RecordWorkflowRunRequest
+	callOrder     []string
 	created       []TaskRow
 	dispatched    []DispatchRequest
 	canceled      []CancelRequest
 	finished      []FinishRequest
 	released      []ReleaseRequest
 	notifications []string
+	notifyCards   []NotifyCardRequest
 
 	analysis      *hermesclient.Analysis // 非 nil 模拟 Analyzer 已启用
 	evidenceCalls []ExtractEvidenceRequest
@@ -56,8 +66,24 @@ type fakeActs struct {
 
 var defaultLease = &Lease{DeviceID: "dev1", Serial: "513cd3de", ClientID: "c1", ClientBaseURL: "https://client:8443"}
 
+func (f *fakeActs) RecordWorkflowRun(_ context.Context, req RecordWorkflowRunRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recordCalls = append(f.recordCalls, req)
+	f.callOrder = append(f.callOrder, "record")
+	if len(f.recordErrs) == 0 {
+		return nil
+	}
+	err := f.recordErrs[0]
+	f.recordErrs = f.recordErrs[1:]
+	return err
+}
 func (f *fakeActs) SelectTestSpecs(_ context.Context, _ DeviceTestInput) (*SpecSelection, error) {
-	return &SpecSelection{Specs: f.specs, Skipped: f.skipped}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.selectCalls++
+	f.callOrder = append(f.callOrder, "select")
+	return &SpecSelection{Specs: f.specs, Skipped: f.skipped}, f.selectErr
 }
 func (f *fakeActs) AcquireDevice(_ context.Context, _ AcquireRequest) (*Lease, error) {
 	f.mu.Lock()
@@ -109,6 +135,12 @@ func (f *fakeActs) Notify(_ context.Context, msg string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.notifications = append(f.notifications, msg)
+	return nil
+}
+func (f *fakeActs) NotifyCard(_ context.Context, req NotifyCardRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notifyCards = append(f.notifyCards, req)
 	return nil
 }
 func (f *fakeActs) ExtractEvidence(_ context.Context, r ExtractEvidenceRequest) (*ExtractEvidenceResponse, error) {
@@ -248,11 +280,19 @@ func TestHappyPathPassed(t *testing.T) {
 	if len(f.finished) != 1 || f.finished[0].Verdict != "PASSED" {
 		t.Errorf("finished=%+v", f.finished)
 	}
-	if len(f.notifications) != 1 ||
-		!strings.Contains(f.notifications[0], "PASSED") ||
-		!strings.Contains(f.notifications[0], "12.0s cases=10/10") ||
-		strings.Contains(f.notifications[0], "runs/x/") {
-		t.Errorf("notification = %q(需含 verdict 与耗时/用例,不含附件对象键)", f.notifications)
+	// 新 workflow 走 notify-card 版本分支(设计文档 §5):Notify 零调用,
+	// 断言改落在 NotifyCard 的 FallbackText 上。
+	if len(f.notifications) != 0 {
+		t.Errorf("notifications = %v, want 零调用(新 workflow 应走 NotifyCard)", f.notifications)
+	}
+	if len(f.notifyCards) != 1 {
+		t.Fatalf("notifyCards = %+v, want 1 次", f.notifyCards)
+	}
+	fallback := f.notifyCards[0].FallbackText
+	if !strings.Contains(fallback, "PASSED") ||
+		!strings.Contains(fallback, "12.0s cases=10/10") ||
+		strings.Contains(fallback, "runs/x/") {
+		t.Errorf("fallback text = %q(需含 verdict 与耗时/用例,不含附件对象键)", fallback)
 	}
 	// §11:PASSED 落规则裁决;不触发证据提取/分析(Phase 2 只对非 PASSED)
 	if len(f.decisions) != 1 || f.decisions[0].Actor != "rule" {
@@ -272,6 +312,142 @@ func TestHappyPathPassed(t *testing.T) {
 	}
 	if f.released[0].InfraFail {
 		t.Error("新版本分支不该再填 InfraFail")
+	}
+}
+
+func TestWorkflowRecordsRunBeforeSelect(t *testing.T) {
+	f := &fakeActs{}
+	env := newEnv(t, f)
+	in := input()
+	in.RuleVersion = rules.DefaultVersion
+	in.Scope = "v2"
+	in.Attempt = 2
+	in.SourceWorkflowID = "device-test-grp/p-gabcd1234-p42"
+	in.Packages = []PackageRef{{Variant: "v2"}, {Variant: "v1"}, {Variant: "v2"}}
+
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: in.WorkflowID()})
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.callOrder) < 2 ||
+		!reflect.DeepEqual(f.callOrder[:2], []string{"record", "select"}) {
+		t.Fatalf("call order = %v", f.callOrder)
+	}
+	if len(f.recordCalls) != 1 {
+		t.Fatalf("record calls = %d", len(f.recordCalls))
+	}
+	want := RecordWorkflowRunRequest{
+		WorkflowID: in.WorkflowID(), Project: in.Project, CommitSHA: in.Commit,
+		PipelineID: in.PipelineID, Version: in.Version, RuleVersion: rules.DefaultVersion,
+		Scope: in.Scope, Attempt: in.Attempt, Variants: []string{"v1", "v2"},
+		SourceWorkflowID: in.SourceWorkflowID,
+	}
+	if !reflect.DeepEqual(f.recordCalls[0], want) {
+		t.Fatalf("record request = %+v, want %+v", f.recordCalls[0], want)
+	}
+	if got := []string{in.Packages[0].Variant, in.Packages[1].Variant, in.Packages[2].Variant}; !reflect.DeepEqual(got, []string{"v2", "v1", "v2"}) {
+		t.Fatalf("input package order mutated: %v", got)
+	}
+}
+
+func TestWorkflowRecordRetriesPastDefaultMaximum(t *testing.T) {
+	f := &fakeActs{recordErrs: []error{errBoom, errBoom, errBoom, errBoom}}
+	env := newEnv(t, f)
+	env.SetTestTimeout(2 * time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.recordCalls) != 5 {
+		t.Fatalf("record calls = %d, want 5", len(f.recordCalls))
+	}
+	if f.selectCalls != 1 {
+		t.Fatalf("select calls = %d, want 1", f.selectCalls)
+	}
+}
+
+func TestWorkflowRecordPermanentFailureBlocksSelect(t *testing.T) {
+	permanent := temporal.NewNonRetryableApplicationError(
+		"immutable conflict", "WorkflowRunPermanent", errBoom)
+	f := &fakeActs{recordErrs: []error{permanent}}
+	env := newEnv(t, f)
+	env.SetTestTimeout(2 * time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if env.GetWorkflowError() == nil {
+		t.Fatal("workflow succeeded")
+	}
+	if len(f.recordCalls) != 1 || f.selectCalls != 0 {
+		t.Fatalf("record=%d select=%d, want 1/0", len(f.recordCalls), f.selectCalls)
+	}
+}
+
+func TestWorkflowRecordRetryPolicyDoesNotLeakToSelect(t *testing.T) {
+	f := &fakeActs{selectErr: errBoom}
+	env := newEnv(t, f)
+	env.SetTestTimeout(2 * time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if env.GetWorkflowError() == nil {
+		t.Fatal("workflow succeeded")
+	}
+	if len(f.recordCalls) != 1 || f.selectCalls != 3 {
+		t.Fatalf("record=%d select=%d, want 1/3", len(f.recordCalls), f.selectCalls)
+	}
+}
+
+func TestWorkflowRecordUsesActualExecutionID(t *testing.T) {
+	f := &fakeActs{}
+	env := newEnv(t, f)
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "unexpected-execution-id"})
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	err := env.GetWorkflowError()
+	if err == nil || !strings.Contains(err.Error(),
+		`workflow execution id "unexpected-execution-id" does not match input id "`+wfID+`"`) {
+		t.Fatalf("workflow error = %v", err)
+	}
+	if len(f.recordCalls) != 0 || f.selectCalls != 0 {
+		t.Fatalf("record=%d select=%d, want 0/0", len(f.recordCalls), f.selectCalls)
+	}
+}
+
+// TestWorkflowSendsCardWithVerbatimFallback 验证 notify-card 版本分支(设计文档 §5):
+// 新 workflow 一律走 NotifyCard,且载荷的 FallbackText 必须与 buildNotification
+// 对同一输入的输出逐字节相同——降级文本只能有一个真源,不许 activity 侧另拼一份。
+func TestWorkflowSendsCardWithVerbatimFallback(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}}
+	env := newEnv(t, f)
+	seedResult(f, passResult(taskID("a1")))
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
+	}, 30*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow err: %v", env.GetWorkflowError())
+	}
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	want := buildNotification(input(), &out)
+
+	if len(f.notifications) != 0 {
+		t.Errorf("Notify 调用次数 = %d, want 0(新 workflow 不应再走纯文本分支): %v", len(f.notifications), f.notifications)
+	}
+	if len(f.notifyCards) != 1 {
+		t.Fatalf("notifyCards = %+v, want 1 次", f.notifyCards)
+	}
+	if got := f.notifyCards[0].FallbackText; got != want {
+		t.Errorf("FallbackText = %q, want 与 buildNotification 逐字节相同 %q", got, want)
+	}
+	// 只查 FallbackText 查不出 workflow 是否真把卡片本体传下去了——
+	// Card 字段单独断言,确保"接线"这条线真的被覆盖。
+	if got, wantCard := f.notifyCards[0].Card, buildNotificationCard(input(), &out); !reflect.DeepEqual(got, wantCard) {
+		t.Errorf("Card = %+v, want 与 buildNotificationCard 同源 %+v", got, wantCard)
 	}
 }
 
@@ -499,10 +675,15 @@ func TestSkippedVariantInOutputAndNotification(t *testing.T) {
 	if len(f.dispatched) != 1 {
 		t.Errorf("dispatched = %d, want 1(跳过变体不派单)", len(f.dispatched))
 	}
-	if len(f.notifications) != 1 ||
-		!strings.Contains(f.notifications[0], "SKIPPED") ||
-		!strings.Contains(f.notifications[0], "no capable device") {
-		t.Errorf("notification = %q(需含 SKIPPED 及原因)", f.notifications)
+	if len(f.notifications) != 0 {
+		t.Errorf("notifications = %v, want 零调用(新 workflow 应走 NotifyCard)", f.notifications)
+	}
+	if len(f.notifyCards) != 1 {
+		t.Fatalf("notifyCards = %+v, want 1 次", f.notifyCards)
+	}
+	if fallback := f.notifyCards[0].FallbackText; !strings.Contains(fallback, "SKIPPED") ||
+		!strings.Contains(fallback, "no capable device") {
+		t.Errorf("fallback text = %q(需含 SKIPPED 及原因)", fallback)
 	}
 }
 
@@ -562,9 +743,14 @@ func TestAnalysisSavedOnFailure(t *testing.T) {
 		out.Tasks[0].Analysis.Summary != "delegate fell back to CPU" {
 		t.Errorf("task summary 应携带 analysis: %+v", out.Tasks)
 	}
-	if len(f.notifications) != 1 ||
-		!strings.Contains(f.notifications[0], "hermes: delegate fell back to CPU") {
-		t.Errorf("notification = %q(需含 hermes summary 行)", f.notifications)
+	if len(f.notifications) != 0 {
+		t.Errorf("notifications = %v, want 零调用(新 workflow 应走 NotifyCard)", f.notifications)
+	}
+	if len(f.notifyCards) != 1 {
+		t.Fatalf("notifyCards = %+v, want 1 次", f.notifyCards)
+	}
+	if fallback := f.notifyCards[0].FallbackText; !strings.Contains(fallback, "hermes: delegate fell back to CPU") {
+		t.Errorf("fallback text = %q(需含 hermes summary 行)", fallback)
 	}
 }
 
@@ -846,5 +1032,606 @@ func TestEscalateFailureKeepsMainFlow(t *testing.T) {
 	}
 	if len(f.notifications) != 1 || !strings.Contains(f.notifications[0], "TEST_FAILED") {
 		t.Errorf("通知应照常发送: %v", f.notifications)
+	}
+}
+
+func TestBuildNotificationCardHeaderColor(t *testing.T) {
+	cases := []struct {
+		name     string
+		verdicts []string
+		want     string
+	}{
+		{"全 PASSED", []string{"PASSED", "PASSED"}, "green"},
+		{"全 SKIPPED", []string{"SKIPPED"}, "green"},
+		{"PASSED + SKIPPED", []string{"PASSED", "SKIPPED"}, "green"},
+		{"只有 INFRA", []string{"INFRA_ERROR"}, "orange"},
+		{"INFRA + SKIPPED", []string{"INFRA_ERROR", "SKIPPED"}, "orange"},
+		{"只有 TEST_FAILED", []string{"TEST_FAILED"}, "red"},
+		{"INFRA + TEST_FAILED", []string{"INFRA_ERROR", "TEST_FAILED"}, "red"}, // 业务失败优先
+		{"无变体", nil, "green"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := &DeviceTestOutput{}
+			for i, v := range tc.verdicts {
+				out.Tasks = append(out.Tasks, TaskSummary{
+					Variant: fmt.Sprintf("v%d", i), Verdict: v, Attempt: 1})
+			}
+			card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+			if card.Header.Template != tc.want {
+				t.Errorf("template = %q, want %q", card.Header.Template, tc.want)
+			}
+		})
+	}
+}
+
+// out.Tasks 为空时,正文必须是与纯文本同款的提示,而不是什么都不放。
+func TestBuildNotificationCardEmptyTasks(t *testing.T) {
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, &DeviceTestOutput{})
+	want := []CardElement{
+		{Tag: "div", Text: &CardText{Tag: "plain_text",
+			Content: "无可测变体(Android 包缺失或未配置)"}},
+	}
+	if !reflect.DeepEqual(card.Elements, want) {
+		t.Errorf("空任务正文不匹配\ngot:\n%swant:\n%s",
+			dumpElements(card.Elements), dumpElements(want))
+	}
+}
+
+var allowedCardKeys = map[string]bool{
+	"config": true, "wide_screen_mode": true, "header": true, "title": true,
+	"template": true, "elements": true, "tag": true, "text": true, "content": true,
+}
+
+// walkCard 按 NotificationCard/CardConfig/CardHeader/CardElement/CardText
+// 五种 DTO 节点逐层校验允许键、必需键、值类型与 div/hr 的 Text 配对。
+// 只做全局九键白名单不够:它会放过合法 key 出现在错误节点、标量 text,
+// 以及缺 tag/content 的 CardText。
+func walkCard(t *testing.T, v any) []string {
+	t.Helper()
+	var bad []string
+
+	checkObject := func(node any, path, kind string, allowed map[string]bool, required ...string) (map[string]any, bool) {
+		obj, ok := node.(map[string]any)
+		if !ok {
+			bad = append(bad, fmt.Sprintf("%s: %s 必须是 object, got %T", path, kind, node))
+			return nil, false
+		}
+		for _, key := range required {
+			if _, ok := obj[key]; !ok {
+				bad = append(bad, fmt.Sprintf("%s: %s 缺必需 key %q", path, kind, key))
+			}
+		}
+		for key := range obj {
+			switch {
+			case !allowedCardKeys[key]:
+				bad = append(bad, fmt.Sprintf("%s.%s: 集合外 key %q", path, key, key))
+			case !allowed[key]:
+				bad = append(bad, fmt.Sprintf("%s.%s: key %q 不属于 %s", path, key, key, kind))
+			}
+		}
+		return obj, true
+	}
+
+	textKeys := map[string]bool{"tag": true, "content": true}
+	validateText := func(node any, path string) {
+		text, ok := checkObject(node, path, "CardText", textKeys, "tag", "content")
+		if !ok {
+			return
+		}
+		tag, ok := text["tag"].(string)
+		if !ok {
+			bad = append(bad, fmt.Sprintf("%s.tag: 必须是 string, got %T", path, text["tag"]))
+		} else if tag != "plain_text" {
+			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want plain_text", path, tag))
+		}
+		if _, ok := text["content"].(string); !ok {
+			bad = append(bad, fmt.Sprintf("%s.content: 必须是 string, got %T", path, text["content"]))
+		}
+	}
+
+	rootKeys := map[string]bool{"config": true, "header": true, "elements": true}
+	root, ok := checkObject(v, "$", "NotificationCard", rootKeys, "config", "header", "elements")
+	if !ok {
+		return bad
+	}
+
+	configKeys := map[string]bool{"wide_screen_mode": true}
+	if config, ok := checkObject(root["config"], "$.config", "CardConfig", configKeys, "wide_screen_mode"); ok {
+		if _, ok := config["wide_screen_mode"].(bool); !ok {
+			bad = append(bad, fmt.Sprintf("$.config.wide_screen_mode: 必须是 bool, got %T",
+				config["wide_screen_mode"]))
+		}
+	}
+
+	headerKeys := map[string]bool{"title": true, "template": true}
+	if header, ok := checkObject(root["header"], "$.header", "CardHeader", headerKeys, "title", "template"); ok {
+		validateText(header["title"], "$.header.title")
+		template, stringOK := header["template"].(string)
+		if !stringOK {
+			bad = append(bad, fmt.Sprintf("$.header.template: 必须是 string, got %T", header["template"]))
+		} else if template != "green" && template != "red" && template != "orange" {
+			bad = append(bad, fmt.Sprintf("$.header.template: got %q,want green|red|orange", template))
+		}
+	}
+
+	elements, ok := root["elements"].([]any)
+	if !ok {
+		bad = append(bad, fmt.Sprintf("$.elements: 必须是 array, got %T", root["elements"]))
+		return bad
+	}
+	elementKeys := map[string]bool{"tag": true, "text": true}
+	for i, node := range elements {
+		path := fmt.Sprintf("$.elements[%d]", i)
+		element, ok := checkObject(node, path, "CardElement", elementKeys, "tag")
+		if !ok {
+			continue
+		}
+		tag, stringOK := element["tag"].(string)
+		if !stringOK {
+			bad = append(bad, fmt.Sprintf("%s.tag: 必须是 string, got %T", path, element["tag"]))
+			continue
+		}
+		switch tag {
+		case "div":
+			text, exists := element["text"]
+			if !exists || text == nil {
+				bad = append(bad, fmt.Sprintf("%s: div 的 text 必须非 nil", path))
+				continue
+			}
+			validateText(text, path+".text")
+		case "hr":
+			if text, exists := element["text"]; exists && text != nil {
+				bad = append(bad, fmt.Sprintf("%s: hr 的 text 必须为 nil", path))
+			}
+		default:
+			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want div|hr", path, tag))
+		}
+	}
+	return bad
+}
+
+func sampleInput() DeviceTestInput {
+	return DeviceTestInput{Project: "algo-super-sdk", Commit: "9da3b9d9", PipelineID: 56, Version: "1.4.2"}
+}
+
+func sampleOutput() *DeviceTestOutput {
+	return &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "PASSED",
+			DurationSec: 412.3, CasesTotal: 38, CasesFailed: 0, Attempt: 1},
+		{Variant: "aarch64_Android_SNPE_1.68", Verdict: "TEST_FAILED", Category: "CODE",
+			DurationSec: 380.14, CasesTotal: 38, CasesFailed: 3, Attempt: 2,
+			Reason:   "three cases crashed",
+			Analysis: &hermesclient.Analysis{Summary: "DSP 初始化崩溃"}},
+		{Variant: "aarch64_Linux_RKNN_2.3.2", Verdict: "SKIPPED",
+			Reason: "fleet 无匹配设备"},
+	}}
+}
+
+func TestCardIsClosedStructure(t *testing.T) {
+	card := buildNotificationCard(sampleInput(), sampleOutput())
+	raw, err := json.Marshal(card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generic any
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		t.Fatal(err)
+	}
+	if bad := walkCard(t, generic); len(bad) != 0 {
+		t.Errorf("卡片出现集合外结构: %v", bad)
+	}
+}
+
+// 反例:证明上面的遍历不是空转。
+func TestCardClosedStructureCatchesViolations(t *testing.T) {
+	cases := []struct{ name, payload string }{
+		{"带 actions", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"}}],"actions":[]}`},
+		{"带 behaviors", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"behaviors":[]}]}`},
+		{"lark_md 文本", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"lark_md","content":"x"}}]}`},
+		{"div 缺 text", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div"}]}`},
+		{"hr 带 text", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"hr","text":{"tag":"plain_text","content":"x"}}]}`},
+		{"text 是标量", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":"x"}]}`},
+		{"text 缺 tag", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"content":"x"}}]}`},
+		{"text 缺 content", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text"}}]}`},
+		{"合法 key 放错节点", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"template":"red"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var generic any
+			if err := json.Unmarshal([]byte(tc.payload), &generic); err != nil {
+				t.Fatal(err)
+			}
+			if bad := walkCard(t, generic); len(bad) == 0 {
+				t.Error("这份卡片应被判违规,断言空转了")
+			}
+		})
+	}
+}
+
+func TestBuildNotificationCardGolden(t *testing.T) {
+	in := DeviceTestInput{Project: "algo-super-sdk", Commit: "9da3b9d9",
+		PipelineID: 56, Version: "1.4.2"}
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "PASSED",
+			DurationSec: 412.3, CasesTotal: 38, CasesFailed: 0, Attempt: 1},
+		{Variant: "aarch64_Android_SNPE_1.68", Verdict: "TEST_FAILED", Category: "CODE",
+			DurationSec: 380.14, CasesTotal: 38, CasesFailed: 3, Attempt: 2,
+			Reason:   "three cases crashed",
+			Analysis: &hermesclient.Analysis{Summary: "DSP 初始化崩溃"}},
+		{Variant: "aarch64_Linux_RKNN_2.3.2", Verdict: "SKIPPED",
+			Reason: "fleet 无匹配设备"},
+	}}
+
+	card := buildNotificationCard(in, out)
+
+	if want := "[hermes-devops] algo-super-sdk g9da3b9d9 p56 (v1.4.2)"; card.Header.Title.Content != want {
+		t.Errorf("header content = %q, want %q", card.Header.Title.Content, want)
+	}
+	if card.Header.Title.Tag != "plain_text" {
+		t.Errorf("header tag = %q, want plain_text", card.Header.Title.Tag)
+	}
+	if card.Header.Template != "red" { // INFRA 不在场,存在 TEST_FAILED → red
+		t.Errorf("template = %q, want red", card.Header.Template)
+	}
+
+	txt := func(c string) *CardText { return &CardText{Tag: "plain_text", Content: c} }
+	want := []CardElement{
+		{Tag: "div", Text: txt("aarch64_Android_SNPE_2.21  PASSED")},
+		{Tag: "div", Text: txt("412.3s · cases 38/38 · attempt 1")},
+		{Tag: "hr"},
+		{Tag: "div", Text: txt("aarch64_Android_SNPE_1.68  TEST_FAILED(CODE)")},
+		{Tag: "div", Text: txt("380.1s · cases 35/38 · attempt 2")}, // %.1f;passed=38-3
+		{Tag: "div", Text: txt("three cases crashed")},
+		{Tag: "div", Text: txt("hermes: DSP 初始化崩溃")},
+		{Tag: "hr"},
+		{Tag: "div", Text: txt("aarch64_Linux_RKNN_2.3.2  SKIPPED")}, // SKIPPED 无 category
+		{Tag: "div", Text: txt("fleet 无匹配设备")},                       // 无指标行:CasesTotal=0 且 SKIPPED 省 attempt
+	}
+	if !reflect.DeepEqual(card.Elements, want) {
+		t.Errorf("elements 不匹配\ngot  (%d):\n%s\nwant (%d):\n%s",
+			len(card.Elements), dumpElements(card.Elements), len(want), dumpElements(want))
+	}
+}
+
+// dumpElements 把切片逐行打出来,便于看出是哪一行/哪个字符不同。
+func dumpElements(es []CardElement) string {
+	var b strings.Builder
+	for i, e := range es {
+		if e.Text == nil {
+			fmt.Fprintf(&b, "  [%d] tag=%s\n", i, e.Tag)
+			continue
+		}
+		fmt.Fprintf(&b, "  [%d] tag=%s texttag=%s content=%q\n", i, e.Tag, e.Text.Tag, e.Text.Content)
+	}
+	return b.String()
+}
+
+// ---- 出现条件:各一条最小用例(设计 §4.3/§8) ----
+
+func TestBuildNotificationCardMetricLineGating(t *testing.T) {
+	// CasesTotal == 0 且非 SKIPPED → 只有 attempt,没有 duration/cases。
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 3},
+	}}
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	want := []CardElement{
+		{Tag: "div", Text: &CardText{Tag: "plain_text", Content: "v  TEST_FAILED"}},
+		{Tag: "div", Text: &CardText{Tag: "plain_text", Content: "attempt 3"}},
+	}
+	if !reflect.DeepEqual(card.Elements, want) {
+		t.Errorf("CasesTotal==0 时指标行不对\ngot:\n%swant:\n%s",
+			dumpElements(card.Elements), dumpElements(want))
+	}
+}
+
+func TestBuildNotificationCardCategoryGating(t *testing.T) {
+	cases := []struct {
+		name    string
+		verdict string
+		cat     string
+		wantMax string // 主行内容
+	}{
+		{"Category 为空", "TEST_FAILED", "", "v  TEST_FAILED"},
+		{"PASSED 不显示 category", "PASSED", "CODE", "v  PASSED"},
+		{"非 PASSED 且有 category", "TEST_FAILED", "CODE", "v  TEST_FAILED(CODE)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := &DeviceTestOutput{Tasks: []TaskSummary{
+				{Variant: "v", Verdict: tc.verdict, Category: tc.cat, Attempt: 1},
+			}}
+			card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+			if got := card.Elements[0].Text.Content; got != tc.wantMax {
+				t.Errorf("主行 = %q, want %q", got, tc.wantMax)
+			}
+		})
+	}
+}
+
+func TestBuildNotificationCardReasonHermesGating(t *testing.T) {
+	// SKIPPED + CasesTotal==0 → 没有指标行,只剩主行,便于单独考察 reason/hermes 门控。
+	// Reason == "" → 无 reason 行;Analysis == nil || Summary == "" → 无 hermes 行。
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "SKIPPED"},
+	}}
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	if len(card.Elements) != 1 {
+		t.Fatalf("Reason/Summary 均空时应只有主行,got %d\n%s",
+			len(card.Elements), dumpElements(card.Elements))
+	}
+
+	out2 := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "SKIPPED",
+			Analysis: &hermesclient.Analysis{Summary: ""}},
+	}}
+	card2 := buildNotificationCard(DeviceTestInput{Project: "p"}, out2)
+	if len(card2.Elements) != 1 {
+		t.Fatalf("Summary 为空串时应无 hermes 行,got %d\n%s",
+			len(card2.Elements), dumpElements(card2.Elements))
+	}
+}
+
+func TestBuildNotificationCardAttemptGating(t *testing.T) {
+	// SKIPPED 不显示 attempt;其余 verdict 显示。
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "vs", Verdict: "SKIPPED", CasesTotal: 5, CasesFailed: 0, DurationSec: 1.0, Attempt: 1},
+		{Variant: "vf", Verdict: "TEST_FAILED", CasesTotal: 5, CasesFailed: 1, DurationSec: 1.0, Attempt: 2},
+	}}
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	// Elements: [0]=vs 主行 [1]=vs 指标行 [2]=hr [3]=vf 主行 [4]=vf 指标行
+	skippedMetric := card.Elements[1].Text.Content
+	if strings.Contains(skippedMetric, "attempt") {
+		t.Errorf("SKIPPED 变体的指标行不应含 attempt: %q", skippedMetric)
+	}
+	failedMetric := card.Elements[4].Text.Content
+	if !strings.Contains(failedMetric, "attempt 2") {
+		t.Errorf("非 SKIPPED 变体的指标行应含 attempt: %q", failedMetric)
+	}
+}
+
+// ---- 渲染安全与截断(设计 §4.5) ----
+
+// allContent 把卡片所有 CardElement.Text.Content(以及 header 标题)拼成一个串,
+// 供裁剪/安全类测试用 strings.Contains 定位片段,不关心具体在哪一行。
+func allContent(card NotificationCard) string {
+	var b strings.Builder
+	b.WriteString(card.Header.Title.Content)
+	b.WriteString("\n")
+	for _, e := range card.Elements {
+		if e.Text != nil {
+			b.WriteString(e.Text.Content)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+func mustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return raw
+}
+
+func TestBuildNotificationCardTruncatesReason(t *testing.T) {
+	long := strings.Repeat("a", 600)
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1, Reason: long},
+	}}
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	reason := card.Elements[len(card.Elements)-1].Text.Content
+	if reason == long {
+		t.Fatal("超长 Reason 未被截断")
+	}
+	if utf8.RuneCountInString(reason) > cardReasonSummaryLimit {
+		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(reason))
+	}
+	if strings.Contains(reason, long) {
+		t.Error("截断后仍包含完整原文")
+	}
+	if !strings.HasSuffix(reason, cardTruncationMarker) {
+		t.Errorf("截断后应带省略标记 %q,got %q", cardTruncationMarker, reason)
+	}
+
+	// 边界:恰好等于上限不截断,上限+1 必须截断到恰好上限个 rune——
+	// 挡住"实际上限比 500 松/紧"(比如误把 max 写成 400)的实现。
+	if got := truncateRunes(strings.Repeat("甲", cardReasonSummaryLimit), cardReasonSummaryLimit); got != strings.Repeat("甲", cardReasonSummaryLimit) {
+		t.Error("恰好 500 rune 不应被截断")
+	}
+	if n := utf8.RuneCountInString(truncateRunes(strings.Repeat("甲", cardReasonSummaryLimit+1), cardReasonSummaryLimit)); n != cardReasonSummaryLimit {
+		t.Errorf("501 rune 截断后应恰为 %d,got %d", cardReasonSummaryLimit, n)
+	}
+}
+
+func TestBuildNotificationCardTruncatesSummary(t *testing.T) {
+	long := strings.Repeat("b", 600)
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1,
+			Analysis: &hermesclient.Analysis{Summary: long}},
+	}}
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	hermes := card.Elements[len(card.Elements)-1].Text.Content
+	if strings.Contains(hermes, long) {
+		t.Fatal("超长 Summary 未被截断")
+	}
+	// 截断后的内容(去掉 "hermes: " 前缀)不应超过上限。
+	content := strings.TrimPrefix(hermes, "hermes: ")
+	if utf8.RuneCountInString(content) > cardReasonSummaryLimit {
+		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(content))
+	}
+	if !strings.HasSuffix(content, cardTruncationMarker) {
+		t.Errorf("截断后应带省略标记 %q,got %q", cardTruncationMarker, content)
+	}
+}
+
+func TestBuildNotificationCardTruncatesChineseReasonValidUTF8(t *testing.T) {
+	long := strings.Repeat("甲", 600)
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1, Reason: long},
+	}}
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	reason := card.Elements[len(card.Elements)-1].Text.Content
+	if !utf8.ValidString(reason) {
+		t.Error("纯中文 Reason 截断后不是合法 UTF-8")
+	}
+	if utf8.RuneCountInString(reason) > cardReasonSummaryLimit {
+		t.Errorf("截断后仍超过 %d rune", cardReasonSummaryLimit)
+	}
+}
+
+func TestBuildNotificationCardTruncatesChineseSummaryValidUTF8(t *testing.T) {
+	long := strings.Repeat("乙", 600)
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1,
+			Analysis: &hermesclient.Analysis{Summary: long}},
+	}}
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	hermes := card.Elements[len(card.Elements)-1].Text.Content
+	if !utf8.ValidString(hermes) {
+		t.Error("纯中文 Summary 截断后不是合法 UTF-8")
+	}
+	// 与 TestBuildNotificationCardTruncatesChineseReasonValidUTF8 对称:去掉
+	// "hermes: " 前缀后按上限校验 rune 数,不放过"截断没生效"这种回归。
+	content := strings.TrimPrefix(hermes, "hermes: ")
+	if utf8.RuneCountInString(content) > cardReasonSummaryLimit {
+		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(content))
+	}
+}
+
+// 恶意/不可信文本(markdown 链接、<at> 语法)必须原样以字面文本出现,
+// 且节点 tag 恒为 plain_text——飞书不会把它们解释成链接或 @ 提及。
+func TestBuildNotificationCardRendersUntrustedTextLiterally(t *testing.T) {
+	in := DeviceTestInput{Project: "a[x](http://evil)b", Commit: "c", PipelineID: 1, Version: "1.0.0"}
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v<at user_id=\"all\">", Verdict: "TEST_FAILED", Attempt: 1,
+			Reason:   "r<at user_id=\"all\">[click](http://evil)",
+			Analysis: &hermesclient.Analysis{Summary: "s<at user_id=\"all\">[click](http://evil)"}},
+	}}
+	card := buildNotificationCard(in, out)
+
+	if !strings.Contains(card.Header.Title.Content, "a[x](http://evil)b") {
+		t.Errorf("Project 未原样出现在 header: %q", card.Header.Title.Content)
+	}
+	if card.Header.Title.Tag != "plain_text" {
+		t.Errorf("header tag = %q, want plain_text", card.Header.Title.Tag)
+	}
+	body := allContent(card)
+	for _, want := range []string{
+		`v<at user_id="all">`,
+		`r<at user_id="all">[click](http://evil)`,
+		`s<at user_id="all">[click](http://evil)`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("卡片正文缺少字面文本 %q", want)
+		}
+	}
+	for _, e := range card.Elements {
+		if e.Text != nil && e.Text.Tag != "plain_text" {
+			t.Errorf("节点 tag = %q, want plain_text", e.Text.Tag)
+		}
+	}
+}
+
+// padTo 造一批变体:第 i 个的 Reason 带唯一标记 MARK-%03d,填充到 detailRunes 长
+// (< 500 rune,避免撞上截断逻辑,让本测试只考察裁剪)。总量顶到预算的数倍,
+// 保证正确实现**必须**丢掉一批详情。
+//
+// 注意:不要在这里预测"该丢几个"——JSON 骨架、主行、hr、header 都算进预算,
+// 测试里重算一遍就是把实现的账抄第二遍,抄错了就会稳定误杀正确实现。
+// 分界由下面从卡片内容**观测**得出,断言只压形状(连续后缀、精确数量、不过度裁剪)。
+func padTo(out *DeviceTestOutput) (*DeviceTestOutput, []string) {
+	const detailRunes, variants = 400, 60
+	var markers []string
+	add := func(variant string) {
+		m := fmt.Sprintf("MARK-%03d", len(markers))
+		markers = append(markers, m)
+		out.Tasks = append(out.Tasks, TaskSummary{
+			Variant: variant, Verdict: "TEST_FAILED", Attempt: 1,
+			Reason: m + strings.Repeat("甲", detailRunes-len([]rune(m))),
+		})
+	}
+	add("v-first")
+	// 填充变体一律排在 v-first 与 v-last 之间,保证首尾两端的标记序号确定
+	for i := 0; i < variants-2; i++ {
+		add(fmt.Sprintf("v-fill-%03d", len(markers)))
+	}
+	add("v-last")
+	return out, markers
+}
+
+// 裁剪必须保留前面变体的详情、只丢末尾的(设计 §4.5 第 1 步)。
+func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
+	out, markers := padTo(&DeviceTestOutput{})
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	body := allContent(card)
+
+	// 1) 保留的标记必须是**完整前缀**、丢弃的必须是**完整后缀**。
+	//    只搜"第一个在、最后一个不在"挡不住"中间也删了几个"。
+	kept := 0
+	for kept < len(markers) && strings.Contains(body, markers[kept]) {
+		kept++
+	}
+	for i := kept; i < len(markers); i++ {
+		if strings.Contains(body, markers[i]) {
+			t.Fatalf("标记 %s 在断点 %d 之后仍存在:丢弃的不是连续后缀", markers[i], kept)
+		}
+	}
+	if kept == 0 {
+		t.Fatal("详情被删光了:至少要保住最前面几个变体的详情")
+	}
+	omitted := len(markers) - kept
+	if omitted == 0 {
+		t.Fatal("这批输入远超预算,不该一个详情都没丢")
+	}
+
+	// 2) 变体主行一个都不许删——只删可选行
+	for i := range out.Tasks {
+		if !strings.Contains(body, out.Tasks[i].Variant) {
+			t.Errorf("变体 %s 的主行被删了,只应删可选行", out.Tasks[i].Variant)
+		}
+	}
+
+	// 2b) 指标行也不许删:设计 §4.5 第 1 步只丢 reason/hermes,metric 保留。
+	// padTo 里每个变体的 Attempt 都是 1、CasesTotal 都是 0,所以指标行内容
+	// 逐变体相同(都是 "attempt 1"),没法按变体区分——改用出现次数:
+	// 只要有一个变体的指标行被连带丢了,计数就会少于变体总数。
+	if got := strings.Count(body, "attempt 1"); got != len(out.Tasks) {
+		t.Errorf("指标行出现次数 = %d,want %d(应逐变体保留,只丢 reason/hermes)",
+			got, len(out.Tasks))
+	}
+
+	// 3) 标注里的数字必须与实际丢弃数**逐字相符**,写死 999 或差一都要红
+	want := fmt.Sprintf("（%d 个变体的详情已省略）", omitted) // 全角括号,与实现逐字一致
+	if !strings.Contains(body, want) {
+		t.Errorf("缺少或写错省略标注,期望包含 %q", want)
+	}
+
+	// 4) 当前结果必须在预算内。
+	n := len(mustMarshal(t, card))
+	if n > cardByteBudget {
+		t.Errorf("裁剪后仍超预算: %d", n)
+	}
+
+	// 5) 裁剪必须是最小的:恢复第一个被省略详情,保持其余后缀详情
+	//    清除,并把省略数减一;这个候选必须重新超预算。相比 75% 经验阈值,
+	//    这里直接证明生产实现停在"再少删一个就放不下"的机械边界。
+	blocks := make([]cardVariantBlock, len(out.Tasks))
+	for i, task := range out.Tasks {
+		blocks[i] = buildCardVariantBlock(task)
+		if i > kept {
+			blocks[i].clearDetail()
+		}
+	}
+	candidate := card
+	candidate.Elements = flattenCardBlocks(blocks)
+	if omittedAfterRestore := omitted - 1; omittedAfterRestore > 0 {
+		candidate.Elements = append(candidate.Elements, cardOmittedNotice(omittedAfterRestore))
+	}
+	if got := len(mustMarshal(t, candidate)); got <= cardByteBudget {
+		t.Errorf("恢复第一个被省略详情后仍只有 %d 字节(预算 %d):生产结果裁剪过度",
+			got, cardByteBudget)
 	}
 }

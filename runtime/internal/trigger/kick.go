@@ -38,8 +38,11 @@ type kickPayload struct {
 
 var (
 	kickVariantRegexp = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
-	kickCommitRegexp  = regexp.MustCompile(`^[0-9a-f]{8,40}$`)
-	kickSHA256Regexp  = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	kickProjectRegexp = regexp.MustCompile(
+		`^[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$`,
+	)
+	kickCommitRegexp = regexp.MustCompile(`^[0-9a-f]{8,40}$`)
+	kickSHA256Regexp = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // validate 校验载荷形态与自洽性;gitlabBase 非空时要求产物 URL 指向
@@ -48,7 +51,8 @@ func (p *kickPayload) validate(gitlabBase string) error {
 	switch {
 	case !kickVariantRegexp.MatchString(p.Variant):
 		return errors.New("bad variant")
-	case p.Project == "" || strings.Contains(p.Project, ".."):
+	case len(p.Project) > 256 || !kickProjectRegexp.MatchString(p.Project) ||
+		strings.Contains(p.Project, ".."):
 		return errors.New("bad project")
 	case !kickCommitRegexp.MatchString(p.Commit):
 		return errors.New("bad commit")
@@ -156,7 +160,9 @@ func (h *Handler) HandleKick(w http.ResponseWriter, r *http.Request) {
 	if p.Retry {
 		// 显式 retry(差距 #11):同一逻辑键(commit,pipeline,variant)原子递增
 		// workflow_attempt 得 N,workflow ID 加 -r{N} 起新 run;普通重放永不走这里。
-		n, err := h.store.NextWorkflowAttempt(r.Context(), p.Commit, p.PipelineID, p.Variant)
+		n, err := h.store.NextWorkflowAttempt(
+			r.Context(), p.Project, p.Commit, p.PipelineID, p.Variant,
+		)
 		if err != nil {
 			log.Error().Err(err).Msg("next workflow attempt")
 			http.Error(w, "retry attempt failed", http.StatusInternalServerError)

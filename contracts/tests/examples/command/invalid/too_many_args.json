@@ -1,1 +1,1 @@
-{ "translation_version": 1, "command": "rerun", "args": ["a", "b", "c", "d"], "confidence": 0.9 }
+{ "translation_version": 2, "command": "rerun", "args": ["workflow-id", "variant", "extra"], "confidence": 0.9 }

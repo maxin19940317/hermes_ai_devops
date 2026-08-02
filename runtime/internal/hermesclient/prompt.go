@@ -6,7 +6,7 @@ import _ "embed"
 const PromptVersionAnalyze = "analyze_v1"
 
 // PromptVersionTranslate 是意图翻译当前 prompt 版本号。
-const PromptVersionTranslate = "cmd_translate_v1"
+const PromptVersionTranslate = "cmd_translate_v2"
 
 // PromptAnalyze 是编译进二进制的 prompt 文本(prompts/analyze_v1.md)。
 // 约束:只依据 evidence 分析、证据不足明说、禁止臆测、只输出符合契约的 JSON。
@@ -14,8 +14,8 @@ const PromptVersionTranslate = "cmd_translate_v1"
 //go:embed prompts/analyze_v1.md
 var PromptAnalyze string
 
-// PromptTranslate 是编译进二进制的意图翻译 prompt(prompts/cmd_translate_v1.md)。
+// PromptTranslate 是编译进二进制的意图翻译 prompt(prompts/cmd_translate_v2.md)。
 // 约束:只输出封闭枚举内的指令、参数只能来自上下文快照、拿不准就返回 none。
 //
-//go:embed prompts/cmd_translate_v1.md
+//go:embed prompts/cmd_translate_v2.md
 var PromptTranslate string

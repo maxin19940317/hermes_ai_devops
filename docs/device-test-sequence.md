@@ -67,6 +67,8 @@ sequenceDiagram
     T->>W: StartWorkflow<br/>ID=device-test-{project}-g{sha}-p{iid}
 
     Note over T,W: Workflow ID 冲突策略:运行中 → 拒绝重复;<br/>上次 COMPLETED → 拒绝重复;上次 FAILED/TERMINATED →<br/>只允许显式 retry(新 Run ID,workflow_attempt+1),<br/>普通 webhook 重放不得自动重启。
+    W->>R: RecordWorkflowRun Activity<br/>(版本门内,设备活动之前)
+    R->>D: INSERT immutable workflow_runs input<br/>(同 ID 同内容幂等,冲突拒绝)
 
     %% =========================
     %% 2. 规格解析
@@ -255,7 +257,7 @@ sequenceDiagram
 | Outbox Relay | 独立进程:claim 未投递 outbox 行 → 发 Temporal Signal(至少一次)→ 标记已投;失败重试并记录 last_error,可监控 |
 | Temporal Workflow | 维护流程、等待 Signal、Durable Timer 租约检查、控制重试与步骤顺序;不直接访问任何外部系统 |
 | Runtime Worker | 以 Activity 执行所有数据库、网络、MinIO、Client、Hermes、飞书操作 |
-| PostgreSQL | Artifact、Task、Result、Lease、Decision、Evidence Snapshot、Outbox 的业务权威数据源 |
+| PostgreSQL | WorkflowRun 输入索引、Artifact、Task、Result、Lease、Decision、Evidence Snapshot、Outbox 的业务权威数据源 |
 | Client Agent | 确定性完成下载、ADB、测试和结果上传(本地 SQLite 幂等) |
 | 规则引擎 | 版本化纯函数,决定 status、verdict 和错误类别;在 Workflow 内按 rule_version 路由调用 |
 | Hermes | 对已确定的事实进行根因解释和后续建议,不可覆盖 verdict |
@@ -280,6 +282,20 @@ sequenceDiagram
 | 13 | kick 精确产物地址(原则 4) | `/kick` 与 `ci/kick.py` 已实现;业务仓库 CI 未接线;webhook 兜底保留 | 业务仓库 CI 接 `kick.py` + 配 `TRIGGER_KICK_URL/TOKEN` |
 | 14 | task_id 由 Workflow 确定性生成 | **已对齐**(devicetest.go:`{workflow_id}:{test_id}:a{attempt}`) | 无 |
 | 15 | 心跳续租校验所有权(lease_id/task/attempt/client/generation) | RenewLease 仅按 device_id+task_id 匹配 | **改造**:device_leases 扩 lease_id/generation/released_at,心跳载荷与 WHERE 条件对齐,失配返回 LEASE_NOT_OWNED |
+
+## workflow_runs 与显式重跑（2026-07-30）
+
+新 workflow 在任何设备 Activity 前把规范化输入写入不可变 `workflow_runs`。该表不保存
+运行状态或终态输出，也不从历史 `artifacts`/`tasks` 回填；关闭状态与
+`DeviceTestOutput` 仍从 Temporal 按精确 workflow ID 读取。`RecentRuns` 优先展示这些
+权威行，缺少 run 记录的 legacy 行只用于显示。
+
+显式重跑语法是 `rerun <source_workflow_id> [variant]`。无 variant 时只重跑源输出中满足
+`verdict != PASSED && verdict != SKIPPED` 的变体；显式 variant 只要属于源 run 就仍可重跑，包括 PASSED 或 SKIPPED。
+每条文本命令都会原子递增分配新的 attempt，workflow ID 随后由输入确定性派生；
+`StartDeviceTest` 失败会留下 attempt 空洞。重复发送命令仍会分配不同 attempt，Temporal
+`RejectDuplicate` 不提供命令级幂等。下一轮交互按钮必须用持久化 claim 固定 attempt
+及其派生出的目标 workflow ID。
 
 ## 实施优先级(四批,按依赖排序)
 

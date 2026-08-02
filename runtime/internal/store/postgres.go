@@ -32,33 +32,33 @@ func OpenPG(ctx context.Context, dsn string) (*PGStore, error) {
 	return &PGStore{DB: db}, nil
 }
 
-// NextWorkflowAttempt 把 (commit,pipeline,variant) 逻辑键的 workflow_attempt
-// 原子 +1 并返回新值(显式 retry 的 -r{N} 后缀来源,差距 #11);
-// 单条 UPDATE 原子递增,并发 retry 得到互不相同的 N;
-// 键未登记(产物尚未 RegisterArtifacts)返回错误。
-func (s *PGStore) NextWorkflowAttempt(ctx context.Context, commitSHA string, pipelineID int, variant string) (int, error) {
+// NextWorkflowAttempt 原子递增指定 project 的 workflow_attempt。
+func (s *PGStore) NextWorkflowAttempt(
+	ctx context.Context, project, commitSHA string, pipelineID int, variant string,
+) (int, error) {
 	var n int
 	err := s.DB.QueryRowContext(ctx, `
 		UPDATE artifacts SET workflow_attempt = workflow_attempt + 1
-		WHERE commit_sha = $1 AND pipeline_id = $2 AND variant = $3
+		WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3 AND variant = $4
 		RETURNING workflow_attempt`,
-		commitSHA, pipelineID, variant).Scan(&n)
+		project, commitSHA, pipelineID, variant).Scan(&n)
 	if err == sql.ErrNoRows {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d/%s",
-			commitSHA, pipelineID, variant)
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d/%s",
+			project, commitSHA, pipelineID, variant)
 	}
 	if err != nil {
-		return 0, fmt.Errorf("next workflow attempt %s/%d/%s: %w", commitSHA, pipelineID, variant, err)
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d/%s: %w",
+			project, commitSHA, pipelineID, variant, err)
 	}
 	return n, nil
 }
 
-// RegisterArtifacts 幂等登记:同 (commit,pipeline,variant) 冲突时忽略。
+// RegisterArtifacts 幂等登记:同 (project,commit,pipeline,variant) 冲突时忽略。
 func (s *PGStore) RegisterArtifacts(ctx context.Context, arts []Artifact) error {
 	const q = `INSERT INTO artifacts
 		(project, commit_sha, pipeline_id, variant, build_type, url, sha256, size, manifest_digest)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		ON CONFLICT (commit_sha, pipeline_id, variant) DO NOTHING`
+		ON CONFLICT ON CONSTRAINT artifacts_project_key DO NOTHING`
 	for _, a := range arts {
 		if _, err := s.DB.ExecContext(ctx, q,
 			a.Project, a.CommitSHA, a.PipelineID, a.Variant, a.BuildType,

@@ -43,12 +43,28 @@ forced refresh on expiry errors); otherwise it falls back to the group custom
 bot webhook (`FEISHU_WEBHOOK_URL`). `FEISHU_RECEIVE_ID` accepts an `open_id`
 (personal DM, set `FEISHU_RECEIVE_ID_TYPE=open_id`) or a `chat_id` (group chat,
 the default when the type is unset). All empty means notifications are silently
-skipped (dev mode). Messages are plain text in this version; interactive cards
-are a later milestone. The worker also runs an optional command listener over the
+skipped (dev mode). Terminal-state notifications render as an interactive card
+(2026-07-30): the header background is green/red/orange by verdict — red whenever
+any task has a non-`INFRA_ERROR` failure (business failure takes priority even if
+`INFRA_ERROR` is also present), orange when every failure is `INFRA_ERROR`, green
+when nothing is judged a failure. If the card send fails, or the configured sender
+doesn't support cards, the worker falls back to the same plain-text message this
+version used to send unconditionally. This milestone ships display only — the
+card has no buttons or other interactive components. The worker also runs an
+optional command listener over the
 app's WebSocket event subscription: when `FEISHU_CMD_WHITELIST` (comma-separated
 open_ids) is set, whitelisted users can send the bot DM commands (`status`,
-`devices`, `rerun <sha8> <pipeline_iid> [variant]`, `unquarantine [device_id]`);
+`devices`, `rerun <source_workflow_id> [variant]`, `unquarantine [device_id]`);
 messages from anyone else are silently ignored.
+
+`rerun` accepts only an authoritative, closed source recorded in `workflow_runs`.
+Without a variant it retries only source-output entries satisfying
+`verdict != PASSED && verdict != SKIPPED`; an explicit variant remains allowed when it
+belongs to the source run, including PASSED or SKIPPED. Legacy rows returned by
+`RecentRuns` are display-only and cannot be rerun. Each direct text command allocates a
+fresh attempt and workflow ID. Temporal duplicate rejection is therefore not an
+idempotency mechanism for repeated commands; persistent action claims belong to the
+subsequent interactive-button round.
 
 ### 飞书指令自然语言翻译(可选)
 
@@ -159,6 +175,37 @@ added. When a release adds columns, apply the matching script in
 docker exec -i hermes-runtime-postgres-1 psql -U hermes_runtime -d hermes_runtime \
   -v ON_ERROR_STOP=1 < deploy/postgres/migrations/<file>.sql
 ```
+
+### workflow_runs migration gate
+
+`workflow_runs` is an immutable registry for new workflow inputs and is not backfilled
+from legacy artifacts or tasks. Its migration changes the artifact unique key from
+`(commit_sha, pipeline_id, variant)` to
+`(project, commit_sha, pipeline_id, variant)`, so it is not rolling-compatible with old
+artifact writers.
+
+The already-merged presign/evidence-v3/attribution batch must be deployed and observed stable first.
+Merging the workflow_runs branch does not authorize the production migration.
+Stop all old artifact writers and Feishu command listeners before removing the old
+unique constraint or restarting `analyze_bridge` on v2.
+
+The mandatory production order is:
+
+```text
+prior batch stable -> stop all old artifact writers and Feishu command listeners -> migrate -> update and restart analyze_bridge on every hermes-agent host -> deploy all new binaries -> resume
+```
+
+During the stopped-ingress window, stop every old Trigger process that can insert
+artifacts and every old Worker process that hosts a Feishu command listener. This stops
+both artifact writes and command ingress before any v2 component starts. Then apply
+`deploy/postgres/migrations/2026-07-30-workflow-runs.sql`, synchronize
+`hermes/analyze_bridge` including `command.schema.json v2` to every hermes-agent host and
+restart each `analyze_bridge`, then deploy all new Trigger/Worker/Relay binaries as one
+release. A forward or reverse version mismatch makes the bridge reject the other side's
+translation payload.
+A forward or reverse v1/v2 mismatch breaks all natural-language commands.
+Only resume command and artifact ingress after analyze_bridge and all new binaries are on v2.
+Do not combine this window with deployment of the prerequisite batch.
 
 ## Verify
 

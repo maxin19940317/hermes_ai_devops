@@ -61,15 +61,16 @@ func (s *PGStore) UnquarantineDevice(ctx context.Context, deviceID string) (bool
 	return n > 0, nil
 }
 
-// ListArtifacts 返回 (commit,pipeline) 逻辑键下的全部产物行(飞书指令 rerun
-// 重建 DeviceTestInput 用);无记录返回空切片。
-func (s *PGStore) ListArtifacts(ctx context.Context, commitSHA string, pipelineID int) ([]Artifact, error) {
+// ListArtifacts 返回指定 project/commit/pipeline 的全部产物。
+func (s *PGStore) ListArtifacts(
+	ctx context.Context, project, commitSHA string, pipelineID int,
+) ([]Artifact, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT project, commit_sha, pipeline_id, variant, build_type, url, sha256, size, manifest_digest
-		FROM artifacts WHERE commit_sha = $1 AND pipeline_id = $2 ORDER BY variant`,
-		commitSHA, pipelineID)
+		FROM artifacts WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3 ORDER BY variant`,
+		project, commitSHA, pipelineID)
 	if err != nil {
-		return nil, fmt.Errorf("list artifacts %s/%d: %w", commitSHA, pipelineID, err)
+		return nil, fmt.Errorf("list artifacts %s/%s/%d: %w", project, commitSHA, pipelineID, err)
 	}
 	defer rows.Close()
 	out := []Artifact{}
@@ -77,74 +78,187 @@ func (s *PGStore) ListArtifacts(ctx context.Context, commitSHA string, pipelineI
 		var a Artifact
 		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
 			&a.BuildType, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest); err != nil {
-			return nil, fmt.Errorf("list artifacts %s/%d: scan: %w", commitSHA, pipelineID, err)
+			return nil, fmt.Errorf("list artifacts %s/%s/%d: scan: %w",
+				project, commitSHA, pipelineID, err)
 		}
 		out = append(out, a)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list artifacts %s/%d: %w", commitSHA, pipelineID, err)
+		return nil, fmt.Errorf("list artifacts %s/%s/%d: %w", project, commitSHA, pipelineID, err)
 	}
 	return out, nil
 }
 
-// NextWorkflowAttemptAll 把 (commit,pipeline) 键下全部产物行的 workflow_attempt
-// 原子 +1,返回新的最大值(bundle 级显式 rerun 的 -r{N} 后缀来源)。
-// 单条 UPDATE 原子递增;键下无记录返回错误。
-func (s *PGStore) NextWorkflowAttemptAll(ctx context.Context, commitSHA string, pipelineID int) (int, error) {
-	var maxN int
-	err := s.DB.QueryRowContext(ctx, `
-		WITH bumped AS (
-			UPDATE artifacts SET workflow_attempt = workflow_attempt + 1
-			WHERE commit_sha = $1 AND pipeline_id = $2
-			RETURNING workflow_attempt
-		)
-		SELECT COALESCE(MAX(workflow_attempt), 0) FROM bumped`,
-		commitSHA, pipelineID).Scan(&maxN)
+// NextWorkflowAttemptAll 锁定指定 project/commit/pipeline 的全部变体，把它们
+// 原子推进到当前最大值的下一水位，确保并发分配不会复用序号。
+func (s *PGStore) NextWorkflowAttemptAll(
+	ctx context.Context, project, commitSHA string, pipelineID int,
+) (int, error) {
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return 0, fmt.Errorf("next workflow attempt %s/%d: %w", commitSHA, pipelineID, err)
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: begin: %w",
+			project, commitSHA, pipelineID, err)
 	}
-	if maxN == 0 {
-		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%d", commitSHA, pipelineID)
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT workflow_attempt
+		FROM artifacts
+		WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3
+		ORDER BY variant
+		FOR UPDATE`,
+		project, commitSHA, pipelineID)
+	if err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: lock: %w",
+			project, commitSHA, pipelineID, err)
 	}
-	return maxN, nil
+	maxN := -1
+	for rows.Next() {
+		var n int
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("next workflow attempt %s/%s/%d: scan: %w",
+				project, commitSHA, pipelineID, err)
+		}
+		if n > maxN {
+			maxN = n
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: lock: %w",
+			project, commitSHA, pipelineID, err)
+	}
+	if maxN < 0 {
+		return 0, fmt.Errorf("next workflow attempt: artifact not registered: %s/%s/%d",
+			project, commitSHA, pipelineID)
+	}
+	target := maxN + 1
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE artifacts SET workflow_attempt = $4
+		WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3`,
+		project, commitSHA, pipelineID, target); err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: update: %w",
+			project, commitSHA, pipelineID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("next workflow attempt %s/%s/%d: commit: %w",
+			project, commitSHA, pipelineID, err)
+	}
+	return target, nil
 }
 
-// RecentRuns 见 MemStore 同名方法的语义说明(设计文档 §3.2)。
-// 实现为 1 + limit 次查询而非单条 SQL:baseID 的构造只在 Go 侧(wf.BaseWorkflowID)
-// 存在一份,不在 SQL 里重复拼接字符串——格式漂移在编译期即不可能。limit 为 10 量级,
-// 且只在人机交互路径上调用,查询次数可接受。
+// RecentRuns 见 MemStore 同名方法的语义说明。
 func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	rows, err := s.DB.QueryContext(ctx, `
-		SELECT project, commit_sha, pipeline_id, variant
-		FROM artifacts
-		ORDER BY created_at DESC, artifact_id DESC
-		LIMIT $1`, limit)
+	return s.recentRuns(ctx, limit, nil)
+}
+
+func (s *PGStore) recentRuns(
+	ctx context.Context, limit int, afterAuthoritative func() error,
+) ([]RecentRun, error) {
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("recent runs: %w", err)
+		return nil, fmt.Errorf("recent runs: begin: %w", err)
 	}
-	out := []RecentRun{}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT wr.workflow_id, wr.project, wr.commit_sha, wr.pipeline_id,
+		       wr.version, wr.rule_version, expanded.variant,
+		       COALESCE(task.verdict, ''), task.ended_at
+		FROM workflow_runs wr
+		CROSS JOIN LATERAL unnest(wr.variants) WITH ORDINALITY
+			AS expanded(variant, ord)
+		LEFT JOIN LATERAL (
+			SELECT verdict, ended_at
+			FROM tasks
+			WHERE workflow_id = wr.workflow_id
+			  AND test_id = expanded.variant
+			ORDER BY attempt DESC, created_at DESC, task_id DESC
+			LIMIT 1
+		) task ON true
+		ORDER BY wr.created_at DESC, wr.workflow_id DESC, expanded.ord
+		LIMIT $1`,
+		limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent runs: authoritative: %w", err)
+	}
+	out := make([]RecentRun, 0, limit)
+	for rows.Next() {
+		var r RecentRun
+		var endedAt sql.NullTime
+		if err := rows.Scan(
+			&r.WorkflowID, &r.Project, &r.Commit, &r.PipelineID,
+			&r.Version, &r.RuleVersion, &r.Variant, &r.Verdict, &endedAt,
+		); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("recent runs: authoritative scan: %w", err)
+		}
+		if endedAt.Valid {
+			r.EndedAt = endedAt.Time.UTC()
+		}
+		r.Authoritative = true
+		out = append(out, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("recent runs: authoritative: %w", err)
+	}
+	if afterAuthoritative != nil {
+		if err := afterAuthoritative(); err != nil {
+			return nil, fmt.Errorf("recent runs: after authoritative: %w", err)
+		}
+	}
+	remaining := limit - len(out)
+	if remaining == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("recent runs: commit: %w", err)
+		}
+		return out, nil
+	}
+
+	rows, err = tx.QueryContext(ctx, `
+		SELECT a.project, a.commit_sha, a.pipeline_id, a.variant
+		FROM artifacts a
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM workflow_runs wr
+			WHERE wr.project = a.project
+			  AND wr.commit_sha = a.commit_sha
+			  AND wr.pipeline_id = a.pipeline_id
+			  AND a.variant = ANY(wr.variants)
+		)
+		ORDER BY a.created_at DESC, a.artifact_id DESC
+		LIMIT $1`,
+		remaining)
+	if err != nil {
+		return nil, fmt.Errorf("recent runs: legacy: %w", err)
+	}
+	legacyStart := len(out)
 	for rows.Next() {
 		var r RecentRun
 		if err := rows.Scan(&r.Project, &r.Commit, &r.PipelineID, &r.Variant); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("recent runs: scan: %w", err)
+			return nil, fmt.Errorf("recent runs: legacy scan: %w", err)
 		}
 		out = append(out, r)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("recent runs: %w", err)
+		return nil, fmt.Errorf("recent runs: legacy: %w", err)
 	}
-	for i := range out {
+
+	for i := legacyStart; i < len(out); i++ {
 		base := wf.BaseWorkflowID(out[i].Project, out[i].Commit, out[i].PipelineID)
 		var verdict sql.NullString
 		var endedAt sql.NullTime
-		// starts_with 而非 LIKE:项目名可能含下划线(Algo_Super_SDK),
-		// 而 _ 是 LIKE 的单字符通配符,走 LIKE 就得加 ESCAPE。
-		err := s.DB.QueryRowContext(ctx, `
+		err := tx.QueryRowContext(ctx, `
 			SELECT verdict, ended_at FROM tasks
 			WHERE test_id = $1
 			  AND (workflow_id = $2 OR starts_with(workflow_id, $2 || '-'))
@@ -154,12 +268,15 @@ func (s *PGStore) RecentRuns(ctx context.Context, limit int) ([]RecentRun, error
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("recent runs: lookup %s: %w", out[i].Variant, err)
+			return nil, fmt.Errorf("recent runs: legacy lookup %s: %w", out[i].Variant, err)
 		}
 		out[i].Verdict = verdict.String
 		if endedAt.Valid {
 			out[i].EndedAt = endedAt.Time.UTC()
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("recent runs: commit: %w", err)
 	}
 	return out, nil
 }

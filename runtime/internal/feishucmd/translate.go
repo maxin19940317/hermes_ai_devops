@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -81,11 +80,15 @@ type snapshot struct {
 }
 
 type snapshotRun struct {
-	Commit      string `json:"commit"`
-	PipelineIID int    `json:"pipeline_iid"`
-	Variant     string `json:"variant"`
-	Verdict     string `json:"verdict,omitempty"`
-	EndedAt     string `json:"ended_at,omitempty"`
+	WorkflowID    string `json:"workflow_id,omitempty"`
+	Commit        string `json:"commit"`
+	PipelineIID   int    `json:"pipeline_iid"`
+	Version       string `json:"version,omitempty"`
+	RuleVersion   string `json:"rule_version,omitempty"`
+	Variant       string `json:"variant"`
+	Verdict       string `json:"verdict,omitempty"`
+	EndedAt       string `json:"ended_at,omitempty"`
+	Authoritative bool   `json:"authoritative"`
 }
 
 type snapshotDev struct {
@@ -108,7 +111,11 @@ func (t *Translator) buildSnapshot(ctx context.Context) snapshot {
 	}
 	if runs, err := t.Store.RecentRuns(ctx, recentRunsLimit); err == nil {
 		for _, r := range runs {
-			sr := snapshotRun{Commit: r.Commit, PipelineIID: r.PipelineID, Variant: r.Variant, Verdict: r.Verdict}
+			sr := snapshotRun{
+				WorkflowID: r.WorkflowID, Commit: r.Commit, PipelineIID: r.PipelineID,
+				Version: r.Version, RuleVersion: r.RuleVersion, Variant: r.Variant,
+				Verdict: r.Verdict, Authoritative: r.Authoritative,
+			}
 			if !r.EndedAt.IsZero() {
 				sr.EndedAt = r.EndedAt.UTC().Format(time.RFC3339)
 			}
@@ -181,7 +188,7 @@ func (t *Translator) Translate(ctx context.Context, openID, rawText string) Tran
 		t.save(ctx, audit)
 		return TranslateResult{Outcome: audit.Outcome, Rendered: rendered, Reply: "没理解这句话。\n" + usage}
 	}
-	if why := t.checkArgs(cmd, snap.Devices); why != "" {
+	if why := t.checkArgs(cmd, snap.RecentRuns, snap.Devices); why != "" {
 		audit.Outcome = store.OutcomeRejectedArgs
 		t.save(ctx, audit)
 		return TranslateResult{Outcome: audit.Outcome, Rendered: rendered,
@@ -209,23 +216,31 @@ func (t *Translator) Translate(ctx context.Context, openID, rawText string) Tran
 }
 
 // checkArgs 复用既有参数校验(设计文档 §5.3);返回空串表示通过。
-// 变体/设备存在性按快照成员判定;execute 内部仍会独立查库,两层都保留。
+// workflow/变体/设备存在性按快照成员判定;execute 内部仍会独立查库,两层都保留。
 // devices 是本次快照里的设备列表,用于 unquarantine 的 device_id 存在性判定。
-func (t *Translator) checkArgs(cmd Command, devices []snapshotDev) string {
+func (t *Translator) checkArgs(cmd Command, runs []snapshotRun, devices []snapshotDev) string {
 	switch cmd.Name {
 	case "rerun":
-		if len(cmd.Args) < 2 || len(cmd.Args) > 3 {
-			return "rerun 需要 <sha> <pipeline_iid> [variant]"
+		if len(cmd.Args) < 1 || len(cmd.Args) > 2 {
+			return "rerun 需要 <source_workflow_id> [variant]"
 		}
-		if err := validateSHA(strings.ToLower(cmd.Args[0])); err != nil {
-			return err.Error()
+		workflowID := cmd.Args[0]
+		variant := ""
+		if len(cmd.Args) == 2 {
+			variant = cmd.Args[1]
 		}
-		if iid, err := strconv.Atoi(cmd.Args[1]); err != nil || iid <= 0 {
-			return fmt.Sprintf("pipeline_iid %q 不是正整数", cmd.Args[1])
+		for _, run := range runs {
+			if !run.Authoritative || run.WorkflowID != workflowID {
+				continue
+			}
+			if variant == "" || run.Variant == variant {
+				return ""
+			}
 		}
-		if len(cmd.Args) == 3 && !contains(t.Variants, cmd.Args[2]) {
-			return fmt.Sprintf("变体 %s 不在已知变体名单内", cmd.Args[2])
+		if variant != "" {
+			return fmt.Sprintf("变体 %s 不属于权威运行 %s", variant, workflowID)
 		}
+		return fmt.Sprintf("workflow %s 不在权威运行快照内", workflowID)
 	case "unquarantine":
 		if len(cmd.Args) > 1 {
 			return "unquarantine 最多一个 device_id"
@@ -239,15 +254,6 @@ func (t *Translator) checkArgs(cmd Command, devices []snapshotDev) string {
 		}
 	}
 	return ""
-}
-
-func contains(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
 
 // containsDevice 判定 device_id 是否在快照设备列表内(unquarantine 的存在性校验)。

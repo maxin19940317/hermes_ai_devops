@@ -27,6 +27,7 @@ type Store interface {
 	SaveEvidenceSnapshot(ctx context.Context, snap store.EvidenceSnapshot) error
 	GetEvidenceSnapshot(ctx context.Context, evidenceID string) (*store.EvidenceSnapshot, error)
 	HasDecision(ctx context.Context, taskID, actor string) (bool, error)
+	RecordWorkflowRun(ctx context.Context, run store.WorkflowRun) error
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).
@@ -53,8 +54,8 @@ type Config struct {
 	EscalationToken         string
 	EscalationMinConfidence float64 // 缺省 0.7
 	// MinIO 预签名直传(§3.7);Endpoint 或凭据为空即禁用,优雅降级为空 presigned_uploads。
-	MinIOEndpoint       string        // 集群内 endpoint(如 minio:9000);兼作启用开关
-	MinIOPublicEndpoint string        // 预签名 URL 的 host,须 Client 可达(签名覆盖 Host)
+	MinIOEndpoint       string // 集群内 endpoint(如 minio:9000);兼作启用开关
+	MinIOPublicEndpoint string // 预签名 URL 的 host,须 Client 可达(签名覆盖 Host)
 	MinIOAccessKey      string
 	MinIOSecretKey      string
 	MinIOBucket         string        // 缺省 hermes-evidence

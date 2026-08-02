@@ -15,8 +15,8 @@ import (
 
 // fakeProber 记录探活调用并按预设失败。
 type fakeProber struct {
-	err   error
-	calls int
+	err    error
+	calls  int
 	gotURL string
 }
 
@@ -30,16 +30,16 @@ const kickGitLabBase = "https://gitlab.example"
 
 func validKick() map[string]any {
 	return map[string]any{
-		"variant":           "aarch64_Android_SNPE_2.21",
-		"package_file":      "algo-super-sdk-aarch64_Android_SNPE_2.21-g8e981b96-p48.tar.gz",
-		"url":               kickGitLabBase + "/api/v4/projects/651/packages/generic/algo-super-sdk/1.0.2/pkg.tar.gz",
-		"sha256":            strings.Repeat("a", 64),
-		"size":              83188921,
-		"manifest_digest":   "sha256:deadbeef",
-		"version":           "1.0.2",
-		"project":           "aios/algo_super_sdk",
-		"commit":            "8e981b96",
-		"pipeline_id":       48,
+		"variant":            "aarch64_Android_SNPE_2.21",
+		"package_file":       "algo-super-sdk-aarch64_Android_SNPE_2.21-g8e981b96-p48.tar.gz",
+		"url":                kickGitLabBase + "/api/v4/projects/651/packages/generic/algo-super-sdk/1.0.2/pkg.tar.gz",
+		"sha256":             strings.Repeat("a", 64),
+		"size":               83188921,
+		"manifest_digest":    "sha256:deadbeef",
+		"version":            "1.0.2",
+		"project":            "aios/algo_super_sdk",
+		"commit":             "8e981b96",
+		"pipeline_id":        48,
 		"pipeline_global_id": 712,
 	}
 }
@@ -196,6 +196,32 @@ func TestKickValidation(t *testing.T) {
 			}
 			if starter.calls != 0 || prober.calls != 0 {
 				t.Error("校验失败不得探活/启动")
+			}
+		})
+	}
+}
+
+func TestKickRejectsUncommandableProject(t *testing.T) {
+	cases := []struct {
+		project string
+		want    int
+	}{
+		{"grp/bad project", http.StatusUnprocessableEntity},
+		{"/absolute", http.StatusUnprocessableEntity},
+		{"grp//double", http.StatusUnprocessableEntity},
+		{"grp/trailing\n", http.StatusUnprocessableEntity},
+		{strings.Repeat("a", 257), http.StatusUnprocessableEntity},
+		{"grp/good_project", http.StatusAccepted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.project, func(t *testing.T) {
+			starter, prober := &fakeStarter{started: true}, &fakeProber{}
+			h, _ := newKickHandler(starter, prober)
+			payload := validKick()
+			payload["project"] = tc.project
+			rec := postKick(h, testSecret, mustJSON(t, payload))
+			if rec.Code != tc.want {
+				t.Fatalf("project %q: code = %d, want %d", tc.project, rec.Code, tc.want)
 			}
 		})
 	}
