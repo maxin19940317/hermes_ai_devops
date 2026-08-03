@@ -2,6 +2,7 @@ package feishucmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -78,11 +79,12 @@ func (e *Executor) nowFn() time.Time {
 	return time.Now().UTC()
 }
 
-func (e *Executor) log() zerolog.Logger {
+func (e *Executor) log() *zerolog.Logger {
 	if e.Log != nil {
-		return *e.Log
+		return e.Log
 	}
-	return zerolog.Nop()
+	nop := zerolog.Nop()
+	return &nop
 }
 
 // HandleMessage 处理一条单聊文本消息。安全红线:非白名单 open_id 静默忽略
@@ -462,6 +464,127 @@ func pkgRef(a store.Artifact) wf.PackageRef {
 		Variant: a.Variant, URL: a.URL, SHA256: a.SHA256,
 		Size: a.Size, ManifestDigest: a.ManifestDigest,
 	}
+}
+
+// retryVariant 从已校验的 workflow run 与 variant 启动单变体重试。
+// 步骤:查 artifact → 取 attempt 号 → 构造 DeviceTestInput → StartDeviceTest。
+// source 不能 nil,已由调用方校验。
+func (e *Executor) retryVariant(
+	ctx context.Context, source *store.WorkflowRun, variant string,
+) (string, error) {
+	arts, err := e.Store.ListArtifacts(ctx, source.Project, source.CommitSHA, source.PipelineID)
+	if err != nil {
+		return "", err
+	}
+	var ref wf.PackageRef
+	found := false
+	for _, art := range arts {
+		if art.Variant == variant {
+			ref = pkgRef(art)
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Sprintf("变体 %s 的 artifact 不存在", variant), nil
+	}
+	n, err := e.Store.NextWorkflowAttempt(
+		ctx, source.Project, source.CommitSHA, source.PipelineID, variant,
+	)
+	if err != nil {
+		return "", err
+	}
+	in := wf.DeviceTestInput{
+		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
+		Version: source.Version, RuleVersion: source.RuleVersion,
+		Scope: variant, SourceWorkflowID: source.WorkflowID, Attempt: n,
+		Packages: []wf.PackageRef{ref},
+	}
+	id, started, err := e.Starter.StartDeviceTest(ctx, in)
+	if err != nil {
+		return "", fmt.Errorf("start workflow: %w", err)
+	}
+	if !started {
+		return fmt.Sprintf("workflow 已存在: %s", id), nil
+	}
+	return fmt.Sprintf("已启动重试 %s: %s", variant, id), nil
+}
+
+// HandleCardAction 处理飞书交互卡片按钮点击(card.action.trigger 经 WS 送达)。
+// 返回值:(回复文本, toast 类型)。toastType 为空时不弹 toast(静默记录)。
+func (e *Executor) HandleCardAction(
+	ctx context.Context, value wf.ButtonValue, openID string,
+) (text, toastType string, err error) {
+	if !e.Whitelist[openID] {
+		e.log().Info().Str("open_id", openID).Msg("card action from non-whitelist sender, ignored")
+		return "", "", nil
+	}
+
+	// 参数防御:action/源 workflow/variant 三者缺一不可
+	if value.Action == "" || value.SourceWorkflowID == "" || value.Variant == "" {
+		return "按钮载荷不完整", "error", nil
+	}
+	if !validRerunArg(value.SourceWorkflowID) || !validRerunArg(value.Variant) {
+		return "按钮载荷非法字符", "error", nil
+	}
+
+	source, err := e.Store.GetWorkflowRun(ctx, value.SourceWorkflowID)
+	if errors.Is(err, store.ErrWorkflowRunNotFound) {
+		return "该次运行记录已过期或不存在", "info", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("get workflow run %s: %w", value.SourceWorkflowID, err)
+	}
+
+	switch value.Action {
+	case "retry":
+		closed, cerr := e.Starter.WorkflowClosed(ctx, value.SourceWorkflowID)
+		if cerr != nil {
+			return fmt.Sprintf("检查 workflow 状态失败: %v", cerr), "error", nil
+		}
+		if !closed {
+			return "workflow 尚未结束，无法重试", "info", nil
+		}
+		text, err = e.retryVariant(ctx, source, value.Variant)
+		if err != nil {
+			return "", "", err
+		}
+		return text, "success", nil
+
+	case "ignore":
+		// 记录人工忽略裁决:decisions 表 actor="human",output 存按钮载荷。
+		output, _ := json.Marshal(value)
+		dec := wf.DecisionRow{
+			TaskID: source.WorkflowID, Actor: "human",
+			Output: output,
+		}
+		if err := e.saveDecision(ctx, dec); err != nil {
+			return "", "", err
+		}
+		e.log().Info().
+			Str("open_id", openID).
+			Str("workflow", value.SourceWorkflowID).
+			Str("variant", value.Variant).
+			Msg("card action: ignore")
+		return fmt.Sprintf("已忽略 %s", value.Variant), "success", nil
+
+	default:
+		return fmt.Sprintf("未知操作: %s", value.Action), "error", nil
+	}
+}
+
+// saveDecision 落 decisions 表(actor="human" 的卡片操作)。
+// 重复插入(相同 task_id+actor)静默成功(幂等)。
+func (e *Executor) saveDecision(ctx context.Context, row wf.DecisionRow) error {
+	// Store 接口里没有 SaveDecision,需要通过类型断言;如果 store 不支持则降级记日志。
+	type decisionSaver interface {
+		SaveDecision(ctx context.Context, row wf.DecisionRow) error
+	}
+	if ds, ok := e.Store.(decisionSaver); ok {
+		return ds.SaveDecision(ctx, row)
+	}
+	e.log().Warn().Str("task_id", row.TaskID).Msg("store does not support SaveDecision, card action unrecorded")
+	return nil
 }
 
 // unquarantine [device_id]:不带 id 时单台直接操作,多台列出要求指定。

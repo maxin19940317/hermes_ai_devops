@@ -307,10 +307,11 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 		return nil, fmt.Errorf("device test %s: %w", in.WorkflowID(), err)
 	}
 
+	actualID := workflow.GetInfo(ctx).WorkflowExecution.ID
+
 	if workflow.GetVersion(
 		ctx, "record-workflow-run-v1", workflow.DefaultVersion, 1,
 	) != workflow.DefaultVersion {
-		actualID := workflow.GetInfo(ctx).WorkflowExecution.ID
 		if actualID != in.WorkflowID() {
 			return nil, fmt.Errorf(
 				"workflow execution id %q does not match input id %q",
@@ -362,7 +363,7 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 		}
 	} else {
 		req := NotifyCardRequest{
-			Card:         buildNotificationCard(in, out),
+			Card:         buildNotificationCard(in, out, actualID),
 			FallbackText: buildNotification(in, out), // 原函数,原样调用
 		}
 		if err := workflow.ExecuteActivity(ctx, "NotifyCard", req).Get(ctx, nil); err != nil {
@@ -882,16 +883,41 @@ type CardHeader struct {
 	Template string   `json:"template"` // 只允许 green | red | orange(§4.1)
 }
 
-// CardElement 只有两种形态:文本块(tag=div,Text 非空)与分隔线(tag=hr,Text 为 nil)。
+// CardElement 有三种形态:文本块(tag=div,Text 非空)、分隔线(tag=hr,Text 为 nil)、
+// 交互按钮组(tag=action,Actions 非空)。三个形态互斥:运行时只设置一种。
 type CardElement struct {
-	Tag  string    `json:"tag"`            // 只允许 div | hr
-	Text *CardText `json:"text,omitempty"` // tag=hr 时必须为 nil
+	Tag     string        `json:"tag"`              // div | hr | action
+	Text    *CardText     `json:"text,omitempty"`    // tag=hr|action 时必须为 nil
+	Actions []CardButton  `json:"actions,omitempty"` // tag=div|hr 时必须为 nil
 }
 
 // CardText 的 Tag 恒为 plain_text(§4.5),没有 lark_md 这个选项。
 type CardText struct {
 	Tag     string `json:"tag"` // 恒为 "plain_text"
 	Content string `json:"content"`
+}
+
+// CardAction 是飞书卡片 1.0 的 action 模块,包含一组按钮。
+// 与 CardElement 共享 namespace:tag="action" 不被 div/hr 白名单拦截。
+type CardAction struct {
+	Tag     string       `json:"tag"`     // 恒为 "action"
+	Actions []CardButton `json:"actions"` // 至少一个
+}
+
+// CardButton 是飞书卡片 1.0 的 button 元素。
+type CardButton struct {
+	Tag   string      `json:"tag"`   // 恒为 "button"
+	Text  CardText    `json:"text"`  // 按钮文案
+	Type  string      `json:"type"`  // primary | default | danger
+	Value ButtonValue `json:"value"` // 点击后原样回传的载荷
+}
+
+// ButtonValue 是按钮点击后经 WS card.action.trigger 原样回传的载荷(§10(4))。
+// 只放身份标识(action+source_workflow_id+variant),其余一律从权威记录派生。
+type ButtonValue struct {
+	Action           string `json:"action"`             // "retry" | "ignore"
+	SourceWorkflowID string `json:"source_workflow_id"` // 重试来源;忽略时仍携带以便审计
+	Variant          string `json:"variant"`            // 具体变体
 }
 
 // NotifyCardRequest 是 NotifyCard 活动的输入(进 workflow history)。
@@ -965,11 +991,13 @@ func cardHeaderTemplate(tasks []TaskSummary) string {
 // cardVariantBlock 是单个变体在卡片里的行分组:主行(main)恒存在且不可裁剪,
 // metric 按格式表条件出现但始终保留;reason/hermes 是"该变体的详情",
 // 裁剪时按变体整体丢弃(设计 §4.5 第 1 步)。
+// actions 是变体失败时的交互按钮组("重试该变体"/"忽略"),不占裁剪预算。
 type cardVariantBlock struct {
-	main   CardElement
-	metric *CardElement
-	reason *CardElement
-	hermes *CardElement
+	main    CardElement
+	metric  *CardElement
+	reason  *CardElement
+	hermes  *CardElement
+	actions *CardElement // tag=action 按钮组;nil = 该变体不可重试(已 PASSED/SKIPPED)
 }
 
 func (b cardVariantBlock) hasDetail() bool { return b.reason != nil || b.hermes != nil }
@@ -990,12 +1018,16 @@ func (b cardVariantBlock) flatten() []CardElement {
 	if b.hermes != nil {
 		es = append(es, *b.hermes)
 	}
+	if b.actions != nil {
+		es = append(es, *b.actions)
+	}
 	return es
 }
 
 // buildCardVariantBlock 逐条对齐 buildNotification 的字段(设计 §4.3),
 // 唯一有意偏离:SKIPPED 不显示 attempt。
-func buildCardVariantBlock(tk TaskSummary) cardVariantBlock {
+// 可判定失败(verdict ∉ {PASSED,SKIPPED})的变体附加"重试该变体"/"忽略"按钮。
+func buildCardVariantBlock(tk TaskSummary, workflowID string) cardVariantBlock {
 	main := fmt.Sprintf("%s  %s", tk.Variant, tk.Verdict)
 	if tk.Verdict != string(rules.VerdictPassed) && tk.Category != "" {
 		main += fmt.Sprintf("(%s)", tk.Category)
@@ -1023,6 +1055,37 @@ func buildCardVariantBlock(tk TaskSummary) cardVariantBlock {
 		h := plainCardDiv("hermes: " + truncateRunes(tk.Analysis.Summary, cardReasonSummaryLimit))
 		blk.hermes = &h
 	}
+	// 可判定失败(verdict ∉ {PASSED,SKIPPED})的变体附加交互按钮。
+	// SKIPPED(OS未接入/无匹配设备)不重试;PASSED 不重试;INFRA_ERROR 亦给按钮
+	// (用户判断是否环境已恢复)。
+	if tk.Verdict != string(rules.VerdictPassed) && tk.Verdict != VerdictSkipped &&
+		workflowID != "" {
+		blk.actions = &CardElement{
+			Tag: "action",
+			Actions: []CardButton{
+				{
+					Tag:  "button",
+					Text: CardText{Tag: "plain_text", Content: "重试该变体"},
+					Type: "primary",
+					Value: ButtonValue{
+						Action:           "retry",
+						SourceWorkflowID: workflowID,
+						Variant:          tk.Variant,
+					},
+				},
+				{
+					Tag:  "button",
+					Text: CardText{Tag: "plain_text", Content: "忽略"},
+					Type: "default",
+					Value: ButtonValue{
+						Action:           "ignore",
+						SourceWorkflowID: workflowID,
+						Variant:          tk.Variant,
+					},
+				},
+			},
+		}
+	}
 	return blk
 }
 
@@ -1046,7 +1109,9 @@ func cardOmittedNotice(n int) CardElement {
 
 // buildNotificationCard 把 buildNotification 同源的数据渲染成飞书交互卡片
 // (设计 §4)。字段对齐见 §4.3,封闭结构见 §4.4,裁剪见 §4.5。
-func buildNotificationCard(in DeviceTestInput, out *DeviceTestOutput) NotificationCard {
+// workflowID 是本次运行的 workflow ID,注入按钮 payload 的 source_workflow_id;
+// 空值时跳过按钮(兼容纯文本降级路径)。
+func buildNotificationCard(in DeviceTestInput, out *DeviceTestOutput, workflowID string) NotificationCard {
 	title := fmt.Sprintf("[hermes-devops] %s g%s p%d (v%s)", in.Project, in.Commit, in.PipelineID, in.Version)
 	card := NotificationCard{
 		Config: CardConfig{WideScreenMode: true},
@@ -1063,7 +1128,7 @@ func buildNotificationCard(in DeviceTestInput, out *DeviceTestOutput) Notificati
 
 	blocks := make([]cardVariantBlock, len(out.Tasks))
 	for i, tk := range out.Tasks {
-		blocks[i] = buildCardVariantBlock(tk)
+		blocks[i] = buildCardVariantBlock(tk, workflowID)
 	}
 	card.Elements = flattenCardBlocks(blocks)
 

@@ -446,7 +446,7 @@ func TestWorkflowSendsCardWithVerbatimFallback(t *testing.T) {
 	}
 	// 只查 FallbackText 查不出 workflow 是否真把卡片本体传下去了——
 	// Card 字段单独断言,确保"接线"这条线真的被覆盖。
-	if got, wantCard := f.notifyCards[0].Card, buildNotificationCard(input(), &out); !reflect.DeepEqual(got, wantCard) {
+	if got, wantCard := f.notifyCards[0].Card, buildNotificationCard(input(), &out, ""); !reflect.DeepEqual(got, wantCard) {
 		t.Errorf("Card = %+v, want 与 buildNotificationCard 同源 %+v", got, wantCard)
 	}
 }
@@ -1030,8 +1030,18 @@ func TestEscalateFailureKeepsMainFlow(t *testing.T) {
 	if out.Tasks[0].Analysis == nil {
 		t.Error("升级失败不得影响 hermes 分析结论")
 	}
-	if len(f.notifications) != 1 || !strings.Contains(f.notifications[0], "TEST_FAILED") {
-		t.Errorf("通知应照常发送: %v", f.notifications)
+	if len(f.notifyCards) != 1 {
+		t.Errorf("通知卡片应发送 1 条, got %d", len(f.notifyCards))
+	}
+	if len(f.notifyCards) == 1 {
+		card := f.notifyCards[0]
+		if card.Card.Header.Template != "red" {
+			t.Errorf("卡片 header = %s, want red(DELEGATE 失败)", card.Card.Header.Template)
+		}
+		// 降级文本应与旧逻辑一致(包含 TEST_FAILED)
+		if !strings.Contains(card.FallbackText, "TEST_FAILED") {
+			t.Errorf("降级文本不含 TEST_FAILED: %s", card.FallbackText)
+		}
 	}
 }
 
@@ -1057,7 +1067,7 @@ func TestBuildNotificationCardHeaderColor(t *testing.T) {
 				out.Tasks = append(out.Tasks, TaskSummary{
 					Variant: fmt.Sprintf("v%d", i), Verdict: v, Attempt: 1})
 			}
-			card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+			card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 			if card.Header.Template != tc.want {
 				t.Errorf("template = %q, want %q", card.Header.Template, tc.want)
 			}
@@ -1067,7 +1077,7 @@ func TestBuildNotificationCardHeaderColor(t *testing.T) {
 
 // out.Tasks 为空时,正文必须是与纯文本同款的提示,而不是什么都不放。
 func TestBuildNotificationCardEmptyTasks(t *testing.T) {
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, &DeviceTestOutput{})
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, &DeviceTestOutput{}, "")
 	want := []CardElement{
 		{Tag: "div", Text: &CardText{Tag: "plain_text",
 			Content: "无可测变体(Android 包缺失或未配置)"}},
@@ -1209,7 +1219,7 @@ func sampleOutput() *DeviceTestOutput {
 }
 
 func TestCardIsClosedStructure(t *testing.T) {
-	card := buildNotificationCard(sampleInput(), sampleOutput())
+	card := buildNotificationCard(sampleInput(), sampleOutput(), "")
 	raw, err := json.Marshal(card)
 	if err != nil {
 		t.Fatal(err)
@@ -1263,7 +1273,7 @@ func TestBuildNotificationCardGolden(t *testing.T) {
 			Reason: "fleet 无匹配设备"},
 	}}
 
-	card := buildNotificationCard(in, out)
+	card := buildNotificationCard(in, out, "")
 
 	if want := "[hermes-devops] algo-super-sdk g9da3b9d9 p56 (v1.4.2)"; card.Header.Title.Content != want {
 		t.Errorf("header content = %q, want %q", card.Header.Title.Content, want)
@@ -1314,7 +1324,7 @@ func TestBuildNotificationCardMetricLineGating(t *testing.T) {
 	out := &DeviceTestOutput{Tasks: []TaskSummary{
 		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 3},
 	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 	want := []CardElement{
 		{Tag: "div", Text: &CardText{Tag: "plain_text", Content: "v  TEST_FAILED"}},
 		{Tag: "div", Text: &CardText{Tag: "plain_text", Content: "attempt 3"}},
@@ -1341,7 +1351,7 @@ func TestBuildNotificationCardCategoryGating(t *testing.T) {
 			out := &DeviceTestOutput{Tasks: []TaskSummary{
 				{Variant: "v", Verdict: tc.verdict, Category: tc.cat, Attempt: 1},
 			}}
-			card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+			card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 			if got := card.Elements[0].Text.Content; got != tc.wantMax {
 				t.Errorf("主行 = %q, want %q", got, tc.wantMax)
 			}
@@ -1355,7 +1365,7 @@ func TestBuildNotificationCardReasonHermesGating(t *testing.T) {
 	out := &DeviceTestOutput{Tasks: []TaskSummary{
 		{Variant: "v", Verdict: "SKIPPED"},
 	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 	if len(card.Elements) != 1 {
 		t.Fatalf("Reason/Summary 均空时应只有主行,got %d\n%s",
 			len(card.Elements), dumpElements(card.Elements))
@@ -1365,7 +1375,7 @@ func TestBuildNotificationCardReasonHermesGating(t *testing.T) {
 		{Variant: "v", Verdict: "SKIPPED",
 			Analysis: &hermesclient.Analysis{Summary: ""}},
 	}}
-	card2 := buildNotificationCard(DeviceTestInput{Project: "p"}, out2)
+	card2 := buildNotificationCard(DeviceTestInput{Project: "p"}, out2, "")
 	if len(card2.Elements) != 1 {
 		t.Fatalf("Summary 为空串时应无 hermes 行,got %d\n%s",
 			len(card2.Elements), dumpElements(card2.Elements))
@@ -1378,7 +1388,7 @@ func TestBuildNotificationCardAttemptGating(t *testing.T) {
 		{Variant: "vs", Verdict: "SKIPPED", CasesTotal: 5, CasesFailed: 0, DurationSec: 1.0, Attempt: 1},
 		{Variant: "vf", Verdict: "TEST_FAILED", CasesTotal: 5, CasesFailed: 1, DurationSec: 1.0, Attempt: 2},
 	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 	// Elements: [0]=vs 主行 [1]=vs 指标行 [2]=hr [3]=vf 主行 [4]=vf 指标行
 	skippedMetric := card.Elements[1].Text.Content
 	if strings.Contains(skippedMetric, "attempt") {
@@ -1421,7 +1431,7 @@ func TestBuildNotificationCardTruncatesReason(t *testing.T) {
 	out := &DeviceTestOutput{Tasks: []TaskSummary{
 		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1, Reason: long},
 	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 	reason := card.Elements[len(card.Elements)-1].Text.Content
 	if reason == long {
 		t.Fatal("超长 Reason 未被截断")
@@ -1452,7 +1462,7 @@ func TestBuildNotificationCardTruncatesSummary(t *testing.T) {
 		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1,
 			Analysis: &hermesclient.Analysis{Summary: long}},
 	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 	hermes := card.Elements[len(card.Elements)-1].Text.Content
 	if strings.Contains(hermes, long) {
 		t.Fatal("超长 Summary 未被截断")
@@ -1472,7 +1482,7 @@ func TestBuildNotificationCardTruncatesChineseReasonValidUTF8(t *testing.T) {
 	out := &DeviceTestOutput{Tasks: []TaskSummary{
 		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1, Reason: long},
 	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 	reason := card.Elements[len(card.Elements)-1].Text.Content
 	if !utf8.ValidString(reason) {
 		t.Error("纯中文 Reason 截断后不是合法 UTF-8")
@@ -1488,7 +1498,7 @@ func TestBuildNotificationCardTruncatesChineseSummaryValidUTF8(t *testing.T) {
 		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1,
 			Analysis: &hermesclient.Analysis{Summary: long}},
 	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 	hermes := card.Elements[len(card.Elements)-1].Text.Content
 	if !utf8.ValidString(hermes) {
 		t.Error("纯中文 Summary 截断后不是合法 UTF-8")
@@ -1510,7 +1520,7 @@ func TestBuildNotificationCardRendersUntrustedTextLiterally(t *testing.T) {
 			Reason:   "r<at user_id=\"all\">[click](http://evil)",
 			Analysis: &hermesclient.Analysis{Summary: "s<at user_id=\"all\">[click](http://evil)"}},
 	}}
-	card := buildNotificationCard(in, out)
+	card := buildNotificationCard(in, out, "")
 
 	if !strings.Contains(card.Header.Title.Content, "a[x](http://evil)b") {
 		t.Errorf("Project 未原样出现在 header: %q", card.Header.Title.Content)
@@ -1565,7 +1575,7 @@ func padTo(out *DeviceTestOutput) (*DeviceTestOutput, []string) {
 // 裁剪必须保留前面变体的详情、只丢末尾的(设计 §4.5 第 1 步)。
 func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
 	out, markers := padTo(&DeviceTestOutput{})
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out)
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 	body := allContent(card)
 
 	// 1) 保留的标记必须是**完整前缀**、丢弃的必须是**完整后缀**。
@@ -1620,7 +1630,7 @@ func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
 	//    这里直接证明生产实现停在"再少删一个就放不下"的机械边界。
 	blocks := make([]cardVariantBlock, len(out.Tasks))
 	for i, task := range out.Tasks {
-		blocks[i] = buildCardVariantBlock(task)
+		blocks[i] = buildCardVariantBlock(task, "")
 		if i > kept {
 			blocks[i].clearDetail()
 		}
@@ -1633,5 +1643,91 @@ func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
 	if got := len(mustMarshal(t, candidate)); got <= cardByteBudget {
 		t.Errorf("恢复第一个被省略详情后仍只有 %d 字节(预算 %d):生产结果裁剪过度",
 			got, cardByteBudget)
+	}
+}
+
+// ---- 交互卡片按钮(重试/忽略)----
+
+func TestBuildNotificationCardButtonsOnFailedVariants(t *testing.T) {
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "TEST_FAILED", Category: "CODE", Attempt: 1},
+	}}
+	card := buildNotificationCard(sampleInput(), out, "device-test-p-gabc-p42")
+	if card.Header.Template != "red" {
+		t.Errorf("header = %s, want red", card.Header.Template)
+	}
+	// 最后一个 element 应为 action 按钮组
+	if len(card.Elements) < 1 {
+		t.Fatal("no elements")
+	}
+	actionEl := card.Elements[len(card.Elements)-1]
+	if actionEl.Tag != "action" {
+		t.Fatalf("last element tag = %s, want action", actionEl.Tag)
+	}
+	if len(actionEl.Actions) != 2 {
+		t.Fatalf("actions = %d, want 2", len(actionEl.Actions))
+	}
+	b0 := actionEl.Actions[0]
+	if b0.Text.Content != "重试该变体" || b0.Type != "primary" ||
+		b0.Value.Action != "retry" || b0.Value.SourceWorkflowID != "device-test-p-gabc-p42" {
+		t.Errorf("button[0] = %+v", b0)
+	}
+	b1 := actionEl.Actions[1]
+	if b1.Text.Content != "忽略" || b1.Type != "default" ||
+		b1.Value.Action != "ignore" {
+		t.Errorf("button[1] = %+v", b1)
+	}
+}
+
+func TestBuildNotificationCardNoButtonsOnPassed(t *testing.T) {
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "PASSED", Attempt: 1},
+	}}
+	card := buildNotificationCard(sampleInput(), out, "wf-id")
+	for _, el := range card.Elements {
+		if el.Tag == "action" {
+			t.Fatal("PASSED 变体不应有按钮")
+		}
+	}
+}
+
+func TestBuildNotificationCardNoButtonsOnSkipped(t *testing.T) {
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "SKIPPED"},
+	}}
+	card := buildNotificationCard(sampleInput(), out, "wf-id")
+	for _, el := range card.Elements {
+		if el.Tag == "action" {
+			t.Fatal("SKIPPED 变体不应有按钮")
+		}
+	}
+}
+
+func TestBuildNotificationCardNoButtonsWhenWorkflowIDEmpty(t *testing.T) {
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "TEST_FAILED", Category: "CODE", Attempt: 1},
+	}}
+	card := buildNotificationCard(sampleInput(), out, "")
+	for _, el := range card.Elements {
+		if el.Tag == "action" {
+			t.Fatal("workflowID 为空时不应有按钮")
+		}
+	}
+}
+
+func TestBuildNotificationCardButtonsOnInfraError(t *testing.T) {
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "INFRA_ERROR", Category: "INFRA", Attempt: 2},
+	}}
+	card := buildNotificationCard(sampleInput(), out, "wf-id")
+	found := false
+	for _, el := range card.Elements {
+		if el.Tag == "action" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("INFRA_ERROR 变体也应有按钮")
 	}
 }

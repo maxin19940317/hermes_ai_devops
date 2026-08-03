@@ -8,8 +8,11 @@ import (
 
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
+
+	wf "hermes-devops/runtime/internal/workflow"
 )
 
 // Listener 是飞书长连接(WebSocket)事件接收的最薄封装(不可单测,
@@ -46,7 +49,53 @@ func (l *Listener) Run(ctx context.Context) error {
 			return nil
 		}).
 		// 消息已读回执:无业务用途,注册空操作避免 SDK 刷 "not found handler" 错误日志。
-		OnP2MessageReadV1(func(_ context.Context, _ *larkim.P2MessageReadV1) error { return nil })
+		OnP2MessageReadV1(func(_ context.Context, _ *larkim.P2MessageReadV1) error { return nil }).
+		// card.action.trigger:交互卡片按钮点击经 WS 送达(设计 §10)。
+		// 不异步:toast 是同步回复,必须在回调返回前写入响应;且操作不超过 10ms
+		// (查 workflow run + 启动 workflow 或写 decisions),飞书 ack 窗口 ≈2s 足够。
+		OnP2CardActionTrigger(func(_ context.Context, ev *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+			if ev == nil || ev.Event == nil || ev.Event.Action == nil || ev.Event.Action.Value == nil {
+				return &callback.CardActionTriggerResponse{
+					Toast: &callback.Toast{Type: "error", Content: "按钮载荷缺失"},
+				}, nil
+			}
+
+			openID := ""
+			if ev.Event.Operator != nil {
+				openID = ev.Event.Operator.OpenID
+			}
+
+			raw, err := json.Marshal(ev.Event.Action.Value)
+			if err != nil {
+				return &callback.CardActionTriggerResponse{
+					Toast: &callback.Toast{Type: "error", Content: "按钮载荷解析失败"},
+				}, nil
+			}
+
+			var value wf.ButtonValue
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return &callback.CardActionTriggerResponse{
+					Toast: &callback.Toast{Type: "error", Content: "按钮载荷格式错误"},
+				}, nil
+			}
+
+			text, toastType, err := l.Exec.HandleCardAction(ctx, value, openID)
+			if err != nil {
+				l.Exec.log().Error().Err(err).
+					Str("action", value.Action).
+					Str("workflow", value.SourceWorkflowID).
+					Msg("card action failed")
+				return &callback.CardActionTriggerResponse{
+					Toast: &callback.Toast{Type: "error", Content: "操作失败，请重试"},
+				}, nil
+			}
+			if toastType == "" {
+				return nil, nil // 静默(非白名单,不弹 toast)
+			}
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{Type: toastType, Content: text},
+			}, nil
+		})
 	cli := larkws.NewClient(l.AppID, l.AppSecret,
 		larkws.WithEventHandler(handler),
 		larkws.WithLogLevel(larkcore.LogLevelError),
