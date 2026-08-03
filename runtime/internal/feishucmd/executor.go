@@ -724,9 +724,9 @@ func (e *Executor) planCmd(ctx context.Context, args []string) (string, error) {
 
 	// 格式化计划摘要
 	var plan struct {
-		PlanID       string `json:"plan_id"`
-		GoalSummary  string `json:"goal_summary"`
-		Build        struct {
+		PlanID      string `json:"plan_id"`
+		GoalSummary string `json:"goal_summary"`
+		Build       struct {
 			Project   string   `json:"project"`
 			Ref       string   `json:"ref"`
 			Targets   []string `json:"targets"`

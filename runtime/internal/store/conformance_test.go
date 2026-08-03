@@ -58,6 +58,9 @@ type fullStore interface {
 	NextWorkflowAttemptAll(ctx context.Context, project, commitSHA string, pipelineID int) (int, error)
 	SaveCommandTranslation(ctx context.Context, row CommandTranslation) error
 	ListCommandTranslations(ctx context.Context, openID string, limit int) ([]CommandTranslation, error)
+	RecentRuns(ctx context.Context, limit int) ([]RecentRun, error)
+	RecordWorkflowRun(ctx context.Context, run WorkflowRun) error
+	GetWorkflowRun(ctx context.Context, workflowID string) (*WorkflowRun, error)
 	SaveMetrics(ctx context.Context, points []MetricPoint) error
 	Baseline(ctx context.Context, project, variant, suite, metricName string, n int) (*MetricBaseline, error)
 }

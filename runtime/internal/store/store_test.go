@@ -1,10 +1,7 @@
 package store
 
 import (
-	"sort"
 	"testing"
-
-	"github.com/ghodss/yomicro/pkg/metrics"
 )
 
 func TestMemStoreArtifactKeyIncludesProject(t *testing.T) {

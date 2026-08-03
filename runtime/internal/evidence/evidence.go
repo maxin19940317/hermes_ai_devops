@@ -449,10 +449,10 @@ func parseJunit(r io.Reader) []JunitFailure {
 // 由 ExtractEvidence 活动在 DB 有数据时填充,DB 为空时各字段为 nil。
 type MetricsBaseline struct {
 	Value    float64  `json:"value"`
-	Baseline *float64 `json:"baseline,omitempty"`   // nil = 无历史基线(N < 3)
-	Delta    *float64 `json:"delta,omitempty"`       // value - baseline
-	DeltaPct *float64 `json:"delta_pct,omitempty"`   // (value - baseline) / baseline * 100
-	SampleN  int      `json:"sample_n"`              // 基线样本数
+	Baseline *float64 `json:"baseline,omitempty"`  // nil = 无历史基线(N < 3)
+	Delta    *float64 `json:"delta,omitempty"`     // value - baseline
+	DeltaPct *float64 `json:"delta_pct,omitempty"` // (value - baseline) / baseline * 100
+	SampleN  int      `json:"sample_n"`            // 基线样本数
 }
 
 // MetricsBaselineMap 是 metric_name → MetricsBaseline 的映射,evidence.json 顶层字段。

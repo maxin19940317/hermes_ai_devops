@@ -1,8 +1,8 @@
 package hermesclient
 
 import (
-	"strings"
 	_ "embed"
+	"strings"
 )
 
 //go:embed prompts/analyze_v1.md
