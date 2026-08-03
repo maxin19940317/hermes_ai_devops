@@ -133,14 +133,18 @@ type ResultReport struct {
 // Client 是 Runtime 回调端点的薄 HTTP 客户端:JSON 编码、状态码分类,
 // 无重试逻辑(重发策略由 Heartbeat/EventReporter/ResultReporter 各自决定)。
 type Client struct {
-	BaseURL string        // Runtime callback base,如 http://host:18091
-	HTTP    *http.Client  // nil → http.DefaultClient
-	Timeout time.Duration // 单次请求超时;0 → DefaultTimeout
+	BaseURL   string            // Runtime callback base,如 http://host:18091
+	HTTP      *http.Client      // nil → http.DefaultClient
+	Transport http.RoundTripper // Phase 3 mTLS;非 nil 时注入 http.Client.Transport
+	Timeout   time.Duration     // 单次请求超时;0 → DefaultTimeout
 }
 
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
+	}
+	if c.Transport != nil {
+		return &http.Client{Transport: c.Transport, Timeout: c.timeout()}
 	}
 	return http.DefaultClient
 }

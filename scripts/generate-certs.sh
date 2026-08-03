@@ -1,0 +1,67 @@
+#!/bin/bash
+# generate-certs.sh — 生成 mTLS 所需的 CA、Server、Client 证书(CLAUDE.md §12 Phase 3)。
+# 用法:
+#   ./generate-certs.sh [client_id1] [client_id2] ...
+#   不传 client_id 时生成一个默认 client 证书(CN=client-default)。
+# 产物:
+#   deploy/certs/ca-cert.pem        CA 证书(分发给所有节点)
+#   deploy/certs/ca-key.pem         CA 私钥(仅 Runtime 保留,签名用)
+#   deploy/certs/server-cert.pem    Runtime 服务端证书(CN=hermes-runtime)
+#   deploy/certs/server-key.pem     Runtime 服务端私钥
+#   deploy/certs/client-{id}.pem    每个 Client 的证书 + 私钥合体(Agent 单文件加载)
+#                                   CN 与 client_id 一致,Runtime 凭 CN 确认身份
+set -euo pipefail
+
+CERTS_DIR="${CERTS_DIR:-deploy/certs}"
+mkdir -p "$CERTS_DIR"
+
+ORG="${CERT_ORG:-hermes-devops}"
+VALIDITY="${CERT_VALIDITY_DAYS:-3650}"
+
+if [ $# -eq 0 ]; then
+	set -- "client-default"
+fi
+CLIENTS=("$@")
+
+echo "=== 1/4 CA ==="
+openssl req -x509 -newkey rsa:4096 -days "$VALIDITY" -nodes \
+	-keyout "$CERTS_DIR/ca-key.pem" -out "$CERTS_DIR/ca-cert.pem" \
+	-subj "/O=${ORG}/CN=hermes-devops-ca" 2>/dev/null
+
+echo "=== 2/4 Server (hermes-runtime) ==="
+openssl req -newkey rsa:4096 -nodes \
+	-keyout "$CERTS_DIR/server-key.pem" -out "$CERTS_DIR/server.csr" \
+	-subj "/O=${ORG}/CN=hermes-runtime" 2>/dev/null
+openssl x509 -req -in "$CERTS_DIR/server.csr" -CA "$CERTS_DIR/ca-cert.pem" -CAkey "$CERTS_DIR/ca-key.pem" \
+	-CAcreateserial -out "$CERTS_DIR/server-cert.pem" -days "$VALIDITY" 2>/dev/null
+rm -f "$CERTS_DIR/server.csr"
+
+for client_id in "${CLIENTS[@]}"; do
+	echo "=== 3/4 Client: ${client_id} ==="
+	openssl req -newkey rsa:4096 -nodes \
+		-keyout "$CERTS_DIR/client-${client_id}-key.pem" \
+		-out "$CERTS_DIR/client-${client_id}.csr" \
+		-subj "/O=${ORG}/CN=${client_id}" 2>/dev/null
+	openssl x509 -req -in "$CERTS_DIR/client-${client_id}.csr" \
+		-CA "$CERTS_DIR/ca-cert.pem" -CAkey "$CERTS_DIR/ca-key.pem" \
+		-CAcreateserial -out "$CERTS_DIR/client-${client_id}-cert.pem" \
+		-days "$VALIDITY" 2>/dev/null
+	rm -f "$CERTS_DIR/client-${client_id}.csr"
+
+	# Agent 单文件加载:cert + key 合并
+	cat "$CERTS_DIR/client-${client_id}-cert.pem" "$CERTS_DIR/client-${client_id}-key.pem" \
+		> "$CERTS_DIR/client-${client_id}.pem"
+	rm -f "$CERTS_DIR/client-${client_id}-key.pem"
+done
+
+echo "=== 4/4 Permissions ==="
+chmod 600 "$CERTS_DIR/"*-key.pem "$CERTS_DIR/ca-key.pem" 2>/dev/null || true
+chmod 644 "$CERTS_DIR/ca-cert.pem"
+
+echo "Done."
+echo "  CA:        $CERTS_DIR/ca-cert.pem  (分发给所有节点)"
+echo "  CA key:    $CERTS_DIR/ca-key.pem   (Runtime 保留)"
+echo "  Server:    $CERTS_DIR/server-cert.pem + server-key.pem"
+for client_id in "${CLIENTS[@]}"; do
+	echo "  Client:    $CERTS_DIR/client-${client_id}.pem  → 复制到 Windows Agent"
+done

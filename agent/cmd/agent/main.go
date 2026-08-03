@@ -23,6 +23,8 @@
 //	AGENT_SOC_ALIASES            可选,平台代号→SoC 型号别名(如 trinket:QCM6125,多个用逗号分隔)
 //	AGENT_DEVICE_CAPABILITIES    可选,旧版单设备能力声明(多设备时忽略)
 //	AGENT_DEVICE_CAPABILITIES_MAP 可选,按 serial/SoC 声明能力的 JSON 对象
+//	AGENT_MTLS_CA_FILE           可选,Phase 3 mTLS: CA 证书路径
+//	AGENT_MTLS_CERT_FILE         可选,Phase 3 mTLS: 客户端合体证书路径(client-{id}.pem)
 package main
 
 import (
@@ -42,6 +44,7 @@ import (
 
 	"hermes-devops/agent/internal/adb"
 	"hermes-devops/agent/internal/executor"
+	agentmtls "hermes-devops/agent/internal/mtls"
 	"hermes-devops/agent/internal/reporter"
 	"hermes-devops/agent/internal/server"
 	"hermes-devops/agent/internal/store"
@@ -63,6 +66,8 @@ type Config struct {
 	SOCAliases         map[string]string
 	Capabilities       []string
 	DeviceCapabilities map[string][]string
+	MTLSCAFile         string
+	MTLSCertFile       string
 }
 
 // parseCSV 解析逗号分隔列表(AGENT_DEVICE_CAPABILITIES),去空白;空串返回 nil。
@@ -240,6 +245,8 @@ func loadConfig(path string, getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	cfg.MTLSCAFile = get("AGENT_MTLS_CA_FILE")
+	cfg.MTLSCertFile = get("AGENT_MTLS_CERT_FILE")
 
 	var missing []string
 	for _, req := range []struct {
@@ -313,6 +320,12 @@ func runAgent(ctx context.Context, cfg Config) error {
 	defer st.Close()
 
 	client := &reporter.Client{BaseURL: cfg.RuntimeCallbackURL}
+	if tr, err := agentmtls.Transport(cfg.MTLSCAFile, cfg.MTLSCertFile); err != nil {
+		return fmt.Errorf("mtls transport: %w", err)
+	} else if tr != nil {
+		client.Transport = tr
+		logf("mTLS client cert loaded for callbacks")
+	}
 	events := &reporter.EventReporter{Store: st, Client: client, Logf: logf}
 	results := &reporter.ResultReporter{Store: st, Client: client, Logf: logf}
 	runner := &adb.ExecRunner{ADBPath: cfg.ADBPath}

@@ -86,6 +86,11 @@ type Config struct {
 	// 空 = 不限(缺省);非空时 AcquireDevice 拒绝低于此版本的 Client。
 	// 版本号用语义化版本比较(如 "0.1.0" < "0.2.0" < "1.0.0")。
 	MinAgentVersion string
+	// Phase 3 mTLS(§12):三件套齐全时启用双向证书认证。
+	// 空 = mTLS 未配置,(全部 HTTP 流量与 Phase 2 无异)。
+	MTLSCAFile   string
+	MTLSCertFile string
+	MTLSKeyFile  string
 }
 
 // Acts carries all activities; method names are the activity name strings referenced in workflow.

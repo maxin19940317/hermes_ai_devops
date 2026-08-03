@@ -311,3 +311,18 @@ docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
 docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
   -f deploy/docker-compose.yml down
 ```
+
+### Phase 3 mTLS (optional)
+
+Generate certificates:
+```bash
+./scripts/generate-certs.sh windows-client-01
+```
+This creates `deploy/certs/` containing:
+- `ca-cert.pem` — CA cert (distribute to all nodes)
+- `server-cert.pem` + `server-key.pem` — Runtime server identity
+- `client-windows-client-01.pem` — Agent cert (copy to Windows, AGENT_MTLS_CERT_FILE)
+
+Enable by setting the three `MTLS_*` env vars in `deploy/.env` and restarting
+the worker. All three must be non-empty to activate; any empty variable
+gracefully degrades to plain HTTP (backward-compatible with Phase 2).

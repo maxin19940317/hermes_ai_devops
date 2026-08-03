@@ -150,6 +150,12 @@ services:
       HERMES_MODEL: ${HERMES_MODEL:-}
       # Agent 最低版本门禁(Phase 3):空 = 不启用;dev 版本 Agent 永远放行。
       MIN_AGENT_VERSION: ${MIN_AGENT_VERSION:-}
+      # Phase 3 mTLS(§12):三件套齐全时启用双向证书认证。
+      MTLS_CA_FILE: ${MTLS_CA_FILE:-}
+      MTLS_CERT_FILE: ${MTLS_CERT_FILE:-}
+      MTLS_KEY_FILE: ${MTLS_KEY_FILE:-}
+    volumes:
+      - ${MTLS_CERTS_DIR:-./certs}:/etc/hermes/certs:ro
     ports:
       - "${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091"
     healthcheck:

@@ -149,6 +149,10 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			FeishuCmdNL:        getenv("FEISHU_CMD_NL") == "true",
 			FeishuCmdNLTimeout: time.Duration(nlTimeoutSec) * time.Second,
 			MinAgentVersion:    getenv("MIN_AGENT_VERSION"),
+			// Phase 3 mTLS(§12):三件套齐全时启用 TLS server/client auth。
+			MTLSCAFile:   getenv("MTLS_CA_FILE"),
+			MTLSCertFile: getenv("MTLS_CERT_FILE"),
+			MTLSKeyFile:  getenv("MTLS_KEY_FILE"),
 			// §3.7:MINIO_ENDPOINT 或凭据为空即禁用预签名(优雅降级)。
 			MinIOEndpoint:       getenv("MINIO_ENDPOINT"),
 			MinIOPublicEndpoint: getenv("MINIO_PUBLIC_ENDPOINT"),

@@ -45,6 +45,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -65,6 +66,7 @@ import (
 	"hermes-devops/runtime/internal/feishu"
 	"hermes-devops/runtime/internal/feishucmd"
 	"hermes-devops/runtime/internal/hermesclient"
+	"hermes-devops/runtime/internal/mtls"
 	"hermes-devops/runtime/internal/presign"
 	"hermes-devops/runtime/internal/store"
 	"hermes-devops/runtime/internal/trigger"
@@ -129,10 +131,21 @@ func main() {
 		log.Info().Msg("HERMES_ENDPOINT 未设置,Analyzer 禁用,规则引擎保底")
 	}
 
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	// Phase 3 mTLS: Client 侧证书用于 Dispatch 活动访问 Agent HTTPS 端点。
+	if tr, err := mtls.ClientTransport(
+		cfg.Activity.MTLSCAFile, cfg.Activity.MTLSCertFile,
+	); err != nil {
+		log.Fatal().Err(err).Msg("mtls client transport")
+	} else if tr != nil {
+		httpClient.Transport = tr
+		log.Info().Msg("dispatch: mTLS client cert enabled")
+	}
+
 	acts := &activity.Acts{
 		Store:   st,
 		Cfg:     cfg.Activity,
-		HTTP:    &http.Client{Timeout: 30 * time.Second},
+		HTTP:    httpClient,
 		SpecCfg: specCfg,
 		Log:     &log,
 		Hermes:  hermes,
@@ -266,12 +279,21 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
-	// 先同步 bind 端口再进入运行循环:绑定失败(如端口占用)在这里直接 fail fast,
-	// 不必等到 goroutine 内部才发现——避免了在后台 goroutine 里调用 log.Fatal()
-	// 直接 os.Exit,把 Temporal worker 的正常关闭路径整个跳过。
 	ln, err := net.Listen("tcp", cfg.CallbacksAddr)
 	if err != nil {
 		log.Fatal().Err(err).Str("addr", cfg.CallbacksAddr).Msg("listen callbacks addr")
+	}
+	// Phase 3 mTLS(§12):三件套齐全时在 listener 上加 TLS 层,
+	// 否则保持纯 HTTP(兼容旧 Agent / 开发环境)。
+	if tlsCfg, err := mtls.ServerConfig(
+		cfg.Activity.MTLSCAFile, cfg.Activity.MTLSCertFile, cfg.Activity.MTLSKeyFile,
+	); err != nil {
+		log.Fatal().Err(err).Msg("mtls server config")
+	} else if tlsCfg != nil {
+		ln = tls.NewListener(ln, tlsCfg)
+		log.Info().Msg("callbacks: mTLS enabled (client cert required)")
+	} else {
+		log.Warn().Msg("callbacks: mTLS not configured, using plain HTTP")
 	}
 
 	// callbackServed 在 Serve 返回后关闭(即 HTTP 服务已完全排空),
