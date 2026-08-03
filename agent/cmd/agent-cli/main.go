@@ -3,7 +3,8 @@
 // 用于在 Windows+USB+ADB 环境手动踩坑,后续套服务壳复用同一 executor。
 //
 // 退出码: 0=COMPLETED 且成功判据满足; 2=COMPLETED 但判据不满足;
-//         3=TIMEOUT; 1=FAILED/参数错误。
+//
+//	3=TIMEOUT; 1=FAILED/参数错误。
 package main
 
 import (
@@ -27,16 +28,16 @@ func main() {
 func run(argv []string) int {
 	fs := flag.NewFlagSet("agent-cli run", flag.ContinueOnError)
 	var (
-		packageURL  = fs.String("package-url", "", "产物 Registry URL(与 --package-file 二选一)")
-		packageFile = fs.String("package-file", "", "本地包路径(与 --package-url 二选一)")
-		sha256Hex   = fs.String("sha256", "", "整包 sha256(package-url 时必填)")
+		packageURL   = fs.String("package-url", "", "产物 Registry URL(与 --package-file 二选一)")
+		packageFile  = fs.String("package-file", "", "本地包路径(与 --package-url 二选一)")
+		sha256Hex    = fs.String("sha256", "", "整包 sha256(package-url 时必填)")
 		authType     = fs.String("auth-type", "", "bearer | job_token | basic(Deploy Token)")
 		authToken    = fs.String("auth-token", "", "下载凭据(建议用环境变量 AGENT_AUTH_TOKEN)")
 		authUsername = fs.String("auth-username", "", "basic 认证用户名(Deploy Token 用户名;建议用环境变量 AGENT_AUTH_USERNAME)")
-		serial      = fs.String("serial", "", "目标设备序列号(必填)")
-		adbPath     = fs.String("adb", "adb", "adb 可执行文件路径")
-		outDir      = fs.String("out", "", "本地结果目录(默认 ./agent-runs/<UTC时间戳>)")
-		keepWorkdir = fs.Bool("keep-device-workdir", false, "保留设备 workdir(覆盖 manifest.cleanup)")
+		serial       = fs.String("serial", "", "目标设备序列号(必填)")
+		adbPath      = fs.String("adb", "adb", "adb 可执行文件路径")
+		outDir       = fs.String("out", "", "本地结果目录(默认 ./agent-runs/<UTC时间戳>)")
+		keepWorkdir  = fs.Bool("keep-device-workdir", false, "保留设备 workdir(覆盖 manifest.cleanup)")
 	)
 	if len(argv) < 1 || argv[0] != "run" {
 		fmt.Fprintln(os.Stderr, "usage: agent-cli run [flags]")

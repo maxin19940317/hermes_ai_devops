@@ -146,8 +146,8 @@ func TestExtractTarGzPreservesModeAndListsFiles(t *testing.T) {
 		data string
 		mode int64
 	}{
-		"run.sh":       {"#!/bin/sh\n", 0o755},
-		"lib/libx.so":  {"ELF", 0o644},
+		"run.sh":        {"#!/bin/sh\n", 0o755},
+		"lib/libx.so":   {"ELF", 0o644},
 		"manifest.yaml": {"manifest_version: 1\n", 0o644},
 	})
 	dest := t.TempDir()

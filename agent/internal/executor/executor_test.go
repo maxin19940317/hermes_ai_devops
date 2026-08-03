@@ -580,14 +580,14 @@ func TestCollectSkipsDisallowedPattern(t *testing.T) {
 		pattern string
 		wantOK  bool
 	}{
-		{"results/*.json", true},        // 合法:字母 + glob
-		{"logs/app.log", true},          // 合法:字母 + 点 + 斜杠
-		{"dumps/**", true},              // 合法:字母 + 双星
-		{"results; rm -rf /", false},    // 非法:分号 + 空格
-		{"$(whoami)", false},            // 非法:美元符号 + 括号
-		{"a`id`b", false},               // 非法:反引号
-		{"file name.log", false},        // 非法:空格
-		{"a|b", false},                  // 非法:管道符
+		{"results/*.json", true},     // 合法:字母 + glob
+		{"logs/app.log", true},       // 合法:字母 + 点 + 斜杠
+		{"dumps/**", true},           // 合法:字母 + 双星
+		{"results; rm -rf /", false}, // 非法:分号 + 空格
+		{"$(whoami)", false},         // 非法:美元符号 + 括号
+		{"a`id`b", false},            // 非法:反引号
+		{"file name.log", false},     // 非法:空格
+		{"a|b", false},               // 非法:管道符
 	} {
 		got := collectPatternOK.MatchString(tc.pattern)
 		if got != tc.wantOK {
