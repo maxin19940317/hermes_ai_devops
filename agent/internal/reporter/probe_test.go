@@ -164,3 +164,73 @@ func TestProbeDevicesIdentifiesLinuxSOCButKeepsDeviceOffline(t *testing.T) {
 		t.Errorf("Linux props = %+v, want soc rk3588", got.Props)
 	}
 }
+
+// validSOC 单元测试:拒绝所有已知的 shell 报错形态,只接受真实 SoC 型号。
+func TestValidSOCRejectsShellErrors(t *testing.T) {
+	cases := []struct {
+		val string
+		ok  bool
+	}{
+		// 真实 SoC 型号
+		{"qcm6125", true},
+		{"mt8189", true},
+		{"trinket", true},
+		{"sdm845", true},
+		{"exynos9810", true},
+		{"rk3588", true},
+		{"msm8953", true},
+		{"tegra", true},
+		// shell 报错文本
+		{"/bin/bash: line 1: /system/bin/getprop: No such file or directory", false},
+		{"/system/bin/sh: getprop: not found", false},
+		{"-bash: /system/bin/getprop: No such file or directory", false},
+		// 空格/大写/特殊字符
+		{"QCM6125", false},
+		{"qcm 6125", false},
+		{"qcm\n6125", false},
+		// 空字符串
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := validSOC(tc.val); got != tc.ok {
+			t.Errorf("validSOC(%q) = %v, want %v", tc.val, got, tc.ok)
+		}
+	}
+}
+
+// ABI 有效但 SOC getprop 返回 shell 错误文本: SOC 应清空但不影响设备上线。
+func TestProbeDevicesRejectsShellErrorSOCWithValidABI(t *testing.T) {
+	shellErr := "/bin/bash: line 1: /system/bin/getprop: No such file or directory"
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\nb5bb1018d94b26da device\n"},
+		"-s b5bb1018d94b26da shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-s b5bb1018d94b26da shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
+		"-s b5bb1018d94b26da shell /system/bin/getprop ro.board.platform":        {Stdout: shellErr + "\n"},
+		"-s b5bb1018d94b26da shell /system/bin/getprop ro.product.board":         {Stdout: shellErr + "\n"},
+		"-s b5bb1018d94b26da shell /system/bin/df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+			"/dev/block/dm-0 10000000 100 1000000 1% /data\n"},
+	}}
+	p := &Prober{Runner: runner}
+
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 1 {
+		t.Fatalf("devices = %+v, want one device", devices)
+	}
+	got := devices[0]
+	if got.State != DeviceIdle {
+		t.Errorf("state = %q, want IDLE(ABI valid, SOC shell error only clears SOC)", got.State)
+	}
+	if got.Props == nil {
+		t.Fatal("props is nil, want valid ABI")
+	}
+	if got.Props.SOC != "" {
+		t.Errorf("SOC = %q, want empty(shell error rejected)", got.Props.SOC)
+	}
+	if got.Props.ABI != "arm64-v8a" {
+		t.Errorf("ABI = %q, want arm64-v8a", got.Props.ABI)
+	}
+	// DisplayName fallback: UNKNOWN-{serial} when SOC is empty.
+	if got.DisplayName != "UNKNOWN-b5bb1018d94b26da" {
+		t.Errorf("display_name = %q, want UNKNOWN-b5bb1018d94b26da", got.DisplayName)
+	}
+}

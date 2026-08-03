@@ -112,8 +112,15 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		props.Android = release
 	}
 	soc, _ := p.getprop(ctx, transport, "ro.board.platform")
-	if soc == "" {
+	if soc == "" || !validSOC(soc) {
+		if soc != "" {
+			p.logf("probe: %s ro.board.platform=%q rejected by validSOC, falling back", serial, soc)
+		}
 		soc, _ = p.getprop(ctx, transport, "ro.product.board")
+	}
+	if soc != "" && !validSOC(soc) {
+		p.logf("probe: %s ro.product.board=%q rejected by validSOC, SOC cleared", serial, soc)
+		soc = ""
 	}
 	if alias, ok := p.SOCAliases[soc]; ok {
 		p.logf("probe: %s soc %s -> %s (alias)", serial, soc, alias)
@@ -138,6 +145,24 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 // androidABI 校验 ro.product.cpu.abi 的内容形态(arm64-v8a / armeabi-v7a /
 // x86 / x86_64 等):小写字母数字开头,仅含小写字母、数字、点、下划线、连字符。
 func androidABI(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+			(i > 0 && (r == '.' || r == '_' || r == '-'))
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// validSOC 校验 getprop ro.board.platform / ro.product.board 的内容形态,
+// 拒绝 shell 错误文本被当做 SoC 型号(老 adbd 合并 stderr 到 stdout 且不回传远程退出码,
+// getprop 不存在时 stdout 是 "/bin/bash: line N: /system/bin/getprop: No such file" 等)。
+// SoC 型号恒为小写字母数字开头,仅含小写字母、数字、下划线、连字符、点。
+func validSOC(s string) bool {
 	if s == "" {
 		return false
 	}
