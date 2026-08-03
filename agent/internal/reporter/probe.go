@@ -90,6 +90,12 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 	dev := DeviceInfo{Serial: serial, DisplayName: "UNKNOWN-" + serial, State: state}
 
 	abi, err := p.getprop(ctx, transport, "ro.product.cpu.abi")
+	if err == nil && !androidABI(abi) {
+		// 老 adbd 不回传远程退出码且 adb 合并 stderr:getprop 不存在时
+		// adb 仍回 exit 0,stdout 是 shell 报错文本(实测 Nexus 4)。
+		// 靠退出码的防护会被绕过,按 abi 内容形态再拦一道。
+		err = fmt.Errorf("abi %q is not an Android ABI (non-Android shell?)", abi)
+	}
 	if err != nil {
 		dev.State = DeviceOffline
 		if soc := p.linuxSOC(ctx, transport); soc != "" {
@@ -127,6 +133,22 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		}
 	}
 	return dev
+}
+
+// androidABI 校验 ro.product.cpu.abi 的内容形态(arm64-v8a / armeabi-v7a /
+// x86 / x86_64 等):小写字母数字开头,仅含小写字母、数字、点、下划线、连字符。
+func androidABI(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+			(i > 0 && (r == '.' || r == '_' || r == '-'))
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Prober) capabilitiesFor(serial, soc string, allowLegacy bool) []string {

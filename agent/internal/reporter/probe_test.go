@@ -116,6 +116,30 @@ func TestProbeDevicesResolvesQuestionMarkTransport(t *testing.T) {
 	}
 }
 
+// 老 adbd 不回传远程退出码且 adb 合并 stderr:getprop 不存在时 adb 仍回
+// exit 0,stdout 是 shell 报错文本。必须按内容形态拦截,不能存进 soc/abi。
+func TestProbeDevicesRejectsShellErrorTextWithZeroExit(t *testing.T) {
+	shellErr := "/bin/bash: line 1: /system/bin/getprop: No such file or directory"
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\nb5bb1018d94b26da device product:occam model:Nexus_4 device:mako\n"},
+		"-s b5bb1018d94b26da shell /system/bin/getprop ro.product.cpu.abi": {Stdout: shellErr + "\n"},
+		"-s b5bb1018d94b26da shell /bin/cat /proc/device-tree/compatible":  {ExitCode: 1},
+	}}
+	p := &Prober{Runner: runner}
+
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 1 {
+		t.Fatalf("devices = %+v, want one device", devices)
+	}
+	got := devices[0]
+	if got.State != DeviceOffline {
+		t.Errorf("state = %q, want OFFLINE for non-Android shell", got.State)
+	}
+	if got.Props != nil && (got.Props.ABI == shellErr || got.Props.SOC == shellErr) {
+		t.Errorf("shell error text leaked into props: %+v", got.Props)
+	}
+}
+
 func TestProbeDevicesIdentifiesLinuxSOCButKeepsDeviceOffline(t *testing.T) {
 	runner := &fakeRunner{responses: map[string]adb.Result{
 		"devices -l": {Stdout: "List of devices attached\nb5bb1018d94b26da device product:mako\n"},
