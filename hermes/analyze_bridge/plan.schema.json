@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-devops/contracts/plan.schema.json",
+  "title": "Plan DSL v1",
+  "description": "Hermes → Runtime 的唯一输入形态。严格 Schema:未知字段一律拒绝(additionalProperties=false),Runtime 拒绝自由文本。所有 pattern 均不使用 lookahead,保证 Go RE2 可用同一正则。契约演进只加字段不删字段,加字段需递增 plan_version。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["plan_version", "plan_id", "origin", "goal_summary", "build", "tests"],
+  "properties": {
+    "plan_version": { "const": 1 },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^pln_[A-Za-z0-9_-]+$",
+      "maxLength": 128
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "enum": ["manual_nl", "gitlab_event", "template"] },
+        "user": { "type": "string", "maxLength": 128 },
+        "raw_text": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "仅作审计留痕,Runtime 不解析其内容"
+        }
+      }
+    },
+    "goal_summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project", "ref", "targets"],
+      "properties": {
+        "project": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "ref": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._]+$",
+            "description": "构建变体名,须与 ci/variants.yaml 中的键一致,如 aarch64_Android_SNPE_2.21"
+          }
+        },
+        "build_type": { "enum": ["Release", "Debug"], "default": "Release" }
+      }
+    },
+    "tests": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/testSpec" }
+    },
+    "policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "on_infra_error": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "retry": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["max_attempts"],
+              "properties": {
+                "max_attempts": { "type": "integer", "minimum": 0, "maximum": 5 },
+                "backoff_sec": { "type": "integer", "minimum": 0, "maximum": 3600, "default": 30 }
+              }
+            }
+          }
+        },
+        "on_signature": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["signature_id"],
+            "properties": {
+              "signature_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+              "retry": { "type": "boolean", "default": false },
+              "actions": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/policyAction" }
+              }
+            }
+          }
+        },
+        "on_perf_regression": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "baseline": {
+              "type": "string",
+              "pattern": "^branch_last_n_passed:[0-9]+$",
+              "default": "branch_last_n_passed:5"
+            },
+            "threshold_pct": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+            "action": { "enum": ["block_and_notify", "notify", "ignore"] }
+          }
+        },
+        "on_test_failed": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "retry": { "type": "boolean", "default": false },
+            "actions": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/policyAction" }
+            }
+          }
+        }
+      }
+    },
+    "notify": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^feishu:[A-Za-z0-9_-]+$" }
+        },
+        "on": {
+          "type": "array",
+          "items": { "enum": ["terminal_state", "failure_only", "all_state_changes"] },
+          "default": ["terminal_state"]
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deadline_min": { "type": "integer", "minimum": 1, "maximum": 1440 },
+        "max_devices": { "type": "integer", "minimum": 1, "maximum": 16 }
+      }
+    }
+  },
+  "$defs": {
+    "policyAction": {
+      "description": "策略动作白名单。Hermes 只能从这里选,不能发明新动作。",
+      "enum": ["analyze", "notify", "retry", "ignore", "quarantine_device"]
+    },
+    "testSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["test_id", "suite"],
+      "properties": {
+        "test_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+        "suite": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "device_selector": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "soc": { "type": "string", "maxLength": 64 },
+            "capabilities": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "maxLength": 64 }
+            },
+            "serial": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "指定具体设备(可选);缺省由 Runtime 按 soc/capabilities 调度"
+            }
+          }
+        },
+        "depends_on": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+          "default": [],
+          "description": "引用同一 Plan 内其他 test_id;引用存在性由 Runtime 语义校验(Schema 无法表达)"
+        }
+      }
+    }
+  }
+}

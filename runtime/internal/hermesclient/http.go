@@ -40,6 +40,12 @@ var commandSchemaJSON string
 // commandSchema 是编译期嵌入的 contracts/command.schema.json(Draft2020)。
 var commandSchema = mustCompileSchema("command.schema.json", commandSchemaJSON)
 
+//go:embed plan.schema.json
+var planSchemaJSON string
+
+// planSchema 是编译期嵌入的 contracts/plan.schema.json(Draft2020)。
+var planSchema = mustCompileSchema("plan.schema.json", planSchemaJSON)
+
 func mustCompileSchema(name, body string) *jsonschema.Schema {
 	c := jsonschema.NewCompiler()
 	c.Draft = jsonschema.Draft2020
@@ -257,3 +263,89 @@ func validateTranslationArgs(args []string) error {
 	}
 	return nil
 }
+
+// planPayload 是发往 bridge 的规划请求格式。
+type planPayload struct {
+	PromptVersion string          `json:"prompt_version"`
+	Model         string          `json:"model,omitempty"`
+	Prompt        string          `json:"prompt"`
+	RawText       string          `json:"raw_text"`
+	Context       json.RawMessage `json:"context"`
+}
+
+// planURL 由 Endpoint(指向 /analyze)推导出同一 bridge 的 /plan:
+// 替换路径最后一段。
+func planURL(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("hermesclient: Endpoint 不是合法 URL: %w", err)
+	}
+	p := strings.TrimRight(u.Path, "/")
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		u.Path = p[:i] + "/plan"
+	} else {
+		u.Path = "/plan"
+	}
+	return u.String(), nil
+}
+
+// Plan 调用 bridge 执行一次规划:响应经内嵌 plan.schema.json 校验后
+// 返回原始 JSON;校验不过或非 2xx 均返回 wrapped error。
+func (c *HTTPClient) Plan(ctx context.Context, req PlanRequest) (json.RawMessage, error) {
+	endpoint, err := planURL(c.cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	ctxJSON := req.Context
+	if len(ctxJSON) == 0 {
+		ctxJSON = json.RawMessage(`{}`)
+	}
+	body, err := json.Marshal(planPayload{
+		PromptVersion: PromptVersionPlan,
+		Model:         req.Model,
+		Prompt:        PromptPlan,
+		RawText:       req.RawText,
+		Context:       ctxJSON,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 编码规划请求失败: %w", err)
+	}
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 构造规划请求失败: %w", err)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	if c.cfg.AuthToken != "" {
+		hreq.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
+	}
+	resp, err := c.hc.Do(hreq)
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 调用 %s 失败: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 读取规划响应失败: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		snippet := string(raw)
+		if len(snippet) > errBodyLimit {
+			snippet = snippet[:errBodyLimit] + "..."
+		}
+		return nil, fmt.Errorf("hermesclient: 平台返回 %d: %s", resp.StatusCode, snippet)
+	}
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("hermesclient: 规划响应不是合法 JSON: %w", err)
+	}
+	if err := planSchema.Validate(doc); err != nil {
+		snippet := string(raw)
+		if len(snippet) > errBodyLimit {
+			snippet = snippet[:errBodyLimit] + "..."
+		}
+		return nil, fmt.Errorf("hermesclient: 响应不符合 plan.schema.json(视为规划失败): %w: %w: body=%s", ErrSchemaInvalid, err, snippet)
+	}
+	return raw, nil
+}
+
+var _ Planner = (*HTTPClient)(nil)

@@ -36,6 +36,10 @@ func TestParse(t *testing.T) {
 		{"   ", "help", nil},
 		{"drop database", "help", nil}, // 自由文本/未知 → help,不放大能力
 		{"rerun", "rerun", nil},
+		// plan 命令:取第一条空白后的全部文本为单参数
+		{"plan", "plan", []string{""}},
+		{"plan 测一下 SNPE 2.21", "plan", []string{"测一下 SNPE 2.21"}},
+		{"plan     ", "plan", []string{""}},
 	}
 	for _, tc := range cases {
 		got := Parse(tc.in)

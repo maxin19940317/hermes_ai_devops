@@ -42,7 +42,11 @@ ANALYSIS_SCHEMA = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
 COMMAND_SCHEMA_PATH = Path(__file__).with_name("command.schema.json")
 COMMAND_SCHEMA = json.loads(COMMAND_SCHEMA_PATH.read_text(encoding="utf-8"))
 
+PLAN_SCHEMA_PATH = Path(__file__).with_name("plan.schema.json")
+PLAN_SCHEMA = json.loads(PLAN_SCHEMA_PATH.read_text(encoding="utf-8"))
+
 TRANSLATE_REQUIRED_FIELDS = ("prompt", "raw_text", "context")
+PLAN_REQUIRED_FIELDS = ("prompt", "raw_text", "context")
 
 app = FastAPI(title="analyze_bridge", version="1")
 
@@ -101,6 +105,27 @@ def build_translate_prompt(payload: dict, prev_errors: list[str]) -> str:
         parts += [
             "",
             "注意:你上一次的输出未通过 command.schema.json 校验,错误如下。",
+            "这次只输出修正后的 JSON 对象本身,不要任何其他文本:",
+            *[f"- {e}" for e in prev_errors[-2:]],
+        ]
+    return "\n".join(parts)
+
+
+def build_plan_prompt(payload: dict, prev_errors: list[str]) -> str:
+    """规划 prompt:平台 prompt 模板 + 可用变体列表 + 用户原文 + (重试时)校验错误。"""
+    parts = [
+        payload["prompt"],
+        "",
+        "可用设备上下文:",
+        json.dumps(payload["context"], ensure_ascii=False),
+        "",
+        "用户原话:",
+        payload["raw_text"],
+    ]
+    if prev_errors:
+        parts += [
+            "",
+            "注意:你上一次的输出未通过 plan.schema.json 校验,错误如下。",
             "这次只输出修正后的 JSON 对象本身,不要任何其他文本:",
             *[f"- {e}" for e in prev_errors[-2:]],
         ]
@@ -178,6 +203,16 @@ def run_translation(payload: dict) -> dict:
     return run_with_schema(payload, COMMAND_SCHEMA, build_translate_prompt, log_ok, log_retry, "降级调用方保底")
 
 
+def run_planning(payload: dict) -> dict:
+    def log_ok(attempt: int) -> None:
+        log.info("plan ok: attempt=%d", attempt)
+
+    def log_retry(attempt: int, err: str) -> None:
+        log.warning("plan attempt %d 校验失败: %s", attempt, err)
+
+    return run_with_schema(payload, PLAN_SCHEMA, build_plan_prompt, log_ok, log_retry, "降级人工规划")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -217,4 +252,23 @@ async def translate(req: Request):
         return await run_in_threadpool(run_translation, payload)
     except BridgeError as e:
         log.error("translate failed: %s", e.msg)
+        return JSONResponse({"error": e.msg}, status_code=e.status)
+
+
+@app.post("/plan")
+async def plan(req: Request):
+    """Planner v1:自然语言 → Plan DSL。与 /analyze 同构:工具集全禁、
+    服务端定形校验、打回重试同一上限。"""
+    if err := check_auth(req):
+        return err
+    try:
+        payload = await req.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "请求体不是合法 JSON"}, status_code=400)
+    if not isinstance(payload, dict) or any(k not in payload for k in PLAN_REQUIRED_FIELDS):
+        return JSONResponse({"error": f"缺少必填字段: {PLAN_REQUIRED_FIELDS}"}, status_code=400)
+    try:
+        return await run_in_threadpool(run_planning, payload)
+    except BridgeError as e:
+        log.error("plan failed: %s", e.msg)
         return JSONResponse({"error": e.msg}, status_code=e.status)

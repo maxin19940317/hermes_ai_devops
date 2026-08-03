@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"hermes-devops/runtime/internal/feishu"
+	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/rules"
 	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
@@ -56,6 +57,11 @@ type Executor struct {
 	// Translator 非 nil 时启用自然语言翻译旁路(设计文档 §3.1);
 	// nil = 未启用,未知输入回 usage(改动前的行为)。
 	Translator *Translator
+	// Planner 非 nil 时启用自然语言规划(Phase 2 Planner v1);
+	// nil = 未启用,plan 命令返回"未启用"。
+	Planner hermesclient.Planner
+	// Variants 是合法变体名单(来自 specCfg),供 plan 上下文快照使用。
+	Variants []string
 	// Now 可注入,便于测试待确认 TTL;nil 用 time.Now().UTC()。
 	Now func() time.Time
 
@@ -285,6 +291,8 @@ func (e *Executor) execute(ctx context.Context, cmd Command) (string, error) {
 		return e.rerun(ctx, cmd.Args)
 	case "unquarantine":
 		return e.unquarantine(ctx, cmd.Args)
+	case "plan":
+		return e.planCmd(ctx, cmd.Args)
 	default:
 		return usage, nil
 	}
@@ -665,4 +673,108 @@ func (e *Executor) unquarantine(ctx context.Context, args []string) (string, err
 		}
 		return strings.TrimRight(b.String(), "\n"), nil
 	}
+}
+
+// planCmd 调用 Planner 将自然语言需求翻译成 Plan DSL,
+// 输出格式化的计划摘要供用户确认。
+func (e *Executor) planCmd(ctx context.Context, args []string) (string, error) {
+	raw := ""
+	if len(args) > 0 {
+		raw = strings.TrimSpace(args[0])
+	}
+	if raw == "" {
+		return "用法: plan <需求描述>\n例如: plan 测一下master的SNPE 2.21", nil
+	}
+	if e.Planner == nil {
+		return "规划器未启用(HERMES_ENDPOINT 未配置)", nil
+	}
+
+	// 组装上下文快照:变体名单 + 设备状态
+	variants := e.Variants
+	if variants == nil {
+		variants = []string{}
+	}
+	ctxSnap := map[string]any{
+		"now":      e.nowFn().UTC().Format(time.RFC3339),
+		"variants": variants,
+		"devices":  []map[string]string{},
+	}
+	if ov, err := e.Store.FleetOverview(ctx); err == nil {
+		devs := make([]map[string]string, 0, len(ov.Devices))
+		for _, d := range ov.Devices {
+			devs = append(devs, map[string]string{
+				"device_id": d.DeviceID, "serial": d.Serial, "status": d.Status, "soc": d.SOC,
+			})
+		}
+		ctxSnap["devices"] = devs
+	}
+	ctxJSON, _ := json.Marshal(ctxSnap)
+
+	planRaw, err := e.Planner.Plan(ctx, hermesclient.PlanRequest{
+		RawText: raw,
+		Context: ctxJSON,
+	})
+	if err != nil {
+		e.log().Warn().Err(err).Msg("planner failed")
+		if errors.Is(err, hermesclient.ErrSchemaInvalid) {
+			return "规划服务返回的数据格式不合法(已重试多次),请换个说法再试", nil
+		}
+		return fmt.Sprintf("规划服务暂时不可用,请稍后重试\n(%v)", err), nil
+	}
+
+	// 格式化计划摘要
+	var plan struct {
+		PlanID       string `json:"plan_id"`
+		GoalSummary  string `json:"goal_summary"`
+		Build        struct {
+			Project   string   `json:"project"`
+			Ref       string   `json:"ref"`
+			Targets   []string `json:"targets"`
+			BuildType string   `json:"build_type"`
+		} `json:"build"`
+		Tests []struct {
+			TestID string `json:"test_id"`
+			Device struct {
+				SOC          []string `json:"soc"`
+				Capabilities []string `json:"capabilities"`
+			} `json:"device_selector"`
+		} `json:"tests"`
+	}
+	if err := json.Unmarshal(planRaw, &plan); err != nil {
+		return fmt.Sprintf("规划成功但解析失败: %v\n原始输出:\n%s", err, truncStr(string(planRaw), 500)), nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "📋 测试计划 %s\n", plan.PlanID)
+	fmt.Fprintf(&b, "  目标: %s\n", plan.GoalSummary)
+	bt := plan.Build.BuildType
+	if bt == "" {
+		bt = "Release"
+	}
+	fmt.Fprintf(&b, "  构建: %s %s %s\n", plan.Build.Project, plan.Build.Ref, bt)
+	fmt.Fprintf(&b, "  变体(%d):\n", len(plan.Build.Targets))
+	for _, t := range plan.Build.Targets {
+		fmt.Fprintf(&b, "    · %s\n", t)
+	}
+	fmt.Fprintf(&b, "  测试项(%d):\n", len(plan.Tests))
+	for _, tk := range plan.Tests {
+		soc := ""
+		if len(tk.Device.SOC) > 0 {
+			soc = "(" + strings.Join(tk.Device.SOC, ",") + ")"
+		}
+		caps := ""
+		if len(tk.Device.Capabilities) > 0 {
+			caps = " [" + strings.Join(tk.Device.Capabilities, ",") + "]"
+		}
+		fmt.Fprintf(&b, "    · %s %s%s\n", tk.TestID, soc, caps)
+	}
+	b.WriteString("\n⏳ 规划阶段不执行测试(实现计划为 Phase 2b);可复制 plan_id 用于后续触发。")
+	return b.String(), nil
+}
+
+func truncStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

@@ -156,7 +156,8 @@ func main() {
 		} else {
 			exec := &feishucmd.Executor{
 				Store: st, Sender: feishuSender, Log: &log, Whitelist: wl,
-				Starter: &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
+				Starter:  &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
+				Variants: specCfg.VariantNames(),
 			}
 			// 自然语言翻译旁路(设计文档 §3.1):三个条件合取才启用——
 			// 开关打开、bridge 端点已配、指令 listener 本身已启用。
@@ -180,9 +181,23 @@ func main() {
 					Model:    cfg.Activity.HermesModel,
 					Log:      &log,
 				}
+				// Planner 与 Translator 共用同一 hermes client:
+				// 同一端点、同一认证、同一超时。
+				exec.Planner = nlClient
 				log.Info().Dur("timeout", cfg.Activity.FeishuCmdNLTimeout).Msg("feishu cmd nl=enabled")
 			} else {
+				// NL 关闭时 Planner 仍可独立启用(规划不需要 NL 翻译能力)。
 				log.Info().Str("reason", nlReason).Msg("feishu cmd nl=disabled")
+			}
+			// Planner 独立于 NL 翻译:即使 NL 关着,只要 hermes 端点可配就启用规划。
+			if exec.Planner == nil && cfg.Activity.HermesEndpoint != "" {
+				planClient := hermesclient.NewHTTPClient(hermesclient.Config{
+					Endpoint:  cfg.Activity.HermesEndpoint,
+					AuthToken: cfg.Activity.HermesAuthToken,
+					Timeout:   cfg.Activity.FeishuCmdNLTimeout,
+				})
+				exec.Planner = planClient
+				log.Info().Msg("feishu cmd planner=enabled(独立于 NL)")
 			}
 			listener := &feishucmd.Listener{
 				AppID: cfg.Activity.FeishuAppID, AppSecret: cfg.Activity.FeishuAppSecret, Exec: exec,

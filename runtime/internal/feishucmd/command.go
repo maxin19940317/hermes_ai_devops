@@ -21,19 +21,31 @@ const usage = `可用指令:
   status                        运行中 workflow / 设备状态 / 活跃租约
   devices                       设备列表(serial/soc/status/fail_streak)
   rerun <source_workflow_id> [variant]  重跑权威终态运行的失败变体(可指定一个变体)
-  unquarantine [device_id]      解除设备隔离(多台时需指定 id)`
+  unquarantine [device_id]      解除设备隔离(多台时需指定 id)
+  plan <需求描述>                自然语言规划:生成可执行的测试计划 Plan DSL`
 
 // Parse 解析一条消息文本:trim 后按空白切分,命令名大小写不敏感;
-// 空文本/未知命令 → help。
+// 空文本/未知命令 → help。plan 取第一条空白后的全部文本作为参数。
 func Parse(text string) Command {
-	fields := strings.Fields(strings.TrimSpace(text))
-	if len(fields) == 0 {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
 		return Command{Name: "help"}
 	}
-	name := strings.ToLower(fields[0])
+	parts := strings.SplitN(trimmed, " ", 2)
+	name := strings.ToLower(parts[0])
 	switch name {
 	case "status", "devices", "rerun", "unquarantine":
-		return Command{Name: name, Args: fields[1:]}
+		args := []string{}
+		if len(parts) > 1 {
+			args = strings.Fields(parts[1])
+		}
+		return Command{Name: name, Args: args}
+	case "plan":
+		raw := ""
+		if len(parts) > 1 {
+			raw = strings.TrimSpace(parts[1])
+		}
+		return Command{Name: "plan", Args: []string{raw}}
 	default:
 		return Command{Name: "help"}
 	}

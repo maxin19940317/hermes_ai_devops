@@ -62,3 +62,16 @@ type TranslateRequest struct {
 type Translator interface {
 	Translate(ctx context.Context, req TranslateRequest) (*Translation, error)
 }
+
+// Planner 是自然语言 → Plan DSL 的规划能力抽象。实现需保证:尊重 ctx 超时;
+// 响应必须通过内嵌 plan.schema.json 校验,否则返回错误(校验不过视为规划失败)。
+type Planner interface {
+	Plan(ctx context.Context, req PlanRequest) (json.RawMessage, error)
+}
+
+// PlanRequest 是一次规划请求的入参。
+type PlanRequest struct {
+	RawText string
+	Context json.RawMessage // 上下文快照(variants/devices/now)
+	Model   string          // 可选透传
+}
