@@ -8,6 +8,11 @@
   "required": ["analysis_version", "summary", "suggested_category", "confidence", "disagrees_with_rule"],
   "properties": {
     "analysis_version": { "const": 1 },
+    "model": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "hermes-agent 平台实际使用的模型标识,由 bridge 注入,供审计追踪"
+    },
     "summary": {
       "type": "string",
       "minLength": 1,

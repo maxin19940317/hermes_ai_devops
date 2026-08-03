@@ -190,7 +190,12 @@ def run_analysis(payload: dict) -> dict:
     def log_retry(attempt: int, err: str) -> None:
         log.warning("analyze attempt %d 校验失败: %s", attempt, err)
 
-    return run_with_schema(payload, ANALYSIS_SCHEMA, build_prompt, log_ok, log_retry, "降级规则引擎")
+    result = run_with_schema(payload, ANALYSIS_SCHEMA, build_prompt, log_ok, log_retry, "降级规则引擎")
+    # 注入 model:hermes-agent 平台不保证在响应里回传模型名,
+    # bridge 从请求中取并注入,供 Runtime 侧的 DecisionRow.Model 审计追踪。
+    if "model" not in result and payload.get("model"):
+        result["model"] = payload["model"]
+    return result
 
 
 def run_translation(payload: dict) -> dict:

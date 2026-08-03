@@ -14,6 +14,7 @@ import (
 // Analysis 与 contracts/analysis.schema.json 字段一一对应,是 Analyzer 的结构化输出。
 type Analysis struct {
 	AnalysisVersion   int      `json:"analysis_version"` // 契约固定为 1
+	Model             string   `json:"model,omitempty"`  // bridge 注入的实际模型标识,供审计
 	Summary           string   `json:"summary"`
 	RootCause         string   `json:"root_cause,omitempty"`
 	SuggestedCategory string   `json:"suggested_category"` // INFRA/BUILD/CODE/MODEL/DELEGATE/DEVICE/PERF/UNKNOWN

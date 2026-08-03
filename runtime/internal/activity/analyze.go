@@ -241,10 +241,31 @@ func (a *Acts) Analyze(ctx context.Context, req wf.AnalyzeRequest) (*hermesclien
 	if a.Hermes == nil {
 		return nil, nil
 	}
-	return a.Hermes.Analyze(ctx, hermesclient.AnalyzeRequest{
+	analysis, err := a.Hermes.Analyze(ctx, hermesclient.AnalyzeRequest{
 		TaskID:       req.TaskID,
 		RuleCategory: req.RuleCategory,
 		Model:        a.Cfg.HermesModel,
 		Evidence:     req.EvidenceJSON,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if analysis == nil {
+		return nil, nil
+	}
+
+	// ---- disagrees_with_rule 完整性校验(§9:判定权永远在规则引擎) ----
+	// LLM 说"不同意"必须与 suggested_category ≠ rule_category 一致,
+	// 否则是自相矛盾(说了不同意但类别一样,或说了同意但类别不同)。
+	// 矛盾视为 Analyzer 输出不可信,降级回规则引擎保底。
+	categoryAgrees := analysis.SuggestedCategory == req.RuleCategory
+	if analysis.DisagreesWithRule == categoryAgrees {
+		a.warnf("analyze: disagrees_with_rule=%v but suggested=%s rule=%s; self-contradictory, discarding",
+			analysis.DisagreesWithRule, analysis.SuggestedCategory, req.RuleCategory)
+		return nil, fmt.Errorf(
+			"hermesclient: disagrees_with_rule=%v contradicts suggested_category=%s vs rule_category=%s",
+			analysis.DisagreesWithRule, analysis.SuggestedCategory, req.RuleCategory,
+		)
+	}
+	return analysis, nil
 }
