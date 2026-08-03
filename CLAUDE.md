@@ -49,7 +49,7 @@
 | 数据库 | PostgreSQL 15+(与 Temporal 共实例分库) | Client 本地用 SQLite(WAL) |
 | 附件/日志存储 | MinIO(S3 兼容),预签名 URL 直传 | 大文件不过 Runtime |
 | 产物仓库 | GitLab Generic Package Registry(现状沿用) | |
-| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 按钮尚未实现,见 §12 Phase 2 |
+| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 展示卡片已实现;重试/忽略按钮已实现(2026-08-03);隔离按钮因无设备级信号源暂不做,见差距 #10 |
 | 部署 | Docker Compose(服务器全套);Client 手动安装 MSI/exe | |
 | 日志 | 结构化日志(zerolog),UTC + 毫秒,全组件 NTP | |
 
@@ -262,7 +262,7 @@ audit_log(actor, action, target, payload_digest, ts)
 legacy artifacts/tasks 回填。`RecentRuns` 中无 `workflow_runs` 身份的 legacy 行只用于
 展示，不可触发副作用。人工重跑语法固定为
 `rerun <source_workflow_id> [variant]`；每条文本指令都会分配新的 attempt，不能把
-Temporal `RejectDuplicate` 当作指令幂等。持久化 action claim 留给下一轮飞书按钮实现。
+Temporal `RejectDuplicate` 当作指令幂等。按钮操作(重试/忽略)经 WS card.action.trigger 回调送达,在 feishucmd.Executor.HandleCardAction 执行;忽略记 decisions 表(actor="human")供审计。
 
 Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, started_at, ...)` + `events(seq, ...)`,每次状态迁移单事务落盘,崩溃重启后据此恢复。
 
@@ -297,9 +297,13 @@ Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, star
 > 为个人实例,宜另起专用实例)、工具白名单与 Schema 输出校验在该平台上的落地方式。
 > §3 硬性边界(Hermes 只经 Runtime、结构化输入、不在执行关键路径)不因复用而放宽。
 
-Evidence Extractor 完整化(签名匹配 + 匹配处 ±50 行上下文 + junit 失败 + 指标差值 → evidence.json,几十 KB 级);Analyzer(LLM 分析 evidence → 结构化结论 → decisions 落库;Hermes 超时/不可用 → 规则引擎保底);飞书交互卡片(2026-07-30:**展示卡片已实现**;重试/忽略按钮待 `workflow_runs` 落地后单独一轮,
-按钮回调经 WS listener 执行而非 workflow signal;隔离按钮因无设备级信号源暂不做,见差距 #10);Planner v1(自然语言 → Plan DSL,服务端 Schema 校验不过打回重试 ≤3 次)。
-**严禁把原始日志全量灌入 LLM;Hermes 按需通过 `fetch_log_range(attachment, start, end)` 工具取片段。**
+Evidence Extractor 完整化✅(签名匹配 ±50 行上下文 + junit 失败 + 指标差值 → evidence.json + metrics 基线比较);
+Analyzer 完善✅(LLM 分析 evidence → 结构化结论 → decisions 落库 + model 审计 + disagrees_with_rule 自洽校验;
+Hermes 超时/不可用 → 规则引擎保底);
+飞书交互卡片✅(展示卡片 2026-07-30 上线;重试/忽略按钮 2026-08-03 上线;
+按钮回调经 WS listener 执行而非 workflow signal;隔离按钮因无设备级信号源暂不做,见差距 #10);
+Planner v1✅(自然语言 → Plan DSL,经 analyze_bridge /plan 路由,Schema 校验不过打回重试 ≤3 次);
+CLAUDE.md §4 卡片状态已同步。
 
 ### Phase 3 — 硬化
 mTLS 双向 + Client 身份签发;全链路幂等键核验;≥10 场景故障注入矩阵(断电/网络分区/adb 僵死/下载中断/回调丢失/重复回调);审计完备;MinIO 生命周期(PASSED 日志 7 天,失败 90 天);Agent 版本上报 + 最低版本门禁。
