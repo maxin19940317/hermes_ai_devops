@@ -110,14 +110,17 @@ docker compose --env-file .env run --rm minio-init
 mc ilm rule ls hermes/hermes-evidence   # or read minio-init's own log line
 ```
 
-Deliberately not implemented: the finer "PASSED logs 7 days, failures 90 days" split
-named in CLAUDE.md §12 Phase 3. Verdict is not part of the object key and is unknown
-at upload time (attachments are uploaded before the rule engine runs), so an
-S3 lifecycle rule cannot see it. Getting the 7-day half requires tagging each object
-with its verdict once the task reaches a terminal state and adding a tag-filtered
-rule — a runtime change, not a bucket-config change. Until then `runs/` uses the
-conservative bound (90 days), which keeps failure evidence for its full window at the
-cost of keeping passing runs' logs longer than necessary.
+The finer "PASSED logs 7 days, failures 90 days" split named in CLAUDE.md §12
+Phase 3 is implemented at the application layer, not as a bucket rule — verdict
+is not part of the object key and is unknown at upload time, so an S3 lifecycle
+rule cannot see it. A Temporal Schedule (`evidence-lifecycle-daily`, daily at
+03:00 UTC, created idempotently at worker startup) runs the
+`EvidenceLifecycleWorkflow`: it queries `tasks` for COMPLETED rows past the
+retention bound (PASSED > 7d, other verdicts > 90d) and deletes only the
+`runs/{task_id}/` prefix. `evidence/{task_id}/` snapshots are deliberately out
+of scope — they are the replay record behind a `decisions` row and must not
+expire. The bucket-level 90-day `runs/` rule stays as a backstop; the schedule
+is what enforces the 7-day PASSED half.
 
 Key environment variables (see `.env.example`):
 
