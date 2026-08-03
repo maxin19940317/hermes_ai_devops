@@ -148,6 +148,8 @@ services:
       HERMES_AUTH_TOKEN: ${HERMES_AUTH_TOKEN:-}
       HERMES_TIMEOUT_SEC: ${HERMES_TIMEOUT_SEC:-60}
       HERMES_MODEL: ${HERMES_MODEL:-}
+      # Agent 最低版本门禁(Phase 3):空 = 不启用;dev 版本 Agent 永远放行。
+      MIN_AGENT_VERSION: ${MIN_AGENT_VERSION:-}
     ports:
       - "${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091"
     healthcheck:
