@@ -327,3 +327,14 @@ func (s *MemStore) HasCapableDevice(_ context.Context, sel wf.DeviceSelector) (b
 	}
 	return false, nil
 }
+
+// GetClientVersion reads a client's version from the clients table.
+func (s *MemStore) GetClientVersion(_ context.Context, clientID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.clients[clientID]
+	if !ok {
+		return "", fmt.Errorf("client %s not found", clientID)
+	}
+	return c.Version, nil
+}

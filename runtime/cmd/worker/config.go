@@ -148,6 +148,7 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			// §12 Phase 2:自然语言翻译旁路总开关(缺省关,灰度)。
 			FeishuCmdNL:        getenv("FEISHU_CMD_NL") == "true",
 			FeishuCmdNLTimeout: time.Duration(nlTimeoutSec) * time.Second,
+			MinAgentVersion:    getenv("MIN_AGENT_VERSION"),
 			// §3.7:MINIO_ENDPOINT 或凭据为空即禁用预签名(优雅降级)。
 			MinIOEndpoint:       getenv("MINIO_ENDPOINT"),
 			MinIOPublicEndpoint: getenv("MINIO_PUBLIC_ENDPOINT"),

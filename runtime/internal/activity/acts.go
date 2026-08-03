@@ -2,6 +2,7 @@ package activity
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -30,6 +31,7 @@ type Store interface {
 	RecordWorkflowRun(ctx context.Context, run store.WorkflowRun) error
 	SaveMetrics(ctx context.Context, points []store.MetricPoint) error
 	Baseline(ctx context.Context, project, variant, suite, metricName string, n int) (*store.MetricBaseline, error)
+	GetClientVersion(ctx context.Context, clientID string) (string, error)
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).
@@ -78,6 +80,10 @@ type Config struct {
 	// FeishuCmdNLTimeout 是 /translate 调用超时,不复用 HermesTimeout:bridge 实测
 	// -t "" 冷/热约 76s/13s,这是人在飞书里等回复的交互路径,需单独调(缺省 60s)。
 	FeishuCmdNLTimeout time.Duration
+	// MinAgentVersion 是最低允许的 Agent 版本号(Phase 3 版本门禁)。
+	// 空 = 不限(缺省);非空时 AcquireDevice 拒绝低于此版本的 Client。
+	// 版本号用语义化版本比较(如 "0.1.0" < "0.2.0" < "1.0.0")。
+	MinAgentVersion string
 }
 
 // Acts carries all activities; method names are the activity name strings referenced in workflow.
@@ -94,7 +100,28 @@ type Acts struct {
 }
 
 func (a *Acts) AcquireDevice(ctx context.Context, req wf.AcquireRequest) (*wf.Lease, error) {
-	return a.Store.AcquireDevice(ctx, req.Selector, req.TaskID, a.Cfg.LeaseSeconds)
+	lease, err := a.Store.AcquireDevice(ctx, req.Selector, req.TaskID, a.Cfg.LeaseSeconds)
+	if err != nil || lease == nil {
+		return lease, err
+	}
+	// Phase 3 版本门禁:拒绝低于最低版本的 Client Agent。
+	// 空 MinAgentVersion = 不限(缺省兼容旧部署)。
+	if a.Cfg.MinAgentVersion != "" {
+		cv, err := a.Store.GetClientVersion(ctx, lease.ClientID)
+		if err != nil {
+			a.warnf("acquire device: get client version %s failed: %v; releasing lease", lease.ClientID, err)
+			_ = a.Store.ReleaseDevice(ctx, lease.DeviceID, req.TaskID, wf.FailScopeNone, a.Cfg.QuarantineAfter)
+			return nil, fmt.Errorf("acquire device: client %s version unknown: %w", lease.ClientID, err)
+		}
+		if compareVersion(cv, a.Cfg.MinAgentVersion) < 0 {
+			a.warnf("acquire device: client %s version %s below minimum %s; releasing lease",
+				lease.ClientID, cv, a.Cfg.MinAgentVersion)
+			_ = a.Store.ReleaseDevice(ctx, lease.DeviceID, req.TaskID, wf.FailScopeNone, a.Cfg.QuarantineAfter)
+			return nil, fmt.Errorf("acquire device: client %s version %s below minimum %s",
+				lease.ClientID, cv, a.Cfg.MinAgentVersion)
+		}
+	}
+	return lease, nil
 }
 
 func (a *Acts) CreateTask(ctx context.Context, row wf.TaskRow) error {

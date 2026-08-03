@@ -46,6 +46,7 @@ import (
 	"hermes-devops/agent/internal/server"
 	"hermes-devops/agent/internal/store"
 	"hermes-devops/agent/internal/uploader"
+	"hermes-devops/agent/internal/version"
 )
 
 // Config 是服务模式配置(键见包注释)。
@@ -201,15 +202,17 @@ func loadConfig(path string, getenv func(string) string) (Config, error) {
 		BaseURL:            get("AGENT_BASE_URL"),
 		ADBPath:            get("AGENT_ADB_PATH"),
 		ListenAddr:         get("AGENT_LISTEN_ADDR"),
-		Version:            get("AGENT_VERSION"),
+		Version:            version.Version, // ldflags injected; env var AGENT_VERSION overrides below
 		RunsRoot:           get("AGENT_RUNS_ROOT"),
 		DBPath:             get("AGENT_DB_PATH"),
 	}
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8480"
 	}
-	if cfg.Version == "" {
-		cfg.Version = "dev"
+	// AGENT_VERSION env var 覆盖构建时注入的版本号(ldflags);
+	// 都没设置时 version.Version(缺省 "dev")。
+	if v := get("AGENT_VERSION"); v != "" {
+		cfg.Version = v
 	}
 	if cfg.RunsRoot == "" {
 		cfg.RunsRoot = "./agent-runs"

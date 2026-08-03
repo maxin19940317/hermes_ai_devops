@@ -59,7 +59,10 @@ powershell -ExecutionPolicy Bypass -File .\dist\start-agent.ps1
 export PATH=$HOME/.local/go/bin:$PATH
 cd agent
 go test ./...
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/agent.exe ./cmd/agent
+VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+GOOS=windows GOARCH=amd64 go build -trimpath \
+  -ldflags="-s -w -X hermes-devops/agent/internal/version.Version=$VERSION" \
+  -o dist/agent.exe ./cmd/agent
 ```
 
 ## agent-cli 手动模式(保留)

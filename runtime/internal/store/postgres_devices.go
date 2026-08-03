@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -281,4 +282,19 @@ func (s *PGStore) ReleaseDevice(ctx context.Context, deviceID, taskID string, sc
 		return fmt.Errorf("release device %s scope=%s: %w", deviceID, scope, err)
 	}
 	return nil
+}
+
+// GetClientVersion reads a client's version from the clients table.
+func (s *PGStore) GetClientVersion(ctx context.Context, clientID string) (string, error) {
+	var version string
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT version FROM clients WHERE client_id=$1`, clientID,
+	).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("client %s not found", clientID)
+	}
+	if err != nil {
+		return "", fmt.Errorf("get client version %s: %w", clientID, err)
+	}
+	return version, nil
 }

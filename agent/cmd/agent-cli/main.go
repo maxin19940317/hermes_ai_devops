@@ -19,6 +19,7 @@ import (
 	"hermes-devops/agent/internal/adb"
 	"hermes-devops/agent/internal/artifact"
 	"hermes-devops/agent/internal/executor"
+	"hermes-devops/agent/internal/version"
 )
 
 func main() {
@@ -28,6 +29,7 @@ func main() {
 func run(argv []string) int {
 	fs := flag.NewFlagSet("agent-cli run", flag.ContinueOnError)
 	var (
+		versionFlag  = fs.Bool("version", false, "打印版本号并退出")
 		packageURL   = fs.String("package-url", "", "产物 Registry URL(与 --package-file 二选一)")
 		packageFile  = fs.String("package-file", "", "本地包路径(与 --package-url 二选一)")
 		sha256Hex    = fs.String("sha256", "", "整包 sha256(package-url 时必填)")
@@ -40,12 +42,20 @@ func run(argv []string) int {
 		keepWorkdir  = fs.Bool("keep-device-workdir", false, "保留设备 workdir(覆盖 manifest.cleanup)")
 	)
 	if len(argv) < 1 || argv[0] != "run" {
+		if len(argv) == 1 && (argv[0] == "-version" || argv[0] == "--version") {
+			fmt.Println(version.Version)
+			return 0
+		}
 		fmt.Fprintln(os.Stderr, "usage: agent-cli run [flags]")
 		fs.PrintDefaults()
 		return 1
 	}
 	if err := fs.Parse(argv[1:]); err != nil {
 		return 1
+	}
+	if *versionFlag {
+		fmt.Println(version.Version)
+		return 0
 	}
 	if *serial == "" {
 		fmt.Fprintln(os.Stderr, "error: --serial 必填(禁止无 -s 的 adb 操作)")
