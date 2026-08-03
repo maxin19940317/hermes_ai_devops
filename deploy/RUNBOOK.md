@@ -117,4 +117,5 @@ docker logs hermes-runtime-worker-1 --since 1h 2>&1 | grep -v DEBUG | tail -20
 | 非 Android 设备注册进表,soc 是 shell 错误文本 | probe 用 Android 命令探 Linux 设备 | 人工置 QUARANTINED;agent probe 防护待做 |
 | 飞书 NL 指令收到两条回复 | WS 事件 ack 超时重投 | 已修(异步处理 + message_id 去重) |
 | Hermes 分析连续 502 | DeepSeek 余额不足 | 充值或换 key;规则引擎保底,主链路不受影响 |
+| 换了 LLM key/endpoint 后 hermes -z 仍 "no final response" | 凭证池缓存:`/opt/data/auth.json` 里 provider 凭证带着旧 base_url 和 `exhausted` 状态,优先级高于 config.yaml 和 .env | 除改 `config.yaml`(base_url/default)和 `.env`(key)外,必须清凭证池:`hermes auth remove deepseek <id>`(注意它会顺带删 `.env` 里的 key 行并禁止 env 重播种,需补回)或 `hermes auth add deepseek --type api-key --api-key <key>`,并确认 auth.json 里凭证的 base_url 指向新 endpoint |
 | `docker compose up` 后 NL/新功能不生效 | 同"compose 未透传" | 同上 |
