@@ -768,7 +768,7 @@ func runAnalysis(ctx, dctx workflow.Context, taskID string, d rules.Decision, ev
 	}
 	row := DecisionRow{
 		TaskID: taskID, Actor: "hermes", InputDigest: ev.Digest,
-		Model: analysis.Model,
+		Model:         analysis.Model,
 		PromptVersion: hermesclient.PromptVersionAnalyze, Output: out,
 		EvidenceSnapshotID: ev.SnapshotID,
 	}
