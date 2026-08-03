@@ -18,6 +18,8 @@ type MinioLifecycleResult struct {
 // MinioLifecycle scans and removes expired task attachments from MinIO.
 // Called daily by EvidenceLifecycleWorkflow (Temporal Schedule).
 // PASSED → 7 days; failed → 90 days.
+// 只清 runs/ 原始附件;evidence/ 快照不过期——它是 decisions 行的回放依据
+// (deploy/README.md 明确设计),删了会让审计链断在悬空 object_key 上。
 func (a *Acts) EvidenceLifecycle(ctx context.Context) (MinioLifecycleResult, error) {
 	res := MinioLifecycleResult{}
 	if !a.Cfg.presignEnabled() {
@@ -43,7 +45,6 @@ func (a *Acts) EvidenceLifecycle(ctx context.Context) (MinioLifecycleResult, err
 	for _, t := range expired {
 		prefixes := []string{
 			"runs/" + t.TaskID + "/",
-			"evidence/" + t.TaskID + "/",
 		}
 		for _, prefix := range prefixes {
 			objectsCh := cli.ListObjects(ctx, bucket, minio.ListObjectsOptions{
