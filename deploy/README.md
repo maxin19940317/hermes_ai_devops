@@ -62,9 +62,10 @@ Without a variant it retries only source-output entries satisfying
 `verdict != PASSED && verdict != SKIPPED`; an explicit variant remains allowed when it
 belongs to the source run, including PASSED or SKIPPED. Legacy rows returned by
 `RecentRuns` are display-only and cannot be rerun. Each direct text command allocates a
-fresh attempt and workflow ID. Temporal duplicate rejection is therefore not an
-idempotency mechanism for repeated commands; persistent action claims belong to the
-subsequent interactive-button round.
+fresh attempt and workflow ID. Explicit single-variant retries (text `rerun` with a
+variant, and the card retry button) are guarded by a claim check: when the latest
+retry for the same source run + variant is still open in Temporal, the command is
+refused with an in-flight notice instead of allocating a new attempt.
 
 ### 飞书指令自然语言翻译(可选)
 

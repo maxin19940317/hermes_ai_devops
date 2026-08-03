@@ -35,6 +35,7 @@ type Artifact struct {
 type ArtifactStore interface {
 	RegisterArtifacts(ctx context.Context, arts []Artifact) error
 	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
+	CurrentWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	ConclusiveWorkflowIDs(ctx context.Context, workflowIDs []string) (map[string]bool, error)
 }
 
@@ -129,5 +130,22 @@ func (s *MemStore) NextWorkflowAttempt(
 	}
 	matched.WorkflowAttempt++
 	s.rows[key] = matched
+	return matched.WorkflowAttempt, nil
+}
+
+// CurrentWorkflowAttempt 只读当前 retry 计数,不递增。供重试前的
+// 防连点检查:先窥视 attempt 派生最新重试 ID 查 Temporal 开关状态,
+// 运行中则不再分配新 attempt(认领语义,防卡片按钮连点)。
+func (s *MemStore) CurrentWorkflowAttempt(
+	_ context.Context, project, commitSHA string, pipelineID int, variant string,
+) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := artifactKey(project, commitSHA, pipelineID, variant)
+	matched, found := s.rows[key]
+	if !found {
+		return 0, fmt.Errorf("current workflow attempt: artifact not registered: %s/%s/%d/%s",
+			project, commitSHA, pipelineID, variant)
+	}
 	return matched.WorkflowAttempt, nil
 }

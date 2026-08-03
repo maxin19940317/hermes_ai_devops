@@ -33,6 +33,7 @@ type fullStore interface {
 	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
 	CreateTask(ctx context.Context, row wf.TaskRow) error
 	GetTask(ctx context.Context, taskID string) (*wf.TaskRow, error)
+	LatestTaskIDForVariant(ctx context.Context, workflowID, variant string) (string, error)
 	SetTaskStatus(ctx context.Context, taskID, status string) error
 	FinishTask(ctx context.Context, req wf.FinishRequest) error
 	ConclusiveWorkflowIDs(ctx context.Context, workflowIDs []string) (map[string]bool, error)
@@ -48,6 +49,7 @@ type fullStore interface {
 	ListDecisions(ctx context.Context, taskID string) ([]wf.DecisionRow, error)
 	HasDecision(ctx context.Context, taskID, actor string) (bool, error)
 	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
+	CurrentWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	SaveEvidenceSnapshot(ctx context.Context, snap EvidenceSnapshot) error
 	GetEvidenceSnapshot(ctx context.Context, evidenceID string) (*EvidenceSnapshot, error)
 	FleetOverview(ctx context.Context) (*FleetOverview, error)
@@ -1041,6 +1043,56 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if _, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "ghost"); err == nil {
 			t.Error("未登记的键应报错")
+		}
+	})
+
+	// CurrentWorkflowAttempt:只读窥视不递增(防连点认领的前置查询);
+	// 未登记的键报错,语义与 NextWorkflowAttempt 一致。
+	t.Run("CurrentWorkflowAttemptReadOnly", func(t *testing.T) {
+		s := newStore(t)
+		art := Artifact{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42,
+			Variant: "v1", BuildType: "Release", URL: "u", SHA256: "s", Size: 1, ManifestDigest: "m"}
+		if err := s.RegisterArtifacts(ctx, []Artifact{art}); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := s.CurrentWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1"); err != nil || n != 0 {
+			t.Fatalf("initial attempt = %d err=%v, want 0", n, err)
+		}
+		if _, err := s.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1"); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ {
+			if n, err := s.CurrentWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1"); err != nil || n != 1 {
+				t.Fatalf("peek attempt = %d err=%v, want 1 (peek 不得递增)", n, err)
+			}
+		}
+		if _, err := s.CurrentWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "ghost"); err == nil {
+			t.Error("未登记的键应报错")
+		}
+	})
+
+	// LatestTaskIDForVariant:取指定 run+variant 最新 attempt 的 task_id
+	// (卡片"忽略"按钮的裁决落点);无记录返回空串不报错。
+	t.Run("LatestTaskIDForVariant", func(t *testing.T) {
+		s := newStore(t)
+		mk := func(id, wfID, variant string, attempt int) wf.TaskRow {
+			return wf.TaskRow{TaskID: id, WorkflowID: wfID, TestID: variant, Attempt: attempt, IdempotencyKey: id}
+		}
+		for _, r := range []wf.TaskRow{
+			mk("w1:v1:a1", "w1", "v1", 1),
+			mk("w1:v1:a2", "w1", "v1", 2),
+			mk("w1:v2:a1", "w1", "v2", 1),
+		} {
+			if err := s.CreateTask(ctx, r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := s.LatestTaskIDForVariant(ctx, "w1", "v1")
+		if err != nil || got != "w1:v1:a2" {
+			t.Fatalf("latest = %q err=%v, want w1:v1:a2", got, err)
+		}
+		if got, err := s.LatestTaskIDForVariant(ctx, "w1", "ghost"); err != nil || got != "" {
+			t.Fatalf("ghost = %q err=%v, want empty string", got, err)
 		}
 	})
 

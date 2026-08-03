@@ -27,8 +27,10 @@ type Store interface {
 	UnquarantineDevice(ctx context.Context, deviceID string) (bool, error)
 	ListArtifacts(ctx context.Context, project, commitSHA string, pipelineID int) ([]store.Artifact, error)
 	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
+	CurrentWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	NextWorkflowAttemptAll(ctx context.Context, project, commitSHA string, pipelineID int) (int, error)
 	GetWorkflowRun(ctx context.Context, workflowID string) (*store.WorkflowRun, error)
+	LatestTaskIDForVariant(ctx context.Context, workflowID, variant string) (string, error)
 	// 以下三个供意图翻译层使用(设计文档 §3.1)
 	RecentRuns(ctx context.Context, limit int) ([]store.RecentRun, error)
 	SaveCommandTranslation(ctx context.Context, row store.CommandTranslation) error
@@ -421,6 +423,9 @@ func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
 	}
 	if explicit {
 		variant := targets[0]
+		if id := e.retryInFlight(ctx, source, variant); id != "" {
+			return fmt.Sprintf("重试正在进行中: %s", id), nil
+		}
 		n, err := e.Store.NextWorkflowAttempt(
 			ctx, source.Project, source.CommitSHA, source.PipelineID, variant,
 		)
@@ -466,6 +471,27 @@ func pkgRef(a store.Artifact) wf.PackageRef {
 	}
 }
 
+// retryInFlight 防连点认领:同一源运行+变体已有未关闭的重试 workflow 时
+// 返回其 ID,否则返回 ""。查询失败按"无"处理——重试是显式人工动作,
+// Temporal 抖动不应阻塞;此时退化为改动前行为(attempt 原子递增,
+// 连点只造成排队重复执行,无数据错乱)。
+func (e *Executor) retryInFlight(ctx context.Context, source *store.WorkflowRun, variant string) string {
+	cur, err := e.Store.CurrentWorkflowAttempt(
+		ctx, source.Project, source.CommitSHA, source.PipelineID, variant)
+	if err != nil || cur < 1 {
+		return ""
+	}
+	latestID := wf.DeviceTestInput{
+		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
+		Scope: variant, Attempt: cur,
+	}.WorkflowID()
+	closed, err := e.Starter.WorkflowClosed(ctx, latestID)
+	if err != nil || closed {
+		return ""
+	}
+	return latestID
+}
+
 // retryVariant 从已校验的 workflow run 与 variant 启动单变体重试。
 // 步骤:查 artifact → 取 attempt 号 → 构造 DeviceTestInput → StartDeviceTest。
 // source 不能 nil,已由调用方校验。
@@ -487,6 +513,9 @@ func (e *Executor) retryVariant(
 	}
 	if !found {
 		return fmt.Sprintf("变体 %s 的 artifact 不存在", variant), nil
+	}
+	if id := e.retryInFlight(ctx, source, variant); id != "" {
+		return fmt.Sprintf("重试正在进行中: %s", id), nil
 	}
 	n, err := e.Store.NextWorkflowAttempt(
 		ctx, source.Project, source.CommitSHA, source.PipelineID, variant,
@@ -553,9 +582,18 @@ func (e *Executor) HandleCardAction(
 
 	case "ignore":
 		// 记录人工忽略裁决:decisions 表 actor="human",output 存按钮载荷。
+		// decisions.task_id 有 FK 指向 tasks,必须落该变体最新任务的真实
+		// task_id,不能直接写 workflow_id(实测违反 decisions_task_id_fkey)。
+		taskID, terr := e.Store.LatestTaskIDForVariant(ctx, source.WorkflowID, value.Variant)
+		if terr != nil {
+			return "", "", fmt.Errorf("lookup task for %s/%s: %w", source.WorkflowID, value.Variant, terr)
+		}
+		if taskID == "" {
+			return "该变体在此运行中没有任务记录", "info", nil
+		}
 		output, _ := json.Marshal(value)
 		dec := wf.DecisionRow{
-			TaskID: source.WorkflowID, Actor: "human",
+			TaskID: taskID, Actor: "human",
 			Output: output,
 		}
 		if err := e.saveDecision(ctx, dec); err != nil {

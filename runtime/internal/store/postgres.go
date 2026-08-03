@@ -53,6 +53,28 @@ func (s *PGStore) NextWorkflowAttempt(
 	return n, nil
 }
 
+// CurrentWorkflowAttempt 只读当前 retry 计数,不递增。供重试前的
+// 防连点检查:先窥视 attempt 派生最新重试 ID 查 Temporal 开关状态,
+// 运行中则不再分配新 attempt(认领语义,防卡片按钮连点)。
+func (s *PGStore) CurrentWorkflowAttempt(
+	ctx context.Context, project, commitSHA string, pipelineID int, variant string,
+) (int, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT workflow_attempt FROM artifacts
+		WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3 AND variant = $4`,
+		project, commitSHA, pipelineID, variant).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("current workflow attempt: artifact not registered: %s/%s/%d/%s",
+			project, commitSHA, pipelineID, variant)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("current workflow attempt %s/%s/%d/%s: %w",
+			project, commitSHA, pipelineID, variant, err)
+	}
+	return n, nil
+}
+
 // RegisterArtifacts 幂等登记:同 (project,commit,pipeline,variant) 冲突时忽略。
 func (s *PGStore) RegisterArtifacts(ctx context.Context, arts []Artifact) error {
 	const q = `INSERT INTO artifacts

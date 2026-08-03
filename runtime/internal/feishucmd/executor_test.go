@@ -66,10 +66,13 @@ type fakeStarter struct {
 	startErr  error
 	closed    bool
 	closedErr error
-	result    *wf.DeviceTestOutput
-	resultErr error
-	calls     []string
-	trace     *[]string
+	// closedByID 非 nil 时按 workflow ID 返回关闭状态(缺省 false=未关闭),
+	// 用于区分源 workflow 已关闭与上一次重试仍在运行两类场景。
+	closedByID map[string]bool
+	result     *wf.DeviceTestOutput
+	resultErr  error
+	calls      []string
+	trace      *[]string
 }
 
 func (f *fakeStarter) StartDeviceTest(_ context.Context, in wf.DeviceTestInput) (string, bool, error) {
@@ -85,6 +88,9 @@ func (f *fakeStarter) WorkflowClosed(_ context.Context, workflowID string) (bool
 	f.calls = append(f.calls, "WorkflowClosed:"+workflowID)
 	if f.trace != nil {
 		*f.trace = append(*f.trace, "WorkflowClosed")
+	}
+	if f.closedByID != nil {
+		return f.closedByID[workflowID], f.closedErr
 	}
 	return f.closed, f.closedErr
 }
@@ -970,5 +976,148 @@ func TestStatusAndDevicesShowClientFailStreak(t *testing.T) {
 		if !strings.Contains(got, "client_fail=") {
 			t.Errorf("%s 输出应含 client_fail=, got %q", cmd, got)
 		}
+	}
+}
+
+// ---- 卡片按钮:ignore ----
+
+// ignore 必须把人工裁决落在该变体最新任务上:decisions.task_id 有 FK 指向
+// tasks,直接写 workflow_id 会违反 decisions_task_id_fkey(2026-08-03 实测)。
+func TestHandleCardActionIgnoreSavesDecisionOnLatestTask(t *testing.T) {
+	ms := store.NewMemStore()
+	if err := ms.RecordWorkflowRun(ctx, store.WorkflowRun{
+		WorkflowID: "w-1", Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42,
+		Version: "1.0.2", RuleVersion: "v1", Variants: []string{"v1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []wf.TaskRow{
+		{TaskID: "w-1:v1:a1", WorkflowID: "w-1", TestID: "v1", Attempt: 1, IdempotencyKey: "w-1:v1:a1"},
+		{TaskID: "w-1:v1:a2", WorkflowID: "w-1", TestID: "v1", Attempt: 2, IdempotencyKey: "w-1:v1:a2"},
+	} {
+		if err := ms.CreateTask(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec := newExec(ms, &fakeStarter{}, &fakeSender{})
+
+	text, toast, err := exec.HandleCardAction(ctx,
+		wf.ButtonValue{Action: "ignore", SourceWorkflowID: "w-1", Variant: "v1"}, wlOpenID)
+	if err != nil || toast != "success" {
+		t.Fatalf("ignore = %q/%q err=%v, want success toast", text, toast, err)
+	}
+	decs, err := ms.ListDecisions(ctx, "w-1:v1:a2")
+	if err != nil || len(decs) != 1 || decs[0].Actor != "human" {
+		t.Fatalf("decisions = %+v err=%v, want one human decision on latest task", decs, err)
+	}
+}
+
+// 变体在该次运行中没有任务记录时,ignore 回 info toast 且不落裁决。
+func TestHandleCardActionIgnoreWithoutTask(t *testing.T) {
+	ms := store.NewMemStore()
+	if err := ms.RecordWorkflowRun(ctx, store.WorkflowRun{
+		WorkflowID: "w-1", Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42,
+		Version: "1.0.2", RuleVersion: "v1", Variants: []string{"v1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	exec := newExec(ms, &fakeStarter{}, &fakeSender{})
+
+	text, toast, err := exec.HandleCardAction(ctx,
+		wf.ButtonValue{Action: "ignore", SourceWorkflowID: "w-1", Variant: "v1"}, wlOpenID)
+	if err != nil || toast != "info" || !strings.Contains(text, "没有任务记录") {
+		t.Fatalf("ignore = %q/%q err=%v, want info toast", text, toast, err)
+	}
+}
+
+// ---- 重试防连点认领 ----
+
+// seedRetrySource 登记源运行 + 变体 artifact,并预消耗一次 attempt
+// (模拟已存在 r1 重试)。
+func seedRetrySource(t *testing.T, ms *store.MemStore) {
+	t.Helper()
+	if err := ms.RecordWorkflowRun(ctx, store.WorkflowRun{
+		WorkflowID: "w-1", Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42,
+		Version: "1.0.2", RuleVersion: "v1", Variants: []string{"v1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.RegisterArtifacts(ctx, []store.Artifact{{
+		Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42, Variant: "v1",
+		BuildType: "Release", URL: "u", SHA256: "s", Size: 1, ManifestDigest: "m",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func startedCount(starter *fakeStarter) int {
+	n := 0
+	for _, c := range starter.calls {
+		if c == "StartDeviceTest" {
+			n++
+		}
+	}
+	return n
+}
+
+// 上一次重试仍在运行时,按钮重试被认领拦截:不分配新 attempt、不起新 workflow。
+func TestHandleCardActionRetryBlockedWhileInFlight(t *testing.T) {
+	ms := store.NewMemStore()
+	seedRetrySource(t, ms)
+	starter := &fakeStarter{closedByID: map[string]bool{"w-1": true}} // r1 未关闭
+	exec := newExec(ms, starter, &fakeSender{})
+
+	text, _, err := exec.HandleCardAction(ctx,
+		wf.ButtonValue{Action: "retry", SourceWorkflowID: "w-1", Variant: "v1"}, wlOpenID)
+	if err != nil || !strings.Contains(text, "重试正在进行中") {
+		t.Fatalf("retry = %q err=%v, want 认领拦截", text, err)
+	}
+	if got := startedCount(starter); got != 0 {
+		t.Errorf("StartDeviceTest 调用 %d 次, want 0", got)
+	}
+	if n, _ := ms.CurrentWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1"); n != 1 {
+		t.Errorf("attempt = %d, want 1(拦截不得消耗 attempt)", n)
+	}
+}
+
+// 上一次重试已关闭时,按钮重试正常推进到下一 attempt。
+func TestHandleCardActionRetryProceedsAfterClosed(t *testing.T) {
+	ms := store.NewMemStore()
+	seedRetrySource(t, ms)
+	r1ID := wf.DeviceTestInput{
+		Project: "grp/p", Commit: "abcd1234", PipelineID: 42, Scope: "v1", Attempt: 1,
+	}.WorkflowID()
+	starter := &fakeStarter{started: true, closedByID: map[string]bool{"w-1": true, r1ID: true}}
+	exec := newExec(ms, starter, &fakeSender{})
+
+	text, toast, err := exec.HandleCardAction(ctx,
+		wf.ButtonValue{Action: "retry", SourceWorkflowID: "w-1", Variant: "v1"}, wlOpenID)
+	if err != nil || toast != "success" || !strings.Contains(text, "已启动重试") {
+		t.Fatalf("retry = %q/%q err=%v, want 已启动", text, toast, err)
+	}
+	if got := startedCount(starter); got != 1 {
+		t.Fatalf("StartDeviceTest 调用 %d 次, want 1", got)
+	}
+	if starter.inputs[0].Attempt != 2 {
+		t.Errorf("新重试 attempt = %d, want 2", starter.inputs[0].Attempt)
+	}
+}
+
+// 文本 rerun 显式变体与按钮共用同一条认领检查。
+func TestRerunExplicitVariantBlockedWhileInFlight(t *testing.T) {
+	ms := store.NewMemStore()
+	seedRetrySource(t, ms)
+	starter := &fakeStarter{closedByID: map[string]bool{"w-1": true}} // r1 未关闭
+	exec := newExec(ms, starter, &fakeSender{})
+
+	text, err := exec.rerun(ctx, []string{"w-1", "v1"})
+	if err != nil || !strings.Contains(text, "重试正在进行中") {
+		t.Fatalf("rerun = %q err=%v, want 认领拦截", text, err)
+	}
+	if got := startedCount(starter); got != 0 {
+		t.Errorf("StartDeviceTest 调用 %d 次, want 0", got)
 	}
 }

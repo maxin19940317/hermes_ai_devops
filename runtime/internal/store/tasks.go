@@ -51,6 +51,26 @@ func (s *MemStore) GetTask(_ context.Context, taskID string) (*wf.TaskRow, error
 	return &row, nil
 }
 
+// LatestTaskIDForVariant 返回某次运行中指定变体最新 attempt 的 task_id;
+// 无记录返回空串(不报错)。供卡片"忽略"按钮定位裁决落点(decisions.task_id
+// 有 FK 指向 tasks,不能写 workflow_id)。
+func (s *MemStore) LatestTaskIDForVariant(_ context.Context, workflowID, variant string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	best := ""
+	bestAttempt := -1
+	var bestSeq int64
+	for id, rec := range s.tasks {
+		if rec.row.WorkflowID != workflowID || rec.row.TestID != variant {
+			continue
+		}
+		if rec.row.Attempt > bestAttempt || (rec.row.Attempt == bestAttempt && rec.seq > bestSeq) {
+			best, bestAttempt, bestSeq = id, rec.row.Attempt, rec.seq
+		}
+	}
+	return best, nil
+}
+
 // SetTaskStatus 更新生命周期状态(status 与 verdict 正交,§9)。
 func (s *MemStore) SetTaskStatus(_ context.Context, taskID, status string) error {
 	s.mu.Lock()

@@ -886,9 +886,9 @@ type CardHeader struct {
 // CardElement 有三种形态:文本块(tag=div,Text 非空)、分隔线(tag=hr,Text 为 nil)、
 // 交互按钮组(tag=action,Actions 非空)。三个形态互斥:运行时只设置一种。
 type CardElement struct {
-	Tag     string        `json:"tag"`              // div | hr | action
-	Text    *CardText     `json:"text,omitempty"`    // tag=hr|action 时必须为 nil
-	Actions []CardButton  `json:"actions,omitempty"` // tag=div|hr 时必须为 nil
+	Tag     string       `json:"tag"`               // div | hr | action
+	Text    *CardText    `json:"text,omitempty"`    // tag=hr|action 时必须为 nil
+	Actions []CardButton `json:"actions,omitempty"` // tag=div|hr 时必须为 nil
 }
 
 // CardText 的 Tag 恒为 plain_text(§4.5),没有 lark_md 这个选项。

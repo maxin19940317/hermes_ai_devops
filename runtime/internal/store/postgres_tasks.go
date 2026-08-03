@@ -42,6 +42,25 @@ func (s *PGStore) GetTask(ctx context.Context, taskID string) (*wf.TaskRow, erro
 	return &row, nil
 }
 
+// LatestTaskIDForVariant 返回某次运行中指定变体最新 attempt 的 task_id;
+// 无记录返回空串(不报错)。供卡片"忽略"按钮定位裁决落点(decisions.task_id
+// 有 FK 指向 tasks,不能写 workflow_id)。走 tasks_run_variant_latest_idx。
+func (s *PGStore) LatestTaskIDForVariant(ctx context.Context, workflowID, variant string) (string, error) {
+	var id string
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT task_id FROM tasks
+		WHERE workflow_id = $1 AND test_id = $2
+		ORDER BY attempt DESC, created_at DESC
+		LIMIT 1`, workflowID, variant).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("latest task for %s/%s: %w", workflowID, variant, err)
+	}
+	return id, nil
+}
+
 // SetTaskStatus 更新生命周期状态(status 与 verdict 正交,§9)。
 // 任务不存在时 UPDATE 空转,无副作用。
 func (s *PGStore) SetTaskStatus(ctx context.Context, taskID, status string) error {
