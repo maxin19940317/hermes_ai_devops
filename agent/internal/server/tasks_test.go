@@ -35,8 +35,8 @@ func TestSafeOutDirName(t *testing.T) {
 // presigned 键和 files map,用于断言 uploadFixedSet 的 filepath.Base 后缀
 // 匹配不仅放行了正确的键,还把本地路径映射到了 wellKnownFiles 声明的位置。
 type filesMapUploader struct {
-	gotKeys   []string
-	gotFiles  map[string]string // objectKey → localPath
+	gotKeys  []string
+	gotFiles map[string]string // objectKey → localPath
 }
 
 func (f *filesMapUploader) Upload(_ context.Context, p []uploader.PresignedUpload,
@@ -95,10 +95,10 @@ func TestUploadFixedSetSuffixMatching(t *testing.T) {
 	// 断言 files map:wellKnownFiles 中有的 4 个文件都应被映射;
 	// unknown.dat 应被跳过(不在 files map 中)。
 	wantInFiles := map[string]string{
-		"runs/task_id/result.json":      "device/results/result.json",
-		"runs/task_id/logcat.txt":       "logcat.txt",
-		"runs/task_id/a2/junit.xml":     "device/results/junit.xml",
-		"some/deep/nested/stdout.log":   "stdout.log",
+		"runs/task_id/result.json":    "device/results/result.json",
+		"runs/task_id/logcat.txt":     "logcat.txt",
+		"runs/task_id/a2/junit.xml":   "device/results/junit.xml",
+		"some/deep/nested/stdout.log": "stdout.log",
 	}
 	for objKey, wantRel := range wantInFiles {
 		gotPath, ok := fake.gotFiles[objKey]
