@@ -197,6 +197,23 @@ SELECT count(*)                                            AS pending,
 FROM outbox
 WHERE published_at IS NULL;
 
+-- 统一审计日志(§11, Phase 3):所有产生副作用的操作都留一行。
+-- actor: 哪个组件(activity:dispatch / activity:acquire_device 等)
+-- action: dispatched / device_leased / device_released / escalated / task_finished
+-- target: 操作对象(task_id / device_id)
+-- payload_digest: 操作载荷的 sha256 摘要(可从对应表 JOIN 回查原始数据)
+-- 写入失败不阻断主流程(活动内 fire-and-forget)
+CREATE TABLE IF NOT EXISTS audit_log (
+    id             BIGSERIAL PRIMARY KEY,
+    actor          TEXT        NOT NULL,
+    action         TEXT        NOT NULL,
+    target         TEXT        NOT NULL,
+    payload_digest TEXT        NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS audit_log_target_idx ON audit_log(target);
+CREATE INDEX IF NOT EXISTS audit_log_action_idx ON audit_log(action, created_at DESC);
+
 -- 飞书指令层自然语言翻译审计(设计文档 §4.3)。翻译发生在任何 task 存在之前,
 -- 无 task_id 可填,故不能复用 decisions 表(其 task_id 是 NOT NULL 外键)。
 -- 追加式:确认流程不更新已有行,pending_confirm 与 confirmed 各占一行。

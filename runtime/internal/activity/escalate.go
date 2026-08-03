@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -58,6 +59,12 @@ func (a *Acts) Escalate(ctx context.Context, req wf.EscalationRequest) (*wf.Esca
 	out["kanban_task_id"] = resp.KanbanTaskID
 	out["result"] = resp.Result
 	a.saveEscalationDecision(ctx, req.TaskID, out)
+	// Phase 3 审计:升级成功 → 落 audit_log
+	a.writeAudit(ctx, store.AuditEntry{
+		Actor:  "activity:escalate",
+		Action: "escalated",
+		Target: req.TaskID,
+	})
 	return resp, nil
 }
 

@@ -66,6 +66,8 @@ type MemStore struct {
 	// 不放进 Client 结构体:那是心跳载荷,UpsertClientDevices 整体覆写,
 	// 放进去会被每 10s 一次的心跳清零。
 	clientFailStreak map[string]int
+	// auditLog 是 audit_log 表(§11 Phase 3)的内存视图。
+	auditLog []AuditEntry
 	// seq 是插入序计数器,给 artifacts/tasks 提供确定的"最近"排序
 	// (内存实现无 created_at 列)。
 	seq    int64
@@ -87,6 +89,7 @@ func NewMemStore() *MemStore {
 		evidenceSnaps:    map[string]EvidenceSnapshot{},
 		rowSeq:           map[string]int64{},
 		clientFailStreak: map[string]int{},
+		auditLog:         []AuditEntry{},
 	}
 }
 

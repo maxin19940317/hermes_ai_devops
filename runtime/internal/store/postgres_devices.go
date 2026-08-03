@@ -298,3 +298,12 @@ func (s *PGStore) GetClientVersion(ctx context.Context, clientID string) (string
 	}
 	return version, nil
 }
+
+// WriteAudit appends a row to the audit_log.
+func (s *PGStore) WriteAudit(ctx context.Context, entry AuditEntry) error {
+	_, err := s.DB.ExecContext(ctx,
+		`INSERT INTO audit_log (actor, action, target, payload_digest) VALUES ($1, $2, $3, $4)`,
+		entry.Actor, entry.Action, entry.Target, entry.PayloadDigest,
+	)
+	return err
+}

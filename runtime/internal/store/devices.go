@@ -338,3 +338,19 @@ func (s *MemStore) GetClientVersion(_ context.Context, clientID string) (string,
 	}
 	return c.Version, nil
 }
+
+// AuditEntry is a single audit_log row (§11 Phase 3).
+type AuditEntry struct {
+	Actor         string // activity:dispatch / activity:acquire_device / ...
+	Action        string // dispatched / device_leased / device_released / escalated
+	Target        string // task_id / device_id
+	PayloadDigest string // sha256 of the marshal of the operation payload (empty = not applicable)
+}
+
+// WriteAudit appends a row to the audit_log (fire-and-forget, never blocks).
+func (s *MemStore) WriteAudit(_ context.Context, entry AuditEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.auditLog = append(s.auditLog, entry)
+	return nil
+}

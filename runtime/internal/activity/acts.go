@@ -32,6 +32,7 @@ type Store interface {
 	SaveMetrics(ctx context.Context, points []store.MetricPoint) error
 	Baseline(ctx context.Context, project, variant, suite, metricName string, n int) (*store.MetricBaseline, error)
 	GetClientVersion(ctx context.Context, clientID string) (string, error)
+	WriteAudit(ctx context.Context, entry store.AuditEntry) error
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).
@@ -99,6 +100,18 @@ type Acts struct {
 	Feishu feishu.Sender
 }
 
+// writeAudit writes an audit_log row; failures are logged but never returned
+// (audit is fire-and-forget, never blocks the main flow).
+func (a *Acts) writeAudit(ctx context.Context, entry store.AuditEntry) {
+	if a.Store == nil {
+		return
+	}
+	if err := a.Store.WriteAudit(ctx, entry); err != nil {
+		a.warnf("audit write failed: %v: actor=%s action=%s target=%s",
+			err, entry.Actor, entry.Action, entry.Target)
+	}
+}
+
 func (a *Acts) AcquireDevice(ctx context.Context, req wf.AcquireRequest) (*wf.Lease, error) {
 	lease, err := a.Store.AcquireDevice(ctx, req.Selector, req.TaskID, a.Cfg.LeaseSeconds)
 	if err != nil || lease == nil {
@@ -121,6 +134,12 @@ func (a *Acts) AcquireDevice(ctx context.Context, req wf.AcquireRequest) (*wf.Le
 				lease.ClientID, cv, a.Cfg.MinAgentVersion)
 		}
 	}
+	// Phase 3 审计:设备租约获取成功 → 落 audit_log
+	a.writeAudit(ctx, store.AuditEntry{
+		Actor:  "activity:acquire_device",
+		Action: "device_leased",
+		Target: lease.DeviceID,
+	})
 	return lease, nil
 }
 
@@ -142,7 +161,16 @@ func (a *Acts) ReleaseDevice(ctx context.Context, req wf.ReleaseRequest) error {
 			scope = wf.FailScopeDevice
 		}
 	}
-	return a.Store.ReleaseDevice(ctx, req.DeviceID, req.TaskID, scope, a.Cfg.QuarantineAfter)
+	if err := a.Store.ReleaseDevice(ctx, req.DeviceID, req.TaskID, scope, a.Cfg.QuarantineAfter); err != nil {
+		return err
+	}
+	// Phase 3 审计:设备释放 → 落 audit_log(成功与失败分支都释放,归因见 scope)
+	a.writeAudit(ctx, store.AuditEntry{
+		Actor:  "activity:release_device",
+		Action: "device_released",
+		Target: req.DeviceID,
+	})
+	return nil
 }
 
 // SaveDecision 落 decisions 表(§11):规则引擎与 LLM 的每次裁决都落表,可回放。

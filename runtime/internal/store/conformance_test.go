@@ -64,6 +64,7 @@ type fullStore interface {
 	SaveMetrics(ctx context.Context, points []MetricPoint) error
 	Baseline(ctx context.Context, project, variant, suite, metricName string, n int) (*MetricBaseline, error)
 	GetClientVersion(ctx context.Context, clientID string) (string, error)
+	WriteAudit(ctx context.Context, entry AuditEntry) error
 }
 
 func TestMemStoreConformance(t *testing.T) {

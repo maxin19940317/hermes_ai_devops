@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 
+	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -23,20 +24,26 @@ func (a *Acts) Dispatch(ctx context.Context, req wf.DispatchRequest) error {
 		"artifact": map[string]any{
 			"url":    req.PackageURL,
 			"sha256": req.PackageSHA256,
-			// username 空串也带上,保持载荷形态稳定(契约只加不删;basic 时才被消费)
-			"auth": map[string]any{"type": a.Cfg.ArtifactAuthType, "token": a.Cfg.ArtifactAuthToken, "username": a.Cfg.ArtifactAuthUsername},
+			"auth":   map[string]any{"type": a.Cfg.ArtifactAuthType, "token": a.Cfg.ArtifactAuthToken, "username": a.Cfg.ArtifactAuthUsername},
 		},
-		"manifest_digest":   req.ManifestDigest,
-		"device_serial":     req.DeviceSerial,
-		"callback_base_url": a.Cfg.CallbackBaseURL,
-		// 租约所有权凭据(§10/差距 #15):Client 心跳续租时原样回传
-		"lease_id":          req.LeaseID,
-		"lease_generation":  req.LeaseGeneration,
-		"presigned_uploads": a.presignedUploads(ctx, req.TaskID), // §3.7;禁用时为空集降级
-		// 按需签发端点(差距 #8);CALLBACK_BASE_URL 为空时也为空,Agent 沿用 presigned_uploads
+		"manifest_digest":    req.ManifestDigest,
+		"device_serial":      req.DeviceSerial,
+		"callback_base_url":  a.Cfg.CallbackBaseURL,
+		"lease_id":           req.LeaseID,
+		"lease_generation":   req.LeaseGeneration,
+		"presigned_uploads":  a.presignedUploads(ctx, req.TaskID),
 		"upload_request_url": uploadRequestURL(a.Cfg.CallbackBaseURL),
 	}
-	return a.post(ctx, req.ClientBaseURL+"/api/v1/tasks", payload, http.StatusAccepted)
+	if err := a.post(ctx, req.ClientBaseURL+"/api/v1/tasks", payload, http.StatusAccepted); err != nil {
+		return err
+	}
+	// Phase 3 审计:派单成功 → 落 audit_log(失败不阻断,fire-and-forget)
+	a.writeAudit(ctx, store.AuditEntry{
+		Actor:  "activity:dispatch",
+		Action: "dispatched",
+		Target: req.TaskID,
+	})
+	return nil
 }
 
 // uploadRequestURL 由回调基址派生按需签发端点地址(差距 #8)。
@@ -48,7 +55,7 @@ func uploadRequestURL(base string) string {
 	return strings.TrimRight(base, "/") + "/callbacks/v1/upload-requests"
 }
 
-// CancelTask 尽力而为取消(§8.1);404 表示 Client 已无此任务,视为成功。
+// CancelTask尽力而为取消(§8.1);404 表示 Client 已无此任务,视为成功。
 func (a *Acts) CancelTask(ctx context.Context, req wf.CancelRequest) error {
 	u := req.ClientBaseURL + "/api/v1/tasks/" + url.PathEscape(req.TaskID)
 	hr, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
