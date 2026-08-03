@@ -1,0 +1,20 @@
+{
+  "plan_version": 1,
+  "plan_id": "pln_20260803_a1b2",
+  "origin": { "type": "manual_nl", "user": "maxin", "raw_text": "测一下master的SNPE 2.21" },
+  "goal_summary": "测试 master 分支 SNPE 2.21 Android 变体",
+  "build": {
+    "project": "algo-super-sdk",
+    "ref": "master",
+    "targets": ["aarch64_Android_SNPE_2.21"],
+    "build_type": "Release"
+  },
+  "tests": [
+    {
+      "test_id": "aarch64_Android_SNPE_2.21",
+      "suite": "smoke",
+      "device_selector": { "soc": ["QCM6125"], "capabilities": ["hexagon"] },
+      "depends_on": ["aarch64_Android_TFLite_2.21.0"]
+    }
+  ]
+}

@@ -13,7 +13,7 @@
     {
       "test_id": "t1",
       "suite": "snpe-smoke",
-      "device_selector": { "soc": "QCM6125", "capabilities": ["hexagon"] },
+      "device_selector": { "soc": ["QCM6125"], "capabilities": ["hexagon"] },
       "depends_on": []
     }
   ],

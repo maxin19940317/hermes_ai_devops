@@ -148,13 +148,19 @@
       "additionalProperties": false,
       "required": ["test_id", "suite"],
       "properties": {
-        "test_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+        "test_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$", "maxLength": 64 },
         "suite": { "type": "string", "minLength": 1, "maxLength": 128 },
         "device_selector": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "soc": { "type": "string", "maxLength": 64 },
+            "soc": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "maxLength": 64 },
+              "default": [],
+              "description": "SoC 型号数组,留空表示任意可用设备"
+            },
             "capabilities": {
               "type": "array",
               "uniqueItems": true,
@@ -170,7 +176,7 @@
         "depends_on": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$" },
           "default": [],
           "description": "引用同一 Plan 内其他 test_id;引用存在性由 Runtime 语义校验(Schema 无法表达)"
         }
