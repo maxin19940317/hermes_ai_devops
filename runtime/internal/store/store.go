@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	wf "hermes-devops/runtime/internal/workflow"
 )
@@ -215,4 +216,40 @@ func (s *MemStore) Baseline(
 	sort.Float64s(vals)
 	median := vals[len(vals)/2]
 	return &MetricBaseline{Median: median, N: len(vals)}, nil
+}
+
+// ExpiredTask is a task whose attachments are due for MinIO lifecycle cleanup.
+type ExpiredTask struct {
+	TaskID  string
+	Verdict string // PASSED | TEST_FAILED | ...
+	EndedAt time.Time
+}
+
+// ListExpiredTaskIDs returns task IDs for cleanup: PASSED older than maxAgePassed,
+// non-PASSED (failed) older than maxAgeFailed.
+func (s *MemStore) ListExpiredTaskIDs(_ context.Context, maxAgePassed, maxAgeFailed time.Duration) ([]ExpiredTask, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoffPassed := time.Now().Add(-maxAgePassed)
+	cutoffFailed := time.Now().Add(-maxAgeFailed)
+	var out []ExpiredTask
+	for taskID, rec := range s.tasks {
+		if _, ok := s.results[taskID]; !ok {
+			continue // no result yet, skip
+		}
+		verdict := rec.verdict
+		if verdict == "" {
+			continue
+		}
+		if verdict == "PASSED" {
+			if rec.endedAt.Before(cutoffPassed) {
+				out = append(out, ExpiredTask{TaskID: taskID, Verdict: verdict, EndedAt: rec.endedAt})
+			}
+		} else {
+			if rec.endedAt.Before(cutoffFailed) {
+				out = append(out, ExpiredTask{TaskID: taskID, Verdict: verdict, EndedAt: rec.endedAt})
+			}
+		}
+	}
+	return out, nil
 }

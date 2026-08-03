@@ -54,7 +54,9 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 
@@ -217,7 +219,32 @@ func main() {
 	w.RegisterWorkflowWithOptions(wf.DeviceTestWorkflow, workflow.RegisterOptions{
 		Name: wf.DeviceTestWorkflowName,
 	})
+	w.RegisterWorkflowWithOptions(wf.EvidenceLifecycleWorkflow, workflow.RegisterOptions{
+		Name: wf.EvidenceLifecycleWorkflowName,
+	})
 	w.RegisterActivity(acts)
+
+	// ---- MinIO 生命周期清理:每天 UTC 3:00 扫一次 ----
+	scheduleClient := tc.ScheduleClient()
+	scheduleHandle, err := scheduleClient.Create(ctx, client.ScheduleOptions{
+		ID: "evidence-lifecycle-daily",
+		Spec: client.ScheduleSpec{
+			CronExpressions: []string{"0 3 * * *"},
+		},
+		Action: &client.ScheduleWorkflowAction{
+			ID:        "evidence-lifecycle",
+			Workflow:  wf.EvidenceLifecycleWorkflowName,
+			TaskQueue: cfg.TemporalTaskQueue,
+		},
+		Overlap: enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+	})
+	if err != nil {
+		if !errors.Is(err, temporal.ErrScheduleAlreadyRunning) {
+			log.Warn().Err(err).Msg("temporal: create evidence-lifecycle schedule failed")
+		}
+	} else {
+		log.Info().Str("id", scheduleHandle.GetID()).Msg("temporal: evidence-lifecycle schedule created")
+	}
 
 	// ---- Client 回调 HTTP 服务(§8.2) ----
 	cb := callbacks.New(st, tc, &log, cfg.Activity.LeaseSeconds)

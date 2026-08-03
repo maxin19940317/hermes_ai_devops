@@ -33,6 +33,7 @@ type Store interface {
 	Baseline(ctx context.Context, project, variant, suite, metricName string, n int) (*store.MetricBaseline, error)
 	GetClientVersion(ctx context.Context, clientID string) (string, error)
 	WriteAudit(ctx context.Context, entry store.AuditEntry) error
+	ListExpiredTaskIDs(ctx context.Context, maxAgePassed, maxAgeFailed time.Duration) ([]store.ExpiredTask, error)
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).
@@ -190,4 +191,9 @@ func (a *Acts) LoadResult(ctx context.Context, req wf.LoadResultRequest) (*wf.Re
 // workflow 据此进入 INFRA 处理。
 func (a *Acts) CheckLease(ctx context.Context, req wf.CheckLeaseRequest) (*time.Time, error) {
 	return a.Store.GetLeaseExpiry(ctx, req.TaskID)
+}
+
+// ListExpiredTaskIDs 列出过期任务 ID
+func (a *Acts) ListExpiredTaskIDs(ctx context.Context, maxAgePassed, maxAgeFailed time.Duration) ([]store.ExpiredTask, error) {
+	return a.Store.ListExpiredTaskIDs(ctx, maxAgePassed, maxAgeFailed)
 }

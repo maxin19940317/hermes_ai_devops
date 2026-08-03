@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/lib/pq"
 
@@ -164,4 +165,34 @@ func (s *PGStore) ConclusiveWorkflowIDs(ctx context.Context, workflowIDs []strin
 		return nil, fmt.Errorf("conclusive workflow ids: %w", err)
 	}
 	return out, nil
+}
+
+// ListExpiredTaskIDs returns task IDs whose attachments are past lifecycle retention.
+// PASSED tasks: older than maxAgePassed; failed tasks: older than maxAgeFailed.
+func (s *PGStore) ListExpiredTaskIDs(ctx context.Context, maxAgePassed, maxAgeFailed time.Duration) ([]ExpiredTask, error) {
+	cutoffPassed := time.Now().Add(-maxAgePassed)
+	cutoffFailed := time.Now().Add(-maxAgeFailed)
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT t.task_id, t.verdict, t.created_at
+		FROM tasks t
+		JOIN results r ON r.task_id = t.task_id
+		WHERE t.status = 'COMPLETED'
+		  AND (
+			(t.verdict = 'PASSED' AND t.created_at < $1) OR
+			(t.verdict <> 'PASSED' AND t.created_at < $2)
+		  )
+		ORDER BY t.created_at ASC`, cutoffPassed, cutoffFailed)
+	if err != nil {
+		return nil, fmt.Errorf("list expired tasks: %w", err)
+	}
+	defer rows.Close()
+	var out []ExpiredTask
+	for rows.Next() {
+		var e ExpiredTask
+		if err := rows.Scan(&e.TaskID, &e.Verdict, &e.EndedAt); err != nil {
+			return nil, fmt.Errorf("list expired tasks scan: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }

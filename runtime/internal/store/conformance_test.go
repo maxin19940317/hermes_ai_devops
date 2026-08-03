@@ -65,6 +65,7 @@ type fullStore interface {
 	Baseline(ctx context.Context, project, variant, suite, metricName string, n int) (*MetricBaseline, error)
 	GetClientVersion(ctx context.Context, clientID string) (string, error)
 	WriteAudit(ctx context.Context, entry AuditEntry) error
+	ListExpiredTaskIDs(ctx context.Context, maxAgePassed, maxAgeFailed time.Duration) ([]ExpiredTask, error)
 }
 
 func TestMemStoreConformance(t *testing.T) {
