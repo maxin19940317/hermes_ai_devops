@@ -54,6 +54,28 @@ func (a *Acts) ExtractEvidence(ctx context.Context, req wf.ExtractEvidenceReques
 			_ = c.Close()
 		}
 	}
+
+	// ---- metrics 基线比较(§9 PERF_REGRESSION 的基础) ----
+	// 每条指标与过去 N 次 PASSED 中位数比较,填充 evidence 的 metrics_baseline。
+	// 基线不足(< 3 个样本)时 baseline/delta 为 nil,Analyzer 读到 nil 应判定"证据不足"。
+	if len(ev.Metrics) > 0 && a.Store != nil {
+		ev.MetricsBaseline = computeMetricsBaseline(ctx, a.Store, req.Project, req.Variant, ev.Metrics)
+	}
+
+	// PASSED 任务:落 metrics 表,供后续基线计算。
+	if ev.Status == "COMPLETED" && ev.ExitCode == 0 && ev.Cases.Failed == 0 && len(ev.Metrics) > 0 && a.Store != nil {
+		points := make([]store.MetricPoint, 0, len(ev.Metrics))
+		for name, val := range ev.Metrics {
+			points = append(points, store.MetricPoint{
+				Project: req.Project, Variant: req.Variant, Suite: "smoke",
+				MetricName: name, Value: val, TaskID: req.TaskID,
+			})
+		}
+		if err := a.Store.SaveMetrics(ctx, points); err != nil {
+			a.warnf("save metrics failed: %v", err)
+		}
+	}
+
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		return nil, fmt.Errorf("marshal evidence: %w", err)
@@ -178,6 +200,38 @@ func evidenceClient(c Config) (*minio.Client, error) {
 		Creds:  credentials.NewStaticV4(c.MinIOAccessKey, c.MinIOSecretKey, ""),
 		Secure: secure,
 	})
+}
+
+// computeMetricsBaseline 对每条指标计算与历史 PASSED 中位数的差值。
+// baselineBaselineN 是基线样本数上限(§10 缺省 5,对应 Plan DSL 缺省策略)。
+const baselineSampleN = 5
+
+func computeMetricsBaseline(
+	ctx context.Context,
+	st Store,
+	project, variant string,
+	metrics map[string]float64,
+) evidence.MetricsBaselineMap {
+	out := make(evidence.MetricsBaselineMap, len(metrics))
+	for name, val := range metrics {
+		mb := evidence.MetricsBaseline{Value: val}
+		bl, err := st.Baseline(ctx, project, variant, "smoke", name, baselineSampleN)
+		if err != nil || bl == nil {
+			out[name] = mb
+			continue
+		}
+		mb.SampleN = bl.N
+		delta := val - bl.Median
+		pct := 0.0
+		if bl.Median != 0 {
+			pct = delta / bl.Median * 100
+		}
+		mb.Baseline = &bl.Median
+		mb.Delta = &delta
+		mb.DeltaPct = &pct
+		out[name] = mb
+	}
+	return out
 }
 
 // Analyze 调 hermes-agent 平台分析 evidence(§12 Phase 2)。

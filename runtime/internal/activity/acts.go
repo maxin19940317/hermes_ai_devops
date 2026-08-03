@@ -28,6 +28,8 @@ type Store interface {
 	GetEvidenceSnapshot(ctx context.Context, evidenceID string) (*store.EvidenceSnapshot, error)
 	HasDecision(ctx context.Context, taskID, actor string) (bool, error)
 	RecordWorkflowRun(ctx context.Context, run store.WorkflowRun) error
+	SaveMetrics(ctx context.Context, points []store.MetricPoint) error
+	Baseline(ctx context.Context, project, variant, suite, metricName string, n int) (*store.MetricBaseline, error)
 }
 
 // Config is activity runtime parameters (§10 defaults + external endpoints).

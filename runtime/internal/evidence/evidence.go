@@ -73,6 +73,7 @@ type Evidence struct {
 	Signatures            []SignatureResult  `json:"signatures"`
 	JunitFailures         []JunitFailure     `json:"junit_failures"`
 	Metrics               map[string]float64 `json:"metrics,omitempty"`
+	MetricsBaseline       MetricsBaselineMap `json:"metrics_baseline,omitempty"`
 	Inputs                Inputs             `json:"inputs"`
 	// Excerpts 兜底摘录:全部签名未命中时给出有界原文(stdout/stderr 尾部 +
 	// logcat 错误行);否则 Analyzer 只见文件元数据,只能回答"证据不足"(v2 新增)。
@@ -443,3 +444,16 @@ func parseJunit(r io.Reader) []JunitFailure {
 	}
 	return out
 }
+
+// MetricsBaseline 是基线比较结果:当前值、下采样中位数基线、差值。
+// 由 ExtractEvidence 活动在 DB 有数据时填充,DB 为空时各字段为 nil。
+type MetricsBaseline struct {
+	Value    float64  `json:"value"`
+	Baseline *float64 `json:"baseline,omitempty"`   // nil = 无历史基线(N < 3)
+	Delta    *float64 `json:"delta,omitempty"`       // value - baseline
+	DeltaPct *float64 `json:"delta_pct,omitempty"`   // (value - baseline) / baseline * 100
+	SampleN  int      `json:"sample_n"`              // 基线样本数
+}
+
+// MetricsBaselineMap 是 metric_name → MetricsBaseline 的映射,evidence.json 顶层字段。
+type MetricsBaselineMap map[string]MetricsBaseline

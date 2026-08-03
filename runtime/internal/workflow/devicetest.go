@@ -204,6 +204,7 @@ type EscalationResponse struct {
 type ExtractEvidenceRequest struct {
 	TaskID  string           `json:"task_id"`
 	Variant string           `json:"variant"`
+	Project string           `json:"project"` // 基线查询键(§9 metrics 表)
 	Result  TaskResultSignal `json:"result"`
 }
 
@@ -605,7 +606,7 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 	// 顺序语义:先规则后分析,分析永不影响判定(§9 红线)。
 	var ev *ExtractEvidenceResponse
 	if d.Verdict != rules.VerdictPassed {
-		ev = extractEvidenceOnce(ctx, taskID, spec, res)
+		ev = extractEvidenceOnce(ctx, taskID, spec, res, in.Project)
 		if ev != nil {
 			// 规则归类修复:runtime 侧确定性提取的签名命中(SDK 测试程序不自报)
 			// 作为规则引擎的额外输入。设备自报优先(同名冲突类别以自报为准,
@@ -642,10 +643,10 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 // extractEvidenceOnce 执行一次证据提取(非 PASSED 路径),供规则归类与
 // Hermes 分析复用;失败返回 nil(降级:归类与分析都按现状进行,
 // 证据缺失不构成重试理由,§3.7)。
-func extractEvidenceOnce(ctx workflow.Context, taskID string, spec TestSpec, res *TaskResultSignal) *ExtractEvidenceResponse {
+func extractEvidenceOnce(ctx workflow.Context, taskID string, spec TestSpec, res *TaskResultSignal, project string) *ExtractEvidenceResponse {
 	var ev ExtractEvidenceResponse
 	if err := workflow.ExecuteActivity(ctx, "ExtractEvidence", ExtractEvidenceRequest{
-		TaskID: taskID, Variant: spec.Variant, Result: *res,
+		TaskID: taskID, Variant: spec.Variant, Project: project, Result: *res,
 	}).Get(ctx, &ev); err != nil {
 		workflow.GetLogger(ctx).Error("extract evidence failed, rule decision stands", "task", taskID, "error", err)
 		return nil

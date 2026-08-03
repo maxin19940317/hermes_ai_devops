@@ -119,6 +119,22 @@ CREATE TABLE IF NOT EXISTS results (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- §9 baseline 比较(metrics 表):每个 PASSED 任务逐指标落点,
+-- Baseline(project, variant, suite, metric_name, n) 取最近 n 条的中位数。
+-- 写入路径:ExtractEvidence 活动完成 evidence 提取后,对 PASSED 任务批量 save。
+CREATE TABLE IF NOT EXISTS metrics (
+    id          BIGSERIAL PRIMARY KEY,
+    project     TEXT           NOT NULL,
+    variant     TEXT           NOT NULL,
+    suite       TEXT           NOT NULL DEFAULT 'smoke',
+    metric_name TEXT           NOT NULL,
+    value       DOUBLE PRECISION NOT NULL,
+    task_id     TEXT           NOT NULL,
+    created_at  TIMESTAMPTZ    NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS metrics_lookup_idx
+    ON metrics (project, variant, suite, metric_name, created_at DESC);
+
 -- 一切裁决(规则引擎/LLM/人工)都落 decisions 表,可回放(§11)。
 -- evidence_snapshot_id 引用 evidence_snapshots(差距 #6 决策可回放):
 -- 仅 hermes 裁决携带(基于 evidence);rule 裁决基于 result,为空。

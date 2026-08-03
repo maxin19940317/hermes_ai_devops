@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -59,6 +60,8 @@ type MemStore struct {
 	evidenceSnaps map[string]EvidenceSnapshot
 	// translations 是 command_translations 表(设计文档 §4.3)的内存视图。
 	translations []CommandTranslation
+	// metrics 是 metrics 表(§9 baseline)的内存视图。
+	metrics []metricsEntry
 	// clientFailStreak 是 clients.fail_streak 的内存视图(差距 #10)。
 	// 不放进 Client 结构体:那是心跳载荷,UpsertClientDevices 整体覆写,
 	// 放进去会被每 10s 一次的心跳清零。
@@ -148,4 +151,65 @@ func (s *MemStore) CurrentWorkflowAttempt(
 			project, commitSHA, pipelineID, variant)
 	}
 	return matched.WorkflowAttempt, nil
+}
+
+// ---- metrics 基线(§9) ----
+
+// MetricPoint 是 metrics 表一行(§11),按 CLAUDE.md §11 数据模型定义。
+type MetricPoint struct {
+	Project    string
+	Variant    string
+	Suite      string
+	MetricName string
+	Value      float64
+	TaskID     string
+}
+
+// MetricBaseline 是过去 N 次 PASSED 运行的中位数基线。
+type MetricBaseline struct {
+	Median float64
+	N      int
+}
+
+// SaveMetrics 批量写入指标点(仅 PASSED 调用)。
+func (s *MemStore) SaveMetrics(_ context.Context, points []MetricPoint) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range points {
+		// 内存实现直接存:key = project|variant|suite|metric|taskID
+		key := p.Project + "|" + p.Variant + "|" + p.Suite + "|" + p.MetricName + "|" + p.TaskID
+		s.metrics = append(s.metrics, metricsEntry{key: key, point: p})
+	}
+	return nil
+}
+
+type metricsEntry struct {
+	key   string
+	point MetricPoint
+}
+
+// Baseline 返回指定 (project, variant, suite, metricName) 最近 n 次已落点
+// 的中位数。可用点数 < 3 → Baseline=nil(基线不可信)。
+func (s *MemStore) Baseline(
+	_ context.Context, project, variant, suite, metricName string, n int,
+) (*MetricBaseline, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var vals []float64
+	// 从最新到最旧遍历(append 顺序即时序)
+	for i := len(s.metrics) - 1; i >= 0 && len(vals) < n; i-- {
+		m := s.metrics[i]
+		if m.point.Project == project && m.point.Variant == variant &&
+			m.point.Suite == suite && m.point.MetricName == metricName {
+			vals = append(vals, m.point.Value)
+		}
+	}
+	if len(vals) < 3 {
+		return nil, nil
+	}
+	// 中位数:升序排序取中间
+	sort.Float64s(vals)
+	median := vals[len(vals)/2]
+	return &MetricBaseline{Median: median, N: len(vals)}, nil
 }

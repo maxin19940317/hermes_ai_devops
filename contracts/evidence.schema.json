@@ -83,7 +83,22 @@
     "metrics": {
       "type": "object",
       "additionalProperties": { "type": "number" },
-      "description": "原始指标快照(来自 result.json);基线差值属后续阶段"
+      "description": "原始指标快照(来自 result.json)"
+    },
+    "metrics_baseline": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["value"],
+        "properties": {
+          "value":     { "type": "number" },
+          "baseline":  { "type": "number" },
+          "delta":     { "type": "number" },
+          "delta_pct": { "type": "number" },
+          "sample_n":  { "type": "integer", "minimum": 0 }
+        }
+      },
+      "description": "每条指标与历史 PASSED 中位数基线的差值;基线不足(< 3 样本)时 baseline/delta 为 null"
     },
     "inputs": {
       "type": "object",
