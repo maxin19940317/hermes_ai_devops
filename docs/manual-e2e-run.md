@@ -337,7 +337,9 @@ docker exec hermes-runtime-temporal-1 tctl --address temporal:7233 \
 
 ```bash
 # 通过飞书指令（如果 FEISHU_CMD_WHITELIST 已配置）：
-# 发送: rerun <commit_short_sha> <pipeline_iid> [variant]
+# 发送: rerun <source_workflow_id> [variant]
+# 只接受 workflow_runs 里有权威记录且已关闭的源运行;
+# 同一源运行+变体已有进行中的重试时会被认领拦截("重试正在进行中")。
 
 # 或通过 /kick 带 retry 标记（需修改 meta JSON 加 "retry": true）
 ```

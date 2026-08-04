@@ -266,11 +266,11 @@ Temporal `RejectDuplicate` 当作指令幂等。按钮操作(重试/忽略)经 W
 
 Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, started_at, ...)` + `events(seq, ...)`,每次状态迁移单事务落盘,崩溃重启后据此恢复。
 
-## 12. 实施阶段(当前所处:Phase 2)
+## 12. 实施阶段(当前所处:Phase 4)
 
 ### Phase 0 — 契约(已随本文件给出草案,首个任务是把 §7/§8 物化为 contracts/ 下的正式 Schema/OpenAPI 并写校验测试)
 
-### Phase 1 — 无 LLM 最小闭环(当前阶段,按此顺序做)
+### Phase 1 — 无 LLM 最小闭环(已完成,按此顺序做)
 
 1. `contracts/` 三个 JSON Schema + 两个 OpenAPI,附正反例测试。
 2. `ci/` 四个脚本(gen_manifest / variants.yaml / write_meta / gen_bundle)+ 业务仓库 `.gitlab-ci.yml` 增量改造(见 §6)。
@@ -305,8 +305,14 @@ Hermes 超时/不可用 → 规则引擎保底);
 Planner v1✅(自然语言 → Plan DSL,经 analyze_bridge /plan 路由,Schema 校验不过打回重试 ≤3 次);
 CLAUDE.md §4 卡片状态已同步。
 
-### Phase 3 — 硬化
-mTLS 双向 + Client 身份签发;全链路幂等键核验;≥10 场景故障注入矩阵(断电/网络分区/adb 僵死/下载中断/回调丢失/重复回调);审计完备;MinIO 生命周期(PASSED 日志 7 天,失败 90 天);Agent 版本上报 + 最低版本门禁。
+### Phase 3 — 硬化(已完成,2026-08-04)
+mTLS 双向 + Client 身份签发✅(2026-08-04 上线,仅 Agent→Runtime 回调方向 18091 强制客户端证书;
+Runtime→Agent 派单方向 8480 仍为测试子网纯 HTTP,待 Agent TLS listener);
+全链路幂等键核验✅ + ≥10 场景故障注入矩阵✅(runtime/internal/workflow/fault_injection_test.go);
+审计完备✅(audit_log 表,dispatched/device_leased/device_released/escalated 四类动作,fire-and-forget 不阻断主链路);
+MinIO 生命周期✅(Temporal Schedule `evidence-lifecycle-daily` 每日 UTC 3:00:runs/ PASSED 7 天、失败 90 天;
+evidence/ 快照不过期,是 decisions 的回放依据);
+Agent 版本上报 + 最低版本门禁✅(ldflags 注入版本,`MIN_AGENT_VERSION` 空=不启用,dev 永远放行)。
 
 ### Phase 4 — 扩展
 多设备并发调度;性能基线 MR 门禁;Linux 变体 SSH Adapter;Grafana 看板。

@@ -29,20 +29,28 @@ fi
 CLIENTS=("$@")
 
 echo "=== 1/4 CA ==="
-openssl req -x509 -newkey rsa:4096 -days "$VALIDITY" -nodes \
-	-keyout "$CERTS_DIR/ca-key.pem" -out "$CERTS_DIR/ca-cert.pem" \
-	-subj "/O=${ORG}/CN=hermes-devops-ca" 2>/dev/null
+if [ -f "$CERTS_DIR/ca-key.pem" ] && [ -f "$CERTS_DIR/ca-cert.pem" ]; then
+	echo "已存在,复用(重签 CA 会使全部已发证书作废)"
+else
+	openssl req -x509 -newkey rsa:4096 -days "$VALIDITY" -nodes \
+		-keyout "$CERTS_DIR/ca-key.pem" -out "$CERTS_DIR/ca-cert.pem" \
+		-subj "/O=${ORG}/CN=hermes-devops-ca" 2>/dev/null
+fi
 
-echo "=== 2/4 Server (hermes-runtime, SAN: ${SERVER_SAN}) ==="
-openssl req -newkey rsa:4096 -nodes \
-	-keyout "$CERTS_DIR/server-key.pem" -out "$CERTS_DIR/server.csr" \
-	-subj "/O=${ORG}/CN=hermes-runtime" 2>/dev/null
-# 注:openssl x509 的 -addext 是 OpenSSL 3.0 才有的;1.1.1 用 -extfile。
-printf 'subjectAltName=%s\n' "$SERVER_SAN" > "$CERTS_DIR/server-ext.cnf"
-openssl x509 -req -in "$CERTS_DIR/server.csr" -CA "$CERTS_DIR/ca-cert.pem" -CAkey "$CERTS_DIR/ca-key.pem" \
-	-CAcreateserial -out "$CERTS_DIR/server-cert.pem" -days "$VALIDITY" \
-	-extfile "$CERTS_DIR/server-ext.cnf" 2>/dev/null
-rm -f "$CERTS_DIR/server.csr" "$CERTS_DIR/server-ext.cnf"
+if [ -f "$CERTS_DIR/server-cert.pem" ] && [ -f "$CERTS_DIR/server-key.pem" ]; then
+	echo "=== 2/4 Server: 已存在,复用(SAN 变更需先删除再重跑) ==="
+else
+	echo "=== 2/4 Server (hermes-runtime, SAN: ${SERVER_SAN}) ==="
+	openssl req -newkey rsa:4096 -nodes \
+		-keyout "$CERTS_DIR/server-key.pem" -out "$CERTS_DIR/server.csr" \
+		-subj "/O=${ORG}/CN=hermes-runtime" 2>/dev/null
+	# 注:openssl x509 的 -addext 是 OpenSSL 3.0 才有的;1.1.1 用 -extfile。
+	printf 'subjectAltName=%s\n' "$SERVER_SAN" > "$CERTS_DIR/server-ext.cnf"
+	openssl x509 -req -in "$CERTS_DIR/server.csr" -CA "$CERTS_DIR/ca-cert.pem" -CAkey "$CERTS_DIR/ca-key.pem" \
+		-CAcreateserial -out "$CERTS_DIR/server-cert.pem" -days "$VALIDITY" \
+		-extfile "$CERTS_DIR/server-ext.cnf" 2>/dev/null
+	rm -f "$CERTS_DIR/server.csr" "$CERTS_DIR/server-ext.cnf"
+fi
 
 for client_id in "${CLIENTS[@]}"; do
 	echo "=== 3/4 Client: ${client_id} ==="
@@ -63,8 +71,9 @@ for client_id in "${CLIENTS[@]}"; do
 done
 
 echo "=== 4/4 Permissions ==="
+# pem 属主可能按需拆给容器用户(如 server-key 属容器 uid),chmod 失败不致命。
 chmod 600 "$CERTS_DIR/"*-key.pem "$CERTS_DIR/ca-key.pem" 2>/dev/null || true
-chmod 644 "$CERTS_DIR/ca-cert.pem"
+chmod 644 "$CERTS_DIR/ca-cert.pem" 2>/dev/null || true
 
 echo "Done."
 echo "  CA:        $CERTS_DIR/ca-cert.pem  (分发给所有节点)"

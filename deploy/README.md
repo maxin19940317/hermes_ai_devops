@@ -51,12 +51,16 @@ any task has a non-`INFRA_ERROR` failure (business failure takes priority even i
 `INFRA_ERROR` is also present), orange when every failure is `INFRA_ERROR`, green
 when nothing is judged a failure. If the card send fails, or the configured sender
 doesn't support cards, the worker falls back to the same plain-text message this
-version used to send unconditionally. This milestone ships display only — the
-card has no buttons or other interactive components. The worker also runs an
+version used to send unconditionally. Since 2026-08-03 failed variants carry
+interactive retry/ignore buttons: actions arrive over the WS listener's
+card.action.trigger callback (not workflow signals — the workflow has already
+ended), retry goes through the same claim-guarded path as `rerun`, and ignore
+writes a `decisions` row with `actor="human"` for audit. The worker also runs an
 optional command listener over the
 app's WebSocket event subscription: when `FEISHU_CMD_WHITELIST` (comma-separated
 open_ids) is set, whitelisted users can send the bot DM commands (`status`,
-`devices`, `rerun <source_workflow_id> [variant]`, `unquarantine [device_id]`);
+`devices`, `rerun <source_workflow_id> [variant]`, `unquarantine [device_id]`,
+`plan <自然语言需求>`);
 messages from anyone else are silently ignored.
 
 `rerun` accepts only an authoritative, closed source recorded in `workflow_runs`.

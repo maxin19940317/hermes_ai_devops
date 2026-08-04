@@ -36,6 +36,10 @@ CLI 细节见 [`dist/README.md`](dist/README.md)。
 必填:`AGENT_CLIENT_ID` / `AGENT_RUNTIME_CALLBACK_URL` / `AGENT_BASE_URL` / `AGENT_ADB_PATH`。
 可选:`AGENT_LISTEN_ADDR`(:8480)/`AGENT_VERSION`/`AGENT_RUNS_ROOT`/`AGENT_DB_PATH`/
 `AGENT_HEARTBEAT_INTERVAL`(10s)/`AGENT_SOC_ALIASES`/`AGENT_DEVICE_CAPABILITIES_MAP`。
+mTLS(2026-08-04 起 Runtime 回调端强制):`AGENT_RUNTIME_CALLBACK_URL` 用 `https://`,
+`AGENT_MTLS_CA_FILE` 指向 ca-cert.pem(验服务端),`AGENT_MTLS_CERT_FILE` 指向
+client-{id}.pem(证书+私钥合体);两变量留空则回退纯 HTTP(仅兼容旧部署,
+当前 q-uat 会握手失败)。注意仅回调方向有 TLS,本 Agent 的 8480 监听仍是纯 HTTP。
 
 ### 运行
 
