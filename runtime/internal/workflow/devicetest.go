@@ -1212,8 +1212,16 @@ func runParallelSpecs(ctx workflow.Context, sel SpecSelection, in DeviceTestInpu
 	}
 
 	// 按 spec 声明顺序收集结果 → 输出顺序确定性
+	// 取消时 Await 返回 err:spec goroutine 可能还没写 sums[idx],
+	// 此时填 FAILED 摘要避免 nil deref → workflow panic → 无限重试。
 	for i := range specs {
-		workflow.Await(ctx, func() bool { return sums[i] != nil })
+		if err := workflow.Await(ctx, func() bool { return sums[i] != nil }); err != nil || sums[i] == nil {
+			out.Tasks = append(out.Tasks, TaskSummary{
+				TestID: specs[i].TestID, Variant: specs[i].Variant,
+				Verdict: "FAILED", Reason: "workflow canceled",
+			})
+			continue
+		}
 		out.Tasks = append(out.Tasks, *sums[i])
 	}
 	return out
@@ -1222,6 +1230,11 @@ func runParallelSpecs(ctx workflow.Context, sel SpecSelection, in DeviceTestInpu
 // demuxSignalLoop 分发器:从 resultCh 消费信号,按 task_id 前缀匹配写入私有 channel。
 // 匹配规则:task_id 格式为 {workflow_id}:{test_id}:a{N},前缀 = {workflow_id}:{test_id}:
 // 匹配的 spec 写入对应 privateCh;不匹配任何 spec 的信号丢弃(历史 attempt 迟到结果)。
+//
+// 尾部阻塞风险:spec goroutine 结束后,迟到重复信号仍会 Send 进其私有 channel 且
+// 无人消费,积累到 channel buffer 满((maxAttempts+1)×3=9)时 Send 阻塞 → 分发器
+// 卡死 → 其余 spec 等不到信号直到 hard deadline。概率极低(需要 9+ 条 Relay 重复
+// 信号且正好落在 spec 完成后),且 workflow 的 hard deadline 兜底保证最终收敛。
 func demuxSignalLoop(ctx workflow.Context, resultCh workflow.ReceiveChannel, specs []TestSpec, privateChs []workflow.Channel) {
 	wfID := workflow.GetInfo(ctx).WorkflowExecution.ID
 	prefixes := make([]string, len(specs))

@@ -24,7 +24,7 @@ func testActs(t *testing.T) *Acts {
 	return &Acts{SpecCfg: cfg}
 }
 
-func TestSelectTestSpecsAndroidOnly(t *testing.T) {
+func TestSelectTestSpecsAndroidAndLinux(t *testing.T) {
 	a := testActs(t)
 	in := wf.DeviceTestInput{Project: "algo-super-sdk", Commit: "abc1234", PipelineID: 42,
 		Packages: []wf.PackageRef{

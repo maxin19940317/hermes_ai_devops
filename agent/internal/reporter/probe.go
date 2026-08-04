@@ -301,18 +301,5 @@ func (p *Prober) linuxABI(ctx context.Context, transport string) string {
 	if err != nil || res.ExitCode != 0 {
 		return ""
 	}
-	arch := strings.TrimSpace(res.Stdout)
-	// Linux uname -m → Android NDK ABI 映射
-	switch arch {
-	case "aarch64":
-		return "arm64-v8a"
-	case "armv7l":
-		return "armeabi-v7a"
-	case "x86_64":
-		return "x86_64"
-	case "i686", "i386":
-		return "x86"
-	default:
-		return arch
-	}
+	return adb.MapLinuxArchToABI(strings.TrimSpace(res.Stdout))
 }

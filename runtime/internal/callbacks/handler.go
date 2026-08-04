@@ -145,9 +145,13 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	devs := make([]store.Device, 0, len(req.Devices))
 	for _, d := range req.Devices {
+		os := d.Props.OS
+		if os == "" {
+			os = "android" // 兼容旧 Agent 心跳:旧版无 OS 字段,默认 android
+		}
 		devs = append(devs, store.Device{
 			DeviceID: d.Serial, Serial: d.Serial, DisplayName: d.DisplayName, ClientID: req.ClientID,
-			ReportedState: d.State, OS: d.Props.OS, SOC: d.Props.SOC, ABI: d.Props.ABI, Capabilities: d.Props.Capabilities,
+			ReportedState: d.State, OS: os, SOC: d.Props.SOC, ABI: d.Props.ABI, Capabilities: d.Props.Capabilities,
 		})
 	}
 	if err := h.store.UpsertClientDevices(r.Context(), store.Client{

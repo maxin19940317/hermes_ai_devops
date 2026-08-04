@@ -516,7 +516,9 @@ func (e *Executor) dumpLogcat(ctx context.Context, serial, outDir string) {
 	// 此处用 adb 本身判断:Android shell 有 /system/bin/logcat,Linux 没有。
 	res, err := e.Runner.Run(ctx, adb.LogcatDump(serial))
 	if err != nil {
-		e.logf("logcat dump: %v (skipped for non-Android)", err)
+		// 失败可能来自 Linux 设备(无 logcat)或 Android 设备 logcat 异常;
+		// 不做 OS 分类判定——logcat 缺失不构成故障。
+		e.logf("logcat dump: %v", err)
 		return
 	}
 	_ = os.WriteFile(filepath.Join(outDir, "logcat.txt"), []byte(res.Stdout), 0o644)
@@ -568,7 +570,7 @@ func (e *Executor) precheckLinux(ctx context.Context, serial string, m *manifest
 		return fmt.Errorf("linux precheck: uname -m: exit=%d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 	arch := strings.TrimSpace(res.Stdout)
-	abi := mapLinuxArchToABI(arch)
+	abi := adb.MapLinuxArchToABI(arch)
 	sum.Environment["abi"] = abi
 	if abi != m.Requirements.ABI {
 		return fmt.Errorf("abi mismatch: device=%s (uname=%s), required=%s", abi, arch, m.Requirements.ABI)
@@ -590,20 +592,4 @@ func (e *Executor) precheckLinux(ctx context.Context, serial string, m *manifest
 		}
 	}
 	return nil
-}
-
-// mapLinuxArchToABI 将 uname -m 输出映射为 Android NDK ABI 名。
-func mapLinuxArchToABI(arch string) string {
-	switch arch {
-	case "aarch64":
-		return "arm64-v8a"
-	case "armv7l":
-		return "armeabi-v7a"
-	case "x86_64":
-		return "x86_64"
-	case "i686", "i386":
-		return "x86"
-	default:
-		return arch
-	}
 }

@@ -58,6 +58,22 @@ func UnameM(serial string) []string {
 	return withSerial(serial, "shell", "uname", "-m")
 }
 
+// MapLinuxArchToABI 将 uname -m 输出映射为 Android NDK ABI 名。
+func MapLinuxArchToABI(arch string) string {
+	switch arch {
+	case "aarch64":
+		return "arm64-v8a"
+	case "armv7l":
+		return "armeabi-v7a"
+	case "x86_64":
+		return "x86_64"
+	case "i686", "i386":
+		return "x86"
+	default:
+		return arch
+	}
+}
+
 // DeviceTreeSerialNumber 读取 Linux 设备树中的序列号。部分 Linux 板
 // (如 rk3568) 的 USB iSerial 为空(adb devices 显示 "?"),
 // 但 /proc/device-tree/serial-number 中存有唯一标识。
