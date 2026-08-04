@@ -1,4 +1,4 @@
-# start-agent.ps1 - Hermes DevOps Agent one-shot startup (Windows)
+﻿# start-agent.ps1 - Hermes DevOps Agent one-shot startup (Windows)
 # Run in any new PowerShell:
 #   powershell -ExecutionPolicy Bypass -File .\start-agent.ps1
 # First time: edit the two variables below (LAN IP of THIS machine, adb path).
