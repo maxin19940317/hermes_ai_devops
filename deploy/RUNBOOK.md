@@ -33,7 +33,10 @@ docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
 
 # 3. 验证
 curl -fsS http://127.0.0.1:18090/healthz   # trigger
-curl -fsS http://127.0.0.1:18091/healthz   # worker/callbacks
+# worker/callbacks 已启用 mTLS(2026-08-04):必须带客户端证书
+curl -fsS --cacert deploy/certs/ca-cert.pem \
+  --cert deploy/certs/client-windows-client-01.pem \
+  https://127.0.0.1:18091/healthz
 docker logs hermes-runtime-relay-1 --tail 5
 docker logs hermes-runtime-worker-1 2>&1 | grep -E "feishu|listener|nl=" | head -3
 ```

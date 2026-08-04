@@ -15,7 +15,7 @@ Windows Client Agent 侧的准备与核对。
 
 | # | 条件 | 核对命令 |
 |---|---|---|
-| 1 | Runtime 三个进程健康 | `curl -fsS http://127.0.0.1:18090/healthz && curl -fsS http://127.0.0.1:18091/healthz && docker logs hermes-runtime-relay-1 --tail 3` |
+| 1 | Runtime 三个进程健康 | `curl -fsS http://127.0.0.1:18090/healthz && curl -fsS --cacert deploy/certs/ca-cert.pem --cert deploy/certs/client-windows-client-01.pem https://127.0.0.1:18091/healthz && docker logs hermes-runtime-relay-1 --tail 3` |
 | 2 | Temporal 健康 | `docker exec hermes-runtime-temporal-1 tctl --address temporal:7233 cluster health` |
 | 3 | MinIO 健康 | `curl -fsS http://127.0.0.1:9000/minio/health/live` |
 | 4 | 有可用设备 | `docker exec hermes-runtime-postgres-1 psql -U hermes_runtime -d hermes_runtime -c "SELECT device_id, status, fail_streak FROM devices"` — 至少一行 `status=IDLE` |
@@ -353,7 +353,7 @@ docker compose --env-file deploy/.env --env-file deploy/images.lock.env \
 
 # 验证
 curl -fsS http://127.0.0.1:18090/healthz
-curl -fsS http://127.0.0.1:18091/healthz
+curl -fsS --cacert deploy/certs/ca-cert.pem --cert deploy/certs/client-windows-client-01.pem https://127.0.0.1:18091/healthz
 ```
 
 Temporal 保证 Workflow 从 History 重放恢复，已完成的 Activity 不重复执行。
@@ -366,7 +366,7 @@ Temporal 保证 Workflow 从 History 重放恢复，已完成的 Activity 不重
 # ---- 服务器侧 ----
 # 健康检查
 curl -fsS http://127.0.0.1:18090/healthz   # trigger
-curl -fsS http://127.0.0.1:18091/healthz   # worker/callbacks
+curl -fsS --cacert deploy/certs/ca-cert.pem --cert deploy/certs/client-windows-client-01.pem https://127.0.0.1:18091/healthz   # worker/callbacks(mTLS)
 
 # 完整验证
 PROJECT_ID=651 PIPELINE_GLOBAL_ID=656 \

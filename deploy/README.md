@@ -8,11 +8,13 @@ or reconfigure the existing Hermes Agent containers or the process using host po
 ## Security boundary
 
 This is a q-uat integration deployment. Trigger is plain HTTP protected by the GitLab
-Webhook Secret Token. Per design decision 2 (UAT LAN exposure), the worker callbacks
-port (18091) and the MinIO API port (9000) bind to the test subnet
-(`${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}` / `${MINIO_BIND_IP:-0.0.0.0}`) so the Windows
-Client on the same subnet can reach them. Both are plain HTTP without mTLS — this
-exposure is test-subnet-only and must not extend beyond it until Phase 3 lands mTLS.
+Webhook Secret Token. Per design decision 2 (UAT LAN exposure), the MinIO API port
+(9000) stays plain HTTP bound to the test subnet (`${MINIO_BIND_IP:-0.0.0.0}`) so the
+Windows Client on the same subnet can reach it. The worker callbacks port (18091) is
+mTLS since 2026-08-04 (Phase 3): the server requires a client certificate signed by
+the deployment CA (`scripts/generate-certs.sh`, certs in `deploy/certs/`, gitignored).
+Only the callbacks direction is covered — the Runtime→Agent dispatch direction
+(agent port 8480) is still plain HTTP on the test subnet.
 The MinIO console (9001) and Temporal UI (18080) stay localhost-pinned.
 
 `CALLBACK_BASE_URL` now points at the server LAN address (`http://10.88.118.251:18091`
@@ -215,7 +217,7 @@ Do not combine this window with deployment of the prerequisite batch.
 
 ```bash
 curl -fsS http://127.0.0.1:18090/healthz
-curl -fsS http://127.0.0.1:18091/healthz
+curl -fsS --cacert deploy/certs/ca-cert.pem --cert deploy/certs/client-windows-client-01.pem https://127.0.0.1:18091/healthz
 deploy/scripts/verify-pipeline.sh deploy/.env deploy/images.lock.env
 ```
 
