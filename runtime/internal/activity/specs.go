@@ -38,6 +38,7 @@ type variantsFile struct {
 			TimeoutSec int `yaml:"timeout_sec"`
 		} `yaml:"test"`
 		SignaturesCommonAndroid []signatureDecl `yaml:"signatures_common_android"`
+		SignaturesCommonLinux   []signatureDecl `yaml:"signatures_common_linux"`
 	} `yaml:"defaults"`
 	Variants map[string]variantDecl `yaml:"variants"`
 }
@@ -89,6 +90,7 @@ func (c *SpecConfig) VariantNames() []string {
 // SignaturesForVariant 合并 defaults.signatures_common_android 与
 // variants.<name>.signatures(同 id 变体覆盖,与 SelectTestSpecs 的
 // SignatureCategory 合并逻辑一致),按声明序返回,供证据提取使用。
+// Linux 变体额外合并 signatures_common_linux(与 SelectTestSpecs 一致)。
 func (c *SpecConfig) SignaturesForVariant(variant string) []evidence.Signature {
 	order := []string{}
 	byID := map[string]evidence.Signature{}
@@ -102,7 +104,11 @@ func (c *SpecConfig) SignaturesForVariant(variant string) []evidence.Signature {
 			}
 		}
 	}
-	merge(c.file.Defaults.SignaturesCommonAndroid)
+	if vd, ok := c.file.Variants[variant]; ok && vd.Requirements.OS == "linux" {
+		merge(c.file.Defaults.SignaturesCommonLinux)
+	} else {
+		merge(c.file.Defaults.SignaturesCommonAndroid)
+	}
 	merge(c.file.Variants[variant].Signatures)
 	out := make([]evidence.Signature, 0, len(order))
 	for _, id := range order {
@@ -111,12 +117,14 @@ func (c *SpecConfig) SignaturesForVariant(variant string) []evidence.Signature {
 	return out
 }
 
-// SelectTestSpecs 把 bundle 中的 Android 变体映射为 TestSpec;
-// Linux 变体第一阶段不进设备测试链路(§6.4),未配置变体跳过。
+// SelectTestSpecs 把 bundle 中的变体映射为 TestSpec;
+// 未在 variants.yaml 中配置的变体跳过。
 // fleet 感知(§12 变体级触发):整个 fleet(含 OFFLINE/BUSY/QUARANTINED)
 // 无任何设备满足变体 selector 时,该变体秒级跳过(Skipped),不进
 // acquire 等待;"设备在但暂不可用"仍由 acquire 的有限等待处理。
 // 输出顺序跟随 in.Packages(workflow 依赖确定性)。
+// Phase 4:Linux 变体(OS=linux)已接入设备测试链路,selector 带 OS 字段;
+// fleet 无匹配设备(如 SNPE Linux 需要 hexagon 但 rk 板无 hexagon)仍秒级跳过。
 func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.SpecSelection, error) {
 	sel := &wf.SpecSelection{}
 	for _, p := range in.Packages {
@@ -124,20 +132,24 @@ func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.
 		if !ok {
 			continue
 		}
-		if v.Requirements.OS != "android" {
-			sel.Skipped = append(sel.Skipped, wf.SkippedSpec{
-				Variant: p.Variant,
-				Reason:  "os " + v.Requirements.OS + " 尚未接入设备测试链路(Phase 4)",
-			})
-			continue
+		os := v.Requirements.OS
+		if os == "" {
+			os = "android" // 兼容:旧 variants.yaml 可能未显式声明 os
 		}
 		timeout := v.Test.TimeoutSec
 		if timeout == 0 {
 			timeout = a.SpecCfg.file.Defaults.Test.TimeoutSec
 		}
 		sigs := map[string]rules.Category{}
-		for _, s := range a.SpecCfg.file.Defaults.SignaturesCommonAndroid {
-			sigs[s.ID] = rules.Category(s.Classify)
+		switch os {
+		case "linux":
+			for _, s := range a.SpecCfg.file.Defaults.SignaturesCommonLinux {
+				sigs[s.ID] = rules.Category(s.Classify)
+			}
+		default:
+			for _, s := range a.SpecCfg.file.Defaults.SignaturesCommonAndroid {
+				sigs[s.ID] = rules.Category(s.Classify)
+			}
 		}
 		for _, s := range v.Signatures {
 			sigs[s.ID] = rules.Category(s.Classify)
@@ -148,6 +160,7 @@ func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.
 			Variant: p.Variant,
 			Package: p,
 			Selector: wf.DeviceSelector{
+				OS:           os,
 				SOC:          v.Requirements.SOC,
 				Capabilities: v.Requirements.Capabilities,
 			},
@@ -161,13 +174,12 @@ func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.
 		if a.Store != nil {
 			capable, err := a.Store.HasCapableDevice(ctx, spec.Selector)
 			if err != nil {
-				// fleet 查询失败不阻塞派发:退回 acquire 等待的旧行为
 				a.warnf("has capable device check failed for %s: %v; keep spec", p.Variant, err)
 			} else if !capable {
 				sel.Skipped = append(sel.Skipped, wf.SkippedSpec{
 					Variant: p.Variant,
-					Reason: fmt.Sprintf("no capable device registered (soc=%v capabilities=%v)",
-						spec.Selector.SOC, spec.Selector.Capabilities),
+					Reason: fmt.Sprintf("no capable device registered (os=%s soc=%v capabilities=%v)",
+						spec.Selector.OS, spec.Selector.SOC, spec.Selector.Capabilities),
 				})
 				continue
 			}

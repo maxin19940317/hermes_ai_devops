@@ -3,6 +3,8 @@ defaults:
     timeout_sec: 900
   signatures_common_android:
     - { id: native_crash, where: logcat, pattern: "Fatal signal|tombstone", classify: CODE }
+  signatures_common_linux:
+    - { id: native_crash, where: stderr, pattern: "Segmentation fault|core dumped", classify: CODE }
 
 variants:
   aarch64_Android_SNPE_2.21:
@@ -12,7 +14,7 @@ variants:
     signatures:
       - { id: cpu_fallback, where: logcat, pattern: "Falling back to CPU", classify: MODEL }
   aarch64_Linux_SNPE_2.21:
-    requirements: { os: linux, abi: aarch64 }
+    requirements: { os: linux, abi: arm64-v8a, soc: [RK3588, RK3568], capabilities: [hexagon] }
   aarch64_Android_RKNN_2.3.2:
     requirements: { os: android, abi: arm64-v8a, soc: [RK3588, RK3566], capabilities: [rknpu], min_free_storage_mb: 512 }
     test:

@@ -29,15 +29,15 @@ func TestSelectTestSpecsAndroidOnly(t *testing.T) {
 	in := wf.DeviceTestInput{Project: "algo-super-sdk", Commit: "abc1234", PipelineID: 42,
 		Packages: []wf.PackageRef{
 			{Variant: "aarch64_Android_SNPE_2.21", URL: "https://gitlab/pkg1", SHA256: "aa", ManifestDigest: "dd"},
-			{Variant: "aarch64_Linux_SNPE_2.21", URL: "https://gitlab/pkg2"}, // Linux:不进链路(§6.4)
-			{Variant: "unknown_variant", URL: "https://gitlab/pkg3"},         // 未配置:跳过
+			{Variant: "aarch64_Linux_SNPE_2.21", URL: "https://gitlab/pkg2"},          // Linux:Phase 4 已接入
+			{Variant: "unknown_variant", URL: "https://gitlab/pkg3"},                  // 未配置:跳过
 		}}
 	sel, err := a.SelectTestSpecs(ctx, in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sel.Specs) != 1 {
-		t.Fatalf("specs = %d, want 1(仅 Android 变体)", len(sel.Specs))
+	if len(sel.Specs) != 2 {
+		t.Fatalf("specs = %d, want 2(Android + Linux 均已接入)", len(sel.Specs))
 	}
 	s := sel.Specs[0]
 	if s.TestID != "aarch64_Android_SNPE_2.21" || s.Variant != s.TestID || s.Package.URL != "https://gitlab/pkg1" {
@@ -46,17 +46,28 @@ func TestSelectTestSpecsAndroidOnly(t *testing.T) {
 	if len(s.Selector.SOC) != 1 || s.Selector.SOC[0] != "QCM6125" || s.Selector.Capabilities[0] != "hexagon" {
 		t.Errorf("selector = %+v", s.Selector)
 	}
+	if s.Selector.OS != "android" {
+		t.Errorf("OS = %q, want android", s.Selector.OS)
+	}
 	// 签名分类 = 公共 Android 签名 + 变体私有签名
 	if s.SignatureCategory["native_crash"] != rules.CategoryCode || s.SignatureCategory["cpu_fallback"] != rules.CategoryModel {
 		t.Errorf("signatures = %+v", s.SignatureCategory)
+	}
+	// Linux 变体:Selector.OS=linux, 公共 Linux 签名
+	ls := sel.Specs[1]
+	if ls.Selector.OS != "linux" {
+		t.Errorf("Linux OS = %q, want linux", ls.Selector.OS)
+	}
+	if ls.SignatureCategory["native_crash"] != rules.CategoryCode {
+		t.Errorf("Linux sigs = %+v, want native_crash=CODE", ls.SignatureCategory)
 	}
 	// §10 缺省 + 硬超时 = timeout_sec + margin
 	if s.MaxInfraRetries != 2 || s.LeaseSeconds != 120 || s.HardTimeoutSec != 2100 {
 		t.Errorf("knobs = %+v", s)
 	}
-	// Linux 变体进入 Skipped(通知可见),未配置变体静默跳过
-	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Linux_SNPE_2.21" {
-		t.Errorf("skipped = %+v, want Linux 变体 1 条", sel.Skipped)
+	// 未配置变体静默跳过;Linux 不再进入 Skipped
+	if len(sel.Skipped) != 0 {
+		t.Errorf("skipped = %+v, want 0(没有 fleet 感知的跳过)", sel.Skipped)
 	}
 }
 
@@ -65,10 +76,10 @@ func TestSelectTestSpecsAndroidOnly(t *testing.T) {
 func TestSelectTestSpecsFleetSkip(t *testing.T) {
 	a := testActs(t)
 	st := store.NewMemStore()
-	// fleet 只有一台 QCM6125:RKNN 变体(要 RK3588)应被跳过,SNPE 保留
+	// fleet 只有一台 Android QCM6125:RKNN Linux 变体(要 RK3588+rknpu)应被跳过,SNPE 保留
 	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1", BaseURL: "https://c1"},
 		[]store.Device{{DeviceID: "d1", Serial: "513cd3de", ClientID: "c1",
-			SOC: "QCM6125", Capabilities: []string{"hexagon"}}}); err != nil {
+			OS: "android", SOC: "QCM6125", Capabilities: []string{"hexagon"}}}); err != nil {
 		t.Fatal(err)
 	}
 	a.Store = st
