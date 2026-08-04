@@ -149,6 +149,7 @@ func TestProbeDevicesIdentifiesLinuxSOCAndReportsIdle(t *testing.T) {
 		"-s b5bb1018d94b26da shell /bin/cat /proc/device-tree/compatible": {
 			Stdout: "friendlyelec,nanopc-t6\x00rockchip,rk3588\x00",
 		},
+		"-s b5bb1018d94b26da shell uname -m": {Stdout: "aarch64\n"},
 	}}
 	p := &Prober{Runner: runner}
 
@@ -162,6 +163,12 @@ func TestProbeDevicesIdentifiesLinuxSOCAndReportsIdle(t *testing.T) {
 	}
 	if got.Props == nil || got.Props.SOC != "rk3588" {
 		t.Errorf("Linux props = %+v, want soc rk3588", got.Props)
+	}
+	if got.Props.OS != "linux" {
+		t.Errorf("Linux props OS = %q, want linux", got.Props.OS)
+	}
+	if got.Props.ABI != "arm64-v8a" {
+		t.Errorf("Linux props ABI = %q, want arm64-v8a", got.Props.ABI)
 	}
 }
 
@@ -239,10 +246,11 @@ func TestProbeDevicesRejectsShellErrorSOCWithValidABI(t *testing.T) {
 func TestProbeDevicesResolvesLinuxSerialViaDeviceTree(t *testing.T) {
 	runner := &fakeRunner{responses: map[string]adb.Result{
 		"devices -l": {Stdout: "List of devices attached\n? device product:rk3568-linux model:Nexus_4\n"},
-		"-s ? shell /system/bin/getprop ro.serialno":          {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
-		"-s ? shell /bin/cat /proc/device-tree/serial-number": {Stdout: "rk3568-evb-1\n", ExitCode: 0},
-		"-s ? shell /system/bin/getprop ro.product.cpu.abi":   {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
-		"-s ? shell /bin/cat /proc/device-tree/compatible":    {Stdout: "rockchip,rk3568\n", ExitCode: 0},
+		"-s ? shell /system/bin/getprop ro.serialno":                     {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-s ? shell /bin/cat /proc/device-tree/serial-number":            {Stdout: "rk3568-evb-1\n", ExitCode: 0},
+		"-s ? shell /system/bin/getprop ro.product.cpu.abi":              {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-s ? shell /bin/cat /proc/device-tree/compatible":               {Stdout: "rockchip,rk3568\n", ExitCode: 0},
+		"-s ? shell uname -m":                                            {Stdout: "aarch64\n"},
 	}}
 	p := &Prober{Runner: runner}
 
@@ -262,6 +270,12 @@ func TestProbeDevicesResolvesLinuxSerialViaDeviceTree(t *testing.T) {
 	}
 	if got.DisplayName != "RK3568-rk3568-evb-1" {
 		t.Errorf("display_name = %q, want RK3568-rk3568-evb-1", got.DisplayName)
+	}
+	if got.Props.OS != "linux" {
+		t.Errorf("OS = %q, want linux", got.Props.OS)
+	}
+	if got.Props.ABI != "arm64-v8a" {
+		t.Errorf("ABI = %q, want arm64-v8a", got.Props.ABI)
 	}
 }
 

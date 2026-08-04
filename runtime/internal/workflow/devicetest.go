@@ -51,6 +51,7 @@ type Attachment struct {
 // ---- 活动契约(实现在 internal/activity) ----
 
 type DeviceSelector struct {
+	OS           string   `json:"os"`           // 空=不约束;非空时大小写不敏感精确匹配
 	SOC          []string `json:"soc"`
 	Capabilities []string `json:"capabilities"`
 }

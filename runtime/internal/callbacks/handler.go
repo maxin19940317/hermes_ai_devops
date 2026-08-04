@@ -110,6 +110,7 @@ type heartbeatReq struct {
 		DisplayName string `json:"display_name"`
 		State       string `json:"state"`
 		Props       struct {
+			OS           string   `json:"os"`
 			SOC          string   `json:"soc"`
 			ABI          string   `json:"abi"`
 			Capabilities []string `json:"capabilities"`
@@ -146,7 +147,7 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	for _, d := range req.Devices {
 		devs = append(devs, store.Device{
 			DeviceID: d.Serial, Serial: d.Serial, DisplayName: d.DisplayName, ClientID: req.ClientID,
-			ReportedState: d.State, SOC: d.Props.SOC, ABI: d.Props.ABI, Capabilities: d.Props.Capabilities,
+			ReportedState: d.State, OS: d.Props.OS, SOC: d.Props.SOC, ABI: d.Props.ABI, Capabilities: d.Props.Capabilities,
 		})
 	}
 	if err := h.store.UpsertClientDevices(r.Context(), store.Client{

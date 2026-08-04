@@ -52,6 +52,12 @@ func DeviceTreeCompatible(serial string) []string {
 	return withSerial(serial, "shell", "/bin/cat", "/proc/device-tree/compatible")
 }
 
+// UnameM 读取 `uname -m` 获取 CPU 架构(Linux 设备通过 adb shell 执行)。
+// 仅用于非 Android 设备的 ABI 识别,不构成任意 shell 接口。
+func UnameM(serial string) []string {
+	return withSerial(serial, "shell", "uname", "-m")
+}
+
 // DeviceTreeSerialNumber 读取 Linux 设备树中的序列号。部分 Linux 板
 // (如 rk3568) 的 USB iSerial 为空(adb devices 显示 "?"),
 // 但 /proc/device-tree/serial-number 中存有唯一标识。
@@ -62,6 +68,12 @@ func DeviceTreeSerialNumber(serial string) []string {
 
 func DiskFreeKB(serial, path string) []string {
 	return withSerial(serial, "shell", "/system/bin/df", "-k", path)
+}
+
+// DiskFreeKBLinux Linux 设备上走 PATH 里的 df(无 /system/bin 前缀)。
+// Android 设备仍用 DiskFreeKB(写死 /system/bin/df)。
+func DiskFreeKBLinux(serial, path string) []string {
+	return withSerial(serial, "shell", "df", "-k", path)
 }
 
 func Push(serial, local, remote string) []string {

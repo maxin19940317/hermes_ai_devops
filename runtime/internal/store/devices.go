@@ -49,6 +49,7 @@ type Device struct {
 	DisplayName   string
 	ClientID      string
 	ReportedState string
+	OS            string // Phase 4: android / linux; 空字符串兼容历史
 	SOC           string
 	ABI           string
 	Capabilities  []string
@@ -283,9 +284,12 @@ func (s *MemStore) GetLeaseExpiry(_ context.Context, taskID string) (*time.Time,
 	return nil, nil
 }
 
-// matchSelector:SOC 大小写不敏感命中列表任一项;Capabilities 须为设备能力子集。
-// 空列表不设限。
+// matchSelector:OS 非空时大小写不敏感精确匹配;Soc 命中列表任一项;
+// Capabilities 须为设备能力子集。空字段不设限。
 func matchSelector(d Device, sel wf.DeviceSelector) bool {
+	if sel.OS != "" && !strings.EqualFold(sel.OS, d.OS) {
+		return false
+	}
 	if len(sel.SOC) > 0 {
 		hit := false
 		for _, soc := range sel.SOC {

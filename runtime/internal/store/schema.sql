@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS devices (
     serial       TEXT        NOT NULL UNIQUE,
     display_name TEXT        NOT NULL DEFAULT '',
     client_id    TEXT        NOT NULL REFERENCES clients(client_id),
+    os           TEXT        NOT NULL DEFAULT 'android',  -- Phase 4: android / linux
     soc          TEXT        NOT NULL DEFAULT '',
     abi          TEXT        NOT NULL DEFAULT '',
     capabilities TEXT[]      NOT NULL DEFAULT '{}',

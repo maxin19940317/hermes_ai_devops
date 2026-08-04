@@ -291,7 +291,17 @@ func (e *Executor) resolveTransport(ctx context.Context, logical string) (string
 }
 
 // precheck 校验设备属性与空间(§12: getprop 属性 / df 空间)。
+// Linux 设备分支(Phase 4):getprop 不可用,走 uname -m 校验 abi,跳过 android/soc
+// (soc 已由 Runtime selector 在派单前保证);df 走原生路径。
 func (e *Executor) precheck(ctx context.Context, serial string, m *manifest.Manifest, sum *Summary) error {
+	if m.Requirements.OS == "linux" {
+		return e.precheckLinux(ctx, serial, m, sum)
+	}
+	return e.precheckAndroid(ctx, serial, m, sum)
+}
+
+// precheckAndroid Android 设备属性校验。
+func (e *Executor) precheckAndroid(ctx context.Context, serial string, m *manifest.Manifest, sum *Summary) error {
 	getprop := func(prop string) (string, error) {
 		res, err := e.Runner.Run(ctx, adb.GetProp(serial, prop))
 		if err != nil {
@@ -412,8 +422,9 @@ func (e *Executor) deploy(ctx context.Context, serial string, m *manifest.Manife
 // run 执行 entry。返回 canceled/timedOut 标志与实际时长;
 // 超时与取消都是客观结局不算 error(仍需收集),取消复用超时 kill 路径。
 func (e *Executor) run(ctx context.Context, serial string, m *manifest.Manifest, outDir string) (bool, bool, adb.Result, time.Duration, error) {
-	_, _ = e.Runner.Run(ctx, adb.LogcatClear(serial)) // best effort
-
+	if m.Requirements.OS != "linux" {
+		_, _ = e.Runner.Run(ctx, adb.LogcatClear(serial)) // best effort, Android only
+	}
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(m.Test.TimeoutSec)*time.Second)
 	defer cancel()
 	// 注册 runCancel 供 Cancel() 解除 Runner.Run 阻塞;
@@ -500,9 +511,12 @@ func (e *Executor) collect(ctx context.Context, serial string, m *manifest.Manif
 }
 
 func (e *Executor) dumpLogcat(ctx context.Context, serial, outDir string) {
+	// Linux 设备无 logcat,跳过。
+	// 注:m 参数不可靠(disconnect 后的 collect 重试可能拿不到 manifest),
+	// 此处用 adb 本身判断:Android shell 有 /system/bin/logcat,Linux 没有。
 	res, err := e.Runner.Run(ctx, adb.LogcatDump(serial))
 	if err != nil {
-		e.logf("logcat dump: %v", err)
+		e.logf("logcat dump: %v (skipped for non-Android)", err)
 		return
 	}
 	_ = os.WriteFile(filepath.Join(outDir, "logcat.txt"), []byte(res.Stdout), 0o644)
@@ -539,4 +553,57 @@ func (e *Executor) writeSummary(sum *Summary) {
 		return
 	}
 	_ = os.WriteFile(filepath.Join(sum.OutDir, "run-summary.json"), append(data, '\n'), 0o644)
+}
+
+// precheckLinux Linux 设备属性校验(Phase 4):getprop 不可用,走 uname -m 校验 abi;
+// soc 已由 Runtime selector 在派单前保证(devices 表 os/soc 列),
+// selector 无匹配设备时该变体在 SelectTestSpecs 即被 SKIPPED,不会走到这里;
+// df 走原生 Linux 路径。
+func (e *Executor) precheckLinux(ctx context.Context, serial string, m *manifest.Manifest, sum *Summary) error {
+	res, err := e.Runner.Run(ctx, adb.UnameM(serial))
+	if err != nil {
+		return fmt.Errorf("linux precheck: uname -m: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("linux precheck: uname -m: exit=%d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	arch := strings.TrimSpace(res.Stdout)
+	abi := mapLinuxArchToABI(arch)
+	sum.Environment["abi"] = abi
+	if abi != m.Requirements.ABI {
+		return fmt.Errorf("abi mismatch: device=%s (uname=%s), required=%s", abi, arch, m.Requirements.ABI)
+	}
+	sum.Environment["os"] = "linux"
+
+	if m.Requirements.MinFreeStorageMB > 0 {
+		res, err := e.Runner.Run(ctx, adb.DiskFreeKBLinux(serial, path.Dir(m.Deploy.Workdir)))
+		if err != nil {
+			return err
+		}
+		availKB, err := parseDFAvailableKB(res.Stdout)
+		if err != nil {
+			return err
+		}
+		if availKB < int64(m.Requirements.MinFreeStorageMB)*1024 {
+			return fmt.Errorf("insufficient storage: %d KB available, need %d MB",
+				availKB, m.Requirements.MinFreeStorageMB)
+		}
+	}
+	return nil
+}
+
+// mapLinuxArchToABI 将 uname -m 输出映射为 Android NDK ABI 名。
+func mapLinuxArchToABI(arch string) string {
+	switch arch {
+	case "aarch64":
+		return "arm64-v8a"
+	case "armv7l":
+		return "armeabi-v7a"
+	case "x86_64":
+		return "x86_64"
+	case "i686", "i386":
+		return "x86"
+	default:
+		return arch
+	}
 }

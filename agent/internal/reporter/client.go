@@ -58,6 +58,7 @@ const (
 
 // DeviceProps 是心跳设备属性(与 executor 预检取同一批 getprop)。
 type DeviceProps struct {
+	OS           string   `json:"os,omitempty"` // Phase 4: android / linux
 	SOC          string   `json:"soc,omitempty"`
 	ABI          string   `json:"abi,omitempty"`
 	Android      string   `json:"android,omitempty"`

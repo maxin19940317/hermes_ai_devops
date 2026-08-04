@@ -40,13 +40,13 @@ func (s *PGStore) UpsertClientDevices(ctx context.Context, c Client, devs []Devi
 			caps = []string{}
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO devices (device_id, serial, display_name, client_id, soc, abi, capabilities, status, fail_streak)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0)
+			INSERT INTO devices (device_id, serial, display_name, client_id, os, soc, abi, capabilities, status, fail_streak)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0)
 			ON CONFLICT (device_id) DO UPDATE SET
 				serial = EXCLUDED.serial, display_name = EXCLUDED.display_name, client_id = EXCLUDED.client_id,
-				soc = EXCLUDED.soc, abi = EXCLUDED.abi, capabilities = EXCLUDED.capabilities,
+				os = EXCLUDED.os, soc = EXCLUDED.soc, abi = EXCLUDED.abi, capabilities = EXCLUDED.capabilities,
 				status = CASE WHEN devices.status IN ('IDLE', 'OFFLINE') THEN EXCLUDED.status ELSE devices.status END`,
-			d.DeviceID, d.Serial, d.DisplayName, d.ClientID, d.SOC, d.ABI, pq.Array(caps), availableState(d.ReportedState)); err != nil {
+			d.DeviceID, d.Serial, d.DisplayName, d.ClientID, d.OS, d.SOC, d.ABI, pq.Array(caps), availableState(d.ReportedState)); err != nil {
 			return fmt.Errorf("upsert device %s: %w", d.DeviceID, err)
 		}
 	}
@@ -141,20 +141,26 @@ func (s *PGStore) lockOneCandidate(ctx context.Context, tx *sql.Tx, sel wf.Devic
 		caps[i] = strings.ToLower(v)
 	}
 
+	var os string
+	if sel.OS != "" {
+		os = strings.ToLower(sel.OS)
+	}
+
 	var d Device
 	err := tx.QueryRowContext(ctx, `
-		SELECT d.device_id, d.serial, d.client_id, d.soc, d.abi, d.capabilities
+		SELECT d.device_id, d.serial, d.client_id, d.soc, d.abi, d.capabilities, d.os
 		FROM devices d
 		LEFT JOIN device_leases l ON l.device_id = d.device_id
 		WHERE (d.status = 'IDLE' OR (d.status = 'BUSY' AND l.lease_expires_at < now()))
-		  AND (cardinality($1::text[]) = 0 OR lower(d.soc) = ANY($1))
-		  AND (cardinality($2::text[]) = 0 OR
-		       COALESCE((SELECT array_agg(lower(cap)) FROM unnest(d.capabilities) AS cap), '{}'::text[]) @> $2::text[])
+		  AND ($1::text = '' OR lower(d.os) = $1)
+		  AND (cardinality($2::text[]) = 0 OR lower(d.soc) = ANY($2))
+		  AND (cardinality($3::text[]) = 0 OR
+		       COALESCE((SELECT array_agg(lower(cap)) FROM unnest(d.capabilities) AS cap), '{}'::text[]) @> $3::text[])
 		ORDER BY d.device_id
 		LIMIT 1
 		FOR UPDATE OF d SKIP LOCKED`,
-		pq.Array(socs), pq.Array(caps)).Scan(
-		&d.DeviceID, &d.Serial, &d.ClientID, &d.SOC, &d.ABI, pq.Array(&d.Capabilities))
+		os, pq.Array(socs), pq.Array(caps)).Scan(
+		&d.DeviceID, &d.Serial, &d.ClientID, &d.SOC, &d.ABI, pq.Array(&d.Capabilities), &d.OS)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -168,14 +174,14 @@ func (s *PGStore) lockOneCandidate(ctx context.Context, tx *sql.Tx, sel wf.Devic
 // OFFLINE/BUSY/QUARANTINED)。语义与 MemStore 一致;设备表小,全量读出后在
 // Go 侧复用 matchSelector,保证两种 store 的匹配语义不漂移。
 func (s *PGStore) HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT soc, capabilities FROM devices`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT soc, capabilities, os FROM devices`)
 	if err != nil {
 		return false, fmt.Errorf("has capable device: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var d Device
-		if err := rows.Scan(&d.SOC, pq.Array(&d.Capabilities)); err != nil {
+		if err := rows.Scan(&d.SOC, pq.Array(&d.Capabilities), &d.OS); err != nil {
 			return false, fmt.Errorf("has capable device: scan: %w", err)
 		}
 		if matchSelector(d, sel) {

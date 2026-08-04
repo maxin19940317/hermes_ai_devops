@@ -101,17 +101,18 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		// 但设备树可读,不应标 OFFLINE——设备在线且 adb shell 连通,只是没有
 		// Android getprop。标 IDLE 使其可被调度。
 		if soc := p.linuxSOC(ctx, transport); soc != "" {
+			abi := p.linuxABI(ctx, transport)
 			dev.State = DeviceIdle
-			dev.Props = &DeviceProps{SOC: soc}
+			dev.Props = &DeviceProps{OS: "linux", SOC: soc, ABI: abi}
 			dev.DisplayName = strings.ToUpper(soc) + "-" + serial
-			p.logf("probe: %s is non-Android Linux (%s); reporting IDLE", serial, soc)
+			p.logf("probe: %s is non-Android Linux (%s/%s); reporting IDLE", serial, soc, abi)
 			return dev
 		}
 		dev.State = DeviceOffline
 		p.logf("probe: %s unreachable or unsupported: %v", serial, err)
 		return dev
 	}
-	props := &DeviceProps{ABI: abi}
+	props := &DeviceProps{OS: "android", ABI: abi}
 	if release, err := p.getprop(ctx, transport, "ro.build.version.release"); err == nil {
 		props.Android = release
 	}
@@ -293,4 +294,25 @@ func (p *Prober) resolveUnknownSerial(ctx context.Context, transport string) (st
 		}
 	}
 	return "", fmt.Errorf("cannot resolve serial for transport '?'")
+}
+
+func (p *Prober) linuxABI(ctx context.Context, transport string) string {
+	res, err := p.Runner.Run(ctx, adb.UnameM(transport))
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	arch := strings.TrimSpace(res.Stdout)
+	// Linux uname -m → Android NDK ABI 映射
+	switch arch {
+	case "aarch64":
+		return "arm64-v8a"
+	case "armv7l":
+		return "armeabi-v7a"
+	case "x86_64":
+		return "x86_64"
+	case "i686", "i386":
+		return "x86"
+	default:
+		return arch
+	}
 }
