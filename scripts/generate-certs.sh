@@ -17,6 +17,11 @@ mkdir -p "$CERTS_DIR"
 
 ORG="${CERT_ORG:-hermes-devops}"
 VALIDITY="${CERT_VALIDITY_DAYS:-3650}"
+# 服务端证书的 SAN:Go 1.15+ 忽略 CN 做主机名校验,没有 SAN 的证书客户端
+# 一律拒连(x509: certificate relies on legacy Common Name field)。
+# 默认覆盖 Agent 实际连接的 LAN 地址与服务器本机回环(排障 curl 用);
+# 部署地址变化时用 CERT_SERVER_SAN 覆盖,逗号分隔的 OpenSSL SAN 列表。
+SERVER_SAN="${CERT_SERVER_SAN:-IP:10.88.118.251,IP:127.0.0.1,DNS:hermes-runtime,DNS:localhost}"
 
 if [ $# -eq 0 ]; then
 	set -- "client-default"
@@ -28,13 +33,16 @@ openssl req -x509 -newkey rsa:4096 -days "$VALIDITY" -nodes \
 	-keyout "$CERTS_DIR/ca-key.pem" -out "$CERTS_DIR/ca-cert.pem" \
 	-subj "/O=${ORG}/CN=hermes-devops-ca" 2>/dev/null
 
-echo "=== 2/4 Server (hermes-runtime) ==="
+echo "=== 2/4 Server (hermes-runtime, SAN: ${SERVER_SAN}) ==="
 openssl req -newkey rsa:4096 -nodes \
 	-keyout "$CERTS_DIR/server-key.pem" -out "$CERTS_DIR/server.csr" \
 	-subj "/O=${ORG}/CN=hermes-runtime" 2>/dev/null
+# 注:openssl x509 的 -addext 是 OpenSSL 3.0 才有的;1.1.1 用 -extfile。
+printf 'subjectAltName=%s\n' "$SERVER_SAN" > "$CERTS_DIR/server-ext.cnf"
 openssl x509 -req -in "$CERTS_DIR/server.csr" -CA "$CERTS_DIR/ca-cert.pem" -CAkey "$CERTS_DIR/ca-key.pem" \
-	-CAcreateserial -out "$CERTS_DIR/server-cert.pem" -days "$VALIDITY" 2>/dev/null
-rm -f "$CERTS_DIR/server.csr"
+	-CAcreateserial -out "$CERTS_DIR/server-cert.pem" -days "$VALIDITY" \
+	-extfile "$CERTS_DIR/server-ext.cnf" 2>/dev/null
+rm -f "$CERTS_DIR/server.csr" "$CERTS_DIR/server-ext.cnf"
 
 for client_id in "${CLIENTS[@]}"; do
 	echo "=== 3/4 Client: ${client_id} ==="

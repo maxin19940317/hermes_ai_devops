@@ -15,3 +15,6 @@ __pycache__/
 # Runtime deployment secrets and platform-specific image digests
 /deploy/.env
 /deploy/images.lock.env
+
+# mTLS 证书与私钥(Phase 3,scripts/generate-certs.sh 生成)
+/deploy/certs/
