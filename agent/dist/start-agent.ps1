@@ -22,10 +22,11 @@ $env:AGENT_BASE_URL             = "http://${AGENT_BASE_IP}:8480"
 $env:AGENT_ADB_PATH             = $ADB
 $env:AGENT_SOC_ALIASES          = "trinket:QCM6125"
 $env:AGENT_DEVICE_CAPABILITIES_MAP = '{"QCM6125":["hexagon"]}'
-# Phase 3 mTLS:回调方向双向认证。pem 默认放本脚本同目录;
+# Phase 3 mTLS:回调方向双向认证。已在系统/用户环境变量里设置过的优先;
+# 未设置时默认取本脚本同目录下的 pem。
 # ca-cert.pem 验服务端,client-*.pem 是客户端证书+私钥合体。
-$env:AGENT_MTLS_CA_FILE         = "$PSScriptRoot\ca-cert.pem"
-$env:AGENT_MTLS_CERT_FILE       = "$PSScriptRoot\client-windows-client-01.pem"
+if (-not $env:AGENT_MTLS_CA_FILE)   { $env:AGENT_MTLS_CA_FILE   = "$PSScriptRoot\ca-cert.pem" }
+if (-not $env:AGENT_MTLS_CERT_FILE) { $env:AGENT_MTLS_CERT_FILE = "$PSScriptRoot\client-windows-client-01.pem" }
 # optional: AGENT_LISTEN_ADDR / AGENT_VERSION / AGENT_RUNS_ROOT / AGENT_DB_PATH / AGENT_HEARTBEAT_INTERVAL
 
 Write-Host "==> 1/4 Prepare private adb server (5137)" -ForegroundColor Cyan
