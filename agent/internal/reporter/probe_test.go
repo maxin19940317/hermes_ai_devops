@@ -140,7 +140,7 @@ func TestProbeDevicesRejectsShellErrorTextWithZeroExit(t *testing.T) {
 	}
 }
 
-func TestProbeDevicesIdentifiesLinuxSOCButKeepsDeviceOffline(t *testing.T) {
+func TestProbeDevicesIdentifiesLinuxSOCAndReportsIdle(t *testing.T) {
 	runner := &fakeRunner{responses: map[string]adb.Result{
 		"devices -l": {Stdout: "List of devices attached\nb5bb1018d94b26da device product:mako\n"},
 		"-s b5bb1018d94b26da shell /system/bin/getprop ro.product.cpu.abi": {
@@ -157,8 +157,8 @@ func TestProbeDevicesIdentifiesLinuxSOCButKeepsDeviceOffline(t *testing.T) {
 		t.Fatalf("devices = %+v, want one Linux device", devices)
 	}
 	got := devices[0]
-	if got.State != DeviceOffline || got.DisplayName != "RK3588-b5bb1018d94b26da" {
-		t.Errorf("Linux device = %+v, want RK3588 display name and OFFLINE", got)
+	if got.State != DeviceIdle || got.DisplayName != "RK3588-b5bb1018d94b26da" {
+		t.Errorf("Linux device = %+v, want RK3588 display name and IDLE(reachable Linux ADB device)", got)
 	}
 	if got.Props == nil || got.Props.SOC != "rk3588" {
 		t.Errorf("Linux props = %+v, want soc rk3588", got.Props)
@@ -235,13 +235,43 @@ func TestProbeDevicesRejectsShellErrorSOCWithValidABI(t *testing.T) {
 	}
 }
 
-// '?' transport 的 serial 解析路径同样要防 shell 报错文本:非 Android 设备
-// 的 ro.serialno 回 exit 0 + 报错文本时,设备应被跳过而不是注册脏 serial。
+// '?' transport 设备:ro.serialno 失败但设备树序列号存在时,应被成功解析为独立设备。
+func TestProbeDevicesResolvesLinuxSerialViaDeviceTree(t *testing.T) {
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\n? device product:rk3568-linux model:Nexus_4\n"},
+		"-s ? shell /system/bin/getprop ro.serialno":                     {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-s ? shell /bin/cat /proc/device-tree/serial-number":            {Stdout: "rk3568-evb-1\n", ExitCode: 0},
+		"-s ? shell /system/bin/getprop ro.product.cpu.abi":              {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-s ? shell /bin/cat /proc/device-tree/compatible":               {Stdout: "rockchip,rk3568\n", ExitCode: 0},
+	}}
+	p := &Prober{Runner: runner}
+
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 1 {
+		t.Fatalf("devices = %+v, want one device", devices)
+	}
+	got := devices[0]
+	if got.Serial != "rk3568-evb-1" {
+		t.Errorf("serial = %q, want rk3568-evb-1", got.Serial)
+	}
+	if got.State != DeviceIdle {
+		t.Errorf("state = %q, want IDLE(Linux ADB device, reachable)", got.State)
+	}
+	if got.Props == nil || got.Props.SOC != "rk3568" {
+		t.Errorf("SOC = %q, want rk3568", got.Props.SOC)
+	}
+	if got.DisplayName != "RK3568-rk3568-evb-1" {
+		t.Errorf("display_name = %q, want RK3568-rk3568-evb-1", got.DisplayName)
+	}
+}
+
+// '?' transport 设备:ro.serialno 与设备树序列号均失败时,设备应被跳过。
 func TestProbeDevicesRejectsShellErrorSerialResolution(t *testing.T) {
 	shellErr := "/bin/sh: line 1: /system/bin/getprop: No such file or directory"
 	runner := &fakeRunner{responses: map[string]adb.Result{
 		"devices -l": {Stdout: "List of devices attached\n? device product:rk3568-linux model:Nexus_4\n"},
 		"-s ? shell /system/bin/getprop ro.serialno": {Stdout: shellErr + "\n"},
+		// 设备树序列号也不存在(未注册 → Run 报错)
 	}}
 	p := &Prober{Runner: runner}
 

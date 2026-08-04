@@ -52,6 +52,14 @@ func DeviceTreeCompatible(serial string) []string {
 	return withSerial(serial, "shell", "/bin/cat", "/proc/device-tree/compatible")
 }
 
+// DeviceTreeSerialNumber 读取 Linux 设备树中的序列号。部分 Linux 板
+// (如 rk3568) 的 USB iSerial 为空(adb devices 显示 "?"),
+// 但 /proc/device-tree/serial-number 中存有唯一标识。
+// 仅用于 ? transport 的 serial 解析回退,不构成任意 shell 接口。
+func DeviceTreeSerialNumber(serial string) []string {
+	return withSerial(serial, "shell", "/bin/cat", "/proc/device-tree/serial-number")
+}
+
 func DiskFreeKB(serial, path string) []string {
 	return withSerial(serial, "shell", "/system/bin/df", "-k", path)
 }

@@ -67,12 +67,9 @@ func (p *Prober) ProbeDevices(ctx context.Context, busy map[string]bool) []Devic
 				p.logf("probe: %d devices have unusable serial '?'; cannot resolve unambiguously", unknownCount)
 				continue
 			}
-			serial, err = p.getprop(ctx, transport, "ro.serialno")
-			// 非 Android 设备上 getprop 可能回 exit 0 但 stdout 是 shell 报错
-			// 文本(老 adbd 不回传远程退出码),必须校验 serial 内容形态,
-			// 否则报错文本会被当成 serial 注册(实测 rk3568-linux 板)。
-			if err != nil || !validSerial(serial) {
-				p.logf("probe: cannot resolve device serial '?' via ro.serialno: %v", err)
+			serial, err = p.resolveUnknownSerial(ctx, transport)
+			if err != nil {
+				p.logf("probe: cannot resolve device serial '?': %v", err)
 				continue
 			}
 			p.logf("probe: transport '?' resolved to serial %s", serial)
@@ -100,13 +97,17 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		err = fmt.Errorf("abi %q is not an Android ABI (non-Android shell?)", abi)
 	}
 	if err != nil {
-		dev.State = DeviceOffline
+		// 非 Android 但 ADB 可达的设备(如 rk3568 Linux 板):getprop 失败
+		// 但设备树可读,不应标 OFFLINE——设备在线且 adb shell 连通,只是没有
+		// Android getprop。标 IDLE 使其可被调度。
 		if soc := p.linuxSOC(ctx, transport); soc != "" {
+			dev.State = DeviceIdle
 			dev.Props = &DeviceProps{SOC: soc}
 			dev.DisplayName = strings.ToUpper(soc) + "-" + serial
-			p.logf("probe: %s is non-Android (%s); reporting OFFLINE", serial, soc)
+			p.logf("probe: %s is non-Android Linux (%s); reporting IDLE", serial, soc)
 			return dev
 		}
+		dev.State = DeviceOffline
 		p.logf("probe: %s unreachable or unsupported: %v", serial, err)
 		return dev
 	}
@@ -274,4 +275,22 @@ func ParseDFAvailableKB(out string) (int64, error) {
 		return 0, fmt.Errorf("parse df available: %w", err)
 	}
 	return kb, nil
+}
+
+// resolveUnknownSerial 尝试解析 transport 为 "?" 的设备的真实序列号。
+// 优先 ro.serialno(Android),失败则回退 /proc/device-tree/serial-number(Linux)。
+func (p *Prober) resolveUnknownSerial(ctx context.Context, transport string) (string, error) {
+	// 尝试 Android getprop ro.serialno
+	serial, err := p.getprop(ctx, transport, "ro.serialno")
+	if err == nil && validSerial(serial) {
+		return serial, nil
+	}
+	// 回退 Linux 设备树序列号
+	if res, dterr := p.Runner.Run(ctx, adb.DeviceTreeSerialNumber(transport)); dterr == nil && res.ExitCode == 0 {
+		serial := strings.TrimSpace(res.Stdout)
+		if validSerial(serial) {
+			return serial, nil
+		}
+	}
+	return "", fmt.Errorf("cannot resolve serial for transport '?'")
 }
