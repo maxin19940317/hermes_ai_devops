@@ -68,7 +68,10 @@ func (p *Prober) ProbeDevices(ctx context.Context, busy map[string]bool) []Devic
 				continue
 			}
 			serial, err = p.getprop(ctx, transport, "ro.serialno")
-			if err != nil || serial == "" || serial == "?" {
+			// 非 Android 设备上 getprop 可能回 exit 0 但 stdout 是 shell 报错
+			// 文本(老 adbd 不回传远程退出码),必须校验 serial 内容形态,
+			// 否则报错文本会被当成 serial 注册(实测 rk3568-linux 板)。
+			if err != nil || !validSerial(serial) {
 				p.logf("probe: cannot resolve device serial '?' via ro.serialno: %v", err)
 				continue
 			}
@@ -140,6 +143,22 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		}
 	}
 	return dev
+}
+
+// validSerial 校验 adb serial 形态:USB serial 为字母数字(可含 - _),
+// 网络设备为 host:port。空串、"?"、含空白或路径符的一律非法。
+func validSerial(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '.' || r == '_' || r == '-' || r == ':'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // androidABI 校验 ro.product.cpu.abi 的内容形态(arm64-v8a / armeabi-v7a /

@@ -234,3 +234,19 @@ func TestProbeDevicesRejectsShellErrorSOCWithValidABI(t *testing.T) {
 		t.Errorf("display_name = %q, want UNKNOWN-b5bb1018d94b26da", got.DisplayName)
 	}
 }
+
+// '?' transport 的 serial 解析路径同样要防 shell 报错文本:非 Android 设备
+// 的 ro.serialno 回 exit 0 + 报错文本时,设备应被跳过而不是注册脏 serial。
+func TestProbeDevicesRejectsShellErrorSerialResolution(t *testing.T) {
+	shellErr := "/bin/sh: line 1: /system/bin/getprop: No such file or directory"
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\n? device product:rk3568-linux model:Nexus_4\n"},
+		"-s ? shell /system/bin/getprop ro.serialno": {Stdout: shellErr + "\n"},
+	}}
+	p := &Prober{Runner: runner}
+
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 0 {
+		t.Fatalf("devices = %+v, want shell-error serial device skipped", devices)
+	}
+}
