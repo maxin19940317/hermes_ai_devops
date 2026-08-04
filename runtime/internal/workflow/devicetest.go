@@ -352,8 +352,14 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 	}
 	resultCh := workflow.GetSignalChannel(ctx, SignalTaskResult)
 
-	for _, spec := range sel.Specs {
-		out.Tasks = append(out.Tasks, runTest(ctx, in, spec, ruleVersion, resultCh))
+	// Phase 4 并发调度:workflow.GetVersion 门——新 workflow 并行执行 spec,
+	// 在途 workflow(重放旧 history)保持串行 loop。
+	if workflow.GetVersion(ctx, "parallel-specs", workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+		for _, spec := range sel.Specs {
+			out.Tasks = append(out.Tasks, runTest(ctx, in, spec, ruleVersion, resultCh))
+		}
+	} else {
+		*out = runParallelSpecs(ctx, sel, in, ruleVersion)
 	}
 
 	// notify-card 版本分支(设计文档 §5):在途 workflow(重放旧 history)必须原样
@@ -366,7 +372,7 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 	} else {
 		req := NotifyCardRequest{
 			Card:         buildNotificationCard(in, out, actualID),
-			FallbackText: buildNotification(in, out), // 原函数,原样调用
+			FallbackText: buildNotification(in, out),
 		}
 		if err := workflow.ExecuteActivity(ctx, "NotifyCard", req).Get(ctx, nil); err != nil {
 			workflow.GetLogger(ctx).Error("notify card failed", "error", err)
@@ -1163,4 +1169,75 @@ func buildNotificationCard(in DeviceTestInput, out *DeviceTestOutput, workflowID
 		card.Elements = append(card.Elements, cardOmittedNotice(omitted))
 	}
 	return card
+}
+
+// runParallelSpecs 并行执行所有 spec(Phase 4 并发调度)。
+// 信号分发器:单 goroutine 从共享 resultCh 消费信号,按 task_id 前缀匹配
+// (prefix = {workflow_id}:{test_id}:) fan-out 到各 spec 的私有 buffered channel。
+// Spec 按声明顺序收齐结果填 out.Tasks(输出顺序确定性,通知卡片逻辑零改动)。
+func runParallelSpecs(ctx workflow.Context, sel SpecSelection, in DeviceTestInput, ruleVersion string) DeviceTestOutput {
+	specs := sel.Specs
+	n := len(specs)
+	out := DeviceTestOutput{Tasks: make([]TaskSummary, 0, n+len(sel.Skipped))}
+	for _, sk := range sel.Skipped {
+		out.Tasks = append(out.Tasks, TaskSummary{
+			TestID: sk.Variant, Variant: sk.Variant,
+			Verdict: VerdictSkipped, Reason: sk.Reason,
+		})
+	}
+
+	resultCh := workflow.GetSignalChannel(ctx, SignalTaskResult)
+	// 每个 spec 一个私有 channel,容量 = maxAttempts * 3(容纳信号冗余)。
+	// Channel 类型同时满足 Send(demux) 和 ReceiveChannel(runTest)。
+	privateChs := make([]workflow.Channel, n)
+	for i, spec := range specs {
+		privateChs[i] = workflow.NewBufferedChannel(ctx, (spec.MaxInfraRetries+1)*3)
+	}
+
+	// 分发器 goroutine:按 task_id 前缀匹配 → fan-out 到私有 channel
+	workflow.Go(ctx, func(ctx workflow.Context) {
+		demuxSignalLoop(ctx, resultCh, specs, privateChs)
+	})
+
+	// 每 spec 一个 goroutine 并发执行
+	sums := make([]*TaskSummary, n)
+	for i := range specs {
+		idx := i
+		spec := specs[idx]
+		priv := privateChs[idx]
+		workflow.Go(ctx, func(ctx workflow.Context) {
+			sum := runTest(ctx, in, spec, ruleVersion, priv)
+			sums[idx] = &sum
+		})
+	}
+
+	// 按 spec 声明顺序收集结果 → 输出顺序确定性
+	for i := range specs {
+		workflow.Await(ctx, func() bool { return sums[i] != nil })
+		out.Tasks = append(out.Tasks, *sums[i])
+	}
+	return out
+}
+
+// demuxSignalLoop 分发器:从 resultCh 消费信号,按 task_id 前缀匹配写入私有 channel。
+// 匹配规则:task_id 格式为 {workflow_id}:{test_id}:a{N},前缀 = {workflow_id}:{test_id}:
+// 匹配的 spec 写入对应 privateCh;不匹配任何 spec 的信号丢弃(历史 attempt 迟到结果)。
+func demuxSignalLoop(ctx workflow.Context, resultCh workflow.ReceiveChannel, specs []TestSpec, privateChs []workflow.Channel) {
+	wfID := workflow.GetInfo(ctx).WorkflowExecution.ID
+	prefixes := make([]string, len(specs))
+	for i, spec := range specs {
+		prefixes[i] = wfID + ":" + spec.TestID + ":"
+	}
+	for {
+		var cand TaskResultSignal
+		if more := resultCh.Receive(ctx, &cand); !more {
+			return
+		}
+		for i, pref := range prefixes {
+			if strings.HasPrefix(cand.TaskID, pref) {
+				privateChs[i].Send(ctx, cand)
+				break
+			}
+		}
+	}
 }
