@@ -1,0 +1,15 @@
+# Dashboard provisioning(Phase 4):从 Git 管理的 JSON 自动加载面板,
+# 改了面板推一下 compose restart grafana 即生效,无需手动导入。
+apiVersion: 1
+
+providers:
+  - name: hermes-devops
+    orgId: 1
+    folder: Hermes DevOps
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -236,6 +236,38 @@ services:
         mc ilm rule add --expire-days "$$MINIO_RUNS_RETAIN_DAYS" --prefix "runs/" "hermes/$$MINIO_BUCKET"
         mc ilm rule ls "hermes/$$MINIO_BUCKET"
 
+  # Phase 4 Grafana(§12):纯观测层,不写任何数据,不进执行关键路径。
+  # 数据源直连 postgres(hermes_runtime 库),dashboard JSON 进 Git 随 compose
+  # provisioning 自动加载——改了面板推一下即生效,无需手动导入。
+  # 端口绑 localhost,远程访问走 SSH 端口转发(同 Temporal UI)。
+  grafana:
+    image: ${GRAFANA_IMAGE:?GRAFANA_IMAGE must come from images.lock.env}
+    restart: unless-stopped
+    networks: [runtime]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # datasource provisioning 用 ${VAR} 插值(见 provisioning/datasources/postgres.yaml)
+      RUNTIME_DB_USER: ${RUNTIME_DB_USER:-hermes_runtime}
+      RUNTIME_DB_PASSWORD: ${RUNTIME_DB_PASSWORD:?RUNTIME_DB_PASSWORD is required}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_HOST_PORT:-13000}:3000"
+    healthcheck:
+      test: [CMD-SHELL, "wget -qO- http://127.0.0.1:3000/api/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
 networks:
   runtime:
     name: hermes-runtime
@@ -248,5 +280,7 @@ networks:
 volumes:
   postgres-data:
     name: hermes-runtime-postgres
+  grafana-data:
+    name: hermes-runtime-grafana
   minio-data:
     name: hermes-runtime-minio

@@ -315,7 +315,7 @@ evidence/ 快照不过期,是 decisions 的回放依据);
 Agent 版本上报 + 最低版本门禁✅(ldflags 注入版本,`MIN_AGENT_VERSION` 空=不启用,dev 永远放行)。
 
 ### Phase 4 — 扩展
-多设备并发调度;性能基线 MR 门禁;Linux 变体 SSH Adapter;Grafana 看板。
+Grafana 看板✅(Phase 4 第 1 轮,2026-08-04 上线:纯只读 postgres datasource,dashboard JSON 进 Git 自动 provisioning,13 个面板覆盖 task 状态/verdict/错误分类/吞吐量堆叠/设备状态/fail_streak 趋势/P50/P99 延迟/基线 delta/outbox 积压/decisions/audit;端口绑 localhost 走 SSH 转发);多设备并发调度;性能基线 MR 门禁;Linux 变体 SSH Adapter。
 
 ## 13. 工程约定
 

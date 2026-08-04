@@ -8,7 +8,7 @@
 | 组件 | 形态 | 更新方式 |
 |---|---|---|
 | trigger / worker / relay | compose 三进程,共享镜像 `hermes-runtime:dev` | §1 标准流程 |
-| postgres / temporal / minio / temporal-ui | compose 基础设施 | 不随业务更新;勿动 |
+| postgres / temporal / minio / temporal-ui / grafana | compose 基础设施 | 不随业务更新;勿动 |
 | analyze_bridge | `hermes-devops-analyzer` 容器内 uvicorn(:8643) | §3.1 |
 | kanban_bridge | 宿主 tobias 账号 uvicorn(:8644) | §3.2 |
 | Windows agent | `windows-client-01` 前台进程(8480/5137) | §3.3 |

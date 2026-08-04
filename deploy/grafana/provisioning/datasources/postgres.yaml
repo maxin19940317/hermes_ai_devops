@@ -1,0 +1,22 @@
+# Grafana datasource provisioning(Phase 4)。
+# 直连 postgres hermes_runtime 库——Grafana 是纯只读消费者,不写任何数据,
+# 不在执行关键路径上(§3 规则 5)。
+# 用 ${VAR} 语法引用 compose 注入的环境变量;Grafana provisioning 支持环境变量插值。
+apiVersion: 1
+
+datasources:
+  - name: HermesRuntime
+    type: postgres
+    uid: hermes-runtime
+    access: proxy
+    isDefault: true
+    editable: false
+    url: postgres:5432
+    database: hermes_runtime
+    user: ${RUNTIME_DB_USER}
+    secureJsonData:
+      password: ${RUNTIME_DB_PASSWORD}
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1500
+      timescaledb: false

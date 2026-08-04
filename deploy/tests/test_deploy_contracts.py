@@ -19,6 +19,15 @@ WORKFLOW_RUNS_MIGRATION = (
     / "2026-07-30-workflow-runs.sql"
 )
 DEPLOY_README = ROOT / "deploy" / "README.md"
+GRAFANA_COMPOSE = ROOT / "deploy" / "docker-compose.yml"
+GRAFANA_DS = ROOT / "deploy" / "grafana" / "provisioning" / "datasources" / "postgres.yaml"
+GRAFANA_DASH_PROVIDER = (
+    ROOT / "deploy" / "grafana" / "provisioning" / "dashboards"
+    / "dashboards.yaml"
+)
+GRAFANA_DASHBOARD = (
+    ROOT / "deploy" / "grafana" / "dashboards" / "device-test-ops.json"
+)
 WORKFLOW_RUNS_SPEC = (
     ROOT / "docs" / "superpowers" / "specs"
     / "2026-07-30-workflow-runs-design.md"
@@ -278,7 +287,7 @@ class ComposeContracts(unittest.TestCase):
         text = COMPOSE.read_text(encoding="utf-8")
         for service in (
             "postgres:", "temporal:", "temporal-ui:", "trigger:", "worker:",
-            "minio:", "minio-init:",
+            "minio:", "minio-init:", "grafana:",
         ):
             self.assertIn(service, text)
         self.assertIn(
@@ -318,12 +327,12 @@ class ComposeContracts(unittest.TestCase):
             '${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091',
             text,
         )
-        # Temporal UI(8080)与 MinIO 控制台(9001)仍必须绑 localhost;
-        # 为它们添加 0.0.0.0 映射必须使本契约失败。
+        # Temporal UI(8080)、MinIO 控制台(9001)和 Grafana(3000)仍必须绑
+        # localhost;为它们添加 0.0.0.0 映射必须使本契约失败。
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("- ") and (
-                ":8080" in stripped or ":9001" in stripped
+                ":8080" in stripped or ":9001" in stripped or ":3000" in stripped
             ):
                 self.assertIn("127.0.0.1:", stripped, stripped)
 
@@ -371,6 +380,7 @@ class ComposeContracts(unittest.TestCase):
             'tctl --address \\"$$(hostname -i):7233\\" cluster health',
             "wget, -qO-, http://127.0.0.1:8090/healthz",
             "wget, -qO-, http://127.0.0.1:8091/healthz",
+            "wget -qO- http://127.0.0.1:3000/api/health",
         ):
             self.assertIn(probe, text)
         self.assertNotIn("sleep ", text)
@@ -385,6 +395,7 @@ class ComposeContracts(unittest.TestCase):
             "RUNTIME_BASE_IMAGE",
             "MINIO_IMAGE",
             "MINIO_MC_IMAGE",
+            "GRAFANA_IMAGE",
         ):
             self.assertIn(variable, text)
         self.assertNotRegex(text, re.compile(r"image:\s+[^$\n]*:latest(?:\s|$)"))
@@ -397,9 +408,73 @@ class ComposeContracts(unittest.TestCase):
             "GITLAB_TOKEN",
             "TRIGGER_WEBHOOK_SECRET",
             "MINIO_ROOT_PASSWORD",
+            "GRAFANA_ADMIN_PASSWORD",
         ):
             self.assertRegex(text, rf"(?m)^{key}=\s*$")
         self.assertNotIn("PRIVATE-TOKEN:", text)
+
+
+class GrafanaConfigContracts(unittest.TestCase):
+    def test_provisioning_files_exist(self):
+        for path in (GRAFANA_DS, GRAFANA_DASH_PROVIDER, GRAFANA_DASHBOARD):
+            self.assertTrue(path.is_file(), path)
+
+    def test_datasource_is_readonly_postgres(self):
+        text = GRAFANA_DS.read_text(encoding="utf-8")
+        self.assertIn("type: postgres", text)
+        self.assertIn("database: hermes_runtime", text)
+        self.assertIn("editable: false", text)
+        self.assertIn("sslmode: disable", text)
+        # Credentials come from compose env, not hardcoded.
+        self.assertIn("${RUNTIME_DB_USER}", text)
+        self.assertIn("${RUNTIME_DB_PASSWORD}", text)
+        self.assertNotIn("minioadmin", text)
+
+    def test_dashboard_provider_loads_from_file(self):
+        text = GRAFANA_DASH_PROVIDER.read_text(encoding="utf-8")
+        self.assertIn("type: file", text)
+        self.assertIn("path: /var/lib/grafana/dashboards", text)
+        self.assertIn("allowUiUpdates: false", text)
+
+    def test_dashboard_json_is_valid(self):
+        import json
+        data = json.loads(GRAFANA_DASHBOARD.read_text(encoding="utf-8"))
+        self.assertEqual(data["title"], "Device Test Operations")
+        self.assertEqual(data["uid"], "device-test-ops")
+        self.assertGreater(len(data["panels"]), 8)
+        for panel in data["panels"]:
+            self.assertIn("title", panel)
+            self.assertIn("type", panel)
+            self.assertIn("gridPos", panel)
+            self.assertIn("datasource", panel)
+            self.assertEqual(panel["datasource"]["uid"], "hermes-runtime")
+
+    def test_compose_grafana_localhost_only(self):
+        text = GRAFANA_COMPOSE.read_text(encoding="utf-8")
+        self.assertIn(
+            '127.0.0.1:${GRAFANA_HOST_PORT:-13000}:3000',
+            text,
+        )
+        self.assertIn("GF_SECURITY_ADMIN_PASSWORD", text)
+        self.assertIn("GRAFANA_IMAGE", text)
+        self.assertIn("./grafana/provisioning:/etc/grafana/provisioning:ro", text)
+        self.assertIn("./grafana/dashboards:/var/lib/grafana/dashboards:ro", text)
+
+    def test_env_example_has_grafana_vars(self):
+        text = ENV_EXAMPLE.read_text(encoding="utf-8")
+        self.assertRegex(text, r"(?m)^GRAFANA_IMAGE=")
+        self.assertRegex(text, r"(?m)^GRAFANA_HOST_PORT=")
+        self.assertRegex(text, r"(?m)^GRAFANA_ADMIN_PASSWORD=\s*$")
+
+    def test_lock_images_includes_grafana(self):
+        text = LOCK_IMAGES.read_text(encoding="utf-8")
+        self.assertIn("GRAFANA_IMAGE", text)
+
+    def test_validate_env_includes_grafana(self):
+        text = VALIDATE_ENV.read_text(encoding="utf-8")
+        self.assertIn("GRAFANA_ADMIN_PASSWORD", text)
+        self.assertIn("GRAFANA_IMAGE", text)
+        self.assertIn("GRAFANA_HOST_PORT 13000", text)
 
 
 class PipelineVerificationContracts(unittest.TestCase):

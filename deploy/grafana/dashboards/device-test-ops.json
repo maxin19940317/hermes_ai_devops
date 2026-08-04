@@ -1,0 +1,345 @@
+{
+  "title": "Device Test Operations",
+  "uid": "device-test-ops",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-7d", "to": "now" },
+  "tags": ["hermes-devops"],
+  "templating": {
+    "list": [
+      {
+        "name": "variant",
+        "type": "query",
+        "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+        "query": "SELECT DISTINCT variant AS __text, variant AS __value FROM tasks ORDER BY variant",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "title": "Task Status Distribution (7d)",
+      "type": "bargauge",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT status AS metric, count(*)::float AS value FROM tasks WHERE created_at > now() - interval '7 days' GROUP BY status ORDER BY count(*) DESC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-greens" }
+        }
+      }
+    },
+    {
+      "title": "Verdict Breakdown (7d, terminal states only)",
+      "type": "piechart",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": {
+        "pieType": "donut",
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "labels": { "name": "auto", "values": ["percent"] }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT CASE WHEN verdict = '' THEN '(running)' ELSE verdict END AS metric, count(*)::float AS value FROM tasks WHERE status IN ('COMPLETED','FAILED','TIMEOUT','CANCELED') AND created_at > now() - interval '7 days' GROUP BY verdict ORDER BY count(*) DESC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-greens" }
+        }
+      }
+    },
+    {
+      "title": "Error Category (7d)",
+      "type": "bargauge",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT CASE WHEN error_category = '' THEN '(none)' ELSE error_category END AS metric, count(*)::float AS value FROM tasks WHERE status IN ('COMPLETED','FAILED','TIMEOUT','CANCELED') AND created_at > now() - interval '7 days' GROUP BY error_category ORDER BY count(*) DESC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-greens" }
+        }
+      }
+    },
+    {
+      "title": "Test Throughput (stacked by verdict, 7d)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 7 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": {
+        "stacking": { "mode": "normal" },
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "PASSED",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, count(*)::int AS value, 'PASSED' AS verdict FROM tasks WHERE verdict = 'PASSED' AND created_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1"
+        },
+        {
+          "refId": "TEST_FAILED",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, count(*)::int AS value, 'TEST_FAILED' AS verdict FROM tasks WHERE verdict = 'TEST_FAILED' AND created_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1"
+        },
+        {
+          "refId": "INFRA_ERROR",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, count(*)::int AS value, 'INFRA_ERROR' AS verdict FROM tasks WHERE verdict = 'INFRA_ERROR' AND created_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1"
+        },
+        {
+          "refId": "PERF_REGRESSION",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, count(*)::int AS value, 'PERF_REGRESSION' AS verdict FROM tasks WHERE verdict = 'PERF_REGRESSION' AND created_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1"
+        },
+        {
+          "refId": "INCONCLUSIVE",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, count(*)::int AS value, 'INCONCLUSIVE' AS verdict FROM tasks WHERE verdict = 'INCONCLUSIVE' AND created_at > now() - interval '7 days' GROUP BY 1 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "fillOpacity": 80, "stacking": { "mode": "normal" } }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "PASSED" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] },
+          { "matcher": { "id": "byName", "options": "TEST_FAILED" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] },
+          { "matcher": { "id": "byName", "options": "INFRA_ERROR" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] },
+          { "matcher": { "id": "byName", "options": "PERF_REGRESSION" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } }] },
+          { "matcher": { "id": "byName", "options": "INCONCLUSIVE" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "gray" } }] }
+        ]
+      }
+    },
+    {
+      "title": "Device Status",
+      "type": "table",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT d.serial, d.display_name, d.soc, d.status, d.fail_streak, c.host AS client_host, c.version AS agent_version, c.last_heartbeat FROM devices d JOIN clients c ON d.client_id = c.client_id ORDER BY d.status, d.serial"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "status" },
+            "properties": [{ "id": "mappings", "value": [{ "type": "value", "options": { "IDLE": { "color": "green" }, "BUSY": { "color": "blue" }, "OFFLINE": { "color": "gray" }, "QUARANTINED": { "color": "red" } } }] }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Device Fail Streak Trend (7d)",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT te.created_at AS time, d.fail_streak AS value, d.serial AS metric FROM task_events te JOIN tasks t ON te.task_id = t.task_id JOIN devices d ON t.device_id = d.device_id WHERE te.created_at > now() - interval '7 days' AND te.to_status IN ('FAILED','COMPLETED','TIMEOUT') ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter" } }
+      }
+    },
+    {
+      "title": "Task Duration P50/P99 (by variant, 7d terminal)",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": { "displayMode": "gradient", "orientation": "horizontal" },
+      "targets": [
+        {
+          "refId": "P50",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT concat(t.workflow_id, '|', t.test_id) AS metric, percentile_cont(0.5) WITHIN GROUP (ORDER BY (r.result_json->>'duration_sec')::float) AS value FROM tasks t JOIN results r ON t.task_id = r.task_id WHERE t.status IN ('COMPLETED','FAILED','TIMEOUT') AND t.created_at > now() - interval '7 days' AND r.result_json ? 'duration_sec' GROUP BY 1 ORDER BY 2 DESC LIMIT 20"
+        },
+        {
+          "refId": "P99",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT concat(t.workflow_id, '|', t.test_id) AS metric, percentile_cont(0.99) WITHIN GROUP (ORDER BY (r.result_json->>'duration_sec')::float) AS value FROM tasks t JOIN results r ON t.task_id = r.task_id WHERE t.status IN ('COMPLETED','FAILED','TIMEOUT') AND t.created_at > now() - interval '7 days' AND r.result_json ? 'duration_sec' GROUP BY 1 ORDER BY 2 DESC LIMIT 20"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "P50" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }] },
+          { "matcher": { "id": "byName", "options": "P99" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }] }
+        ]
+      }
+    },
+    {
+      "title": "Metrics Baseline Delta % (PASSED, last 30d)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH latest AS (SELECT project, variant, metric_name, value, task_id, row_number() OVER (PARTITION BY project, variant, metric_name ORDER BY created_at DESC) AS rn FROM metrics WHERE created_at > now() - interval '30 days'), baseline AS (SELECT project, variant, metric_name, percentile_cont(0.5) WITHIN GROUP (ORDER BY value) AS median_val FROM metrics WHERE created_at > now() - interval '30 days' GROUP BY 1,2,3) SELECT l.variant, l.metric_name, l.value, b.median_val AS baseline, round(((l.value - b.median_val) / nullif(b.median_val, 0) * 100)::numeric, 1) AS delta_pct FROM latest l JOIN baseline b ON l.project = b.project AND l.variant = b.variant AND l.metric_name = b.metric_name WHERE l.rn = 1 ORDER BY abs(((l.value - b.median_val) / nullif(b.median_val, 0) * 100)) DESC NULLS LAST LIMIT 30"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "delta_pct" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 10 }, { "color": "red", "value": 20 }] } },
+              { "id": "custom", "value": { "align": "auto", "cellOptions": { "type": "color" } } }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Outbox Backlog",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 30 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT 'pending' AS metric, count(*)::float AS value FROM outbox WHERE published_at IS NULL UNION ALL SELECT 'stuck', count(*)::float FROM outbox WHERE published_at IS NULL AND attempts >= 3 UNION ALL SELECT 'oldest_age_sec', coalesce(extract(epoch from (now() - min(created_at))), 0)::float FROM outbox WHERE published_at IS NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "stuck" }, "properties": [{ "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }] }
+        ]
+      }
+    },
+    {
+      "title": "Outbox Pending Over Time (1h)",
+      "type": "timeseries",
+      "gridPos": { "h": 4, "w": 10, "x": 6, "y": 30 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": { "legend": { "displayMode": "show", "placement": "right" } },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('minute', created_at) AS time, count(*)::int AS value, 'published' AS metric FROM outbox WHERE published_at IS NOT NULL AND created_at > now() - interval '1 hour' GROUP BY 1 UNION ALL SELECT date_trunc('minute', created_at), count(*)::int, 'pending' FROM outbox WHERE published_at IS NULL AND created_at > now() - interval '1 hour' GROUP BY 1 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 20 } }
+      }
+    },
+    {
+      "title": "Outbox Errors (latest 10)",
+      "type": "table",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 30 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT id, event_key, attempts, left(last_error, 80) AS error_snippet, created_at FROM outbox WHERE published_at IS NULL AND attempts > 0 ORDER BY attempts DESC, created_at DESC LIMIT 10"
+        }
+      ]
+    },
+    {
+      "title": "Decisions (latest 15)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT d.created_at, d.task_id, d.actor, d.model, d.prompt_version, left(d.output::text, 60) AS output_snippet FROM decisions d ORDER BY d.created_at DESC LIMIT 15"
+        }
+      ]
+    },
+    {
+      "title": "Audit Log (latest 15)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 },
+      "datasource": { "uid": "hermes-runtime", "type": "postgres" },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at, actor, action, target FROM audit_log ORDER BY created_at DESC LIMIT 15"
+        }
+      ]
+    }
+  ]
+}

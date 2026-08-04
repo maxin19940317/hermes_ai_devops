@@ -332,3 +332,45 @@ This creates `deploy/certs/` containing:
 Enable by setting the three `MTLS_*` env vars in `deploy/.env` and restarting
 the worker. All three must be non-empty to activate; any empty variable
 gracefully degrades to plain HTTP (backward-compatible with Phase 2).
+
+## Grafana dashboard (Phase 4)
+
+Grafana is a pure read-only consumer of the `hermes_runtime` database — it is
+not on any execution critical path and writes no data. The dashboard JSON lives
+in `deploy/grafana/dashboards/` and is provisioned automatically on container
+start; change a panel, push, and `docker compose ... up -d --no-deps grafana`
+picks it up.
+
+The dashboard (`Device Test Operations`) shows:
+
+| Panel | Source | Purpose |
+|---|---|---|
+| Task Status Distribution | `tasks.status` | How many tasks are in each lifecycle state (7d) |
+| Verdict Breakdown | `tasks.verdict` (terminal states) | Donut: PASSED vs TEST_FAILED vs INFRA_ERROR vs INCONCLUSIVE |
+| Error Category | `tasks.error_category` | INFRA / CODE / MODEL / DEVICE / PERF / UNKNOWN |
+| Test Throughput | `tasks` stacked by verdict | 7d bar chart, green/red/orange/yellow/gray |
+| Device Status | `devices` JOIN `clients` | Live table: serial, SoC, status, fail_streak, agent version, heartbeat |
+| Device Fail Streak Trend | `task_events` JOIN `devices` | 7d step-line per device — catch escalating failure streaks |
+| Task Duration P50/P99 | `results.result_json->duration_sec` | Percentile by task, top 20 |
+| Metrics Baseline Delta % | `metrics` table | Latest value vs 30d median, sorted by abs(delta) — spot regressions |
+| Outbox Backlog | `outbox` + `outbox_backlog` view | Pending / stuck / oldest age stat + 1h time series + error snippets |
+| Decisions | `decisions` | Latest 15: actor (rule/hermes/human), model, output snippet |
+| Audit Log | `audit_log` | Latest 15: actor, action, target |
+
+Access (localhost-only, like Temporal UI):
+
+```bash
+# local
+open http://127.0.0.1:${GRAFANA_HOST_PORT:-13000}
+
+# remote via SSH port forwarding
+ssh -L 13000:127.0.0.1:13000 "$Q_UAT_HOST"
+```
+
+Login with `GRAFANA_ADMIN_USER` (default `admin`) and
+`GRAFANA_ADMIN_PASSWORD` (required in `deploy/.env`).
+
+The datasource connects as `${RUNTIME_DB_USER}` (same role the Runtime uses)
+with `sslmode: disable` inside the Compose network. Grafana's `editable: false`
+flag prevents UI-side datasource tampering; the only way to change it is
+through Git-tracked provisioning files.
