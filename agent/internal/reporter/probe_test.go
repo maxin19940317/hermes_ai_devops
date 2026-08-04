@@ -239,10 +239,10 @@ func TestProbeDevicesRejectsShellErrorSOCWithValidABI(t *testing.T) {
 func TestProbeDevicesResolvesLinuxSerialViaDeviceTree(t *testing.T) {
 	runner := &fakeRunner{responses: map[string]adb.Result{
 		"devices -l": {Stdout: "List of devices attached\n? device product:rk3568-linux model:Nexus_4\n"},
-		"-s ? shell /system/bin/getprop ro.serialno":                     {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
-		"-s ? shell /bin/cat /proc/device-tree/serial-number":            {Stdout: "rk3568-evb-1\n", ExitCode: 0},
-		"-s ? shell /system/bin/getprop ro.product.cpu.abi":              {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
-		"-s ? shell /bin/cat /proc/device-tree/compatible":               {Stdout: "rockchip,rk3568\n", ExitCode: 0},
+		"-s ? shell /system/bin/getprop ro.serialno":          {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-s ? shell /bin/cat /proc/device-tree/serial-number": {Stdout: "rk3568-evb-1\n", ExitCode: 0},
+		"-s ? shell /system/bin/getprop ro.product.cpu.abi":   {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-s ? shell /bin/cat /proc/device-tree/compatible":    {Stdout: "rockchip,rk3568\n", ExitCode: 0},
 	}}
 	p := &Prober{Runner: runner}
 
