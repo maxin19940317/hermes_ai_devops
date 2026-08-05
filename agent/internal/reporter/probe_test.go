@@ -151,7 +151,7 @@ func TestProbeDevicesIdentifiesLinuxSOCAndReportsIdle(t *testing.T) {
 		},
 		"-s b5bb1018d94b26da shell uname -m": {Stdout: "aarch64\n"},
 	}}
-	p := &Prober{Runner: runner}
+	p := &Prober{Runner: runner, DeviceCapabilities: map[string][]string{"rk3588": {"rknpu"}}}
 
 	devices := p.ProbeDevices(context.Background(), map[string]bool{})
 	if len(devices) != 1 {
@@ -169,6 +169,10 @@ func TestProbeDevicesIdentifiesLinuxSOCAndReportsIdle(t *testing.T) {
 	}
 	if got.Props.ABI != "arm64-v8a" {
 		t.Errorf("Linux props ABI = %q, want arm64-v8a", got.Props.ABI)
+	}
+	// 能力声明须与 Android 路径同源生效(2026-08-05:Linux 分支漏接 capabilitiesFor)
+	if len(got.Props.Capabilities) != 1 || got.Props.Capabilities[0] != "rknpu" {
+		t.Errorf("Linux props Capabilities = %v, want [rknpu]", got.Props.Capabilities)
 	}
 }
 

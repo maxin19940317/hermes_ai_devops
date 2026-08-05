@@ -103,7 +103,9 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		if soc := p.linuxSOC(ctx, transport); soc != "" {
 			abi := p.linuxABI(ctx, transport)
 			dev.State = DeviceIdle
-			dev.Props = &DeviceProps{OS: "linux", SOC: soc, ABI: abi}
+			// Capabilities 与 Android 路径同源(probe.go:138):能力是配置声明
+			// 而非探测,Linux 板同样需要(rknpu 调度约束,2026-08-05 实机遗漏)
+			dev.Props = &DeviceProps{OS: "linux", SOC: soc, ABI: abi, Capabilities: p.capabilitiesFor(serial, soc, allowLegacyCaps)}
 			dev.DisplayName = strings.ToUpper(soc) + "-" + serial
 			p.logf("probe: %s is non-Android Linux (%s/%s); reporting IDLE", serial, soc, abi)
 			return dev
