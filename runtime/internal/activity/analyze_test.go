@@ -8,8 +8,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"hermes-devops/runtime/internal/hermesclient"
 	"hermes-devops/runtime/internal/store"
@@ -103,11 +105,14 @@ func TestExtractEvidenceDegradesWithoutMinIO(t *testing.T) {
 	}
 }
 
-// fakeMinIO 伺服 S3 子集:bucket location 查询 + PutObject 记录。
+// fakeMinIO 伺服 S3 子集:bucket location 查询 + PutObject 记录 +
+// objects 注册键的 Stat(HEAD)/Get(GET)。
 type fakeMinIO struct {
 	putPath string
 	putBody []byte
 	putCode int // 0 → 200
+
+	objects map[string]string // object key → 内容(Get/Stat 用)
 }
 
 func (f *fakeMinIO) handler() http.Handler {
@@ -127,6 +132,17 @@ func (f *fakeMinIO) handler() http.Handler {
 			w.Header().Set("ETag", `"deadbeef"`)
 			w.WriteHeader(code)
 			return
+		}
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			key := strings.TrimPrefix(r.URL.Path, "/bucket/")
+			if body, ok := f.objects[key]; ok {
+				w.Header().Set("ETag", `"deadbeef"`)
+				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+				w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(body))
+				return
+			}
 		}
 		w.WriteHeader(http.StatusNotFound)
 	})
@@ -194,5 +210,45 @@ func TestExtractEvidenceSnapshotUploadFailureDegrades(t *testing.T) {
 	}
 	if snap, _ := st.GetEvidenceSnapshot(ctx, "w:t:a1"); snap != nil {
 		t.Errorf("上传失败不得落快照: %+v", snap)
+	}
+}
+
+// TestExtractEvidenceScansDeviceLogs:collect 回来的 device/logs/*.log 进入
+// 证据扫描(where=logs)。2026-08-05 p84 实证:seg 的 "Unsupported backend:
+// mtk_tflite" 只在 logs/seg_crowd_test.log,stdout/stderr 都没有,
+// 原 4 文件扫描集(native_crash/delegate_fallback)全部错过。
+func TestExtractEvidenceScansDeviceLogs(t *testing.T) {
+	fm := &fakeMinIO{objects: map[string]string{
+		"runs/t1/stdout.log":                     "Init Success\ntext: KZ9C259707002\n",
+		"runs/t1/stderr.log":                     "",
+		"runs/t1/device/logs/seg_crowd_test.log": "E2092 engine_adapter.hpp:153 [EngineAdapter] Unsupported backend: mtk_tflite\n",
+	}}
+	srv := httptest.NewServer(fm.handler())
+	defer srv.Close()
+	a := testActs(t) // SpecCfg = testdata/variants.yaml(Linux 公共签名含 backend_unsupported)
+	a.Cfg = Config{MinIOEndpoint: srv.URL, MinIOAccessKey: "k", MinIOSecretKey: "s", MinIOBucket: "bucket"}
+
+	resp, err := a.ExtractEvidence(ctx, wf.ExtractEvidenceRequest{
+		TaskID: "t1", Variant: "aarch64_Linux_SNPE_2.21",
+		Result: wf.TaskResultSignal{
+			TaskID: "t1", Status: "COMPLETED", ExitCode: 1, CasesTotal: 2, CasesFailed: 1,
+			Attachments: []wf.Attachment{
+				{Name: "stdout.log", ObjectKey: "runs/t1/stdout.log"},
+				{Name: "stderr.log", ObjectKey: "runs/t1/stderr.log"},
+				{Name: "seg_crowd_test.log", ObjectKey: "runs/t1/device/logs/seg_crowd_test.log"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, id := range resp.MatchedSignatures {
+		if id == "backend_unsupported" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("MatchedSignatures = %v, want 含 backend_unsupported(命中 device logs)", resp.MatchedSignatures)
 	}
 }

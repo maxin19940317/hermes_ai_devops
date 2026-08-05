@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"path"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -143,15 +145,23 @@ func attemptFromTaskID(taskID string) int {
 	return n
 }
 
-// fetchEvidenceFiles 按附件清单从 MinIO 拉取 4 类证据文件。返回的 reader 由
-// 调用方(ExtractEvidence)在提取完成后关闭。
+// fetchEvidenceFiles 按附件清单从 MinIO 拉取证据文件。除 4 类固定文件外,
+// 还把 collect 回来的设备日志(object_key 含 /device/logs/ 的 .log)按文件名
+// 排序拼接为合成的 "logs" 键——run.sh 把每个测试二进制的输出重定向到
+// logs/<binary>.log,真实错误只在那里(2026-08-05 p84 seg mtk_tflite 实证)。
+// 返回的 reader 由调用方(ExtractEvidence)在提取完成后关闭。
 func (a *Acts) fetchEvidenceFiles(ctx context.Context, atts []wf.Attachment) (map[string]io.Reader, []string) {
 	byName := map[string]string{} // 证据文件名 → object key
+	logKeys := []string{}         // device/logs 附件的 object key(按 Name 排序)
 	for _, att := range atts {
 		if _, ok := evidenceFileKey[att.Name]; ok {
 			byName[att.Name] = att.ObjectKey
 		}
+		if strings.HasSuffix(att.Name, ".log") && strings.Contains(att.ObjectKey, "/device/logs/") {
+			logKeys = append(logKeys, att.ObjectKey)
+		}
 	}
+	sort.Strings(logKeys)
 	var cli *minio.Client
 	if a.Cfg.presignEnabled() {
 		if c, err := evidenceClient(a.Cfg); err != nil {
@@ -182,6 +192,28 @@ func (a *Acts) fetchEvidenceFiles(ctx context.Context, atts []wf.Attachment) (ma
 			continue
 		}
 		files[evidenceFileKey[name]] = obj
+	}
+	// 设备 collect 日志拼接:逐个拉取,带文件名头部分隔;单文件失败跳过该文件
+	// (与其余缺失同级降级,不进 missing——logs 是合成键,非契约固定文件)。
+	if cli != nil && len(logKeys) > 0 {
+		var buf bytes.Buffer
+		for _, key := range logKeys {
+			obj, err := cli.GetObject(ctx, a.Cfg.MinIOBucket, key, minio.GetObjectOptions{})
+			if err != nil {
+				a.warnf("device log get %s failed: %v; skipped", key, err)
+				continue
+			}
+			content, err := io.ReadAll(obj)
+			_ = obj.Close()
+			if err != nil {
+				a.warnf("device log read %s failed: %v; skipped", key, err)
+				continue
+			}
+			fmt.Fprintf(&buf, "===== %s =====\n%s\n", path.Base(key), content)
+		}
+		if buf.Len() > 0 {
+			files["logs"] = bytes.NewReader(buf.Bytes())
+		}
 	}
 	return files, missing
 }

@@ -29,6 +29,9 @@ defaults:
     - { id: native_crash, where: logcat, pattern: "Fatal signal|tombstone", classify: CODE }
   signatures_common_linux:
     - { id: native_crash, where: stderr, pattern: "Segmentation fault|core dumped", classify: CODE }
+    # run.sh 把每个测试二进制的输出重定向到 logs/<binary>.log,后端类错误只在那里
+    # (2026-08-05 p84:seg 报 Unsupported backend: mtk_tflite,stdout/stderr 均无)
+    - { id: backend_unsupported, where: logs, pattern: "Unsupported backend", classify: MODEL }
 
 variants:
   aarch64_Android_SNPE_1.68:

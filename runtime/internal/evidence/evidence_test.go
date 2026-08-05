@@ -750,3 +750,49 @@ func validateJSON(t *testing.T, v any) {
 		t.Fatalf("schema 校验失败: %v\n%s", err, raw)
 	}
 }
+
+// TestExtractLogsWhere:where=logs 的签名对设备 collect 日志(合成键 logs)
+// 求值——run.sh 把二进制输出重定向到 logs/<binary>.log,后端类错误只在那里
+// (2026-08-05 p84:seg "Unsupported backend: mtk_tflite",stdout/stderr 均无)。
+func TestExtractLogsWhere(t *testing.T) {
+	in := baseInput()
+	in.Signatures = []Signature{{ID: "backend_unsupported", Where: "logs", Pattern: "Unsupported backend", Classify: "MODEL"}}
+	in.Files["logs"] = strings.NewReader("===== seg_crowd_test.log =====\nE2092 engine_adapter.hpp:153 [EngineAdapter] Unsupported backend: mtk_tflite\n")
+	ev := Extract(in)
+	s := ev.Signatures[0]
+	if !s.Matched || len(s.Matches) != 1 {
+		t.Fatalf("matches = %+v, want 1 处命中", s)
+	}
+	if s.Matches[0].LineNo != 2 {
+		t.Errorf("line = %d, want 2", s.Matches[0].LineNo)
+	}
+	validateJSON(t, ev)
+}
+
+// TestExtractLogsExcerptFallback:全部签名未命中时,兜底摘录须含设备 collect
+// 日志尾部(device_logs.txt),且 attachments 记录该合成文件。
+func TestExtractLogsExcerptFallback(t *testing.T) {
+	in := baseInput()
+	in.Signatures = []Signature{{ID: "nomatch", Where: "logs", Pattern: "zzz-never", Classify: "CODE"}}
+	in.Files["logs"] = strings.NewReader("===== seg_crowd_test.log =====\nUnsupported backend: mtk_tflite\n")
+	ev := Extract(in)
+	found := false
+	for _, ex := range ev.Excerpts {
+		if ex.File == "device_logs.txt" && strings.Contains(ex.Content, "Unsupported backend") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("excerpts = %+v, want device_logs.txt 尾部摘录", ev.Excerpts)
+	}
+	seen := false
+	for _, att := range ev.Inputs.Attachments {
+		if att.Name == "device_logs.txt" && att.Size > 0 {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Errorf("attachments = %+v, want device_logs.txt(带大小)", ev.Inputs.Attachments)
+	}
+	validateJSON(t, ev)
+}

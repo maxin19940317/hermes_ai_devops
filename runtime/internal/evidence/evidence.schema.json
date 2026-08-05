@@ -39,7 +39,7 @@
         "required": ["id", "where", "classify", "matched", "matches"],
         "properties": {
           "id": { "type": "string", "minLength": 1 },
-          "where": { "enum": ["logcat", "stdout", "stderr"] },
+          "where": { "enum": ["logcat", "stdout", "stderr", "logs"] },
           "classify": { "enum": ["INFRA", "BUILD", "CODE", "MODEL", "DELEGATE", "DEVICE", "PERF", "UNKNOWN"] },
           "matched": { "type": "boolean" },
           "matches": {

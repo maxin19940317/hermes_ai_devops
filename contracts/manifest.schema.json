@@ -126,7 +126,7 @@
                 "pattern": "^[A-Za-z0-9_-]+$",
                 "description": "与 Plan 的 policies.on_signature[].signature_id 关联"
               },
-              "where": { "enum": ["logcat", "stdout", "stderr", "file"] },
+              "where": { "enum": ["logcat", "stdout", "stderr", "logs", "file"] },
               "pattern": { "type": "string", "minLength": 1, "maxLength": 1024 },
               "classify": { "$ref": "#/$defs/errorCategory" }
             }

@@ -5,6 +5,7 @@ defaults:
     - { id: native_crash, where: logcat, pattern: "Fatal signal|tombstone", classify: CODE }
   signatures_common_linux:
     - { id: native_crash, where: stderr, pattern: "Segmentation fault|core dumped", classify: CODE }
+    - { id: backend_unsupported, where: logs, pattern: "Unsupported backend", classify: MODEL }
 
 variants:
   aarch64_Android_SNPE_2.21:

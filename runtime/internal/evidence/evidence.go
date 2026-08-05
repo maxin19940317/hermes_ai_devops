@@ -31,7 +31,7 @@ const (
 // Signature 是一条失败签名声明(来自 variants.yaml 合并结果)。
 type Signature struct {
 	ID       string // 签名 id
-	Where    string // 扫描目标:logcat|stdout|stderr
+	Where    string // 扫描目标:logcat|stdout|stderr|logs(设备 collect 日志)
 	Pattern  string // 正则
 	Classify string // 分类:INFRA|BUILD|CODE|MODEL|DELEGATE|DEVICE|PERF|UNKNOWN
 }
@@ -48,7 +48,7 @@ type Input struct {
 	Metrics               map[string]float64 // 原始指标快照,原样透传
 
 	Signatures []Signature
-	Files      map[string]io.Reader // 键:"logcat"|"stdout"|"stderr"|"junit";缺键 = 该证据缺失
+	Files      map[string]io.Reader // 键:"logcat"|"stdout"|"stderr"|"logs"|"junit";缺键 = 该证据缺失
 	Missing    []string             // 调用方已知的缺失文件名,透传进 inputs.missing
 }
 
@@ -126,13 +126,17 @@ type Attachment struct {
 }
 
 // fileKeys 固定顺序,保证 attachments / truncated_files 输出确定。
-var fileKeys = []string{"logcat", "stdout", "stderr", "junit"}
+var fileKeys = []string{"logcat", "stdout", "stderr", "logs", "junit"}
 
 // fileNames 把 Files 键映射为证据文件名。
+// logs 是合成键:设备侧 collect 的 device/logs/*.log 按文件名排序拼接而成
+// (2026-08-05:run.sh 把每个测试二进制的输出重定向到 logs/<binary>.log,
+// 真实错误只出现在那里,stdout/stderr 反而没有——p84 seg mtk_tflite)。
 var fileNames = map[string]string{
 	"logcat": "logcat.txt",
 	"stdout": "stdout.log",
 	"stderr": "stderr.log",
+	"logs":   "device_logs.txt",
 	"junit":  "junit.xml",
 }
 
@@ -175,7 +179,7 @@ func Extract(in Input) Evidence {
 
 	// 每个日志只做一次有界状态的完整流式扫描。
 	scans := make(map[string]*streamScan)
-	for _, key := range []string{"logcat", "stdout", "stderr"} {
+	for _, key := range []string{"logcat", "stdout", "stderr", "logs"} {
 		if r, ok := in.Files[key]; ok && r != nil {
 			scans[key] = scanStream(r, matchers[key], key == "logcat")
 			if scans[key].truncated || scans[key].readErr != nil {
@@ -285,7 +289,7 @@ func Extract(in Input) Evidence {
 // logcatErrLine 匹配 logcat 的错误/致命行(级别列 E/F)。
 var logcatErrLine = regexp.MustCompile(` [EF] `)
 
-// buildStreamExcerpts 构造兜底摘录:stdout/stderr 尾部 + logcat 全文件中有界保留的最早错误行。
+// buildStreamExcerpts 构造兜底摘录:stdout/stderr/device_logs 尾部 + logcat 全文件中有界保留的最早错误行。
 func buildStreamExcerpts(scans map[string]*streamScan) []Excerpt {
 	out := make([]Excerpt, 0, 3)
 	budget := contextBudgetBytes
@@ -313,6 +317,7 @@ func buildStreamExcerpts(scans map[string]*streamScan) []Excerpt {
 	}
 	tail("stdout", "stdout.log")
 	tail("stderr", "stderr.log")
+	tail("logs", "device_logs.txt")
 
 	if budget > 0 {
 		if scan := scans["logcat"]; scan != nil && scan.readErr == nil {
