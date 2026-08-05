@@ -1,4 +1,4 @@
-﻿# start-agent.ps1 - Hermes DevOps Agent one-shot startup (Windows)
+# start-agent.ps1 - Hermes DevOps Agent one-shot startup (Windows)
 # Run in any new PowerShell:
 #   powershell -ExecutionPolicy Bypass -File .\start-agent.ps1
 # First time: edit the two variables below (LAN IP of THIS machine, adb path).
@@ -21,7 +21,7 @@ $env:AGENT_RUNTIME_CALLBACK_URL = "https://${QUAT}:18091"
 $env:AGENT_BASE_URL             = "http://${AGENT_BASE_IP}:8480"
 $env:AGENT_ADB_PATH             = $ADB
 $env:AGENT_SOC_ALIASES          = "trinket:QCM6125"
-$env:AGENT_DEVICE_CAPABILITIES_MAP = '{"QCM6125":["hexagon"]}'
+$env:AGENT_DEVICE_CAPABILITIES_MAP = '{"QCM6125":["hexagon"],"rk3568":["rknpu"],"rk3588":["rknpu"]}'
 # Phase 3 mTLS:回调方向双向认证。已在系统/用户环境变量里设置过的优先;
 # 未设置时默认取本脚本同目录下的 pem。
 # ca-cert.pem 验服务端,client-*.pem 是客户端证书+私钥合体。
