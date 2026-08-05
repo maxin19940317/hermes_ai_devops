@@ -2,13 +2,14 @@
 # gen_manifest.py 按此渲染包内 manifest.yaml;deploy.files 由脚本扫描包内容生成,不在此声明。
 # 约定:
 #   - env 值中的 {workdir} 占位符由 Client Agent 部署时替换,此处原样保留。
-#   - Linux 变体第一阶段不进设备测试链路,但 Manifest 照常生成(§6.4)。
-#   - soc/capabilities 为设备调度约束;TFLite 走 CPU/GPU,不限 soc。
+#   - Linux 变体已接入设备测试链路(Phase 4);soc/capabilities 为设备调度约束。
+#   - workdir_linux 不能用 /opt:RK3568 固件 rootfs 整体只读(2026-08-04 实机:
+#     /opt、/root 均 Read-only),/data 是其可写分区,与 Android 同父目录。
 
 defaults:
   deploy:
     workdir_android: /data/local/tmp/algo-super-sdk
-    workdir_linux: /opt/algo-super-sdk
+    workdir_linux: /data/local/tmp/algo-super-sdk
   test:
     entry: ./run.sh
     timeout_sec: 900
