@@ -288,7 +288,10 @@ func (p *Prober) resolveUnknownSerial(ctx context.Context, transport string) (st
 	}
 	// 回退 Linux 设备树序列号
 	if res, dterr := p.Runner.Run(ctx, adb.DeviceTreeSerialNumber(transport)); dterr == nil && res.ExitCode == 0 {
-		serial := strings.TrimSpace(res.Stdout)
+		// 设备树字符串按规范 NUL 结尾(RK3568 实测 ac6dcbcbfc640f3a\0):
+		// 先按首个 NUL 截断再去空白,否则 validSerial 拒绝 NUL 字符。
+		serial, _, _ := strings.Cut(res.Stdout, "\x00")
+		serial = strings.TrimSpace(serial)
 		if validSerial(serial) {
 			return serial, nil
 		}

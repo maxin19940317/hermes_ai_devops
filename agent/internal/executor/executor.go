@@ -265,7 +265,8 @@ func (e *Executor) finishCanceled(sum *Summary) (*Summary, error) {
 // resolveTransport 把逻辑 serial(ro.serialno)解析为可寻址的 transport。
 // 快路径:serial 本身就在 devices 列表中,原样返回,零额外调用。
 // 慢路径:USB gadget serial 丢失(列表只有 "?" 或陌生 serial)时,逐个
-// transport 探测 ro.serialno,返回匹配者;全部不匹配报可见列表便于排查。
+// transport 探测 ro.serialno,返回匹配者;Linux 设备无 getprop,再回退
+// /proc/device-tree/serial-number;全部不匹配报可见列表便于排查。
 func (e *Executor) resolveTransport(ctx context.Context, logical string) (string, error) {
 	res, err := e.Runner.Run(ctx, adb.Devices())
 	if err != nil {
@@ -279,11 +280,17 @@ func (e *Executor) resolveTransport(ctx context.Context, logical string) (string
 	}
 	for _, t := range transports {
 		res, err := e.Runner.Run(ctx, adb.GetProp(t, "ro.serialno"))
-		if err != nil {
-			continue // 该 transport 探测失败,试下一个
-		}
-		if strings.TrimSpace(res.Stdout) == logical {
+		if err == nil && strings.TrimSpace(res.Stdout) == logical {
 			return t, nil
+		}
+		// Linux 设备无 getprop(2026-08-04 RK3568 实机:/system/bin/getprop
+		// 不存在,stdout 空不匹配 → "device not found via adb"):
+		// 回退设备树序列号;设备树字符串 NUL 结尾,先截断(与 probe 一致)。
+		if res, dterr := e.Runner.Run(ctx, adb.DeviceTreeSerialNumber(t)); dterr == nil && res.ExitCode == 0 {
+			serial, _, _ := strings.Cut(res.Stdout, "\x00")
+			if strings.TrimSpace(serial) == logical {
+				return t, nil
+			}
 		}
 	}
 	return "", fmt.Errorf("device %q not found via adb (visible transports: %s)",
@@ -394,26 +401,28 @@ func (e *Executor) deploy(ctx context.Context, serial string, m *manifest.Manife
 	}
 	for _, args := range steps {
 		if res, err := e.Runner.Run(ctx, args); err != nil || res.ExitCode != 0 {
-			return fmt.Errorf("workdir setup (%v): exit=%d err=%w", args, res.ExitCode, err)
+			return fmt.Errorf("workdir setup (%v): exit=%d stderr=%q err=%v", args, res.ExitCode, strings.TrimSpace(res.Stderr), err)
 		}
 	}
 	for _, df := range m.Deploy.Files {
 		remote := path.Join(wd, df.Dst)
 		if dir := path.Dir(remote); dir != wd {
-			if _, err := e.Runner.Run(ctx, adb.ShellMkdirAll(serial, dir)); err != nil {
-				return err
+			// exit code 必须检查:只查 Go error 时 mkdir 静默失败,真实错误
+			// 推迟到 push 才暴露且丢失 stderr(2026-08-04 RK3568 实机)
+			if res, err := e.Runner.Run(ctx, adb.ShellMkdirAll(serial, dir)); err != nil || res.ExitCode != 0 {
+				return fmt.Errorf("mkdir %s: exit=%d stderr=%q err=%v", dir, res.ExitCode, strings.TrimSpace(res.Stderr), err)
 			}
 		}
 		local := filepath.Join(extractDir, filepath.FromSlash(df.Src))
 		if res, err := e.Runner.Run(ctx, adb.Push(serial, local, remote)); err != nil || res.ExitCode != 0 {
-			return fmt.Errorf("push %s: exit=%d err=%w", df.Src, res.ExitCode, err)
+			return fmt.Errorf("push %s: exit=%d stderr=%q err=%v", df.Src, res.ExitCode, strings.TrimSpace(res.Stderr), err)
 		}
 		mode := df.Mode
 		if mode == "" {
 			mode = "0644"
 		}
 		if res, err := e.Runner.Run(ctx, adb.ShellChmod(serial, mode, remote)); err != nil || res.ExitCode != 0 {
-			return fmt.Errorf("chmod %s: exit=%d err=%w", remote, res.ExitCode, err)
+			return fmt.Errorf("chmod %s: exit=%d stderr=%q err=%v", remote, res.ExitCode, strings.TrimSpace(res.Stderr), err)
 		}
 	}
 	return nil

@@ -17,6 +17,7 @@ import (
 
 	"hermes-devops/agent/internal/adb"
 	"hermes-devops/agent/internal/artifact"
+	"hermes-devops/agent/internal/manifest"
 )
 
 const (
@@ -90,9 +91,16 @@ type fakeADB struct {
 
 	// 寻址解析(2026-07-30 USB gadget serial 丢失场景)支持:
 	// devicesList 缺省返回仅含 serial 的列表(快路径);serialnoByTransport
-	// 用于慢路径探测(transport -> ro.serialno)。
-	devicesList         string
-	serialnoByTransport map[string]string
+	// 用于慢路径探测(transport -> ro.serialno);
+	// deviceTreeSerialByTransport 用于 Linux 设备的设备树序列号回退
+	// (2026-08-04 RK3568:无 getprop,/proc/device-tree/serial-number NUL 结尾)。
+	devicesList                 string
+	serialnoByTransport         map[string]string
+	deviceTreeSerialByTransport map[string]string
+
+	// mkdirFailSubstr 命中该子串的 mkdir 返回 exit=1 + stderr
+	// (模拟只读 rootfs 建子目录失败,2026-08-04 RK3568 实机)
+	mkdirFailSubstr string
 }
 
 func defaultProps() map[string]string {
@@ -124,6 +132,12 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 
 	cmd := args[2]
 	switch {
+	case cmd == "shell" && len(args) == 5 && filepath.Base(args[3]) == "cat":
+		// 设备树读取(仅寻址回退用到 serial-number);未配置的 transport 视为文件不存在
+		if v, ok := f.deviceTreeSerialByTransport[args[1]]; ok {
+			return adb.Result{Stdout: v}, nil
+		}
+		return adb.Result{ExitCode: 1, Stderr: "cat: /proc/device-tree/serial-number: No such file or directory"}, nil
 	case cmd == "shell" && len(args) == 5 && filepath.Base(args[3]) == "getprop":
 		if args[4] == "ro.serialno" {
 			if v, ok := f.serialnoByTransport[args[1]]; ok {
@@ -159,6 +173,9 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 			}
 			return adb.Result{Stdout: "suite ok\n", ExitCode: f.runExit}, nil
 		default: // mkdir/rm/chmod/pkill
+			if f.mkdirFailSubstr != "" && strings.Contains(s, "mkdir") && strings.Contains(s, f.mkdirFailSubstr) {
+				return adb.Result{ExitCode: 1, Stderr: "mkdir: can't create directory '" + f.mkdirFailSubstr + "': Read-only file system\n"}, nil
+			}
 			return adb.Result{}, nil
 		}
 	}
@@ -570,6 +587,56 @@ func TestExecuteDeviceNotFoundNoTransport(t *testing.T) {
 	}
 	if idx := f.find("push"); idx >= 0 {
 		t.Error("寻址失败不得发生 push")
+	}
+}
+
+// TestResolveTransportFallsBackToDeviceTreeSerial:Linux 设备无 getprop
+// (ro.serialno 探测空输出),寻址必须回退 /proc/device-tree/serial-number,
+// 且设备树字符串的 NUL 结尾要先截断再比对
+// (2026-08-04 RK3568 实机:a1 INFRA_ERROR "device not found via adb")。
+func TestResolveTransportFallsBackToDeviceTreeSerial(t *testing.T) {
+	f := &fakeADB{
+		props:                       defaultProps(),
+		devicesList:                 "List of devices attached\n513cd3de\tdevice product:trinket\n?\tdevice product:rk3568-linux\n",
+		serialnoByTransport:         map[string]string{"513cd3de": "513cd3de"},
+		deviceTreeSerialByTransport: map[string]string{"?": "ac6dcbcbfc640f3a\x00\n"},
+	}
+	e := &Executor{Runner: f}
+	got, err := e.resolveTransport(context.Background(), "ac6dcbcbfc640f3a")
+	if err != nil {
+		t.Fatalf("resolveTransport: %v", err)
+	}
+	if got != "?" {
+		t.Errorf("transport = %q, want '?'", got)
+	}
+}
+
+// TestDeployFailsOnSubdirMkdir:子目录 mkdir 非零退出必须立即可见且带 stderr,
+// 不得静默推迟到 push(2026-08-04 RK3568 实机:rootfs 只读,bin/ 建目录被忽略,
+// push 报 "No such file or directory" 且错误消息丢失 stderr)。
+func TestDeployFailsOnSubdirMkdir(t *testing.T) {
+	f := &fakeADB{mkdirFailSubstr: "/bin"}
+	e := &Executor{Runner: f}
+	extractDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(extractDir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extractDir, "bin", "ocr_test"), []byte("elf"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := &manifest.Manifest{}
+	m.Deploy.Workdir = workdir
+	m.Deploy.Files = []manifest.File{{Src: "bin/ocr_test", Dst: "bin/ocr_test", Mode: "0755"}}
+
+	err := e.deploy(context.Background(), serial, m, extractDir)
+	if err == nil {
+		t.Fatal("deploy: want mkdir failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "mkdir") || !strings.Contains(err.Error(), "Read-only file system") {
+		t.Errorf("err = %v, want mkdir 失败且带 stderr", err)
+	}
+	if idx := f.find("push"); idx >= 0 {
+		t.Error("mkdir 失败后不得发生 push")
 	}
 }
 
