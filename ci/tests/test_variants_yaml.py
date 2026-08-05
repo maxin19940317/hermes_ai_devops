@@ -1,4 +1,4 @@
-"""variants.yaml:8 个变体齐全,且每个变体渲染出的 Manifest 都能过 Schema。"""
+"""variants.yaml:全部变体齐全,且每个变体渲染出的 Manifest 都能过 Schema。"""
 import json
 
 import yaml
@@ -7,13 +7,18 @@ from jsonschema import Draft202012Validator
 import gen_manifest
 from ci_helpers import MANIFEST_SCHEMA, VARIANTS_FILE
 
+# RKNN 变体 2026-08-05 起按 SoC 型号拆分(pipeline 1101:RK3562/3568/3576 各自出包)
 EXPECTED_VARIANTS = {
     "aarch64_Linux_SNPE_1.68",
     "aarch64_Android_SNPE_1.68",
     "aarch64_Linux_SNPE_2.21",
     "aarch64_Android_SNPE_2.21",
-    "aarch64_Linux_RKNN_2.3.2",
-    "aarch64_Android_RKNN_2.3.2",
+    "aarch64_Linux_RK3562_RKNN_2.3.2",
+    "aarch64_Linux_RK3568_RKNN_2.3.2",
+    "aarch64_Linux_RK3576_RKNN_2.3.2",
+    "aarch64_Android_RK3562_RKNN_2.3.2",
+    "aarch64_Android_RK3568_RKNN_2.3.2",
+    "aarch64_Android_RK3576_RKNN_2.3.2",
     "aarch64_Linux_TFLite_2.21.0",
     "aarch64_Android_TFLite_2.21.0",
 }
@@ -28,7 +33,7 @@ DUMMY_FILES = [
 ]
 
 
-def test_all_eight_variants_present():
+def test_all_variants_present():
     defaults, variants = gen_manifest.load_variants(VARIANTS_FILE)
     assert set(variants) == EXPECTED_VARIANTS
 
