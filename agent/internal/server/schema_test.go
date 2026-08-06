@@ -155,7 +155,7 @@ func TestValidateDispatchRejectsInvalid(t *testing.T) {
 		"presigned_uploads 缺 url": func(d map[string]any) {
 			d["presigned_uploads"] = []any{map[string]any{"object_key": "runs/t-1/a.txt"}}
 		},
-		"task_id 超长":         func(d map[string]any) { d["task_id"] = strings.Repeat("x", 129) },
+		"task_id 超长":         func(d map[string]any) { d["task_id"] = strings.Repeat("x", 257) },
 		"idempotency_key 超长": func(d map[string]any) { d["idempotency_key"] = strings.Repeat("x", 257) },
 	}
 	for name, mutate := range cases {

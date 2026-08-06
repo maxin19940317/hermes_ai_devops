@@ -318,8 +318,8 @@ func TestReport500ExhaustsAttempts(t *testing.T) {
 func TestReportBlocksInvalidResultBeforeSend(t *testing.T) {
 	f, srv := newFakeRuntime(t)
 	s := openTempStore(t)
-	// task_id 超长(契约 maxLength 128):组装结果必不过 Schema
-	longID := strings.Repeat("x", 200)
+	// task_id 超长(契约 maxLength 256,2026-08-06 由 128 放宽):组装结果必不过 Schema
+	longID := strings.Repeat("x", 300)
 	seedTerminalTask(t, s, longID, "wf1:"+longID+":a1", true)
 
 	rr := newResultReporter(s, srv.URL)
