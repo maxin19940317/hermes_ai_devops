@@ -4,7 +4,7 @@ artifact:
   project: algo-super-sdk
   commit: a1b2c3d
   pipeline_id: 4322
-  platform: aarch64_Linux_TFLite_2.21.0
+  platform: aarch64_Linux_Qualcomm_TFLite_2.21.0
   build_type: Release
 requirements:
   os: linux

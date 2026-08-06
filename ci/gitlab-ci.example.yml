@@ -93,8 +93,7 @@ publish:bundle:
     - build:aarch64_Android_RK3568_RKNN_2.3.2
     - build:aarch64_Linux_RK3576_RKNN_2.3.2
     - build:aarch64_Android_RK3576_RKNN_2.3.2
-    - build:aarch64_Linux_TFLite_2.21.0
-    - build:aarch64_Android_Qualcomm_TFLite_2.21.0
+    - build:aarch64_Linux_Qualcomm_TFLite_2.21.0
   script:
     - python3 hermes-devops/ci/gen_bundle.py
         --meta-dir dist/meta

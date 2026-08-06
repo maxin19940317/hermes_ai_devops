@@ -157,7 +157,9 @@ variants:
     signatures:
       - { id: rknn_init_fail, where: logs, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }
 
-  aarch64_Linux_TFLite_2.21.0:
+  aarch64_Linux_Qualcomm_TFLite_2.21.0:
+    # 2026-08-06(pipeline 1113)包名变更:Linux TFLite 与 Android 对齐,编码 Qualcomm。
+    # requirements 不变:soc 约束仍为 RK3588/RK3568(与业务仓库 ci/hermes 一致)。
     requirements: { os: linux, abi: arm64-v8a, soc: [RK3588, RK3568], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
