@@ -29,8 +29,8 @@ func TestSelectTestSpecsAndroidAndLinux(t *testing.T) {
 	in := wf.DeviceTestInput{Project: "algo-super-sdk", Commit: "abc1234", PipelineID: 42,
 		Packages: []wf.PackageRef{
 			{Variant: "aarch64_Android_SNPE_2.21", URL: "https://gitlab/pkg1", SHA256: "aa", ManifestDigest: "dd"},
-			{Variant: "aarch64_Linux_SNPE_2.21", URL: "https://gitlab/pkg2"},          // Linux:Phase 4 已接入
-			{Variant: "unknown_variant", URL: "https://gitlab/pkg3"},                  // 未配置:跳过
+			{Variant: "aarch64_Linux_SNPE_2.21", URL: "https://gitlab/pkg2"}, // Linux:Phase 4 已接入
+			{Variant: "unknown_variant", URL: "https://gitlab/pkg3"},         // 未配置:跳过
 		}}
 	sel, err := a.SelectTestSpecs(ctx, in)
 	if err != nil {
@@ -82,6 +82,14 @@ func TestSelectTestSpecsFleetSkip(t *testing.T) {
 			OS: "android", SOC: "QCM6125", Capabilities: []string{"hexagon"}}}); err != nil {
 		t.Fatal(err)
 	}
+	// 离线设备只应折叠计数,不占差异列表(2026-08-06:历史设备是噪声)
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1", BaseURL: "https://c1"},
+		[]store.Device{{DeviceID: "d1", Serial: "513cd3de", ClientID: "c1",
+			OS: "android", SOC: "QCM6125", Capabilities: []string{"hexagon"}},
+			{DeviceID: "d2-dead", Serial: "deadbeef", ClientID: "c1", ReportedState: "OFFLINE",
+				OS: "linux", SOC: "RK3568", Capabilities: []string{"rknpu"}}}); err != nil {
+		t.Fatal(err)
+	}
 	a.Store = st
 	in := wf.DeviceTestInput{Project: "p", Commit: "abc1234", PipelineID: 1,
 		Packages: []wf.PackageRef{
@@ -98,12 +106,16 @@ func TestSelectTestSpecsFleetSkip(t *testing.T) {
 	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Android_RKNN_2.3.2" {
 		t.Fatalf("skipped = %+v, want RKNN 无匹配设备", sel.Skipped)
 	}
-	// 智能跳过原因:需求 + fleet 每台设备的具体差异(2026-08-06)
+	// 智能跳过原因:需求 + 在线设备的具体差异;离线设备折叠计数不列出(2026-08-06)
 	reason := sel.Skipped[0].Reason
-	for _, want := range []string{"无匹配设备", "os=android", "soc=[RK3588 RK3566]", "capabilities=[rknpu]", "d1(soc=QCM6125,缺 rknpu)"} {
+	for _, want := range []string{"无匹配设备", "os=android", "soc=[RK3588 RK3566]", "capabilities=[rknpu]",
+		"在线设备:d1(soc=QCM6125,缺 rknpu)", "另有 1 台离线"} {
 		if !strings.Contains(reason, want) {
 			t.Errorf("reason = %q, want 含 %q", reason, want)
 		}
+	}
+	if strings.Contains(reason, "d2-dead") {
+		t.Errorf("reason = %q, 离线设备不应出现在差异列表", reason)
 	}
 }
 

@@ -204,17 +204,31 @@ func (a *Acts) skipReason(ctx context.Context, sel wf.DeviceSelector) string {
 	if len(fleet) == 0 {
 		return "无匹配设备:" + need + ";fleet 无任何已注册设备(agent 未上线?)"
 	}
-	const maxShown = 3 // 通知可读性上限,超出折叠计数
-	devs := make([]string, 0, maxShown+1)
-	for i, d := range fleet {
-		if i >= maxShown {
-			devs = append(devs, fmt.Sprintf("…等 %d 台", len(fleet)))
-			break
+	// 只详列在线(IDLE/BUSY)设备的差异;OFFLINE/QUARANTINED 折叠为计数——
+	// 历史设备对"为什么没有设备能跑"没有信息量(2026-08-06 review)。
+	alive := []string{}
+	offline, quarantined := 0, 0
+	for _, d := range fleet {
+		switch d.Status {
+		case store.DeviceOffline:
+			offline++
+		case store.DeviceQuarantined:
+			quarantined++
+		default:
+			miss := strings.Join(store.SelectorMismatch(d.Device, sel), ",")
+			alive = append(alive, fmt.Sprintf("%s(%s)", d.DeviceID, miss))
 		}
-		miss := strings.Join(store.SelectorMismatch(d, sel), ",")
-		devs = append(devs, fmt.Sprintf("%s(%s)", d.DeviceID, miss))
 	}
-	return "无匹配设备:" + need + ";fleet:" + strings.Join(devs, "、")
+	reason := "无匹配设备:" + need
+	if len(alive) == 0 {
+		reason += ";fleet 无在线设备"
+	} else {
+		reason += ";在线设备:" + strings.Join(alive, "、")
+	}
+	if offline > 0 || quarantined > 0 {
+		reason += fmt.Sprintf("(另有 %d 台离线、%d 台隔离未列出)", offline, quarantined)
+	}
+	return reason
 }
 
 // selectorDesc 只渲染非空约束项,供 fleet-skip 原因展示——selector 只含

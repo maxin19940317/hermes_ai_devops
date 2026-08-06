@@ -320,6 +320,13 @@ func SelectorMismatch(d Device, sel wf.DeviceSelector) []string {
 	return misses
 }
 
+// FleetDevice 是 ListFleet 的返回项:设备属性 + 当前状态
+// (供 fleet-skip 原因区分在线/离线/隔离)。
+type FleetDevice struct {
+	Device
+	Status string
+}
+
 // matchSelector:OS 非空时大小写不敏感精确匹配;Soc 命中列表任一项;
 // Capabilities 须为设备能力子集。空字段不设限。
 func matchSelector(d Device, sel wf.DeviceSelector) bool {
@@ -327,13 +334,13 @@ func matchSelector(d Device, sel wf.DeviceSelector) bool {
 }
 
 // ListFleet 返回全部已注册设备(按 device_id 排序,输出确定性),
-// 供 fleet-skip 原因展示(差异说明)。
-func (s *MemStore) ListFleet(_ context.Context) ([]Device, error) {
+// 供 fleet-skip 原因展示(差异说明 + 在线/离线区分)。
+func (s *MemStore) ListFleet(_ context.Context) ([]FleetDevice, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]Device, 0, len(s.devices))
+	out := make([]FleetDevice, 0, len(s.devices))
 	for _, row := range s.devices {
-		out = append(out, row.Device)
+		out = append(out, FleetDevice{Device: row.Device, Status: row.Status})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DeviceID < out[j].DeviceID })
 	return out, nil

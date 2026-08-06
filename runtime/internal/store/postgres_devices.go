@@ -171,16 +171,16 @@ func (s *PGStore) lockOneCandidate(ctx context.Context, tx *sql.Tx, sel wf.Devic
 }
 
 // ListFleet 返回全部已注册设备(按 device_id 排序),供 fleet-skip 原因展示。
-func (s *PGStore) ListFleet(ctx context.Context) ([]Device, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT device_id, os, soc, capabilities FROM devices ORDER BY device_id`)
+func (s *PGStore) ListFleet(ctx context.Context) ([]FleetDevice, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT device_id, os, soc, capabilities, status FROM devices ORDER BY device_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list fleet: %w", err)
 	}
 	defer rows.Close()
-	out := []Device{}
+	out := []FleetDevice{}
 	for rows.Next() {
-		var d Device
-		if err := rows.Scan(&d.DeviceID, &d.OS, &d.SOC, pq.Array(&d.Capabilities)); err != nil {
+		var d FleetDevice
+		if err := rows.Scan(&d.DeviceID, &d.OS, &d.SOC, pq.Array(&d.Capabilities), &d.Status); err != nil {
 			return nil, fmt.Errorf("list fleet: scan: %w", err)
 		}
 		out = append(out, d)
