@@ -97,9 +97,9 @@ variants:
       - { id: delegate_fallback, where: stdout, pattern: "falling back to CPU|Delegate creation failed", classify: DELEGATE }
 
   aarch64_Linux_SNPE_1.68:
-    # soc 必须是高通系(SNPE=高通 SDK,目标是未来的高通 Linux 板);
-    # 配 RK + hexagon 是无解 selector——高通 Linux 板接入也永远匹配不到(2026-08-05 review)
-    requirements: { os: linux, abi: arm64-v8a, soc: [QCM6125], capabilities: [hexagon], min_free_storage_mb: 512 }
+    # SNPE=高通 SDK:目标是任意带 hexagon 的高通 Linux 板,不限定具体 SoC 型号
+    # (soc 留空=不约束;hexagon 能力即高通 DSP 的判据。2026-08-05 review)
+    requirements: { os: linux, abi: arm64-v8a, capabilities: [hexagon], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
       ADSP_LIBRARY_PATH: "{workdir}/lib/dsp"
@@ -110,7 +110,7 @@ variants:
       - { id: dsp_unavailable, where: logs, pattern: "RUNTIME_NOT_AVAILABLE|DspTransport.*not supported|DSP does not support", classify: DELEGATE }
 
   aarch64_Linux_SNPE_2.21:
-    requirements: { os: linux, abi: arm64-v8a, soc: [QCM6125], capabilities: [hexagon], min_free_storage_mb: 512 }
+    requirements: { os: linux, abi: arm64-v8a, capabilities: [hexagon], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
       ADSP_LIBRARY_PATH: "{workdir}/lib/dsp"
