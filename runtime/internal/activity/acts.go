@@ -23,6 +23,7 @@ type Store interface {
 	FinishTask(ctx context.Context, req wf.FinishRequest) error
 	SaveDecision(ctx context.Context, row wf.DecisionRow) error
 	HasCapableDevice(ctx context.Context, sel wf.DeviceSelector) (bool, error)
+	ListFleet(ctx context.Context) ([]store.Device, error)
 	GetResult(ctx context.Context, taskID string) (*wf.ResultRecord, error)
 	GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time, error)
 	SaveEvidenceSnapshot(ctx context.Context, snap store.EvidenceSnapshot) error

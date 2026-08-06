@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -284,11 +285,13 @@ func (s *MemStore) GetLeaseExpiry(_ context.Context, taskID string) (*time.Time,
 	return nil, nil
 }
 
-// matchSelector:OS 非空时大小写不敏感精确匹配;Soc 命中列表任一项;
-// Capabilities 须为设备能力子集。空字段不设限。
-func matchSelector(d Device, sel wf.DeviceSelector) bool {
+// SelectorMismatch 返回设备不满足 selector 的约束项(人类可读,如
+// "os=android"、"缺 hexagon"),供 fleet-skip 原因展示;空切片 = 完全匹配。
+// 匹配语义与 matchSelector 同源(唯一事实,防漂移)。
+func SelectorMismatch(d Device, sel wf.DeviceSelector) []string {
+	var misses []string
 	if sel.OS != "" && !strings.EqualFold(sel.OS, d.OS) {
-		return false
+		misses = append(misses, "os="+d.OS)
 	}
 	if len(sel.SOC) > 0 {
 		hit := false
@@ -299,7 +302,7 @@ func matchSelector(d Device, sel wf.DeviceSelector) bool {
 			}
 		}
 		if !hit {
-			return false
+			misses = append(misses, "soc="+d.SOC)
 		}
 	}
 	for _, want := range sel.Capabilities {
@@ -311,10 +314,29 @@ func matchSelector(d Device, sel wf.DeviceSelector) bool {
 			}
 		}
 		if !has {
-			return false
+			misses = append(misses, "缺 "+want)
 		}
 	}
-	return true
+	return misses
+}
+
+// matchSelector:OS 非空时大小写不敏感精确匹配;Soc 命中列表任一项;
+// Capabilities 须为设备能力子集。空字段不设限。
+func matchSelector(d Device, sel wf.DeviceSelector) bool {
+	return len(SelectorMismatch(d, sel)) == 0
+}
+
+// ListFleet 返回全部已注册设备(按 device_id 排序,输出确定性),
+// 供 fleet-skip 原因展示(差异说明)。
+func (s *MemStore) ListFleet(_ context.Context) ([]Device, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Device, 0, len(s.devices))
+	for _, row := range s.devices {
+		out = append(out, row.Device)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DeviceID < out[j].DeviceID })
+	return out, nil
 }
 
 // HasCapableDevice 报告 fleet 中是否存在满足 sel 的设备(任意状态,含

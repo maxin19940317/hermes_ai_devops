@@ -170,6 +170,24 @@ func (s *PGStore) lockOneCandidate(ctx context.Context, tx *sql.Tx, sel wf.Devic
 	return &d, nil
 }
 
+// ListFleet 返回全部已注册设备(按 device_id 排序),供 fleet-skip 原因展示。
+func (s *PGStore) ListFleet(ctx context.Context) ([]Device, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT device_id, os, soc, capabilities FROM devices ORDER BY device_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list fleet: %w", err)
+	}
+	defer rows.Close()
+	out := []Device{}
+	for rows.Next() {
+		var d Device
+		if err := rows.Scan(&d.DeviceID, &d.OS, &d.SOC, pq.Array(&d.Capabilities)); err != nil {
+			return nil, fmt.Errorf("list fleet: scan: %w", err)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // HasCapableDevice 报告 fleet 中是否存在满足 sel 的设备(任意状态,含
 // OFFLINE/BUSY/QUARANTINED)。语义与 MemStore 一致;设备表小,全量读出后在
 // Go 侧复用 matchSelector,保证两种 store 的匹配语义不漂移。

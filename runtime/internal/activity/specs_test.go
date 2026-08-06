@@ -95,9 +95,15 @@ func TestSelectTestSpecsFleetSkip(t *testing.T) {
 	if len(sel.Specs) != 1 || sel.Specs[0].Variant != "aarch64_Android_SNPE_2.21" {
 		t.Errorf("specs = %+v, want 仅 SNPE", sel.Specs)
 	}
-	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Android_RKNN_2.3.2" ||
-		!strings.Contains(sel.Skipped[0].Reason, "no capable device") {
-		t.Errorf("skipped = %+v, want RKNN 无匹配设备", sel.Skipped)
+	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Android_RKNN_2.3.2" {
+		t.Fatalf("skipped = %+v, want RKNN 无匹配设备", sel.Skipped)
+	}
+	// 智能跳过原因:需求 + fleet 每台设备的具体差异(2026-08-06)
+	reason := sel.Skipped[0].Reason
+	for _, want := range []string{"无匹配设备", "os=android", "soc=[RK3588 RK3566]", "capabilities=[rknpu]", "d1(soc=QCM6125,缺 rknpu)"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("reason = %q, want 含 %q", reason, want)
+		}
 	}
 }
 

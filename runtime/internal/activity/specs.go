@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
 	"hermes-devops/runtime/internal/evidence"
 	"hermes-devops/runtime/internal/rules"
+	"hermes-devops/runtime/internal/store"
 	wf "hermes-devops/runtime/internal/workflow"
 )
 
@@ -178,8 +180,7 @@ func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.
 			} else if !capable {
 				sel.Skipped = append(sel.Skipped, wf.SkippedSpec{
 					Variant: p.Variant,
-					Reason: fmt.Sprintf("no capable device registered (os=%s soc=%v capabilities=%v)",
-						spec.Selector.OS, spec.Selector.SOC, spec.Selector.Capabilities),
+					Reason:  a.skipReason(ctx, spec.Selector),
 				})
 				continue
 			}
@@ -187,4 +188,47 @@ func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.
 		sel.Specs = append(sel.Specs, spec)
 	}
 	return sel, nil
+}
+
+// skipReason 生成可读的 fleet-skip 原因:变体需求 + fleet 各设备的具体差异
+// (2026-08-06:原始消息只列 selector 字段,看不出"为什么没设备能跑")。
+// 例:无匹配设备:需要 os=linux capabilities=[hexagon];fleet:513cd3de(os=android)、
+// ac6dcbcbfc640f3a(缺 hexagon)。fleet 查询失败降级为仅列需求。
+func (a *Acts) skipReason(ctx context.Context, sel wf.DeviceSelector) string {
+	need := "需要 " + selectorDesc(sel)
+	fleet, err := a.Store.ListFleet(ctx)
+	if err != nil {
+		a.warnf("list fleet for skip reason failed: %v", err)
+		return "无匹配设备:" + need
+	}
+	if len(fleet) == 0 {
+		return "无匹配设备:" + need + ";fleet 无任何已注册设备(agent 未上线?)"
+	}
+	const maxShown = 3 // 通知可读性上限,超出折叠计数
+	devs := make([]string, 0, maxShown+1)
+	for i, d := range fleet {
+		if i >= maxShown {
+			devs = append(devs, fmt.Sprintf("…等 %d 台", len(fleet)))
+			break
+		}
+		miss := strings.Join(store.SelectorMismatch(d, sel), ",")
+		devs = append(devs, fmt.Sprintf("%s(%s)", d.DeviceID, miss))
+	}
+	return "无匹配设备:" + need + ";fleet:" + strings.Join(devs, "、")
+}
+
+// selectorDesc 只渲染非空约束项,供 fleet-skip 原因展示——selector 只含
+// os+capabilities 时不再出现 "soc=[]" 这种噪声(2026-08-05 SNPE Linux 实例)。
+func selectorDesc(sel wf.DeviceSelector) string {
+	parts := []string{}
+	if sel.OS != "" {
+		parts = append(parts, "os="+sel.OS)
+	}
+	if len(sel.SOC) > 0 {
+		parts = append(parts, fmt.Sprintf("soc=%v", sel.SOC))
+	}
+	if len(sel.Capabilities) > 0 {
+		parts = append(parts, fmt.Sprintf("capabilities=%v", sel.Capabilities))
+	}
+	return strings.Join(parts, " ")
 }
