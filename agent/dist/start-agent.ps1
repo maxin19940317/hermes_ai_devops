@@ -21,6 +21,10 @@ $env:AGENT_RUNTIME_CALLBACK_URL = "https://${QUAT}:18091"
 $env:AGENT_BASE_URL             = "http://${AGENT_BASE_IP}:8480"
 $env:AGENT_ADB_PATH             = $ADB
 $env:AGENT_SOC_ALIASES          = "trinket:QCM6125"
+# 方案 B(2026-08-06):设备能力表已迁移到 Runtime 统一管理(服务端权威,
+# deploy/.env 的 DEVICE_CAPABILITIES_MAP)。新板接入只改服务端配置即可,
+# 不再需要改本脚本。下面这行保留仅作 Agent 侧兜底(服务端未配置该板时
+# 仍可上报能力);日常接入新板请勿在此追加,应更新服务端。
 $env:AGENT_DEVICE_CAPABILITIES_MAP = '{"QCM6125":["hexagon"],"rk3568":["rknpu"],"rk3588":["rknpu"]}'
 # Phase 3 mTLS:回调方向双向认证。已在系统/用户环境变量里设置过的优先;
 # 未设置时默认取本脚本同目录下的 pem。

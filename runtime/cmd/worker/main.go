@@ -260,7 +260,7 @@ func main() {
 	}
 
 	// ---- Client 回调 HTTP 服务(§8.2) ----
-	cb := callbacks.New(st, tc, &log, cfg.Activity.LeaseSeconds)
+	cb := callbacks.New(st, tc, &log, cfg.Activity.LeaseSeconds).WithDeviceCaps(cfg.DeviceCapabilities)
 	// 按需签发(差距 #8):MinIO 未配置时 Presign 为 nil,端点返回 503,Agent 回退。
 	if signer, err := presign.NewSigner(presign.Config{
 		Endpoint: cfg.Activity.MinIOEndpoint, PublicEndpoint: cfg.Activity.MinIOPublicEndpoint,

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -212,4 +213,59 @@ func TestUploadRequestMaxFilesDefault(t *testing.T) {
 	if cfg.Activity.UploadMaxFiles != 64 {
 		t.Errorf("UploadMaxFiles = %d, want 64", cfg.Activity.UploadMaxFiles)
 	}
+}
+
+// TestDeviceCapabilitiesMapParsing:方案 B(2026-08-06)能力表归 Runtime 管理。
+// 合法 JSON 解析为小写键;缺省空表;非法 JSON fail fast。
+func TestDeviceCapabilitiesMapParsing(t *testing.T) {
+	t.Run("缺省为空表", func(t *testing.T) {
+		cfg, err := loadConfig(lookup(map[string]string{
+			"VARIANTS_CONFIG":   "../../ci/variants.yaml",
+			"CALLBACK_BASE_URL": "https://runtime.example:8091",
+		}))
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		if len(cfg.DeviceCapabilities) != 0 {
+			t.Errorf("DeviceCapabilities = %v, want 空", cfg.DeviceCapabilities)
+		}
+	})
+	t.Run("合法 JSON 键归一小写", func(t *testing.T) {
+		cfg, err := loadConfig(lookup(map[string]string{
+			"VARIANTS_CONFIG":          "../../ci/variants.yaml",
+			"CALLBACK_BASE_URL":        "https://runtime.example:8091",
+			"DEVICE_CAPABILITIES_MAP":  `{"QCM6125":["hexagon","GPU"],"rk3568":["rknpu"],"idp":["hexagon"]}`,
+		}))
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		want := map[string][]string{
+			"qcm6125": {"hexagon", "gpu"},
+			"rk3568":  {"rknpu"},
+			"idp":     {"hexagon"},
+		}
+		if !reflect.DeepEqual(cfg.DeviceCapabilities, want) {
+			t.Errorf("DeviceCapabilities = %v, want %v", cfg.DeviceCapabilities, want)
+		}
+	})
+	t.Run("非法 JSON fail fast", func(t *testing.T) {
+		_, err := loadConfig(lookup(map[string]string{
+			"VARIANTS_CONFIG":         "../../ci/variants.yaml",
+			"CALLBACK_BASE_URL":       "https://runtime.example:8091",
+			"DEVICE_CAPABILITIES_MAP": `{"QCM6125": [hexagon]}`,
+		}))
+		if err == nil {
+			t.Fatal("非法 JSON 应 fail fast")
+		}
+	})
+	t.Run("空能力 fail fast", func(t *testing.T) {
+		_, err := loadConfig(lookup(map[string]string{
+			"VARIANTS_CONFIG":         "../../ci/variants.yaml",
+			"CALLBACK_BASE_URL":       "https://runtime.example:8091",
+			"DEVICE_CAPABILITIES_MAP": `{"QCM6125":[""]}`,
+		}))
+		if err == nil {
+			t.Fatal("空能力应 fail fast")
+		}
+	})
 }

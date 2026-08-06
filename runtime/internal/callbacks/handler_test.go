@@ -346,3 +346,82 @@ func TestResultUnknownTaskIs400(t *testing.T) {
 		t.Errorf("未知任务不得 signal: %v", sig.calls)
 	}
 }
+
+// TestHeartbeatCalibratesCapabilitiesFromServerTable:方案 B(2026-08-06)——
+// 能力以服务端表为权威。serial 优先于 soc;命中 → 覆盖 Agent 上报值;
+// 未命中 → 保留上报值(向后兼容)。
+func TestHeartbeatCalibratesCapabilitiesFromServerTable(t *testing.T) {
+	t.Run("soc 命中覆盖", func(t *testing.T) {
+		s := store.NewMemStore()
+		sig := &fakeSignaler{}
+		h := New(s, sig, nil, 120).WithDeviceCaps(map[string][]string{
+			"qcm6125": {"hexagon"},
+			"idp":     {"hexagon"},
+		})
+		srv := httptest.NewServer(h.Mux())
+		defer srv.Close()
+		// Agent 上报空能力(新板未配置 agent),服务端表按 soc 校准
+		resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
+			"client_id": "c1", "agent_version": "0.12.0",
+			"devices": []map[string]any{
+				{"serial": "825485946", "state": "IDLE",
+					"props": map[string]any{"os": "linux", "soc": "idp", "abi": "arm64-v8a", "capabilities": []string{}}},
+			},
+			"active_task_ids": []string{},
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		devs, _ := s.ListFleet(ctx)
+		if len(devs) != 1 || len(devs[0].Capabilities) != 1 || devs[0].Capabilities[0] != "hexagon" {
+			t.Errorf("devices = %+v, want 服务端校准为 hexagon", devs)
+		}
+	})
+	t.Run("serial 优先于 soc", func(t *testing.T) {
+		s := store.NewMemStore()
+		sig := &fakeSignaler{}
+		h := New(s, sig, nil, 120).WithDeviceCaps(map[string][]string{
+			"qcm6125":    {"hexagon"},
+			"513cd3de":   {"hexagon", "custom"},
+		})
+		srv := httptest.NewServer(h.Mux())
+		defer srv.Close()
+		resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
+			"client_id": "c1", "agent_version": "0.12.0",
+			"devices": []map[string]any{
+				{"serial": "513cd3de", "state": "IDLE",
+					"props": map[string]any{"os": "android", "soc": "QCM6125", "abi": "arm64-v8a", "capabilities": []string{}}},
+			},
+			"active_task_ids": []string{},
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		devs, _ := s.ListFleet(ctx)
+		if len(devs) != 1 || len(devs[0].Capabilities) != 2 || devs[0].Capabilities[1] != "custom" {
+			t.Errorf("devices = %+v, want serial 级覆盖(custom)", devs)
+		}
+	})
+	t.Run("未命中保留 Agent 上报", func(t *testing.T) {
+		s := store.NewMemStore()
+		sig := &fakeSignaler{}
+		h := New(s, sig, nil, 120).WithDeviceCaps(map[string][]string{"qcm6125": {"hexagon"}})
+		srv := httptest.NewServer(h.Mux())
+		defer srv.Close()
+		resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
+			"client_id": "c1", "agent_version": "0.12.0",
+			"devices": []map[string]any{
+				{"serial": "b84aa09110cfc84a", "state": "IDLE",
+					"props": map[string]any{"os": "android", "soc": "rk3576", "abi": "arm64-v8a", "capabilities": []string{"custom-caps"}}},
+			},
+			"active_task_ids": []string{},
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		devs, _ := s.ListFleet(ctx)
+		if len(devs) != 1 || len(devs[0].Capabilities) != 1 || devs[0].Capabilities[0] != "custom-caps" {
+			t.Errorf("devices = %+v, want 保留 Agent 上报 custom-caps", devs)
+		}
+	})
+}

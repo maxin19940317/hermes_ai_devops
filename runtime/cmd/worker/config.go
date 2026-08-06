@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"hermes-devops/runtime/internal/activity"
@@ -16,8 +18,39 @@ type Config struct {
 	DatabaseURL        string // 空 → 内存 store(仅开发,重启即失)
 	CallbacksAddr      string
 	VariantsConfigPath string
+	DeviceCapabilities map[string][]string // 服务端权威能力表(键=soc/serial,小写)
 	Activity           activity.Config
 	SpecDefaults       activity.SpecDefaults
+}
+
+// parseDeviceCapabilities 解析 DEVICE_CAPABILITIES_MAP(JSON {"soc":["cap"]}),
+// 键归一为小写(匹配时大小写不敏感)。空串 = 空表(不启用校准);
+// 非法 JSON 或值非字符串数组 = fail fast。
+func parseDeviceCapabilities(raw string) (map[string][]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var m map[string][]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, fmt.Errorf("非法 JSON: %w", err)
+	}
+	out := make(map[string][]string, len(m))
+	for k, caps := range m {
+		key := strings.ToLower(k)
+		if key == "" {
+			return nil, fmt.Errorf("空键不允许")
+		}
+		norm := make([]string, 0, len(caps))
+		for _, c := range caps {
+			c = strings.ToLower(strings.TrimSpace(c))
+			if c == "" {
+				return nil, fmt.Errorf("%s: 空能力不允许", k)
+			}
+			norm = append(norm, c)
+		}
+		out[key] = norm
+	}
+	return out, nil
 }
 
 // loadConfig 从 getenv(通常是 os.Getenv)派生 Config;
@@ -105,6 +138,13 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// 方案 B(2026-08-06):设备能力表归 Runtime 统一管理(服务端权威)。
+	// JSON 格式 {"<soc 或 serial>":["<cap>",...]},键大小写不敏感;
+	// 空/未配置 = 不启用校准(回退 Agent 上报的能力)。
+	deviceCaps, err := parseDeviceCapabilities(getenv("DEVICE_CAPABILITIES_MAP"))
+	if err != nil {
+		return Config{}, fmt.Errorf("DEVICE_CAPABILITIES_MAP: %w", err)
+	}
 	hermesTimeoutSec, err := envInt("HERMES_TIMEOUT_SEC", 60)
 	if err != nil {
 		return Config{}, err
@@ -126,6 +166,7 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		DatabaseURL:        getenv("DATABASE_URL"),
 		CallbacksAddr:      env("WORKER_CALLBACKS_ADDR", ":8091"),
 		VariantsConfigPath: variantsPath,
+		DeviceCapabilities: deviceCaps,
 		Activity: activity.Config{
 			LeaseSeconds:         leaseSeconds,
 			QuarantineAfter:      quarantineAfter,

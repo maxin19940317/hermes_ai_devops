@@ -115,6 +115,10 @@ services:
       <<: *runtime-environment
       WORKER_CALLBACKS_ADDR: :8091
       VARIANTS_CONFIG: /etc/hermes/variants.yaml
+      # 方案 B(2026-08-06):设备能力表归 Runtime 统一管理(服务端权威)。
+      # JSON {"<soc|serial>":["<cap>"]};空 = 回退 Agent 上报能力。
+      # 新板接入只需在此加一行 + 重启 worker,无需改 Windows Agent。
+      DEVICE_CAPABILITIES_MAP: ${DEVICE_CAPABILITIES_MAP:-}
       DEVICE_WAIT_ROUNDS: ${DEVICE_WAIT_ROUNDS:-20}
       DEVICE_WAIT_SECONDS: ${DEVICE_WAIT_SECONDS:-30}
       CALLBACK_BASE_URL: ${CALLBACK_BASE_URL:-http://127.0.0.1:18091}

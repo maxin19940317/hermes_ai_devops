@@ -61,6 +61,12 @@ type Handler struct {
 	Presign *presign.Signer
 	// UploadMaxFiles 是单次请求的文件数上限;<=0 时用 defaultUploadMaxFiles。
 	UploadMaxFiles int
+
+	// DeviceCaps 是服务端权威的设备能力表(方案 B,2026-08-06):
+	// 键 = soc 或 serial(小写),值 = 能力列表。心跳注册设备时按 soc 校准
+	// capabilities:命中服务端表 → 覆盖 Agent 上报值;未命中 → 保留上报值
+	// (向后兼容,平滑迁移)。nil = 不启用校准。
+	DeviceCaps map[string][]string
 }
 
 func New(s Store, sig Signaler, log *zerolog.Logger, leaseSeconds int) *Handler {
@@ -72,6 +78,12 @@ func New(s Store, sig Signaler, log *zerolog.Logger, leaseSeconds int) *Handler 
 		leaseSeconds = 120 // §10 缺省
 	}
 	return &Handler{store: s, signaler: sig, log: l, leaseSec: leaseSeconds}
+}
+
+// WithDeviceCaps 注入服务端权威能力表(方案 B)。
+func (h *Handler) WithDeviceCaps(caps map[string][]string) *Handler {
+	h.DeviceCaps = caps
+	return h
 }
 
 func (h *Handler) Mux() *http.ServeMux {
@@ -149,9 +161,24 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		if os == "" {
 			os = "android" // 兼容旧 Agent 心跳:旧版无 OS 字段,默认 android
 		}
+		// 方案 B(2026-08-06):能力以服务端表为权威。按 serial(优先,支持
+		// 单板覆盖)或 soc 命中服务端表 → 覆盖 Agent 上报值;未命中 → 保留
+		// 上报值(向后兼容,平滑迁移)。
+		caps := d.Props.Capabilities
+		if len(h.DeviceCaps) > 0 {
+			var capsByKey []string
+			if capsByKey = h.DeviceCaps[strings.ToLower(d.Serial)]; capsByKey == nil {
+				capsByKey = h.DeviceCaps[strings.ToLower(d.Props.SOC)]
+			}
+			if capsByKey != nil {
+				caps = append([]string(nil), capsByKey...)
+				h.log.Debug().Str("serial", d.Serial).Str("soc", d.Props.SOC).
+					Strs("caps", caps).Msg("heartbeat: capabilities calibrated by server table")
+			}
+		}
 		devs = append(devs, store.Device{
 			DeviceID: d.Serial, Serial: d.Serial, DisplayName: d.DisplayName, ClientID: req.ClientID,
-			ReportedState: d.State, OS: os, SOC: d.Props.SOC, ABI: d.Props.ABI, Capabilities: d.Props.Capabilities,
+			ReportedState: d.State, OS: os, SOC: d.Props.SOC, ABI: d.Props.ABI, Capabilities: caps,
 		})
 	}
 	if err := h.store.UpsertClientDevices(r.Context(), store.Client{
