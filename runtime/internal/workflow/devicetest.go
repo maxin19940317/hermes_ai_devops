@@ -966,9 +966,10 @@ type CardElement struct {
 	Actions []CardButton `json:"actions,omitempty"` // tag=div|hr 时必须为 nil
 }
 
-// CardText 的 Tag 恒为 plain_text(§4.5),没有 lark_md 这个选项。
+// CardText 的 Tag 取值 plain_text(旧版一律)或 lark_md(2026-08-06 修订:
+// 结构化字段直接美化,动态文本经 escapeCardText 转义后才可 lark_md)。
 type CardText struct {
-	Tag     string `json:"tag"` // 恒为 "plain_text"
+	Tag     string `json:"tag"` // "plain_text" | "lark_md"
 	Content string `json:"content"`
 }
 
@@ -1035,6 +1036,25 @@ func truncateRunes(s string, max int) string {
 // 卡片里所有文本节点一律 plain_text,不用 lark_md)。
 func plainCardDiv(content string) CardElement {
 	return CardElement{Tag: "div", Text: &CardText{Tag: "plain_text", Content: content}}
+}
+
+// escapeCardText 转义动态不可信文本供 lark_md 渲染(2026-08-06 CONTRACT-ISSUE
+// 修订设计 §4.5:结构化字段用 lark_md 美化,动态文本转义后也允许 lark_md)。
+// lark_md 会把 `[text](url)`、`<at user_id="...">`、标签语法解释执行;Reason
+// 与 Hermes Summary 是模型/规则产物,必须先把 <、>、& 转成字面量,使注入
+// 链接/@提及退化为纯文本,同时保留 **粗体**、`code`、换行等安全语法。
+// 转义顺序:先 &(否则先转 < 会把 &lt; 再转成 &amp;lt;)再 < 再 >。
+func escapeCardText(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+// mdCardDiv 构造一个 tag=div、text.tag=lark_md 的卡片行。
+// content 由调用方保证已 escapeCardText(动态字段)或内容可控(结构化字段)。
+func mdCardDiv(content string) CardElement {
+	return CardElement{Tag: "div", Text: &CardText{Tag: "lark_md", Content: content}}
 }
 
 // cardHeaderTemplate 按设计 §4.1 判定 header 颜色。
@@ -1106,37 +1126,45 @@ func (b cardVariantBlock) flatten() []CardElement {
 // buildCardVariantBlock 逐条对齐 buildNotification 的字段(设计 §4.3),
 // 唯一有意偏离:SKIPPED 不显示 attempt。
 // 可判定失败(verdict ∉ {PASSED,SKIPPED})的变体附加"重试该变体"/"忽略"按钮。
+// 2026-08-06 修订(设计 §4.5):结构化字段(verdict/耗时/cases/指标)用 lark_md
+// 美化——verdict 加粗、PASSED 绿色文字;Reason 与 Hermes Summary 是动态
+// 不可信文本,先 escapeCardText 转义再 lark_md(注入链接/@提及退化为字面)。
 func buildCardVariantBlock(tk TaskSummary, workflowID string) cardVariantBlock {
-	main := fmt.Sprintf("%s  %s", tk.Variant, tk.Verdict)
+	main := fmt.Sprintf("**%s**  **%s**", escapeCardText(tk.Variant), tk.Verdict)
 	if tk.Verdict != string(rules.VerdictPassed) && tk.Category != "" {
-		main += fmt.Sprintf("(%s)", tk.Category)
+		main += fmt.Sprintf(" **(%s)**", escapeCardText(tk.Category))
 	}
-	blk := cardVariantBlock{main: plainCardDiv(main)}
+	if tk.Verdict == string(rules.VerdictPassed) {
+		main += " <font color='green'>✅</font>"
+	} else if tk.Verdict != VerdictSkipped {
+		main += " <font color='red'>❌</font>"
+	}
+	blk := cardVariantBlock{main: mdCardDiv(main)}
 
 	var parts []string
 	if tk.CasesTotal > 0 {
 		parts = append(parts, fmt.Sprintf("%.1fs", tk.DurationSec))
-		parts = append(parts, fmt.Sprintf("cases %d/%d", tk.CasesTotal-tk.CasesFailed, tk.CasesTotal))
+		parts = append(parts, fmt.Sprintf("cases **%d/%d**", tk.CasesTotal-tk.CasesFailed, tk.CasesTotal))
 	}
 	if tk.Verdict != VerdictSkipped {
 		parts = append(parts, fmt.Sprintf("attempt %d", tk.Attempt))
 	}
 	if len(parts) > 0 {
-		m := plainCardDiv(strings.Join(parts, " · "))
+		m := mdCardDiv(strings.Join(parts, " · "))
 		blk.metric = &m
 	}
 	// 性能指标独立成行(2026-08-06 排版):不挤进耗时/用例行
 	if len(tk.Metrics) > 0 {
-		m := plainCardDiv(formatMetrics(tk.Metrics))
+		m := mdCardDiv(escapeCardText(formatMetrics(tk.Metrics)))
 		blk.metrics = &m
 	}
 
 	if tk.Reason != "" {
-		r := plainCardDiv(truncateRunes(tk.Reason, cardReasonSummaryLimit))
+		r := mdCardDiv(escapeCardText(truncateRunes(tk.Reason, cardReasonSummaryLimit)))
 		blk.reason = &r
 	}
 	if tk.Analysis != nil && tk.Analysis.Summary != "" {
-		h := plainCardDiv("hermes: " + truncateRunes(tk.Analysis.Summary, cardReasonSummaryLimit))
+		h := mdCardDiv("hermes: " + escapeCardText(truncateRunes(tk.Analysis.Summary, cardReasonSummaryLimit)))
 		blk.hermes = &h
 	}
 	// 可判定失败(verdict ∉ {PASSED,SKIPPED})的变体附加交互按钮。

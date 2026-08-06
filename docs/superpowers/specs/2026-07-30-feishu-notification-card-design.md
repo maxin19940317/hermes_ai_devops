@@ -195,6 +195,17 @@ markdown 渲染会让 `[text](url)`、`<at user_id="...">`、标签语法被解�
 是模型产物，用 markdown 渲染等于允许模型在通知里插链接和 @ 提及；而 `Project` 连字符
 白名单都没有。若将来某处确需 markdown，必须显式转义后再放。
 
+> **2026-08-06 修订(CONTRACT-ISSUE)**:卡片支持 `lark_md`,但严格分类:
+>
+> | 文本 | 渲染 | 处理 |
+> |---|---|---|
+> | 结构化字段(verdict/category/cases/attempt/指标) | `lark_md` | 内容可控,直接美化(`**粗体**`、`<font color='green'>✅</font>` 等飞书标签) |
+> | 动态不可信文本(`Reason` / `Analysis.Summary` / `Variant`) | `lark_md` | **必须先 `escapeCardText()`**:`&`→`&amp;`、`<`→`&lt;`、`>`→`&gt;`,使 `<at>`/链接退化字面,保留粗体/换行安全语法 |
+>
+> 验证:封闭 DTO 的 `walkCard` 同时断言 `tag ∈ {plain_text, lark_md}` 且
+> `lark_md` 内容不含未转义 `<at`(注入风险即判违规);`escapeCardText` 有
+> 表驱动单测,卡片级有注入反例(`TestCardEscapesDynamicText`)。
+
 验证方式是 §4.4 的封闭 DTO 加 §8 的递归断言，而不是逐字段列举——列举会随
 字段增加而漏。
 

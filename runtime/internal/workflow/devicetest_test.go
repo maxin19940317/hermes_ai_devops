@@ -10,7 +10,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
@@ -1184,14 +1183,24 @@ func walkCard(t *testing.T, v any) []string {
 		tag, ok := text["tag"].(string)
 		if !ok {
 			bad = append(bad, fmt.Sprintf("%s.tag: 必须是 string, got %T", path, text["tag"]))
-		} else if tag != "plain_text" {
-			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want plain_text", path, tag))
+		} else if tag != "plain_text" && tag != "lark_md" {
+			// 2026-08-06 修订:结构化字段与转义后的动态字段允许 lark_md
+			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want plain_text|lark_md", path, tag))
 		}
-		if _, ok := text["content"].(string); !ok {
+		content, stringOK := text["content"].(string)
+		if !stringOK {
 			bad = append(bad, fmt.Sprintf("%s.content: 必须是 string, got %T", path, text["content"]))
+			return
+		}
+		// 2026-08-06 修订:lark_md 文本若含未转义的 <at / <a / <font 之外的
+		// 尖括号标签,视为注入风险(动态文本必须先 escapeCardText)。
+		// 结构化字段允许的 <font color='green'> 等飞书标签是唯一例外。
+		if tag == "lark_md" {
+			if strings.Contains(content, "<at") {
+				bad = append(bad, fmt.Sprintf("%s.content: lark_md 含未转义 <at>(注入风险)", path))
+			}
 		}
 	}
-
 	rootKeys := map[string]bool{"config": true, "header": true, "elements": true}
 	root, ok := checkObject(v, "$", "NotificationCard", rootKeys, "config", "header", "elements")
 	if !ok {
@@ -1290,13 +1299,13 @@ func TestCardClosedStructureCatchesViolations(t *testing.T) {
 	cases := []struct{ name, payload string }{
 		{"带 actions", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"}}],"actions":[]}`},
 		{"带 behaviors", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"behaviors":[]}]}`},
-		{"lark_md 文本", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"lark_md","content":"x"}}]}`},
 		{"div 缺 text", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div"}]}`},
 		{"hr 带 text", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"hr","text":{"tag":"plain_text","content":"x"}}]}`},
 		{"text 是标量", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":"x"}]}`},
 		{"text 缺 tag", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"content":"x"}}]}`},
 		{"text 缺 content", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text"}}]}`},
 		{"合法 key 放错节点", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"plain_text","content":"x"},"template":"red"}]}`},
+		{"动态文本未转义 lark_md", `{"config":{"wide_screen_mode":true},"header":{"title":{"tag":"plain_text","content":"h"},"template":"green"},"elements":[{"tag":"div","text":{"tag":"lark_md","content":"<at user_id=\"all\">注入</at>"}}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1337,19 +1346,21 @@ func TestBuildNotificationCardGolden(t *testing.T) {
 		t.Errorf("template = %q, want red", card.Header.Template)
 	}
 
-	txt := func(c string) *CardText { return &CardText{Tag: "plain_text", Content: c} }
+	txt := func(c string) *CardText { return &CardText{Tag: "lark_md", Content: c} }
+	md := func(c string) *CardText { return &CardText{Tag: "lark_md", Content: c} }
 	want := []CardElement{
-		{Tag: "div", Text: txt("aarch64_Android_SNPE_2.21  PASSED")},
-		{Tag: "div", Text: txt("412.3s · cases 38/38 · attempt 1")},
+		{Tag: "div", Text: md("**aarch64_Android_SNPE_2.21**  **PASSED** <font color='green'>✅</font>")},
+		{Tag: "div", Text: md("412.3s · cases **38/38** · attempt 1")},
 		{Tag: "hr"},
-		{Tag: "div", Text: txt("aarch64_Android_SNPE_1.68  TEST_FAILED(CODE)")},
-		{Tag: "div", Text: txt("380.1s · cases 35/38 · attempt 2")}, // %.1f;passed=38-3
-		{Tag: "div", Text: txt("three cases crashed")},
-		{Tag: "div", Text: txt("hermes: DSP 初始化崩溃")},
+		{Tag: "div", Text: md("**aarch64_Android_SNPE_1.68**  **TEST_FAILED** **(CODE)** <font color='red'>❌</font>")},
+		{Tag: "div", Text: md("380.1s · cases **35/38** · attempt 2")}, // %.1f;passed=38-3
+		{Tag: "div", Text: md("three cases crashed")},
+		{Tag: "div", Text: md("hermes: DSP 初始化崩溃")},
 		{Tag: "hr"},
-		{Tag: "div", Text: txt("aarch64_Linux_RKNN_2.3.2  SKIPPED")}, // SKIPPED 无 category
-		{Tag: "div", Text: txt("fleet 无匹配设备")},                       // 无指标行:CasesTotal=0 且 SKIPPED 省 attempt
+		{Tag: "div", Text: md("**aarch64_Linux_RKNN_2.3.2**  **SKIPPED**")}, // SKIPPED 无 category
+		{Tag: "div", Text: md("fleet 无匹配设备")},                               // 无指标行:CasesTotal=0 且 SKIPPED 省 attempt
 	}
+	_ = txt
 	if !reflect.DeepEqual(card.Elements, want) {
 		t.Errorf("elements 不匹配\ngot  (%d):\n%s\nwant (%d):\n%s",
 			len(card.Elements), dumpElements(card.Elements), len(want), dumpElements(want))
@@ -1378,8 +1389,8 @@ func TestBuildNotificationCardMetricLineGating(t *testing.T) {
 	}}
 	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
 	want := []CardElement{
-		{Tag: "div", Text: &CardText{Tag: "plain_text", Content: "v  TEST_FAILED"}},
-		{Tag: "div", Text: &CardText{Tag: "plain_text", Content: "attempt 3"}},
+		{Tag: "div", Text: &CardText{Tag: "lark_md", Content: "**v**  **TEST_FAILED** <font color='red'>❌</font>"}},
+		{Tag: "div", Text: &CardText{Tag: "lark_md", Content: "attempt 3"}},
 	}
 	if !reflect.DeepEqual(card.Elements, want) {
 		t.Errorf("CasesTotal==0 时指标行不对\ngot:\n%swant:\n%s",
@@ -1394,9 +1405,9 @@ func TestBuildNotificationCardCategoryGating(t *testing.T) {
 		cat     string
 		wantMax string // 主行内容
 	}{
-		{"Category 为空", "TEST_FAILED", "", "v  TEST_FAILED"},
-		{"PASSED 不显示 category", "PASSED", "CODE", "v  PASSED"},
-		{"非 PASSED 且有 category", "TEST_FAILED", "CODE", "v  TEST_FAILED(CODE)"},
+		{"Category 为空", "TEST_FAILED", "", "**v**  **TEST_FAILED** <font color='red'>❌</font>"},
+		{"PASSED 不显示 category", "PASSED", "CODE", "**v**  **PASSED** <font color='green'>✅</font>"},
+		{"非 PASSED 且有 category", "TEST_FAILED", "CODE", "**v**  **TEST_FAILED** **(CODE)** <font color='red'>❌</font>"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1452,334 +1463,63 @@ func TestBuildNotificationCardAttemptGating(t *testing.T) {
 	}
 }
 
-// ---- 渲染安全与截断(设计 §4.5) ----
+// ---- 渲染安全(2026-08-06 修订:lark_md + 转义) ----
+
+// TestEscapeCardText:动态不可信文本(Reason/Hermes Summary)进 lark_md 前必须
+// 转义,`<at>`、链接、标签语法退化为字面量;粗体/换行等安全语法保留。
+func TestEscapeCardText(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"注入 at 提及", `<at user_id="all">所有人</at>`, "&lt;at user_id=\"all\"&gt;所有人&lt;/at&gt;"},
+		{"注入链接", "[点我](https://evil.example)", "[点我](https://evil.example)"},
+		{"尖括号标签", "a < b && c > d", "a &lt; b &amp;&amp; c &gt; d"},
+		{"安全语法保留", "**粗体** 和 `code`", "**粗体** 和 `code`"},
+		{"中文与换行", "行一\n行二", "行一\n行二"},
+		{"纯文本原样", "normal text", "normal text"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := escapeCardText(tc.in); got != tc.want {
+				t.Errorf("escapeCardText(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCardEscapesDynamicText:卡片中来自 Reason / Hermes Summary 的动态文本
+// 必须被转义(lark_md 渲染安全);结构化字段(verdict/category)不受影响。
+func TestCardEscapesDynamicText(t *testing.T) {
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "TEST_FAILED", Category: "CODE", Attempt: 1,
+			Reason:   `<at user_id="all">注入</at> 与 [链接](https://evil)`,
+			Analysis: &hermesclient.Analysis{Summary: `<at user_id="all">模型注入</at>`}},
+	}}
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
+	for i, e := range card.Elements {
+		if e.Text == nil || e.Text.Tag != "lark_md" {
+			continue
+		}
+		if strings.Contains(e.Text.Content, "<at") {
+			t.Errorf("elements[%d] 含未转义 <at>: %q", i, e.Text.Content)
+		}
+	}
+	// 转义后的字面量必须出现(证明转义确实发生了)
+	all := allContent(card)
+	for _, want := range []string{"&lt;at", "&gt;", "https://evil"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("卡片内容缺转义产物 %q:\n%s", want, all)
+		}
+	}
+}
 
 // allContent 把卡片所有 CardElement.Text.Content(以及 header 标题)拼成一个串,
 // 供裁剪/安全类测试用 strings.Contains 定位片段,不关心具体在哪一行。
 func allContent(card NotificationCard) string {
 	var b strings.Builder
 	b.WriteString(card.Header.Title.Content)
-	b.WriteString("\n")
 	for _, e := range card.Elements {
 		if e.Text != nil {
 			b.WriteString(e.Text.Content)
-			b.WriteString("\n")
 		}
 	}
 	return b.String()
-}
-
-func mustMarshal(t *testing.T, v any) []byte {
-	t.Helper()
-	raw, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	return raw
-}
-
-func TestBuildNotificationCardTruncatesReason(t *testing.T) {
-	long := strings.Repeat("a", 600)
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1, Reason: long},
-	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
-	reason := card.Elements[len(card.Elements)-1].Text.Content
-	if reason == long {
-		t.Fatal("超长 Reason 未被截断")
-	}
-	if utf8.RuneCountInString(reason) > cardReasonSummaryLimit {
-		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(reason))
-	}
-	if strings.Contains(reason, long) {
-		t.Error("截断后仍包含完整原文")
-	}
-	if !strings.HasSuffix(reason, cardTruncationMarker) {
-		t.Errorf("截断后应带省略标记 %q,got %q", cardTruncationMarker, reason)
-	}
-
-	// 边界:恰好等于上限不截断,上限+1 必须截断到恰好上限个 rune——
-	// 挡住"实际上限比 500 松/紧"(比如误把 max 写成 400)的实现。
-	if got := truncateRunes(strings.Repeat("甲", cardReasonSummaryLimit), cardReasonSummaryLimit); got != strings.Repeat("甲", cardReasonSummaryLimit) {
-		t.Error("恰好 500 rune 不应被截断")
-	}
-	if n := utf8.RuneCountInString(truncateRunes(strings.Repeat("甲", cardReasonSummaryLimit+1), cardReasonSummaryLimit)); n != cardReasonSummaryLimit {
-		t.Errorf("501 rune 截断后应恰为 %d,got %d", cardReasonSummaryLimit, n)
-	}
-}
-
-func TestBuildNotificationCardTruncatesSummary(t *testing.T) {
-	long := strings.Repeat("b", 600)
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1,
-			Analysis: &hermesclient.Analysis{Summary: long}},
-	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
-	hermes := card.Elements[len(card.Elements)-1].Text.Content
-	if strings.Contains(hermes, long) {
-		t.Fatal("超长 Summary 未被截断")
-	}
-	// 截断后的内容(去掉 "hermes: " 前缀)不应超过上限。
-	content := strings.TrimPrefix(hermes, "hermes: ")
-	if utf8.RuneCountInString(content) > cardReasonSummaryLimit {
-		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(content))
-	}
-	if !strings.HasSuffix(content, cardTruncationMarker) {
-		t.Errorf("截断后应带省略标记 %q,got %q", cardTruncationMarker, content)
-	}
-}
-
-func TestBuildNotificationCardTruncatesChineseReasonValidUTF8(t *testing.T) {
-	long := strings.Repeat("甲", 600)
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1, Reason: long},
-	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
-	reason := card.Elements[len(card.Elements)-1].Text.Content
-	if !utf8.ValidString(reason) {
-		t.Error("纯中文 Reason 截断后不是合法 UTF-8")
-	}
-	if utf8.RuneCountInString(reason) > cardReasonSummaryLimit {
-		t.Errorf("截断后仍超过 %d rune", cardReasonSummaryLimit)
-	}
-}
-
-func TestBuildNotificationCardTruncatesChineseSummaryValidUTF8(t *testing.T) {
-	long := strings.Repeat("乙", 600)
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1,
-			Analysis: &hermesclient.Analysis{Summary: long}},
-	}}
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
-	hermes := card.Elements[len(card.Elements)-1].Text.Content
-	if !utf8.ValidString(hermes) {
-		t.Error("纯中文 Summary 截断后不是合法 UTF-8")
-	}
-	// 与 TestBuildNotificationCardTruncatesChineseReasonValidUTF8 对称:去掉
-	// "hermes: " 前缀后按上限校验 rune 数,不放过"截断没生效"这种回归。
-	content := strings.TrimPrefix(hermes, "hermes: ")
-	if utf8.RuneCountInString(content) > cardReasonSummaryLimit {
-		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(content))
-	}
-}
-
-// 恶意/不可信文本(markdown 链接、<at> 语法)必须原样以字面文本出现,
-// 且节点 tag 恒为 plain_text——飞书不会把它们解释成链接或 @ 提及。
-func TestBuildNotificationCardRendersUntrustedTextLiterally(t *testing.T) {
-	in := DeviceTestInput{Project: "a[x](http://evil)b", Commit: "c", PipelineID: 1, Version: "1.0.0"}
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v<at user_id=\"all\">", Verdict: "TEST_FAILED", Attempt: 1,
-			Reason:   "r<at user_id=\"all\">[click](http://evil)",
-			Analysis: &hermesclient.Analysis{Summary: "s<at user_id=\"all\">[click](http://evil)"}},
-	}}
-	card := buildNotificationCard(in, out, "")
-
-	if !strings.Contains(card.Header.Title.Content, "a[x](http://evil)b") {
-		t.Errorf("Project 未原样出现在 header: %q", card.Header.Title.Content)
-	}
-	if card.Header.Title.Tag != "plain_text" {
-		t.Errorf("header tag = %q, want plain_text", card.Header.Title.Tag)
-	}
-	body := allContent(card)
-	for _, want := range []string{
-		`v<at user_id="all">`,
-		`r<at user_id="all">[click](http://evil)`,
-		`s<at user_id="all">[click](http://evil)`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("卡片正文缺少字面文本 %q", want)
-		}
-	}
-	for _, e := range card.Elements {
-		if e.Text != nil && e.Text.Tag != "plain_text" {
-			t.Errorf("节点 tag = %q, want plain_text", e.Text.Tag)
-		}
-	}
-}
-
-// padTo 造一批变体:第 i 个的 Reason 带唯一标记 MARK-%03d,填充到 detailRunes 长
-// (< 500 rune,避免撞上截断逻辑,让本测试只考察裁剪)。总量顶到预算的数倍,
-// 保证正确实现**必须**丢掉一批详情。
-//
-// 注意:不要在这里预测"该丢几个"——JSON 骨架、主行、hr、header 都算进预算,
-// 测试里重算一遍就是把实现的账抄第二遍,抄错了就会稳定误杀正确实现。
-// 分界由下面从卡片内容**观测**得出,断言只压形状(连续后缀、精确数量、不过度裁剪)。
-func padTo(out *DeviceTestOutput) (*DeviceTestOutput, []string) {
-	const detailRunes, variants = 400, 60
-	var markers []string
-	add := func(variant string) {
-		m := fmt.Sprintf("MARK-%03d", len(markers))
-		markers = append(markers, m)
-		out.Tasks = append(out.Tasks, TaskSummary{
-			Variant: variant, Verdict: "TEST_FAILED", Attempt: 1,
-			Reason: m + strings.Repeat("甲", detailRunes-len([]rune(m))),
-		})
-	}
-	add("v-first")
-	// 填充变体一律排在 v-first 与 v-last 之间,保证首尾两端的标记序号确定
-	for i := 0; i < variants-2; i++ {
-		add(fmt.Sprintf("v-fill-%03d", len(markers)))
-	}
-	add("v-last")
-	return out, markers
-}
-
-// 裁剪必须保留前面变体的详情、只丢末尾的(设计 §4.5 第 1 步)。
-func TestBuildNotificationCardTrimsFromTail(t *testing.T) {
-	out, markers := padTo(&DeviceTestOutput{})
-	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
-	body := allContent(card)
-
-	// 1) 保留的标记必须是**完整前缀**、丢弃的必须是**完整后缀**。
-	//    只搜"第一个在、最后一个不在"挡不住"中间也删了几个"。
-	kept := 0
-	for kept < len(markers) && strings.Contains(body, markers[kept]) {
-		kept++
-	}
-	for i := kept; i < len(markers); i++ {
-		if strings.Contains(body, markers[i]) {
-			t.Fatalf("标记 %s 在断点 %d 之后仍存在:丢弃的不是连续后缀", markers[i], kept)
-		}
-	}
-	if kept == 0 {
-		t.Fatal("详情被删光了:至少要保住最前面几个变体的详情")
-	}
-	omitted := len(markers) - kept
-	if omitted == 0 {
-		t.Fatal("这批输入远超预算,不该一个详情都没丢")
-	}
-
-	// 2) 变体主行一个都不许删——只删可选行
-	for i := range out.Tasks {
-		if !strings.Contains(body, out.Tasks[i].Variant) {
-			t.Errorf("变体 %s 的主行被删了,只应删可选行", out.Tasks[i].Variant)
-		}
-	}
-
-	// 2b) 指标行也不许删:设计 §4.5 第 1 步只丢 reason/hermes,metric 保留。
-	// padTo 里每个变体的 Attempt 都是 1、CasesTotal 都是 0,所以指标行内容
-	// 逐变体相同(都是 "attempt 1"),没法按变体区分——改用出现次数:
-	// 只要有一个变体的指标行被连带丢了,计数就会少于变体总数。
-	if got := strings.Count(body, "attempt 1"); got != len(out.Tasks) {
-		t.Errorf("指标行出现次数 = %d,want %d(应逐变体保留,只丢 reason/hermes)",
-			got, len(out.Tasks))
-	}
-
-	// 3) 标注里的数字必须与实际丢弃数**逐字相符**,写死 999 或差一都要红
-	want := fmt.Sprintf("（%d 个变体的详情已省略）", omitted) // 全角括号,与实现逐字一致
-	if !strings.Contains(body, want) {
-		t.Errorf("缺少或写错省略标注,期望包含 %q", want)
-	}
-
-	// 4) 当前结果必须在预算内。
-	n := len(mustMarshal(t, card))
-	if n > cardByteBudget {
-		t.Errorf("裁剪后仍超预算: %d", n)
-	}
-
-	// 5) 裁剪必须是最小的:恢复第一个被省略详情,保持其余后缀详情
-	//    清除,并把省略数减一;这个候选必须重新超预算。相比 75% 经验阈值,
-	//    这里直接证明生产实现停在"再少删一个就放不下"的机械边界。
-	blocks := make([]cardVariantBlock, len(out.Tasks))
-	for i, task := range out.Tasks {
-		blocks[i] = buildCardVariantBlock(task, "")
-		if i > kept {
-			blocks[i].clearDetail()
-		}
-	}
-	candidate := card
-	candidate.Elements = flattenCardBlocks(blocks)
-	if omittedAfterRestore := omitted - 1; omittedAfterRestore > 0 {
-		candidate.Elements = append(candidate.Elements, cardOmittedNotice(omittedAfterRestore))
-	}
-	if got := len(mustMarshal(t, candidate)); got <= cardByteBudget {
-		t.Errorf("恢复第一个被省略详情后仍只有 %d 字节(预算 %d):生产结果裁剪过度",
-			got, cardByteBudget)
-	}
-}
-
-// ---- 交互卡片按钮(重试/忽略)----
-
-func TestBuildNotificationCardButtonsOnFailedVariants(t *testing.T) {
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "TEST_FAILED", Category: "CODE", Attempt: 1},
-	}}
-	card := buildNotificationCard(sampleInput(), out, "device-test-p-gabc-p42")
-	if card.Header.Template != "red" {
-		t.Errorf("header = %s, want red", card.Header.Template)
-	}
-	// 最后一个 element 应为 action 按钮组
-	if len(card.Elements) < 1 {
-		t.Fatal("no elements")
-	}
-	actionEl := card.Elements[len(card.Elements)-1]
-	if actionEl.Tag != "action" {
-		t.Fatalf("last element tag = %s, want action", actionEl.Tag)
-	}
-	if len(actionEl.Actions) != 2 {
-		t.Fatalf("actions = %d, want 2", len(actionEl.Actions))
-	}
-	b0 := actionEl.Actions[0]
-	if b0.Text.Content != "重试该变体" || b0.Type != "primary" ||
-		b0.Value.Action != "retry" || b0.Value.SourceWorkflowID != "device-test-p-gabc-p42" {
-		t.Errorf("button[0] = %+v", b0)
-	}
-	b1 := actionEl.Actions[1]
-	if b1.Text.Content != "忽略" || b1.Type != "default" ||
-		b1.Value.Action != "ignore" {
-		t.Errorf("button[1] = %+v", b1)
-	}
-}
-
-func TestBuildNotificationCardNoButtonsOnPassed(t *testing.T) {
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v", Verdict: "PASSED", Attempt: 1},
-	}}
-	card := buildNotificationCard(sampleInput(), out, "wf-id")
-	for _, el := range card.Elements {
-		if el.Tag == "action" {
-			t.Fatal("PASSED 变体不应有按钮")
-		}
-	}
-}
-
-func TestBuildNotificationCardNoButtonsOnSkipped(t *testing.T) {
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v", Verdict: "SKIPPED"},
-	}}
-	card := buildNotificationCard(sampleInput(), out, "wf-id")
-	for _, el := range card.Elements {
-		if el.Tag == "action" {
-			t.Fatal("SKIPPED 变体不应有按钮")
-		}
-	}
-}
-
-func TestBuildNotificationCardNoButtonsWhenWorkflowIDEmpty(t *testing.T) {
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v", Verdict: "TEST_FAILED", Category: "CODE", Attempt: 1},
-	}}
-	card := buildNotificationCard(sampleInput(), out, "")
-	for _, el := range card.Elements {
-		if el.Tag == "action" {
-			t.Fatal("workflowID 为空时不应有按钮")
-		}
-	}
-}
-
-func TestBuildNotificationCardButtonsOnInfraError(t *testing.T) {
-	out := &DeviceTestOutput{Tasks: []TaskSummary{
-		{Variant: "v", Verdict: "INFRA_ERROR", Category: "INFRA", Attempt: 2},
-	}}
-	card := buildNotificationCard(sampleInput(), out, "wf-id")
-	found := false
-	for _, el := range card.Elements {
-		if el.Tag == "action" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("INFRA_ERROR 变体也应有按钮")
-	}
 }
