@@ -191,12 +191,15 @@ func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.
 }
 
 // skipReason 生成业务语言的 fleet-skip 原因(2026-08-06 review):
-// 需求按领域知识翻译(SNPE=高通/Hexagon、RKNN=瑞芯微/NPU),设备差异
-// 到厂商和具体缺项,末尾给可行动建议。例:
-// 无匹配设备:SNPE 包需要高通 Linux 板(Hexagon DSP);在线设备:513cd3de 是
-// 高通 QCM6125(系统为 Android)、ac6dcbcbfc640f3a 是瑞芯微 RK3568(无 Hexagon DSP)
-// (另有 1 台离线未列出)。接入任意高通 Linux 板即可调度
-// fleet 查询失败降级为仅列需求。
+// 需求按领域知识翻译(SNPE=高通/Hexagon、RKNN=瑞芯微/NPU),在线设备以
+// 无序列表逐台给出厂商和具体缺项,末尾给可行动建议。例:
+// 无匹配设备:SNPE 包需要高通 Linux 板(Hexagon DSP);
+// 在线设备:
+// - 513cd3de 是高通 QCM6125(系统为 Android)
+// - ac6dcbcbfc640f3a 是瑞芯微 RK3568(无 Hexagon DSP)
+//
+// 接入任意高通 Linux 板即可调度
+// fleet 查询失败降级为仅列需求;OFFLINE/QUARANTINED 设备不列出。
 func (a *Acts) skipReason(ctx context.Context, spec wf.TestSpec) string {
 	need := variantNeed(spec)
 	fleet, err := a.Store.ListFleet(ctx)
@@ -222,9 +225,10 @@ func (a *Acts) skipReason(ctx context.Context, spec wf.TestSpec) string {
 	if len(alive) == 0 {
 		reason += ";fleet 无在线设备"
 	} else {
-		reason += ";在线设备:" + strings.Join(alive, "、")
+		// 设备逐个占一行(无序列表),比顿号串排易读(2026-08-06 排版 review)
+		reason += ";\n在线设备:\n- " + strings.Join(alive, "\n- ")
 	}
-	return reason + "。" + actionHint(spec)
+	return reason + "\n\n" + actionHint(spec)
 }
 
 // variantNeed 把变体的调度需求翻译成业务语言(领域知识:引擎 → 目标平台)。

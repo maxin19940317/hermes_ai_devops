@@ -106,13 +106,13 @@ func TestSelectTestSpecsFleetSkip(t *testing.T) {
 	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Android_RKNN_2.3.2" {
 		t.Fatalf("skipped = %+v, want RKNN 无匹配设备", sel.Skipped)
 	}
-	// 智能跳过原因:领域知识翻译需求 + 在线设备差异 + 可行动建议;
-	// 离线/隔离设备完全不提(2026-08-06 review ×2)
+	// 智能跳过原因:领域知识翻译需求 + 在线设备无序列表 + 可行动建议;
+	// 离线/隔离设备完全不提(2026-08-06 review ×3)
 	reason := sel.Skipped[0].Reason
 	for _, want := range []string{
 		"RKNN 包需要瑞芯微 RK3588/RK3566(Android 系统,RK NPU)",
-		"在线设备:d1 是高通 QCM6125(非目标平台、无 RK NPU)",
-		"接入瑞芯微 RK3588/RK3566 的 Android 板即可调度",
+		"在线设备:\n- d1 是高通 QCM6125(非目标平台、无 RK NPU)",
+		"\n\n接入瑞芯微 RK3588/RK3566 的 Android 板即可调度",
 	} {
 		if !strings.Contains(reason, want) {
 			t.Errorf("reason = %q, want 含 %q", reason, want)
