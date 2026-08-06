@@ -57,6 +57,8 @@ type fakeActs struct {
 	escCalls  []EscalationRequest
 	escErr    error // 非 nil 模拟 Escalate 活动失败
 
+	savedMetrics []SaveMetricsRequest // SaveMetrics 活动调用记录(PASSED 基线沉淀)
+
 	results   map[string]ResultRecord // LoadResult 的权威数据源(模拟 results 表)
 	loadCalls []string
 
@@ -202,6 +204,12 @@ func (f *fakeActs) Escalate(_ context.Context, r EscalationRequest) (*Escalation
 	}
 	return &EscalationResponse{KanbanTaskID: "t_1", IdempotencyKey: "k", Result: "created"}, nil
 }
+func (f *fakeActs) SaveMetrics(_ context.Context, r SaveMetricsRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.savedMetrics = append(f.savedMetrics, r)
+	return nil
+}
 
 // seedResult 把 sig 登记为 results 表的权威行:事务性 Outbox 链路下
 // workflow 只消费 signal 里的 task_id,结果本体由 LoadResult 回读(差距 #2)。
@@ -312,6 +320,47 @@ func TestHappyPathPassed(t *testing.T) {
 	}
 	if f.released[0].InfraFail {
 		t.Error("新版本分支不该再填 InfraFail")
+	}
+}
+
+// TestHappyPathPassedSavesMetrics:PASSED 且结果带 metrics 时,workflow 调
+// SaveMetrics 沉淀基线(2026-08-06 修复:此前指标保存挂在只在非 PASSED
+// 运行的 ExtractEvidence 里,metrics 表恒空),且随通知透出。
+func TestHappyPathPassedSavesMetrics(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}}
+	env := newEnv(t, f)
+	res := passResult(taskID("a1"))
+	res.Metrics = map[string]float64{"ocr_test.inference_ms_avg": 1451.39}
+	seedResult(f, res)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, res)
+	}, 30*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow err: %v", env.GetWorkflowError())
+	}
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Tasks) != 1 || out.Tasks[0].Verdict != "PASSED" {
+		t.Fatalf("tasks = %+v", out.Tasks)
+	}
+	if got := out.Tasks[0].Metrics["ocr_test.inference_ms_avg"]; got != 1451.39 {
+		t.Errorf("summary metrics = %v, want 1451.39", out.Tasks[0].Metrics)
+	}
+	if len(f.savedMetrics) != 1 {
+		t.Fatalf("SaveMetrics 调用 = %d 次, want 1", len(f.savedMetrics))
+	}
+	sm := f.savedMetrics[0]
+	if sm.TaskID != taskID("a1") || sm.Project != "grp/p" || sm.Variant != spec1().Variant ||
+		sm.Metrics["ocr_test.inference_ms_avg"] != 1451.39 {
+		t.Errorf("SaveMetrics req = %+v", sm)
+	}
+	fallback := f.notifyCards[0].FallbackText
+	if !strings.Contains(fallback, "ocr_test=1451.4ms") {
+		t.Errorf("fallback text = %q, want 含推理耗时", fallback)
 	}
 }
 

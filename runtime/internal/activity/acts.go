@@ -191,6 +191,24 @@ func (a *Acts) LoadResult(ctx context.Context, req wf.LoadResultRequest) (*wf.Re
 	return a.Store.GetResult(ctx, req.TaskID)
 }
 
+// SaveMetrics 落 PASSED 任务的性能指标点(metrics 表,§9 基线数据源,
+// schema.sql 既定写入路径)。由 workflow 在 PASSED 分支调用(ExtractEvidence
+// 只在非 PASSED 路径运行,承担不了);workflow 侧 fire-and-forget 不重试,
+// 无需幂等键。
+func (a *Acts) SaveMetrics(ctx context.Context, req wf.SaveMetricsRequest) error {
+	if len(req.Metrics) == 0 {
+		return nil
+	}
+	points := make([]store.MetricPoint, 0, len(req.Metrics))
+	for name, val := range req.Metrics {
+		points = append(points, store.MetricPoint{
+			Project: req.Project, Variant: req.Variant, Suite: "smoke",
+			MetricName: name, Value: val, TaskID: req.TaskID,
+		})
+	}
+	return a.Store.SaveMetrics(ctx, points)
+}
+
 // CheckLease 读库返回 task 当前租约的到期时刻(原则 6:由 workflow 的租约
 // 到期 Durable Timer 触发,非轮询);租约不存在/已释放返回 (nil, nil),
 // workflow 据此进入 INFRA 处理。

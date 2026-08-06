@@ -137,6 +137,14 @@ type LoadResultRequest struct {
 	TaskID string `json:"task_id"`
 }
 
+// SaveMetricsRequest 落 PASSED 任务的性能指标(metrics 表,§9 基线数据源)。
+type SaveMetricsRequest struct {
+	TaskID  string             `json:"task_id"`
+	Project string             `json:"project"`
+	Variant string             `json:"variant"`
+	Metrics map[string]float64 `json:"metrics"`
+}
+
 type FinishRequest struct {
 	TaskID   string `json:"task_id"`
 	Status   string `json:"status"`
@@ -272,6 +280,9 @@ type TaskSummary struct {
 	CasesTotal  int          `json:"cases_total,omitempty"`
 	CasesFailed int          `json:"cases_failed,omitempty"`
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// Metrics 是设备上报的性能指标(如 ocr_test.inference_ms_avg),随通知透出;
+	// PASSED 时另由 SaveMetrics 活动沉淀进 metrics 表作基线。
+	Metrics map[string]float64 `json:"metrics,omitempty"`
 	// Analysis 是 Phase 2 LLM Analyzer 的补充结论(仅非 PASSED 且 Analyzer 启用时
 	// 非空);随输出与通知透出,判定权仍在规则引擎(§9)。
 	Analysis  *hermesclient.Analysis `json:"analysis,omitempty"`
@@ -482,6 +493,25 @@ func failScope(site releaseSite, category rules.Category, resultStatus string) F
 	return FailScopeNone // 未覆盖组合保守处理:不加不减
 }
 
+// formatMetrics 紧凑展示性能指标(按键名排序,输出确定性):
+// "<binary>.inference_ms_avg" 显示为 "<binary>=123.4ms",其余按 key=value。
+func formatMetrics(m map[string]float64) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if name, ok := strings.CutSuffix(k, ".inference_ms_avg"); ok {
+			parts = append(parts, fmt.Sprintf("%s=%.1fms", name, m[k]))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s=%.3g", k, m[k]))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
 func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVersion string, attempt int, resultCh workflow.ReceiveChannel) TaskSummary {
 	wfID := workflow.GetInfo(ctx).WorkflowExecution.ID
 	// 幂等键 = {workflow_id}:{test_id}:{attempt}(§12.6),task_id 同值
@@ -631,7 +661,19 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 	sum.Verdict, sum.Category, sum.Reason = string(d.Verdict), string(d.Category), d.Reason
 	sum.DurationSec, sum.CasesTotal, sum.CasesFailed = res.DurationSec, res.CasesTotal, res.CasesFailed
 	sum.Attachments = res.Attachments
+	sum.Metrics = res.Metrics
 	sum.retryable = d.Retry
+	// PASSED 任务的性能指标沉淀进 metrics 表(§9 基线数据源;ExtractEvidence
+	// 只在非 PASSED 路径跑,承担不了)。GetVersion 门:旧 history 无此活动调用,
+	// 重放安全;失败仅记日志,指标缺失由下次 PASSED 补齐,不阻断主链路。
+	if d.Verdict == rules.VerdictPassed && len(res.Metrics) > 0 &&
+		workflow.GetVersion(ctx, "save-metrics", workflow.DefaultVersion, 1) != workflow.DefaultVersion {
+		if err := workflow.ExecuteActivity(ctx, "SaveMetrics", SaveMetricsRequest{
+			TaskID: taskID, Project: in.Project, Variant: spec.Variant, Metrics: res.Metrics,
+		}).Get(ctx, nil); err != nil {
+			workflow.GetLogger(ctx).Error("save metrics failed", "task", taskID, "error", err)
+		}
+	}
 	// 规则裁决落 decisions 表(§11 可回放):落的是归类修复后的最终裁决
 	// (reason 含签名 id 可与初判区分);INFRA 早退路径的裁决已随 FinishTask 落 tasks 表
 	saveRuleDecision(dctx, taskID, d)
@@ -862,6 +904,9 @@ func buildNotification(in DeviceTestInput, out *DeviceTestOutput) string {
 		if tk.CasesTotal > 0 {
 			fmt.Fprintf(&b, " %.1fs cases=%d/%d", tk.DurationSec, tk.CasesTotal-tk.CasesFailed, tk.CasesTotal)
 		}
+		if len(tk.Metrics) > 0 {
+			fmt.Fprintf(&b, " %s", formatMetrics(tk.Metrics))
+		}
 		fmt.Fprintf(&b, " attempt=%d %s\n", tk.Attempt, tk.Reason)
 		// Phase 2:LLM Analyzer 的总结性结论随通知透出(仅非 PASSED 且分析成功时存在)
 		if tk.Analysis != nil && tk.Analysis.Summary != "" {
@@ -1046,6 +1091,9 @@ func buildCardVariantBlock(tk TaskSummary, workflowID string) cardVariantBlock {
 	if tk.CasesTotal > 0 {
 		parts = append(parts, fmt.Sprintf("%.1fs", tk.DurationSec))
 		parts = append(parts, fmt.Sprintf("cases %d/%d", tk.CasesTotal-tk.CasesFailed, tk.CasesTotal))
+	}
+	if len(tk.Metrics) > 0 {
+		parts = append(parts, formatMetrics(tk.Metrics))
 	}
 	if tk.Verdict != VerdictSkipped {
 		parts = append(parts, fmt.Sprintf("attempt %d", tk.Attempt))

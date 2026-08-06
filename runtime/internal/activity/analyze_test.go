@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -250,5 +251,28 @@ func TestExtractEvidenceScansDeviceLogs(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("MatchedSignatures = %v, want 含 backend_unsupported(命中 device logs)", resp.MatchedSignatures)
+	}
+}
+
+// TestSaveMetricsActivity:PASSED 指标落 metrics 表(§9 基线数据源);
+// 空 metrics 是幂等空操作。Baseline 需 ≥3 个样本才返回中位数。
+func TestSaveMetricsActivity(t *testing.T) {
+	st := store.NewMemStore()
+	a := &Acts{Store: st}
+	for i, v := range []float64{100, 200, 300} {
+		err := a.SaveMetrics(ctx, wf.SaveMetricsRequest{
+			TaskID: fmt.Sprintf("t%d", i), Project: "p", Variant: "v",
+			Metrics: map[string]float64{"ocr_test.inference_ms_avg": v},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	bl, err := st.Baseline(ctx, "p", "v", "smoke", "ocr_test.inference_ms_avg", 5)
+	if err != nil || bl == nil || bl.N != 3 || bl.Median != 200 {
+		t.Errorf("baseline = %+v err=%v, want N=3 中位数 200", bl, err)
+	}
+	if err := a.SaveMetrics(ctx, wf.SaveMetricsRequest{TaskID: "t9"}); err != nil {
+		t.Errorf("空 metrics 应为幂等空操作: %v", err)
 	}
 }

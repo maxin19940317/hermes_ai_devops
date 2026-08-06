@@ -122,7 +122,9 @@ CREATE TABLE IF NOT EXISTS results (
 
 -- §9 baseline 比较(metrics 表):每个 PASSED 任务逐指标落点,
 -- Baseline(project, variant, suite, metric_name, n) 取最近 n 条的中位数。
--- 写入路径:ExtractEvidence 活动完成 evidence 提取后,对 PASSED 任务批量 save。
+-- 写入路径:workflow 在 PASSED 分支调 SaveMetrics 活动批量落点
+-- (2026-08-06 修正:ExtractEvidence 只在非 PASSED 路径运行,原注释描述的
+-- 路径实际永远不写,metrics 表因此一直为空)。
 CREATE TABLE IF NOT EXISTS metrics (
     id          BIGSERIAL PRIMARY KEY,
     project     TEXT           NOT NULL,

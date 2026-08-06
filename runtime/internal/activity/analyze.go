@@ -64,20 +64,6 @@ func (a *Acts) ExtractEvidence(ctx context.Context, req wf.ExtractEvidenceReques
 		ev.MetricsBaseline = computeMetricsBaseline(ctx, a.Store, req.Project, req.Variant, ev.Metrics)
 	}
 
-	// PASSED 任务:落 metrics 表,供后续基线计算。
-	if ev.Status == "COMPLETED" && ev.ExitCode == 0 && ev.Cases.Failed == 0 && len(ev.Metrics) > 0 && a.Store != nil {
-		points := make([]store.MetricPoint, 0, len(ev.Metrics))
-		for name, val := range ev.Metrics {
-			points = append(points, store.MetricPoint{
-				Project: req.Project, Variant: req.Variant, Suite: "smoke",
-				MetricName: name, Value: val, TaskID: req.TaskID,
-			})
-		}
-		if err := a.Store.SaveMetrics(ctx, points); err != nil {
-			a.warnf("save metrics failed: %v", err)
-		}
-	}
-
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		return nil, fmt.Errorf("marshal evidence: %w", err)
