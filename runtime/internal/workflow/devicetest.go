@@ -1032,8 +1032,7 @@ func truncateRunes(s string, max int) string {
 	return string(r[:keep]) + cardTruncationMarker
 }
 
-// plainCardDiv 构造一个 tag=div、text.tag=plain_text 的卡片行(设计 §4.5:
-// 卡片里所有文本节点一律 plain_text,不用 lark_md)。
+// plainCardDiv 构造一个 tag=div、text.tag=plain_text 的卡片行(设计 §4.5)。
 func plainCardDiv(content string) CardElement {
 	return CardElement{Tag: "div", Text: &CardText{Tag: "plain_text", Content: content}}
 }
@@ -1049,6 +1048,30 @@ func escapeCardText(s string) string {
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	return s
+}
+
+// cardReasonLines 把原因文本按行拆成卡片元素(2026-08-06):每行一个独立
+// lark_md div,`- ` 开头的列表项在飞书卡片里渲染为无序列表项(多行塞一个
+// div 只会按纯文本换行,实测不渲染列表)。整段原因仍受 cardReasonSummaryLimit
+// rune 上限约束:逐行累积预算,超限截断当前行并加省略标记后停止。
+// 空行跳过(不占预算不占行)。
+func cardReasonLines(reason string) []CardElement {
+	var out []CardElement
+	budget := cardReasonSummaryLimit
+	for _, line := range strings.Split(reason, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		runes := []rune(line)
+		if len(runes) > budget {
+			line = truncateRunes(line, budget)
+			out = append(out, mdCardDiv(escapeCardText(line)))
+			break // 预算耗尽,截断当前行并停止
+		}
+		budget -= len(runes)
+		out = append(out, mdCardDiv(escapeCardText(line)))
+	}
+	return out
 }
 
 // mdCardDiv 构造一个 tag=div、text.tag=lark_md 的卡片行。
@@ -1086,17 +1109,20 @@ func cardHeaderTemplate(tasks []TaskSummary) string {
 // cardVariantBlock 是单个变体在卡片里的行分组:主行(main)恒存在且不可裁剪,
 // metric 按格式表条件出现但始终保留;metrics(性能指标)独立成行与 metric 同
 // 级保留;reason/hermes 是"该变体的详情",裁剪时按变体整体丢弃(设计 §4.5 第 1 步)。
+// reason 是多行(2026-08-06):无设备/无匹配原因按行拆分,`- ` 列表项各自独立
+// div —— 飞书 lark_md 对单 div 以 `- ` 开头的内容渲染为无序列表项,多行塞进
+// 一个 div 只会按纯文本换行显示(实测)。
 // actions 是变体失败时的交互按钮组("重试该变体"/"忽略"),不占裁剪预算。
 type cardVariantBlock struct {
 	main    CardElement
 	metric  *CardElement
 	metrics *CardElement
-	reason  *CardElement
+	reason  []CardElement // 0..n 行;每行独立 div(列表项/段落)
 	hermes  *CardElement
 	actions *CardElement // tag=action 按钮组;nil = 该变体不可重试(已 PASSED/SKIPPED)
 }
 
-func (b cardVariantBlock) hasDetail() bool { return b.reason != nil || b.hermes != nil }
+func (b cardVariantBlock) hasDetail() bool { return len(b.reason) > 0 || b.hermes != nil }
 
 func (b *cardVariantBlock) clearDetail() {
 	b.reason = nil
@@ -1111,9 +1137,7 @@ func (b cardVariantBlock) flatten() []CardElement {
 	if b.metrics != nil {
 		es = append(es, *b.metrics)
 	}
-	if b.reason != nil {
-		es = append(es, *b.reason)
-	}
+	es = append(es, b.reason...)
 	if b.hermes != nil {
 		es = append(es, *b.hermes)
 	}
@@ -1160,8 +1184,7 @@ func buildCardVariantBlock(tk TaskSummary, workflowID string) cardVariantBlock {
 	}
 
 	if tk.Reason != "" {
-		r := mdCardDiv(escapeCardText(truncateRunes(tk.Reason, cardReasonSummaryLimit)))
-		blk.reason = &r
+		blk.reason = cardReasonLines(tk.Reason)
 	}
 	if tk.Analysis != nil && tk.Analysis.Summary != "" {
 		h := mdCardDiv("hermes: " + escapeCardText(truncateRunes(tk.Analysis.Summary, cardReasonSummaryLimit)))

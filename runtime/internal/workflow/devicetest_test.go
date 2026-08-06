@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
@@ -1522,4 +1523,105 @@ func allContent(card NotificationCard) string {
 		}
 	}
 	return b.String()
+}
+
+// TestBuildNotificationCardTruncatesReason:超长 Reason 截断后带省略标记,
+// 且不超过 cardReasonSummaryLimit rune;多行拆分后仍保持该上限(逐行累积)。
+func TestBuildNotificationCardTruncatesReason(t *testing.T) {
+	long := strings.Repeat("a", 600)
+	els := cardReasonLines(long)
+	var reason strings.Builder
+	for _, e := range els {
+		reason.WriteString(e.Text.Content)
+	}
+	got := reason.String()
+	if got == long {
+		t.Fatal("超长 Reason 未被截断")
+	}
+	if utf8.RuneCountInString(got) > cardReasonSummaryLimit {
+		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(got))
+	}
+	if strings.Contains(got, long) {
+		t.Error("截断后仍包含完整原文")
+	}
+	if !strings.HasSuffix(got, cardTruncationMarker) {
+		t.Errorf("截断后应带省略标记 %q,got %q", cardTruncationMarker, got)
+	}
+	// 边界:恰好等于上限不截断,上限+1 必须截断到恰好上限个 rune
+	if got := truncateRunes(strings.Repeat("甲", cardReasonSummaryLimit), cardReasonSummaryLimit); got != strings.Repeat("甲", cardReasonSummaryLimit) {
+		t.Error("恰好 500 rune 不应被截断")
+	}
+	if n := utf8.RuneCountInString(truncateRunes(strings.Repeat("甲", cardReasonSummaryLimit+1), cardReasonSummaryLimit)); n != cardReasonSummaryLimit {
+		t.Errorf("501 rune 截断后应恰为 %d,got %d", cardReasonSummaryLimit, n)
+	}
+}
+
+func TestBuildNotificationCardTruncatesSummary(t *testing.T) {
+	long := strings.Repeat("b", 600)
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "v", Verdict: "TEST_FAILED", Attempt: 1,
+			Analysis: &hermesclient.Analysis{Summary: long}},
+	}}
+	card := buildNotificationCard(DeviceTestInput{Project: "p"}, out, "")
+	// 定位 hermes 行(最后一个非空文本,reason 为空时即它)
+	hermes := ""
+	for _, e := range card.Elements {
+		if e.Text != nil {
+			hermes = e.Text.Content
+		}
+	}
+	if strings.Contains(hermes, long) {
+		t.Fatal("超长 Summary 未被截断")
+	}
+	content := strings.TrimPrefix(hermes, "hermes: ")
+	if utf8.RuneCountInString(content) > cardReasonSummaryLimit {
+		t.Errorf("截断后仍超过 %d rune: %d", cardReasonSummaryLimit, utf8.RuneCountInString(content))
+	}
+	if !strings.HasSuffix(content, cardTruncationMarker) {
+		t.Errorf("截断后应带省略标记 %q,got %q", cardTruncationMarker, content)
+	}
+}
+
+// TestBuildNotificationCardTruncatesChineseValidUTF8:纯中文超长文本截断后
+// 必须是合法 UTF-8(不能切出半个字符)。
+func TestBuildNotificationCardTruncatesChineseValidUTF8(t *testing.T) {
+	els := cardReasonLines(strings.Repeat("甲", 600))
+	var reason strings.Builder
+	for _, e := range els {
+		reason.WriteString(e.Text.Content)
+	}
+	got := reason.String()
+	if !utf8.ValidString(got) {
+		t.Error("纯中文 Reason 截断后不是合法 UTF-8")
+	}
+	if utf8.RuneCountInString(got) > cardReasonSummaryLimit {
+		t.Errorf("截断后仍超过 %d rune", cardReasonSummaryLimit)
+	}
+}
+
+// TestCardReasonLinesListAndParagraph:原因按行拆分——`- ` 列表项与普通段落
+// 各自独立 div;空行跳过。
+func TestCardReasonLinesListAndParagraph(t *testing.T) {
+	reason := "无可用设备:测试需求;\n匹配设备:\n- 513cd3de 当前离线\n在线设备:\n- a 是 MTK\n\n接入即可"
+	els := cardReasonLines(reason)
+	var kinds []string
+	for _, e := range els {
+		kinds = append(kinds, e.Text.Content)
+	}
+	want := []string{
+		"无可用设备:测试需求;",
+		"匹配设备:",
+		"- 513cd3de 当前离线",
+		"在线设备:",
+		"- a 是 MTK",
+		"接入即可",
+	}
+	if !reflect.DeepEqual(kinds, want) {
+		t.Errorf("cardReasonLines = %v, want %v", kinds, want)
+	}
+	for _, e := range els {
+		if e.Text.Tag != "lark_md" {
+			t.Errorf("行 %q 的 tag = %s, want lark_md", e.Text.Content, e.Text.Tag)
+		}
+	}
 }
