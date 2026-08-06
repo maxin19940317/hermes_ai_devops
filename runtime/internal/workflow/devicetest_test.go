@@ -1143,6 +1143,7 @@ func TestBuildNotificationCardEmptyTasks(t *testing.T) {
 var allowedCardKeys = map[string]bool{
 	"config": true, "wide_screen_mode": true, "header": true, "title": true,
 	"template": true, "elements": true, "tag": true, "text": true, "content": true,
+	"element_style": true, "display": true, "list_type": true,
 }
 
 // walkCard 按 NotificationCard/CardConfig/CardHeader/CardElement/CardText
@@ -1232,7 +1233,7 @@ func walkCard(t *testing.T, v any) []string {
 		bad = append(bad, fmt.Sprintf("$.elements: 必须是 array, got %T", root["elements"]))
 		return bad
 	}
-	elementKeys := map[string]bool{"tag": true, "text": true}
+	elementKeys := map[string]bool{"tag": true, "text": true, "content": true, "element_style": true}
 	for i, node := range elements {
 		path := fmt.Sprintf("$.elements[%d]", i)
 		element, ok := checkObject(node, path, "CardElement", elementKeys, "tag")
@@ -1252,12 +1253,46 @@ func walkCard(t *testing.T, v any) []string {
 				continue
 			}
 			validateText(text, path+".text")
+		case "markdown":
+			// 2026-08-06:飞书 markdown 元素——content 必填字符串(多行,\n 分隔);
+			// element_style 可选,display=list 时渲染无序/有序列表。
+			content, cok := element["content"].(string)
+			if !cok {
+				bad = append(bad, fmt.Sprintf("%s: markdown 的 content 必须是 string, got %T", path, element["content"]))
+			}
+			if strings.Contains(content, "<at") {
+				bad = append(bad, fmt.Sprintf("%s.content: markdown 含未转义 <at>(注入风险)", path))
+			}
+			if es, exists := element["element_style"]; exists && es != nil {
+				styleKeys := map[string]bool{"display": true, "list_type": true}
+				style, sok := checkObject(es, path+".element_style", "CardElStyle", styleKeys, "display")
+				if !sok {
+					continue
+				}
+				display, dok := style["display"].(string)
+				if !dok {
+					bad = append(bad, fmt.Sprintf("%s.element_style.display: 必须是 string, got %T", path, style["display"]))
+					continue
+				}
+				if display != "normal" && display != "list" {
+					bad = append(bad, fmt.Sprintf("%s.element_style.display: got %q,want normal|list", path, display))
+				}
+				if lt, exists := style["list_type"]; exists && lt != nil {
+					ltv, ltok := lt.(string)
+					if !ltok || (ltv != "bullet" && ltv != "ordered") {
+						bad = append(bad, fmt.Sprintf("%s.element_style.list_type: got %v,want bullet|ordered", path, lt))
+					}
+					if display != "list" {
+						bad = append(bad, fmt.Sprintf("%s.element_style: display=normal 时不得带 list_type", path))
+					}
+				}
+			}
 		case "hr":
 			if text, exists := element["text"]; exists && text != nil {
 				bad = append(bad, fmt.Sprintf("%s: hr 的 text 必须为 nil", path))
 			}
 		default:
-			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want div|hr", path, tag))
+			bad = append(bad, fmt.Sprintf("%s.tag: got %q,want div|markdown|hr", path, tag))
 		}
 	}
 	return bad
@@ -1604,24 +1639,40 @@ func TestBuildNotificationCardTruncatesChineseValidUTF8(t *testing.T) {
 func TestCardReasonLinesListAndParagraph(t *testing.T) {
 	reason := "无可用设备:测试需求;\n匹配设备:\n- 513cd3de 当前离线\n在线设备:\n- a 是 MTK\n\n接入即可"
 	els := cardReasonLines(reason)
-	var kinds []string
-	for _, e := range els {
-		kinds = append(kinds, e.Text.Content)
+	// 期望:非列表行 → lark_md div;连续列表行 → 单个 markdown bullet 元素
+	want := []struct{ tag, content string }{
+		{"div", "无可用设备:测试需求;"},
+		{"div", "匹配设备:"},
+		{"markdown", "513cd3de 当前离线"},
+		{"div", "在线设备:"},
+		{"markdown", "a 是 MTK"},
+		{"div", "接入即可"},
 	}
-	want := []string{
-		"无可用设备:测试需求;",
-		"匹配设备:",
-		"- 513cd3de 当前离线",
-		"在线设备:",
-		"- a 是 MTK",
-		"接入即可",
+	if len(els) != len(want) {
+		t.Fatalf("cardReasonLines 元素数 = %d, want %d: %+v", len(els), len(want), els)
 	}
-	if !reflect.DeepEqual(kinds, want) {
-		t.Errorf("cardReasonLines = %v, want %v", kinds, want)
-	}
-	for _, e := range els {
-		if e.Text.Tag != "lark_md" {
-			t.Errorf("行 %q 的 tag = %s, want lark_md", e.Text.Content, e.Text.Tag)
+	for i, w := range want {
+		e := els[i]
+		if e.Tag != w.tag {
+			t.Errorf("[%d] tag = %q, want %q", i, e.Tag, w.tag)
 		}
+		if w.tag == "markdown" {
+			if e.Content != w.content {
+				t.Errorf("[%d] content = %q, want %q", i, e.Content, w.content)
+			}
+			if e.ElementStyle == nil || e.ElementStyle.Display != "list" || e.ElementStyle.ListType != "bullet" {
+				t.Errorf("[%d] element_style = %+v, want list/bullet", i, e.ElementStyle)
+			}
+		} else {
+			if e.Text == nil || e.Text.Tag != "lark_md" || e.Text.Content != w.content {
+				t.Errorf("[%d] text = %+v, want lark_md %q", i, e.Text, w.content)
+			}
+		}
+	}
+	// 连续列表行归并进同一个 markdown 元素
+	els2 := cardReasonLines("列表:\n- 甲\n- 乙\n- 丙\n结尾")
+	if len(els2) != 3 || els2[1].Tag != "markdown" ||
+		els2[1].Content != "甲\n乙\n丙" {
+		t.Errorf("连续列表行未归并: %+v", els2)
 	}
 }

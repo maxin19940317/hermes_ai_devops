@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
@@ -958,12 +959,24 @@ type CardHeader struct {
 	Template string   `json:"template"` // 只允许 green | red | orange(§4.1)
 }
 
-// CardElement 有三种形态:文本块(tag=div,Text 非空)、分隔线(tag=hr,Text 为 nil)、
-// 交互按钮组(tag=action,Actions 非空)。三个形态互斥:运行时只设置一种。
+// CardElement 有四种形态:文本块(tag=div,Text 非空)、markdown 块(tag=markdown,
+// Content+ElementStyle)、分隔线(tag=hr)、交互按钮组(tag=action,Actions 非空)。
+// 形态互斥:运行时只设置一种。markdown 元素用于真正的无序列表(2026-08-06:
+// 飞书 lark_md 的 div 文本不支持 `- ` 列表语法,只有 tag=markdown +
+// elementStyle.display=list 才渲染圆点列表)。
 type CardElement struct {
-	Tag     string       `json:"tag"`               // div | hr | action
-	Text    *CardText    `json:"text,omitempty"`    // tag=hr|action 时必须为 nil
-	Actions []CardButton `json:"actions,omitempty"` // tag=div|hr 时必须为 nil
+	Tag          string         `json:"tag"`               // div | markdown | hr | action
+	Text         *CardText      `json:"text,omitempty"`    // tag=div|hr|action 用
+	Content      string         `json:"content,omitempty"` // tag=markdown 用:多行文本,\n 分隔
+	ElementStyle *CardElStyle   `json:"element_style,omitempty"`
+	Actions      []CardButton   `json:"actions,omitempty"` // tag=div|hr 时必须为 nil
+}
+
+// CardElStyle 是 markdown 元素的样式(飞书卡片):display=list 时按行渲染列表,
+// listType 指定 bullet(无序)/ordered(有序)。
+type CardElStyle struct {
+	Display  string `json:"display,omitempty"`   // "normal" | "list"
+	ListType string `json:"list_type,omitempty"` // display=list 时:"bullet" | "ordered"
 }
 
 // CardText 的 Tag 取值 plain_text(旧版一律)或 lark_md(2026-08-06 修订:
@@ -1050,27 +1063,58 @@ func escapeCardText(s string) string {
 	return s
 }
 
-// cardReasonLines 把原因文本按行拆成卡片元素(2026-08-06):每行一个独立
-// lark_md div,`- ` 开头的列表项在飞书卡片里渲染为无序列表项(多行塞一个
-// div 只会按纯文本换行,实测不渲染列表)。整段原因仍受 cardReasonSummaryLimit
-// rune 上限约束:逐行累积预算,超限截断当前行并加省略标记后停止。
-// 空行跳过(不占预算不占行)。
+// cardReasonLines 把原因文本按行拆成卡片元素(2026-08-06):`- ` 开头的连续
+// 列表行归入一个 tag=markdown 元素(elementStyle.display=list,listType=bullet),
+// 飞书渲染为真正的无序列表(圆点缩进);非列表行(段头/说明)用 lark_md div。
+// 飞书 lark_md 的 div 文本不支持 `- ` 列表语法(只支持行内格式),实测 `- ` 会
+// 按字面量显示;无序列表必须用 markdown 元素。
+// 整段原因受 cardReasonSummaryLimit rune 上限约束:逐行累积预算,超限截断
+// 当前行并加省略标记后停止。空行跳过。
 func cardReasonLines(reason string) []CardElement {
 	var out []CardElement
+	var list []string // 连续列表行,归入同一个 markdown bullet 元素
 	budget := cardReasonSummaryLimit
+
+	flushList := func() {
+		if len(list) == 0 {
+			return
+		}
+		out = append(out, CardElement{
+			Tag:     "markdown",
+			Content: strings.Join(list, "\n"),
+			ElementStyle: &CardElStyle{Display: "list", ListType: "bullet"},
+		})
+		list = nil
+	}
+	emit := func(line string) {
+		if strings.HasPrefix(line, "- ") {
+			list = append(list, escapeCardText(strings.TrimPrefix(line, "- ")))
+			return
+		}
+		flushList()
+		out = append(out, mdCardDiv(escapeCardText(line)))
+	}
+
 	for _, line := range strings.Split(reason, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		runes := []rune(line)
-		if len(runes) > budget {
+		n := utf8.RuneCountInString(line)
+		if n > budget {
 			line = truncateRunes(line, budget)
-			out = append(out, mdCardDiv(escapeCardText(line)))
-			break // 预算耗尽,截断当前行并停止
+			if strings.HasPrefix(line, "- ") {
+				list = append(list, escapeCardText(strings.TrimPrefix(line, "- ")))
+			} else {
+				flushList()
+				out = append(out, mdCardDiv(escapeCardText(line)))
+			}
+			flushList()
+			return out
 		}
-		budget -= len(runes)
-		out = append(out, mdCardDiv(escapeCardText(line)))
+		budget -= n
+		emit(line)
 	}
+	flushList()
 	return out
 }
 
