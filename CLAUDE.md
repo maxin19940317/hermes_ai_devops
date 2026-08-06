@@ -15,7 +15,7 @@
 - **服务器**:Linux,运行 GitLab、GitLab Runner、Package Registry,以及本项目的所有服务端组件。
 - **Client 机器**:Windows,与服务器同一局域网,通过 USB 连接目标开发板(Android,ADB 访问)。
 - **GitLab 版本:13.8**。Generic Package 版本号强制 strict `X.Y.Z`,不接受 `+` 和预发布后缀。这是已踩过的坑,产物唯一性靠**文件名**编码(见 §7)。
-- 现有 CI 已能构建 8 个变体并上传 Registry(见 §6 现状)。
+- 现有 CI 已能构建 12 个变体并上传 Registry(见 §6 现状)。
 - 第一阶段:1 台 Client、1~2 块开发板。但数据模型从第一天按多 Client 多设备设计。
 
 ## 3. 三层架构与硬性边界(最重要的一节)
@@ -66,7 +66,7 @@ hermes-devops/
 │   └── callbacks-api.openapi.yaml
 ├── ci/                        # 给业务仓库(algo-super-sdk)使用的 CI 脚本
 │   ├── gen_manifest.py
-│   ├── variants.yaml          # 8 个变体 → Manifest 参数映射表
+│   ├── variants.yaml          # 12 个变体 → Manifest 参数映射表
 │   ├── write_meta.py
 │   └── gen_bundle.py
 ├── runtime/                   # Go: Temporal Worker + Trigger + REST API
@@ -91,9 +91,14 @@ hermes-devops/
 
 业务仓库 `algo-super-sdk` 已有 `.gitlab-ci.yml`:
 
-- 触发:MR / tag / master push;8 个构建变体:
-  `aarch64_{Linux,Android}_SNPE_1.68`、`aarch64_{Linux,Android}_SNPE_2.21`、
-  `aarch64_{Linux,Android}_RKNN_2.3.2`、`aarch64_{Linux,Android}_TFLite_2.21.0`
+- 触发:MR / tag / master push;12 个构建变体
+  (2026-08-06 pipeline 1109 起,SNPE/TFLite 变体名编码目标 SoC):
+  `aarch64_{Linux,Android}_QCS{QCM}6125_SNPE_1.68`、
+  `aarch64_{Linux,Android}_QCS{QCM}6490_SNPE_2.21`、
+  `aarch64_{Linux,Android}_RK3562_RKNN_2.3.2`、
+  `aarch64_{Linux,Android}_RK3568_RKNN_2.3.2`、
+  `aarch64_{Linux,Android}_RK3576_RKNN_2.3.2`、
+  `aarch64_Android_Qualcomm_TFLite_2.21.0`、`aarch64_Linux_TFLite_2.21.0`
 - 每变体执行 `./rebuild.sh $variant` + `./release_pack.sh --platform $variant --output-dir dist`,产出 `*.tar.gz + *.sha256`,上传 Generic Registry(版本号取 CMakeLists 的 X.Y.Z;tag 时取 tag)。
 - 已有 candidate(master, `rc.{CI_PIPELINE_IID}`)/ release(tag)双轨与手动打 tag job。
 - 上传对 400 already-exists 做 skip(幂等)。
@@ -105,11 +110,11 @@ hermes-devops/
    解决"版本号不变导致新构建被 skip 静默丢弃"的阻塞问题。URL 保持确定性可寻址:
    `{CI_API_V4_URL}/projects/{id}/packages/generic/{name}/{X.Y.Z}/{上述文件名}`。
 2. **包内注入契约文件**:`gen_manifest.py` 在打包后解包 → 写入 `manifest.yaml`(按 `ci/variants.yaml` 渲染)+ `files.sha256` → 重打包重命名。生成后立即用 `manifest.schema.json` 校验,不合法 fail pipeline。
-3. **bundle 聚合**:每个 build job 输出 `dist/meta/{variant}.json`(job artifact);新增 `publish:bundle` job 聚合为 `bundle-g{sha}.json` 上传 Registry。**8 个 meta 不齐全则不发 bundle**(挡住被 interruptible 打断的残缺构建)。
+3. **bundle 聚合**:每个 build job 输出 `dist/meta/{variant}.json`(job artifact);新增 `publish:bundle` job 聚合为 `bundle-g{sha}.json` 上传 Registry。**12 个 meta 不齐全则不发 bundle**(挡住被 interruptible 打断的残缺构建)。
    **2026-07-22 演进:变体级触发(kick)**。build job 上传成功后直发
    `POST /kick`(meta 原样透传,复用 webhook 密钥),Trigger 校验(形态 +
    URL 归属 + Registry 探活)后起**单变体 workflow**(ID 含 variant,重复 kick
-   由 Temporal 去重)——一个包编好即测,不等全部 8 个包与 pipeline success。
+   由 Temporal 去重)——一个包编好即测,不等全部 12 个包与 pipeline success。
    bundle 保留为发布完整性断言;`TRIGGER_PIPELINE_WEBHOOK=false` 后 pipeline
    success webhook 仅记录不再起完整 workflow(防双跑)。触发与设备解耦:
    fleet 无匹配设备的变体由 SelectTestSpecs 秒级跳过(任意 OS/板型,CI 不改)。
@@ -125,7 +130,7 @@ hermes-devops/
   "plan_id": "pln_20260716_001",
   "origin": { "type": "manual_nl|gitlab_event|template", "user": "...", "raw_text": "..." },
   "goal_summary": "一句话目标",
-  "build": { "project": "algo-super-sdk", "ref": "master", "targets": ["aarch64_Android_SNPE_2.21"], "build_type": "Release" },
+  "build": { "project": "algo-super-sdk", "ref": "master", "targets": ["aarch64_Android_QCM6490_SNPE_2.21"], "build_type": "Release" },
   "tests": [
     { "test_id": "t1", "suite": "snpe-smoke",
       "device_selector": { "soc": "QCM6125", "capabilities": ["hexagon"] },
@@ -312,7 +317,11 @@ Runtime→Agent 派单方向 8480 仍为测试子网纯 HTTP,待 Agent TLS liste
 审计完备✅(audit_log 表,dispatched/device_leased/device_released/escalated 四类动作,fire-and-forget 不阻断主链路);
 MinIO 生命周期✅(Temporal Schedule `evidence-lifecycle-daily` 每日 UTC 3:00:runs/ PASSED 7 天、失败 90 天;
 evidence/ 快照不过期,是 decisions 的回放依据);
-Agent 版本上报 + 最低版本门禁✅(ldflags 注入版本,`MIN_AGENT_VERSION` 空=不启用,dev 永远放行)。
+Agent 版本上报 + 最低版本门禁✅(ldflags 注入版本,`MIN_AGENT_VERSION` 空=不启用,dev 永远放行);
+设备能力表归 Runtime 统一管理✅(方案 B,2026-08-06:服务端 `DEVICE_CAPABILITIES_MAP`
+按 soc/serial 声明能力,心跳注册时校准覆盖 Agent 上报值,未命中保留上报值向后兼容;
+**新板接入只需改服务端配置 + 重启 worker,不再改 Windows Agent**;Agent 侧
+`AGENT_DEVICE_CAPABILITIES_MAP` 降级为兜底)。
 
 ### Phase 4 — 扩展
 Grafana 看板✅(Phase 4 第 1 轮,2026-08-04 上线:纯只读 postgres datasource,dashboard JSON 进 Git 自动 provisioning,13 个面板覆盖 task 状态/verdict/错误分类/吞吐量堆叠/设备状态/fail_streak 趋势/P50/P99 延迟/基线 delta/outbox 积压/decisions/audit;端口绑 localhost 走 SSH 转发);多设备并发调度;性能基线 MR 门禁;Linux 变体 SSH Adapter。
