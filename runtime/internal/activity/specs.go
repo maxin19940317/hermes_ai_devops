@@ -180,7 +180,7 @@ func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.
 			} else if !capable {
 				sel.Skipped = append(sel.Skipped, wf.SkippedSpec{
 					Variant: p.Variant,
-					Reason:  a.skipReason(ctx, spec.Selector),
+					Reason:  a.skipReason(ctx, spec),
 				})
 				continue
 			}
@@ -190,22 +190,25 @@ func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.
 	return sel, nil
 }
 
-// skipReason 生成可读的 fleet-skip 原因:变体需求 + fleet 各设备的具体差异
-// (2026-08-06:原始消息只列 selector 字段,看不出"为什么没设备能跑")。
-// 例:无匹配设备:需要 os=linux capabilities=[hexagon];fleet:513cd3de(os=android)、
-// ac6dcbcbfc640f3a(缺 hexagon)。fleet 查询失败降级为仅列需求。
-func (a *Acts) skipReason(ctx context.Context, sel wf.DeviceSelector) string {
-	need := "需要 " + selectorDesc(sel)
+// skipReason 生成业务语言的 fleet-skip 原因(2026-08-06 review):
+// 需求按领域知识翻译(SNPE=高通/Hexagon、RKNN=瑞芯微/NPU),设备差异
+// 到厂商和具体缺项,末尾给可行动建议。例:
+// 无匹配设备:SNPE 包需要高通 Linux 板(Hexagon DSP);在线设备:513cd3de 是
+// 高通 QCM6125(系统为 Android)、ac6dcbcbfc640f3a 是瑞芯微 RK3568(无 Hexagon DSP)
+// (另有 1 台离线未列出)。接入任意高通 Linux 板即可调度
+// fleet 查询失败降级为仅列需求。
+func (a *Acts) skipReason(ctx context.Context, spec wf.TestSpec) string {
+	need := variantNeed(spec)
 	fleet, err := a.Store.ListFleet(ctx)
 	if err != nil {
 		a.warnf("list fleet for skip reason failed: %v", err)
 		return "无匹配设备:" + need
 	}
 	if len(fleet) == 0 {
-		return "无匹配设备:" + need + ";fleet 无任何已注册设备(agent 未上线?)"
+		return "无匹配设备:" + need + ";fleet 无任何已注册设备(agent 未上线?)。"
 	}
 	// 只详列在线(IDLE/BUSY)设备的差异;OFFLINE/QUARANTINED 折叠为计数——
-	// 历史设备对"为什么没有设备能跑"没有信息量(2026-08-06 review)。
+	// 历史设备对"为什么没有设备能跑"没有信息量。
 	alive := []string{}
 	offline, quarantined := 0, 0
 	for _, d := range fleet {
@@ -215,8 +218,7 @@ func (a *Acts) skipReason(ctx context.Context, sel wf.DeviceSelector) string {
 		case store.DeviceQuarantined:
 			quarantined++
 		default:
-			miss := strings.Join(store.SelectorMismatch(d.Device, sel), ",")
-			alive = append(alive, fmt.Sprintf("%s(%s)", d.DeviceID, miss))
+			alive = append(alive, deviceCN(d, spec.Selector))
 		}
 	}
 	reason := "无匹配设备:" + need
@@ -225,10 +227,117 @@ func (a *Acts) skipReason(ctx context.Context, sel wf.DeviceSelector) string {
 	} else {
 		reason += ";在线设备:" + strings.Join(alive, "、")
 	}
-	if offline > 0 || quarantined > 0 {
-		reason += fmt.Sprintf("(另有 %d 台离线、%d 台隔离未列出)", offline, quarantined)
+	if offline+quarantined > 0 {
+		folds := []string{}
+		if offline > 0 {
+			folds = append(folds, fmt.Sprintf("%d 台离线", offline))
+		}
+		if quarantined > 0 {
+			folds = append(folds, fmt.Sprintf("%d 台隔离", quarantined))
+		}
+		reason += "(另有 " + strings.Join(folds, "、") + " 未列出)"
 	}
-	return reason
+	return reason + "。" + actionHint(spec)
+}
+
+// variantNeed 把变体的调度需求翻译成业务语言(领域知识:引擎 → 目标平台)。
+func variantNeed(spec wf.TestSpec) string {
+	os := osCN(spec.Selector.OS)
+	switch engineOf(spec.Variant) {
+	case "SNPE":
+		return fmt.Sprintf("SNPE 包需要高通 %s 板(Hexagon DSP)", os)
+	case "RKNN":
+		return fmt.Sprintf("RKNN 包需要瑞芯微 %s(%s 系统,RK NPU)", strings.Join(spec.Selector.SOC, "/"), os)
+	case "TFLite":
+		return fmt.Sprintf("TFLite 包需要 %s 设备(通用 CPU/GPU 即可)", os)
+	}
+	return "需要 " + selectorDesc(spec.Selector)
+}
+
+// deviceCN 用业务语言描述单台设备与需求的差异(厂商 + 具体缺项)。
+func deviceCN(d store.FleetDevice, sel wf.DeviceSelector) string {
+	misses := store.SelectorMismatch(d.Device, sel)
+	var b strings.Builder
+	b.WriteString(d.DeviceID)
+	if v := vendorOf(d.SOC); v != "" && d.SOC != "" {
+		fmt.Fprintf(&b, " 是%s %s", v, strings.ToUpper(d.SOC))
+	}
+	parts := []string{}
+	for _, m := range misses {
+		switch {
+		case strings.HasPrefix(m, "os="):
+			parts = append(parts, "系统为 "+osCN(strings.TrimPrefix(m, "os=")))
+		case strings.HasPrefix(m, "soc="):
+			parts = append(parts, "非目标平台")
+		case strings.HasPrefix(m, "缺 "):
+			parts = append(parts, "无 "+capCN(strings.TrimPrefix(m, "缺 ")))
+		default:
+			parts = append(parts, m)
+		}
+	}
+	fmt.Fprintf(&b, "(%s)", strings.Join(parts, "、"))
+	return b.String()
+}
+
+// actionHint 给出可行动的调度建议(领域知识:引擎 → 该接什么板)。
+func actionHint(spec wf.TestSpec) string {
+	switch engineOf(spec.Variant) {
+	case "SNPE":
+		return fmt.Sprintf("接入任意高通 %s 板即可调度", osCN(spec.Selector.OS))
+	case "RKNN":
+		return fmt.Sprintf("接入瑞芯微 %s 的 %s 板即可调度", strings.Join(spec.Selector.SOC, "/"), osCN(spec.Selector.OS))
+	}
+	return "接入满足条件的设备后即可调度"
+}
+
+// engineOf 从变体名识别推理引擎(aarch64_Linux_RK3568_RKNN_2.3.2 → RKNN)。
+func engineOf(variant string) string {
+	v := strings.ToUpper(variant)
+	switch {
+	case strings.Contains(v, "SNPE"):
+		return "SNPE"
+	case strings.Contains(v, "RKNN"):
+		return "RKNN"
+	case strings.Contains(v, "TFLITE"):
+		return "TFLite"
+	}
+	return ""
+}
+
+// vendorOf 从 SoC 型号识别厂商(大小写不敏感)。
+func vendorOf(soc string) string {
+	s := strings.ToUpper(soc)
+	switch {
+	case strings.HasPrefix(s, "RK"):
+		return "瑞芯微"
+	case strings.HasPrefix(s, "QCM"), strings.HasPrefix(s, "QCS"),
+		strings.HasPrefix(s, "SM"), strings.HasPrefix(s, "SDM"), strings.HasPrefix(s, "SA"):
+		return "高通"
+	case strings.HasPrefix(s, "MT"):
+		return "联发科"
+	}
+	return ""
+}
+
+// capCN 能力标识的中文名(调度约束 → 业务语言)。
+func capCN(cap string) string {
+	switch strings.ToLower(cap) {
+	case "hexagon":
+		return "Hexagon DSP"
+	case "rknpu":
+		return "RK NPU"
+	}
+	return cap
+}
+
+func osCN(os string) string {
+	if strings.EqualFold(os, "android") {
+		return "Android"
+	}
+	if strings.EqualFold(os, "linux") {
+		return "Linux"
+	}
+	return os
 }
 
 // selectorDesc 只渲染非空约束项,供 fleet-skip 原因展示——selector 只含
