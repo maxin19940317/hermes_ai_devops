@@ -1639,13 +1639,14 @@ func TestBuildNotificationCardTruncatesChineseValidUTF8(t *testing.T) {
 func TestCardReasonLinesListAndParagraph(t *testing.T) {
 	reason := "无可用设备:测试需求;\n匹配设备:\n- 513cd3de 当前离线\n在线设备:\n- a 是 MTK\n\n接入即可"
 	els := cardReasonLines(reason)
-	// 期望:非列表行 → lark_md div;连续列表行 → 单个 markdown bullet 元素
+	// 期望:非列表行 → lark_md div;连续列表行 → 单个 markdown bullet 元素,
+	// content **保留 "- " 前缀**(display=list 时飞书渲染圆点,实测去掉前缀无圆点)
 	want := []struct{ tag, content string }{
 		{"div", "无可用设备:测试需求;"},
 		{"div", "匹配设备:"},
-		{"markdown", "513cd3de 当前离线"},
+		{"markdown", "- 513cd3de 当前离线"},
 		{"div", "在线设备:"},
-		{"markdown", "a 是 MTK"},
+		{"markdown", "- a 是 MTK"},
 		{"div", "接入即可"},
 	}
 	if len(els) != len(want) {
@@ -1669,10 +1670,10 @@ func TestCardReasonLinesListAndParagraph(t *testing.T) {
 			}
 		}
 	}
-	// 连续列表行归并进同一个 markdown 元素
+	// 连续列表行归并进同一个 markdown 元素,保留各行的 "- " 前缀
 	els2 := cardReasonLines("列表:\n- 甲\n- 乙\n- 丙\n结尾")
 	if len(els2) != 3 || els2[1].Tag != "markdown" ||
-		els2[1].Content != "甲\n乙\n丙" {
-		t.Errorf("连续列表行未归并: %+v", els2)
+		els2[1].Content != "- 甲\n- 乙\n- 丙" {
+		t.Errorf("连续列表行未归并/前缀丢失: %+v", els2)
 	}
 }

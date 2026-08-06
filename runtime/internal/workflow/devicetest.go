@@ -1068,11 +1068,14 @@ func escapeCardText(s string) string {
 // 飞书渲染为真正的无序列表(圆点缩进);非列表行(段头/说明)用 lark_md div。
 // 飞书 lark_md 的 div 文本不支持 `- ` 列表语法(只支持行内格式),实测 `- ` 会
 // 按字面量显示;无序列表必须用 markdown 元素。
+// **关键语义**:markdown 元素在 display=list 时,content 里必须**保留 `- ` 前缀**
+// (飞书把 `- ` 解释为列表项并渲染圆点);去掉前缀后飞书不知道哪些是列表项,
+// 只按普通文本逐行显示(实测 2026-08-06 r8)。
 // 整段原因受 cardReasonSummaryLimit rune 上限约束:逐行累积预算,超限截断
 // 当前行并加省略标记后停止。空行跳过。
 func cardReasonLines(reason string) []CardElement {
 	var out []CardElement
-	var list []string // 连续列表行,归入同一个 markdown bullet 元素
+	var list []string // 连续列表行(保留 "- " 前缀),归入同一个 markdown bullet 元素
 	budget := cardReasonSummaryLimit
 
 	flushList := func() {
@@ -1088,7 +1091,7 @@ func cardReasonLines(reason string) []CardElement {
 	}
 	emit := func(line string) {
 		if strings.HasPrefix(line, "- ") {
-			list = append(list, escapeCardText(strings.TrimPrefix(line, "- ")))
+			list = append(list, escapeCardText(line)) // 保留 "- " 前缀(display=list 时渲染圆点)
 			return
 		}
 		flushList()
@@ -1102,12 +1105,7 @@ func cardReasonLines(reason string) []CardElement {
 		n := utf8.RuneCountInString(line)
 		if n > budget {
 			line = truncateRunes(line, budget)
-			if strings.HasPrefix(line, "- ") {
-				list = append(list, escapeCardText(strings.TrimPrefix(line, "- ")))
-			} else {
-				flushList()
-				out = append(out, mdCardDiv(escapeCardText(line)))
-			}
+			emit(line)
 			flushList()
 			return out
 		}
