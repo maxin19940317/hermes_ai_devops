@@ -7,20 +7,22 @@ from jsonschema import Draft202012Validator
 import gen_manifest
 from ci_helpers import MANIFEST_SCHEMA, VARIANTS_FILE
 
-# RKNN 变体 2026-08-05 起按 SoC 型号拆分(pipeline 1101:RK3562/3568/3576 各自出包)
+# 12 个构建变体(pipeline 1109 起)。2026-08-06 包名变更:SNPE/TFLite 变体名
+# 编码目标 SoC(Android QCM* / Linux QCS*,TFLite Android 为 Qualcomm);
+# RKNN 按 SoC 型号拆分(RK3562/3568/3576)维持不变。
 EXPECTED_VARIANTS = {
-    "aarch64_Linux_SNPE_1.68",
-    "aarch64_Android_SNPE_1.68",
-    "aarch64_Linux_SNPE_2.21",
-    "aarch64_Android_SNPE_2.21",
-    "aarch64_Linux_RK3562_RKNN_2.3.2",
-    "aarch64_Linux_RK3568_RKNN_2.3.2",
-    "aarch64_Linux_RK3576_RKNN_2.3.2",
+    "aarch64_Android_QCM6125_SNPE_1.68",
+    "aarch64_Android_QCM6490_SNPE_2.21",
     "aarch64_Android_RK3562_RKNN_2.3.2",
     "aarch64_Android_RK3568_RKNN_2.3.2",
     "aarch64_Android_RK3576_RKNN_2.3.2",
+    "aarch64_Android_Qualcomm_TFLite_2.21.0",
+    "aarch64_Linux_QCS6125_SNPE_1.68",
+    "aarch64_Linux_QCS6490_SNPE_2.21",
+    "aarch64_Linux_RK3562_RKNN_2.3.2",
+    "aarch64_Linux_RK3568_RKNN_2.3.2",
+    "aarch64_Linux_RK3576_RKNN_2.3.2",
     "aarch64_Linux_TFLite_2.21.0",
-    "aarch64_Android_TFLite_2.21.0",
 }
 
 DUMMY_FILES = [

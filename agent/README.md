@@ -88,7 +88,7 @@ GOOS=windows GOARCH=amd64 go build ./cmd/agent-cli  # Windows 单二进制
 
 ```powershell
 agent-cli run `
-  --package-url "https://gitlab.../packages/generic/algo-super-sdk/1.2.3/algo-super-sdk-aarch64_Android_SNPE_2.21-gxxxxxxx-p42.tar.gz" `
+  --package-url "https://gitlab.../packages/generic/algo-super-sdk/1.2.3/algo-super-sdk-aarch64_Android_QCM6490_SNPE_2.21-gxxxxxxx-p42.tar.gz" `
   --sha256 <bundle 中的整包 sha256> `
   --auth-type job_token --auth-token $env:AGENT_AUTH_TOKEN `
   --serial R5CT10XXXXX `

@@ -28,9 +28,9 @@ func TestSelectTestSpecsAndroidAndLinux(t *testing.T) {
 	a := testActs(t)
 	in := wf.DeviceTestInput{Project: "algo-super-sdk", Commit: "abc1234", PipelineID: 42,
 		Packages: []wf.PackageRef{
-			{Variant: "aarch64_Android_SNPE_2.21", URL: "https://gitlab/pkg1", SHA256: "aa", ManifestDigest: "dd"},
-			{Variant: "aarch64_Linux_SNPE_2.21", URL: "https://gitlab/pkg2"}, // Linux:Phase 4 已接入
-			{Variant: "unknown_variant", URL: "https://gitlab/pkg3"},         // 未配置:跳过
+			{Variant: "aarch64_Android_QCM6490_SNPE_2.21", URL: "https://gitlab/pkg1", SHA256: "aa", ManifestDigest: "dd"},
+			{Variant: "aarch64_Linux_QCS6490_SNPE_2.21", URL: "https://gitlab/pkg2"}, // Linux:Phase 4 已接入
+			{Variant: "unknown_variant", URL: "https://gitlab/pkg3"},                 // 未配置:跳过
 		}}
 	sel, err := a.SelectTestSpecs(ctx, in)
 	if err != nil {
@@ -40,10 +40,10 @@ func TestSelectTestSpecsAndroidAndLinux(t *testing.T) {
 		t.Fatalf("specs = %d, want 2(Android + Linux 均已接入)", len(sel.Specs))
 	}
 	s := sel.Specs[0]
-	if s.TestID != "aarch64_Android_SNPE_2.21" || s.Variant != s.TestID || s.Package.URL != "https://gitlab/pkg1" {
+	if s.TestID != "aarch64_Android_QCM6490_SNPE_2.21" || s.Variant != s.TestID || s.Package.URL != "https://gitlab/pkg1" {
 		t.Errorf("spec = %+v", s)
 	}
-	if len(s.Selector.SOC) != 1 || s.Selector.SOC[0] != "QCM6125" || s.Selector.Capabilities[0] != "hexagon" {
+	if len(s.Selector.SOC) != 1 || s.Selector.SOC[0] != "QCM6490" || s.Selector.Capabilities[0] != "hexagon" {
 		t.Errorf("selector = %+v", s.Selector)
 	}
 	if s.Selector.OS != "android" {
@@ -93,26 +93,26 @@ func TestSelectTestSpecsFleetSkip(t *testing.T) {
 	a.Store = st
 	in := wf.DeviceTestInput{Project: "p", Commit: "abc1234", PipelineID: 1,
 		Packages: []wf.PackageRef{
-			{Variant: "aarch64_Android_SNPE_2.21", URL: "https://gitlab/pkg1"},
-			{Variant: "aarch64_Android_RKNN_2.3.2", URL: "https://gitlab/pkg2"},
+			{Variant: "aarch64_Android_QCM6125_SNPE_1.68", URL: "https://gitlab/pkg1"},
+			{Variant: "aarch64_Android_RK3568_RKNN_2.3.2", URL: "https://gitlab/pkg2"},
 		}}
 	sel, err := a.SelectTestSpecs(ctx, in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sel.Specs) != 1 || sel.Specs[0].Variant != "aarch64_Android_SNPE_2.21" {
-		t.Errorf("specs = %+v, want 仅 SNPE", sel.Specs)
+	if len(sel.Specs) != 1 || sel.Specs[0].Variant != "aarch64_Android_QCM6125_SNPE_1.68" {
+		t.Errorf("specs = %+v, want 仅 SNPE(QCM6125 匹配 fleet 的 QCM6125 板)", sel.Specs)
 	}
-	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Android_RKNN_2.3.2" {
+	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Android_RK3568_RKNN_2.3.2" {
 		t.Fatalf("skipped = %+v, want RKNN 无匹配设备", sel.Skipped)
 	}
 	// 智能跳过原因:领域知识翻译需求 + 在线设备无序列表 + 可行动建议;
 	// 离线/隔离设备完全不提(2026-08-06 review ×3)
 	reason := sel.Skipped[0].Reason
 	for _, want := range []string{
-		"RKNN 包需要瑞芯微 RK3588/RK3566(Android 系统,RK NPU)",
+		"RKNN 包需要瑞芯微 RK3568(Android 系统,RK NPU)",
 		"在线设备:\n- d1 是高通 QCM6125(非目标平台、无 RK NPU)",
-		"\n\n接入瑞芯微 RK3588/RK3566 的 Android 板即可调度",
+		"\n\n接入瑞芯微 RK3568 的 Android 板即可调度",
 	} {
 		if !strings.Contains(reason, want) {
 			t.Errorf("reason = %q, want 含 %q", reason, want)
@@ -132,10 +132,10 @@ func TestSignaturesForVariant(t *testing.T) {
 		{ID: "native_crash", Where: "logcat", Pattern: "Fatal signal|tombstone", Classify: "CODE"},
 	}
 	cfg.file.Variants = map[string]variantDecl{
-		"aarch64_Android_SNPE_2.21": {Signatures: []signatureDecl{
+		"aarch64_Android_QCM6490_SNPE_2.21": {Signatures: []signatureDecl{
 			{ID: "cpu_fallback", Where: "logcat", Pattern: "Falling back to CPU", Classify: "MODEL"},
 		}},
-		"aarch64_Android_RKNN_2.3.2": {Signatures: []signatureDecl{
+		"aarch64_Android_RK3568_RKNN_2.3.2": {Signatures: []signatureDecl{
 			// 变体覆盖同 id:替换 where/pattern/classify,位置保持声明序
 			{ID: "native_crash", Where: "stderr", Pattern: "Segmentation fault", Classify: "DEVICE"},
 			{ID: "rknn_init_fail", Where: "logcat", Pattern: "rknn_init.*fail|RKNN_ERR", Classify: "DELEGATE"},
@@ -143,7 +143,7 @@ func TestSignaturesForVariant(t *testing.T) {
 	}
 
 	// 合并:公共在前,变体私有追加在后
-	sigs := cfg.SignaturesForVariant("aarch64_Android_SNPE_2.21")
+	sigs := cfg.SignaturesForVariant("aarch64_Android_QCM6490_SNPE_2.21")
 	if len(sigs) != 2 || sigs[0].ID != "native_crash" || sigs[1].ID != "cpu_fallback" {
 		t.Fatalf("sigs = %+v", sigs)
 	}
@@ -155,7 +155,7 @@ func TestSignaturesForVariant(t *testing.T) {
 	}
 
 	// 变体覆盖同 id:单条记录取变体值,顺序不变
-	sigs = cfg.SignaturesForVariant("aarch64_Android_RKNN_2.3.2")
+	sigs = cfg.SignaturesForVariant("aarch64_Android_RK3568_RKNN_2.3.2")
 	if len(sigs) != 2 || sigs[0].ID != "native_crash" || sigs[1].ID != "rknn_init_fail" {
 		t.Fatalf("sigs = %+v", sigs)
 	}
@@ -174,7 +174,13 @@ func TestSignaturesForVariant(t *testing.T) {
 func TestVariantNamesSorted(t *testing.T) {
 	a := testActs(t)
 	got := a.SpecCfg.VariantNames()
-	want := []string{"aarch64_Android_RKNN_2.3.2", "aarch64_Android_SNPE_2.21", "aarch64_Linux_SNPE_2.21"}
+	want := []string{
+		"aarch64_Android_QCM6125_SNPE_1.68",
+		"aarch64_Android_QCM6490_SNPE_2.21",
+		"aarch64_Android_Qualcomm_TFLite_2.21.0",
+		"aarch64_Android_RK3568_RKNN_2.3.2",
+		"aarch64_Linux_QCS6490_SNPE_2.21",
+	}
 	if len(got) != len(want) {
 		t.Fatalf("VariantNames() = %v, want %v", got, want)
 	}
@@ -189,4 +195,143 @@ func TestLoadSpecConfigMissingFile(t *testing.T) {
 	if _, err := LoadSpecConfig("testdata/nonexistent.yaml", SpecDefaults{}); err == nil {
 		t.Error("缺失文件应报错(worker 启动时 fail fast)")
 	}
+}
+
+// TestQualcommTFLiteSkippedOnNonQualcommFleet:2026-08-06 实机回归——
+// aarch64_Android_Qualcomm_TFLite_2.21.0 曾因无 soc 约束被派到 MTK mt8189 板
+// (AcquireDevice 按 device_id 升序选中 10.83.100.13:5555),而包内 GPU delegate
+// 是 Adreno。加 soc 约束后,fleet 只有 MTK/RK 板时必须秒级跳过,不得派发。
+func TestQualcommTFLiteSkippedOnNonQualcommFleet(t *testing.T) {
+	a := testActs(t)
+	st := store.NewMemStore()
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1", BaseURL: "https://c1"},
+		[]store.Device{
+			{DeviceID: "10.83.100.13:5555", Serial: "10.83.100.13:5555", ClientID: "c1",
+				OS: "android", SOC: "mt8189"},
+			{DeviceID: "b84aa09110cfc84a", Serial: "b84aa09110cfc84a", ClientID: "c1",
+				OS: "android", SOC: "rk3576"},
+		}); err != nil {
+		t.Fatal(err)
+	}
+	a.Store = st
+	sel, err := a.SelectTestSpecs(ctx, wf.DeviceTestInput{
+		Project: "p", Commit: "abc1234", PipelineID: 1,
+		Packages: []wf.PackageRef{
+			{Variant: "aarch64_Android_Qualcomm_TFLite_2.21.0", URL: "https://gitlab/pkg1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sel.Specs) != 0 {
+		t.Errorf("specs = %+v, want 0(非高通 fleet 不得派发 Qualcomm 包)", sel.Specs)
+	}
+	if len(sel.Skipped) != 1 || sel.Skipped[0].Variant != "aarch64_Android_Qualcomm_TFLite_2.21.0" {
+		t.Fatalf("skipped = %+v, want Qualcomm TFLite 秒级跳过", sel.Skipped)
+	}
+	// 领域语言:高通平台 + 具体缺项
+	for _, want := range []string{"高通", "非目标平台"} {
+		if !strings.Contains(sel.Skipped[0].Reason, want) {
+			t.Errorf("reason = %q, want 含 %q", sel.Skipped[0].Reason, want)
+		}
+	}
+	// 有高通板(任意状态)时必须保留 spec
+	st2 := store.NewMemStore()
+	if err := st2.UpsertClientDevices(ctx, store.Client{ClientID: "c1", BaseURL: "https://c1"},
+		[]store.Device{
+			{DeviceID: "513cd3de", Serial: "513cd3de", ClientID: "c1",
+				OS: "android", SOC: "QCM6125", Capabilities: []string{"hexagon"}},
+		}); err != nil {
+		t.Fatal(err)
+	}
+	a.Store = st2
+	sel2, err := a.SelectTestSpecs(ctx, wf.DeviceTestInput{
+		Project: "p", Commit: "abc1234", PipelineID: 1,
+		Packages: []wf.PackageRef{
+			{Variant: "aarch64_Android_Qualcomm_TFLite_2.21.0", URL: "https://gitlab/pkg1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sel2.Specs) != 1 || len(sel2.Skipped) != 0 {
+		t.Errorf("specs = %+v skipped=%+v, want 1 spec / 0 skipped(QCM6125 在 fleet 中)",
+			sel2.Specs, sel2.Skipped)
+	}
+}
+
+// TestExplainNoDevice:acquire 有限等待超时后的原因须与 SKIPPED 同等信息量
+// (2026-08-06:曾只报 "no device available")。有匹配设备但离线时要明确点出
+// 状态;无任何匹配设备时退化为 skipReason 同构的文案。
+func TestExplainNoDevice(t *testing.T) {
+	t.Run("匹配设备离线", func(t *testing.T) {
+		a := testActs(t)
+		st := store.NewMemStore()
+		if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1", BaseURL: "https://c1"},
+			[]store.Device{
+				{DeviceID: "513cd3de", Serial: "513cd3de", ClientID: "c1", ReportedState: store.DeviceOffline,
+					OS: "android", SOC: "QCM6125", Capabilities: []string{"hexagon"}},
+				{DeviceID: "10.83.100.13:5555", Serial: "10.83.100.13:5555", ClientID: "c1",
+					OS: "android", SOC: "mt8189"},
+			}); err != nil {
+			t.Fatal(err)
+		}
+		a.Store = st
+		got, err := a.ExplainNoDevice(ctx, wf.ExplainNoDeviceRequest{
+			Variant: "aarch64_Android_Qualcomm_TFLite_2.21.0",
+			Selector: wf.DeviceSelector{OS: "android", SOC: []string{"QCM6125", "QCM6490"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"无可用设备:TFLite 包需要高通 Android 板(QCM6125/QCM6490)",
+			"匹配设备:\n- 513cd3de(高通 QCM6125)当前离线,接入/唤醒后可调度",
+			"在线设备:\n- 10.83.100.13:5555 是联发科 MT8189(非目标平台)",
+			"接入高通 Android 板(QCM6125/QCM6490)即可调度",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("reason = %q, want 含 %q", got, want)
+			}
+		}
+		if strings.Contains(got, "fleet 无在线设备") {
+			t.Errorf("reason = %q, 有在线设备时不应说 fleet 无在线设备", got)
+		}
+	})
+	t.Run("无任何匹配设备", func(t *testing.T) {
+		a := testActs(t)
+		st := store.NewMemStore()
+		if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1", BaseURL: "https://c1"},
+			[]store.Device{
+				{DeviceID: "b84aa09110cfc84a", Serial: "b84aa09110cfc84a", ClientID: "c1",
+					OS: "android", SOC: "rk3576"},
+			}); err != nil {
+			t.Fatal(err)
+		}
+		a.Store = st
+		got, err := a.ExplainNoDevice(ctx, wf.ExplainNoDeviceRequest{
+			Variant: "aarch64_Android_Qualcomm_TFLite_2.21.0",
+			Selector: wf.DeviceSelector{OS: "android", SOC: []string{"QCM6125", "QCM6490"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(got, "无可用设备") || !strings.Contains(got, "在线设备") ||
+			strings.Contains(got, "匹配设备:") {
+			t.Errorf("reason = %q, 无匹配设备时不应有匹配设备段", got)
+		}
+	})
+	t.Run("fleet 为空", func(t *testing.T) {
+		a := testActs(t)
+		a.Store = store.NewMemStore()
+		got, err := a.ExplainNoDevice(ctx, wf.ExplainNoDeviceRequest{
+			Variant: "v", Selector: wf.DeviceSelector{OS: "android"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(got, "fleet 无任何已注册设备") {
+			t.Errorf("reason = %q, want 提示 agent 未上线", got)
+		}
+	})
 }

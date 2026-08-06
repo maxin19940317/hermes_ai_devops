@@ -240,6 +240,11 @@ func variantNeed(spec wf.TestSpec) string {
 	case "RKNN":
 		return fmt.Sprintf("RKNN 包需要瑞芯微 %s(%s 系统,RK NPU)", strings.Join(spec.Selector.SOC, "/"), os)
 	case "TFLite":
+		// 2026-08-06:Qualcomm TFLite 带 soc 约束后,领域语言须区分高通平台
+		// (否则 fleet-skip 原因误导为"任意板可跑",见 TestQualcommTFLiteSkippedOnNonQualcommFleet)
+		if len(spec.Selector.SOC) > 0 {
+			return fmt.Sprintf("TFLite 包需要高通 %s 板(%s)", os, strings.Join(spec.Selector.SOC, "/"))
+		}
 		return fmt.Sprintf("TFLite 包需要 %s 设备(通用 CPU/GPU 即可)", os)
 	}
 	return "需要 " + selectorDesc(spec.Selector)
@@ -277,6 +282,12 @@ func actionHint(spec wf.TestSpec) string {
 		return fmt.Sprintf("接入任意高通 %s 板即可调度", osCN(spec.Selector.OS))
 	case "RKNN":
 		return fmt.Sprintf("接入瑞芯微 %s 的 %s 板即可调度", strings.Join(spec.Selector.SOC, "/"), osCN(spec.Selector.OS))
+	case "TFLite":
+		// 2026-08-06:Qualcomm TFLite 带 soc 约束,提示接入高通板
+		if len(spec.Selector.SOC) > 0 {
+			return fmt.Sprintf("接入高通 %s 板(%s)即可调度", osCN(spec.Selector.OS), strings.Join(spec.Selector.SOC, "/"))
+		}
+		return "接入满足条件的设备后即可调度"
 	}
 	return "接入满足条件的设备后即可调度"
 }
@@ -345,4 +356,80 @@ func selectorDesc(sel wf.DeviceSelector) string {
 		parts = append(parts, fmt.Sprintf("capabilities=%v", sel.Capabilities))
 	}
 	return strings.Join(parts, " ")
+}
+
+// ExplainNoDevice 在 acquire 有限等待超时后生成业务语言的原因(2026-08-06:
+// 曾只报 "no device available",与 SKIPPED 的丰富原因反差过大)。语义与
+// skipReason 互补:skipReason 用于 fleet 无任何匹配设备(秒级);
+// 此处 fleet 有匹配设备但均不可用(离线/忙/隔离),要明确点出匹配设备状态。
+func (a *Acts) ExplainNoDevice(ctx context.Context, req wf.ExplainNoDeviceRequest) (string, error) {
+	spec := wf.TestSpec{Variant: req.Variant, Selector: req.Selector}
+	return a.noDeviceReason(ctx, spec), nil
+}
+
+// noDeviceReason 生成 acquire 超时后的详细原因:需求翻译 + 匹配设备状态 +
+// 在线设备差异 + 可行动建议。格式与 skipReason 对齐,多一层"匹配设备"段。
+// 例:
+// 无可用设备:TFLite 包需要高通 Android 板(QCM6125/QCM6490);
+// 匹配设备:
+// - 513cd3de(高通 QCM6125)当前 OFFLINE,接入/唤醒后可调度
+// 在线设备:
+// - 10.83.100.13:5555 是联发科 MT8189(非目标平台)
+//
+// 接入高通 Android 板(QCM6125/QCM6490)即可调度
+func (a *Acts) noDeviceReason(ctx context.Context, spec wf.TestSpec) string {
+	need := variantNeed(spec)
+	fleet, err := a.Store.ListFleet(ctx)
+	if err != nil {
+		a.warnf("list fleet for no-device reason failed: %v", err)
+		return "无可用设备:" + need
+	}
+	if len(fleet) == 0 {
+		return "无可用设备:" + need + ";fleet 无任何已注册设备(agent 未上线?)。"
+	}
+	// 匹配设备(任意状态,带状态说明)与在线设备差异(仅 IDLE/BUSY)分离
+	var matched, alive []string
+	for _, d := range fleet {
+		matches := len(store.SelectorMismatch(d.Device, spec.Selector)) == 0
+		if matches {
+			label := strings.ToUpper(d.SOC)
+			if v := vendorOf(d.SOC); v != "" {
+				label = v + " " + label
+			}
+			matched = append(matched, fmt.Sprintf("%s(%s)当前%s,接入/唤醒后可调度",
+				d.DeviceID, label, deviceStatusCN(d.Status)))
+			continue
+		}
+		switch d.Status {
+		case store.DeviceOffline, store.DeviceQuarantined:
+			continue
+		default:
+			alive = append(alive, deviceCN(d, spec.Selector))
+		}
+	}
+	reason := "无可用设备:" + need
+	if len(matched) > 0 {
+		reason += ";\n匹配设备:\n- " + strings.Join(matched, "\n- ")
+	}
+	if len(alive) > 0 {
+		reason += ";\n在线设备:\n- " + strings.Join(alive, "\n- ")
+	} else if len(matched) == 0 {
+		reason += ";fleet 无在线设备"
+	}
+	return reason + "\n\n" + actionHint(spec)
+}
+
+// deviceStatusCN 设备状态的中文名(业务语言,供 noDeviceReason 展示)。
+func deviceStatusCN(status string) string {
+	switch status {
+	case store.DeviceIdle:
+		return "空闲"
+	case store.DeviceBusy:
+		return "忙"
+	case store.DeviceOffline:
+		return "离线"
+	case store.DeviceQuarantined:
+		return "隔离"
+	}
+	return status
 }

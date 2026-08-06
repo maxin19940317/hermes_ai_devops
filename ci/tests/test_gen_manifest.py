@@ -16,7 +16,7 @@ from ci_helpers import (
     sha256_bytes,
 )
 
-VARIANT = "aarch64_Android_SNPE_2.21"
+VARIANT = "aarch64_Android_QCM6490_SNPE_2.21"
 SOURCE_DATE_EPOCH = 1_700_000_000
 
 

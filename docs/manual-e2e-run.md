@@ -33,7 +33,7 @@ Windows Client Agent 侧的准备与核对。
 
 ### 方式 A：变体级 `/kick`（推荐，主路径）
 
-变体级触发不依赖 pipeline webhook，**一个包上传成功即可测试**，无需等待全部 8 个变体。
+变体级触发不依赖 pipeline webhook，**一个包上传成功即可测试**，无需等待全部 12 个变体。
 
 **前提**：业务仓库 CI 已接入 `ci/kick.py`（§6.3），且 GitLab CI/CD 变量
 `TRIGGER_KICK_URL` / `TRIGGER_KICK_TOKEN` 已配置。如果尚未接入，可手动模拟：
@@ -46,7 +46,7 @@ Windows Client Agent 侧的准备与核对。
 curl -v -X POST \
   -H "Content-Type: application/json" \
   -H "X-Gitlab-Token: $(grep TRIGGER_WEBHOOK_SECRET deploy/.env | cut -d= -f2)" \
-  --data-binary @dist/meta/aarch64_Android_SNPE_2.21.json \
+  --data-binary @dist/meta/aarch64_Android_QCM6490_SNPE_2.21.json \
   http://127.0.0.1:18090/kick
 ```
 

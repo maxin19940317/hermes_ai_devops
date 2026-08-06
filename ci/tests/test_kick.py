@@ -5,7 +5,7 @@ import kick
 import pytest
 
 META = {
-    "variant": "aarch64_Android_SNPE_2.21",
+    "variant": "aarch64_Android_QCM6490_SNPE_2.21",
     "package_file": "pkg.tar.gz",
     "url": "https://gitlab.example/api/v4/projects/651/packages/generic/algo-super-sdk/1.0.2/pkg.tar.gz",
     "sha256": "a" * 64,

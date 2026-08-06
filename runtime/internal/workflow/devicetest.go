@@ -75,6 +75,13 @@ type AcquireRequest struct {
 	Selector DeviceSelector `json:"selector"`
 }
 
+// ExplainNoDeviceRequest 是 acquire 有限等待超时后请求详细原因的活动输入
+// (2026-08-06:超时曾只报 "no device available",与 SKIPPED 的丰富原因反差过大)。
+type ExplainNoDeviceRequest struct {
+	Variant  string         `json:"variant"`
+	Selector DeviceSelector `json:"selector"`
+}
+
 // Lease 是 AcquireDevice 的结果;nil 表示当前无可用设备。
 // LeaseID/Generation 是租约所有权凭据(§10/差距 #15):随派单透传 Client,
 // 心跳续租时必须原样携带,失配即 LEASE_NOT_OWNED。
@@ -538,7 +545,15 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 			break
 		}
 		if round >= spec.DeviceWaitRounds {
-			return infra("no device available", false)
+			// 有限等待耗尽:生成与 SKIPPED 同等信息量的原因(需求 + 匹配设备
+			// 状态 + 在线设备差异),不再只报 "no device available"(2026-08-06)。
+			var reason string
+			if err := workflow.ExecuteActivity(ctx, "ExplainNoDevice", ExplainNoDeviceRequest{
+				Variant: spec.Variant, Selector: spec.Selector,
+			}).Get(ctx, &reason); err != nil || reason == "" {
+				reason = "no device available"
+			}
+			return infra(reason, false)
 		}
 		if err := workflow.Sleep(ctx, time.Duration(spec.DeviceWaitSeconds)*time.Second); err != nil {
 			return infra("canceled while waiting for device", false)

@@ -11,28 +11,32 @@
 #      解决"版本号不变导致新构建被 400 skip 静默丢弃"(§6.1)。
 #      URL 仍确定性可寻址,重跑同一 job 产生同名文件,400 skip 变回安全幂等。
 #   B. 打包后注入 manifest.yaml + files.sha256,Schema 不过则 fail(§6.2)。
-#   C. 每 job 产出 dist/meta/{variant}.json;publish:bundle 聚合,8 个不齐不发(§6.3)。
+#   C. 每 job 产出 dist/meta/{variant}.json;publish:bundle 聚合,12 个不齐不发(§6.3)。
 #   D. 变体级触发:上传成功后直发 Trigger /kick,一个包编好即测,
-#      不等全部 8 个包与 pipeline success(§6.3;TRIGGER_KICK_URL/TOKEN 走 CI/CD 变量)。
+#      不等全部 12 个包与 pipeline success(§6.3;TRIGGER_KICK_URL/TOKEN 走 CI/CD 变量)。
+#
+# 变体名(2026-08-06 pipeline 1109 起):SNPE/TFLite 变体名编码目标 SoC
+#   (Android QCM6125/QCM6490/Qualcomm,Linux QCS6125/QCS6490),RKNN 按
+#   RK3562/3568/3576 拆三个;共 12 个。job 名与 variants.yaml 键一一对应。
 
 variables:
   RELEASE_PACKAGE_NAME: algo-super-sdk
   # RELEASE_VERSION 沿用现状:master 取 CMakeLists 的 X.Y.Z,tag 时取 tag
 
-# ---- 每个构建 job 的 script 尾部追加(以一个变体为例,其余 7 个同构) ----
-build:aarch64_Android_SNPE_2.21:
+# ---- 每个构建 job 的 script 尾部追加(以一个变体为例,其余 11 个同构) ----
+build:aarch64_Android_QCM6490_SNPE_2.21:
   stage: build
   interruptible: true
   script:
-    - ./rebuild.sh aarch64_Android_SNPE_2.21
+    - ./rebuild.sh aarch64_Android_QCM6490_SNPE_2.21
     # GitLab 13.8 用 commit 时间固定归档元数据。
     - export SOURCE_DATE_EPOCH="$(date --date="${CI_COMMIT_TIMESTAMP}" +%s)"
-    - ./release_pack.sh --platform aarch64_Android_SNPE_2.21 --output-dir dist
+    - ./release_pack.sh --platform aarch64_Android_QCM6490_SNPE_2.21 --output-dir dist
     # B: 注入契约文件并重命名(gen_manifest 校验失败会直接 fail pipeline)
     - ORIG_PKG=$(ls dist/*.tar.gz | head -1)
     - python3 hermes-devops/ci/gen_manifest.py
         --package "$ORIG_PKG"
-        --variant aarch64_Android_SNPE_2.21
+        --variant aarch64_Android_QCM6490_SNPE_2.21
         --variants-file hermes-devops/ci/variants.yaml
         --schema hermes-devops/contracts/manifest.schema.json
         --project "$CI_PROJECT_PATH"
@@ -46,7 +50,7 @@ build:aarch64_Android_SNPE_2.21:
     # C: 生成 meta(job artifact,供 publish:bundle 聚合)
     - python3 hermes-devops/ci/write_meta.py
         --info dist/manifest-info.json
-        --variant aarch64_Android_SNPE_2.21
+        --variant aarch64_Android_QCM6490_SNPE_2.21
         --project "$CI_PROJECT_PATH"
         --version "$RELEASE_VERSION"
         --commit "$CI_COMMIT_SHORT_SHA"
@@ -67,26 +71,30 @@ build:aarch64_Android_SNPE_2.21:
     # D: 变体级触发(仅上传成功的分支)。kick 失败即 fail job(可见、可重试,
     #    Temporal 按确定性 workflow ID 去重,重试不会重复测试)。
     - python3 hermes-devops/ci/kick.py
-        --meta "dist/meta/aarch64_Android_SNPE_2.21.json"
+        --meta "dist/meta/aarch64_Android_QCM6490_SNPE_2.21.json"
         --trigger-url "${TRIGGER_KICK_URL}"
         --token-env TRIGGER_KICK_TOKEN
   artifacts:
     paths: [dist/meta/]
     expire_in: 1 week
 
-# ---- 新增聚合 job:8 个 meta 齐全才发 bundle,Trigger 服务只认 bundle ----
+# ---- 新增聚合 job:12 个 meta 齐全才发 bundle,Trigger 服务只认 bundle ----
 publish:bundle:
   stage: publish
   interruptible: false
   needs:
-    - build:aarch64_Linux_SNPE_1.68
-    - build:aarch64_Android_SNPE_1.68
-    - build:aarch64_Linux_SNPE_2.21
-    - build:aarch64_Android_SNPE_2.21
-    - build:aarch64_Linux_RKNN_2.3.2
-    - build:aarch64_Android_RKNN_2.3.2
+    - build:aarch64_Linux_QCS6125_SNPE_1.68
+    - build:aarch64_Android_QCM6125_SNPE_1.68
+    - build:aarch64_Linux_QCS6490_SNPE_2.21
+    - build:aarch64_Android_QCM6490_SNPE_2.21
+    - build:aarch64_Linux_RK3562_RKNN_2.3.2
+    - build:aarch64_Android_RK3562_RKNN_2.3.2
+    - build:aarch64_Linux_RK3568_RKNN_2.3.2
+    - build:aarch64_Android_RK3568_RKNN_2.3.2
+    - build:aarch64_Linux_RK3576_RKNN_2.3.2
+    - build:aarch64_Android_RK3576_RKNN_2.3.2
     - build:aarch64_Linux_TFLite_2.21.0
-    - build:aarch64_Android_TFLite_2.21.0
+    - build:aarch64_Android_Qualcomm_TFLite_2.21.0
   script:
     - python3 hermes-devops/ci/gen_bundle.py
         --meta-dir dist/meta

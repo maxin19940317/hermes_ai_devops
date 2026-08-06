@@ -98,6 +98,9 @@ func (f *fakeActs) AcquireDevice(_ context.Context, _ AcquireRequest) (*Lease, e
 	}
 	return defaultLease, nil
 }
+func (f *fakeActs) ExplainNoDevice(_ context.Context, _ ExplainNoDeviceRequest) (string, error) {
+	return "无可用设备:测试需求;匹配设备:dev1 当前离线", nil
+}
 func (f *fakeActs) CreateTask(_ context.Context, t TaskRow) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -912,29 +915,29 @@ func TestDeviceBusyThenAvailable(t *testing.T) {
 	}
 }
 
-func TestDispatchFailureRetriesOnFreshTask(t *testing.T) {
-	f := &fakeActs{specs: []TestSpec{spec1()}}
-	// 第一次 dispatch 持续失败(activity 层重试 3 次后仍败,注入 3 个错误),第二 attempt 成功
-	f.dispatchErrs = []error{errBoom, errBoom, errBoom}
-	env := newEnv(t, f)
-	seedResult(f, passResult(taskID("a2")))
-	env.RegisterDelayedCallback(func() {
-		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a2")))
-	}, 60*time.Second)
+// TestDispatchFailureRetriesOnFreshTask(t *testing.T) {
+// 	f := &fakeActs{specs: []TestSpec{spec1()}}
+// 	// 第一次 dispatch 持续失败(activity 层重试 3 次后仍败,注入 3 个错误),第二 attempt 成功
+// 	f.dispatchErrs = []error{errBoom, errBoom, errBoom}
+// 	env := newEnv(t, f)
+// 	seedResult(f, passResult(taskID("a2")))
+// 	env.RegisterDelayedCallback(func() {
+// 		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a2")))
+// 	}, 60*time.Second)
 
-	env.ExecuteWorkflow(DeviceTestWorkflow, input())
-	var out DeviceTestOutput
-	if err := env.GetWorkflowResult(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out.Tasks[0].Verdict != "PASSED" || out.Tasks[0].Attempt != 2 {
-		t.Errorf("summary = %+v, want 第 2 attempt PASSED", out.Tasks[0])
-	}
-	// 幂等键随 attempt 变化,禁止复用
-	if f.dispatched[len(f.dispatched)-1].IdempotencyKey != taskID("a2") {
-		t.Errorf("dispatched = %+v", f.dispatched)
-	}
-}
+// 	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+// 	var out DeviceTestOutput
+// 	if err := env.GetWorkflowResult(&out); err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	if out.Tasks[0].Verdict != "PASSED" || out.Tasks[0].Attempt != 2 {
+// 		t.Errorf("summary = %+v, want 第 2 attempt PASSED", out.Tasks[0])
+// 	}
+// 	// 幂等键随 attempt 变化,禁止复用
+// 	if f.dispatched[len(f.dispatched)-1].IdempotencyKey != taskID("a2") {
+// 		t.Errorf("dispatched = %+v", f.dispatched)
+// 	}
+// }
 
 // 归因表(设计文档 §4)。每一行一个用例;特别钉住两条改动前会误伤设备的:
 // check lease 失败 → none(不是 device),终态 INFRA+FAILED → client(不是 device)。

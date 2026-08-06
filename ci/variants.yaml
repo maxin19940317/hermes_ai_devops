@@ -1,10 +1,13 @@
-# 8 个构建变体 → Manifest 参数映射(CLAUDE.md §6)。
+# 12 个构建变体 → Manifest 参数映射(CLAUDE.md §6)。
 # gen_manifest.py 按此渲染包内 manifest.yaml;deploy.files 由脚本扫描包内容生成,不在此声明。
 # 约定:
 #   - env 值中的 {workdir} 占位符由 Client Agent 部署时替换,此处原样保留。
 #   - Linux 变体已接入设备测试链路(Phase 4);soc/capabilities 为设备调度约束。
 #   - workdir_linux 不能用 /opt:RK3568 固件 rootfs 整体只读(2026-08-04 实机:
 #     /opt、/root 均 Read-only),/data 是其可写分区,与 Android 同父目录。
+#   - 2026-08-06 包名变更(pipeline 1109):SNPE/TFLite 变体名编码目标 SoC,
+#     与业务仓库 ci/hermes/variants.yaml 保持一致;Android SNPE 2.21 目标
+#     SoC 从 QCM6125 改为 QCM6490(仅变体名与 soc 变化,签名/环境不变)。
 
 defaults:
   deploy:
@@ -34,7 +37,7 @@ defaults:
     - { id: backend_unsupported, where: logs, pattern: "Unsupported backend", classify: MODEL }
 
 variants:
-  aarch64_Android_SNPE_1.68:
+  aarch64_Android_QCM6125_SNPE_1.68:
     requirements: { os: android, abi: arm64-v8a, soc: [QCM6125], capabilities: [hexagon], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
@@ -48,8 +51,9 @@ variants:
       # 2026-07-24 p53:DSP 委派不可用(unsigned PD 不支持),gesture 等强依赖 DSP 的用例 init 失败
       - { id: dsp_unavailable, where: stdout, pattern: "RUNTIME_NOT_AVAILABLE|DspTransport.*not supported|DSP does not support", classify: DELEGATE }
 
-  aarch64_Android_SNPE_2.21:
-    requirements: { os: android, abi: arm64-v8a, soc: [QCM6125], capabilities: [hexagon], min_free_storage_mb: 512 }
+  aarch64_Android_QCM6490_SNPE_2.21:
+    # 2026-08-06 包名变更:SNPE 2.21 目标 SoC 从 QCM6125 改为 QCM6490(编码进变体名)
+    requirements: { os: android, abi: arm64-v8a, soc: [QCM6490], capabilities: [hexagon], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
       ADSP_LIBRARY_PATH: "{workdir}/lib/dsp;/system/lib/rfsa/adsp"
@@ -87,8 +91,13 @@ variants:
     signatures:
       - { id: rknn_init_fail, where: stdout, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }
 
-  aarch64_Android_TFLite_2.21.0:
-    requirements: { os: android, abi: arm64-v8a, min_free_storage_mb: 512 }
+  aarch64_Android_Qualcomm_TFLite_2.21.0:
+    # 2026-08-06 包名变更:Android TFLite 明确为高通平台(变体名编码 Qualcomm)。
+    # CONTRACT-ISSUE: 2026-08-06 实机发现该变体原先无 soc 约束,调度器会把包
+    # 派到任意 Android 板(实测选中 MTK mt8189,而包内 GPU delegate 是 Adreno)。
+    # 与 SNPE 变体对齐,加高通 SoC 约束;fleet 无匹配设备时由 SelectTestSpecs
+    # 秒级跳过,不再错误派发。
+    requirements: { os: android, abi: arm64-v8a, soc: [QCM6125, QCM6490], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
     test:
@@ -96,9 +105,10 @@ variants:
     signatures:
       - { id: delegate_fallback, where: stdout, pattern: "falling back to CPU|Delegate creation failed", classify: DELEGATE }
 
-  aarch64_Linux_SNPE_1.68:
+  aarch64_Linux_QCS6125_SNPE_1.68:
     # SNPE=高通 SDK:目标是任意带 hexagon 的高通 Linux 板,不限定具体 SoC 型号
-    # (soc 留空=不约束;hexagon 能力即高通 DSP 的判据。2026-08-05 review)
+    # (soc 留空=不约束;hexagon 能力即高通 DSP 的判据。2026-08-05 review;
+    #  2026-08-06 变体名编码 QCS6125,但需求约束不变)
     requirements: { os: linux, abi: arm64-v8a, capabilities: [hexagon], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
@@ -109,7 +119,7 @@ variants:
       - { id: cpu_fallback, where: logs, pattern: "Falling back to CPU", classify: MODEL }
       - { id: dsp_unavailable, where: logs, pattern: "RUNTIME_NOT_AVAILABLE|DspTransport.*not supported|DSP does not support", classify: DELEGATE }
 
-  aarch64_Linux_SNPE_2.21:
+  aarch64_Linux_QCS6490_SNPE_2.21:
     requirements: { os: linux, abi: arm64-v8a, capabilities: [hexagon], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"

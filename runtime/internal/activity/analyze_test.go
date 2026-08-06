@@ -230,7 +230,7 @@ func TestExtractEvidenceScansDeviceLogs(t *testing.T) {
 	a.Cfg = Config{MinIOEndpoint: srv.URL, MinIOAccessKey: "k", MinIOSecretKey: "s", MinIOBucket: "bucket"}
 
 	resp, err := a.ExtractEvidence(ctx, wf.ExtractEvidenceRequest{
-		TaskID: "t1", Variant: "aarch64_Linux_SNPE_2.21",
+		TaskID: "t1", Variant: "aarch64_Linux_QCS6490_SNPE_2.21",
 		Result: wf.TaskResultSignal{
 			TaskID: "t1", Status: "COMPLETED", ExitCode: 1, CasesTotal: 2, CasesFailed: 1,
 			Attachments: []wf.Attachment{

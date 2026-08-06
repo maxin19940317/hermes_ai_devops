@@ -42,7 +42,7 @@
           "items": {
             "type": "string",
             "pattern": "^[A-Za-z0-9._]+$",
-            "description": "构建变体名,须与 ci/variants.yaml 中的键一致,如 aarch64_Android_SNPE_2.21"
+            "description": "构建变体名,须与 ci/variants.yaml 中的键一致,如 aarch64_Android_QCM6490_SNPE_2.21"
           }
         },
         "build_type": { "enum": ["Release", "Debug"], "default": "Release" }
