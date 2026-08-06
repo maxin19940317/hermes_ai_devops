@@ -51,7 +51,7 @@ type Attachment struct {
 // ---- 活动契约(实现在 internal/activity) ----
 
 type DeviceSelector struct {
-	OS           string   `json:"os"`           // 空=不约束;非空时大小写不敏感精确匹配
+	OS           string   `json:"os"` // 空=不约束;非空时大小写不敏感精确匹配
 	SOC          []string `json:"soc"`
 	Capabilities []string `json:"capabilities"`
 }
@@ -904,11 +904,18 @@ func buildNotification(in DeviceTestInput, out *DeviceTestOutput) string {
 		if tk.CasesTotal > 0 {
 			fmt.Fprintf(&b, " %.1fs cases=%d/%d", tk.DurationSec, tk.CasesTotal-tk.CasesFailed, tk.CasesTotal)
 		}
-		if len(tk.Metrics) > 0 {
-			fmt.Fprintf(&b, " %s", formatMetrics(tk.Metrics))
+		if tk.Verdict != VerdictSkipped { // SKIPPED 的 attempt=0 是噪声(与卡片行为对齐)
+			fmt.Fprintf(&b, " attempt=%d", tk.Attempt)
 		}
-		fmt.Fprintf(&b, " attempt=%d %s\n", tk.Attempt, tk.Reason)
-		// Phase 2:LLM Analyzer 的总结性结论随通知透出(仅非 PASSED 且分析成功时存在)
+		b.WriteString("\n")
+		// 指标/原因/hermes 各占一行,主行保持一瞥可读(2026-08-06 排版);
+		// PASSED 的 reason 恒为 "all criteria met",与 verdict 重复,不展示
+		if len(tk.Metrics) > 0 {
+			fmt.Fprintf(&b, "  · %s\n", formatMetrics(tk.Metrics))
+		}
+		if tk.Verdict != string(rules.VerdictPassed) && tk.Reason != "" {
+			fmt.Fprintf(&b, "  · %s\n", tk.Reason)
+		}
 		if tk.Analysis != nil && tk.Analysis.Summary != "" {
 			fmt.Fprintf(&b, "  · hermes: %s\n", tk.Analysis.Summary)
 		}
@@ -1042,12 +1049,13 @@ func cardHeaderTemplate(tasks []TaskSummary) string {
 }
 
 // cardVariantBlock 是单个变体在卡片里的行分组:主行(main)恒存在且不可裁剪,
-// metric 按格式表条件出现但始终保留;reason/hermes 是"该变体的详情",
-// 裁剪时按变体整体丢弃(设计 §4.5 第 1 步)。
+// metric 按格式表条件出现但始终保留;metrics(性能指标)独立成行与 metric 同
+// 级保留;reason/hermes 是"该变体的详情",裁剪时按变体整体丢弃(设计 §4.5 第 1 步)。
 // actions 是变体失败时的交互按钮组("重试该变体"/"忽略"),不占裁剪预算。
 type cardVariantBlock struct {
 	main    CardElement
 	metric  *CardElement
+	metrics *CardElement
 	reason  *CardElement
 	hermes  *CardElement
 	actions *CardElement // tag=action 按钮组;nil = 该变体不可重试(已 PASSED/SKIPPED)
@@ -1064,6 +1072,9 @@ func (b cardVariantBlock) flatten() []CardElement {
 	es := []CardElement{b.main}
 	if b.metric != nil {
 		es = append(es, *b.metric)
+	}
+	if b.metrics != nil {
+		es = append(es, *b.metrics)
 	}
 	if b.reason != nil {
 		es = append(es, *b.reason)
@@ -1092,15 +1103,17 @@ func buildCardVariantBlock(tk TaskSummary, workflowID string) cardVariantBlock {
 		parts = append(parts, fmt.Sprintf("%.1fs", tk.DurationSec))
 		parts = append(parts, fmt.Sprintf("cases %d/%d", tk.CasesTotal-tk.CasesFailed, tk.CasesTotal))
 	}
-	if len(tk.Metrics) > 0 {
-		parts = append(parts, formatMetrics(tk.Metrics))
-	}
 	if tk.Verdict != VerdictSkipped {
 		parts = append(parts, fmt.Sprintf("attempt %d", tk.Attempt))
 	}
 	if len(parts) > 0 {
 		m := plainCardDiv(strings.Join(parts, " · "))
 		blk.metric = &m
+	}
+	// 性能指标独立成行(2026-08-06 排版):不挤进耗时/用例行
+	if len(tk.Metrics) > 0 {
+		m := plainCardDiv(formatMetrics(tk.Metrics))
+		blk.metrics = &m
 	}
 
 	if tk.Reason != "" {

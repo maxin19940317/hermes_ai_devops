@@ -207,16 +207,13 @@ func (a *Acts) skipReason(ctx context.Context, spec wf.TestSpec) string {
 	if len(fleet) == 0 {
 		return "无匹配设备:" + need + ";fleet 无任何已注册设备(agent 未上线?)。"
 	}
-	// 只详列在线(IDLE/BUSY)设备的差异;OFFLINE/QUARANTINED 折叠为计数——
-	// 历史设备对"为什么没有设备能跑"没有信息量。
+	// 只列在线(IDLE/BUSY)设备的差异;OFFLINE/QUARANTINED 直接不提——
+	// 历史设备对"为什么没有设备能跑"没有信息量(2026-08-06 review ×2)。
 	alive := []string{}
-	offline, quarantined := 0, 0
 	for _, d := range fleet {
 		switch d.Status {
-		case store.DeviceOffline:
-			offline++
-		case store.DeviceQuarantined:
-			quarantined++
+		case store.DeviceOffline, store.DeviceQuarantined:
+			continue
 		default:
 			alive = append(alive, deviceCN(d, spec.Selector))
 		}
@@ -226,16 +223,6 @@ func (a *Acts) skipReason(ctx context.Context, spec wf.TestSpec) string {
 		reason += ";fleet 无在线设备"
 	} else {
 		reason += ";在线设备:" + strings.Join(alive, "、")
-	}
-	if offline+quarantined > 0 {
-		folds := []string{}
-		if offline > 0 {
-			folds = append(folds, fmt.Sprintf("%d 台离线", offline))
-		}
-		if quarantined > 0 {
-			folds = append(folds, fmt.Sprintf("%d 台隔离", quarantined))
-		}
-		reason += "(另有 " + strings.Join(folds, "、") + " 未列出)"
 	}
 	return reason + "。" + actionHint(spec)
 }
