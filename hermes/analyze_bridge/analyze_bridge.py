@@ -45,8 +45,13 @@ COMMAND_SCHEMA = json.loads(COMMAND_SCHEMA_PATH.read_text(encoding="utf-8"))
 PLAN_SCHEMA_PATH = Path(__file__).with_name("plan.schema.json")
 PLAN_SCHEMA = json.loads(PLAN_SCHEMA_PATH.read_text(encoding="utf-8"))
 
+EXPRESS_SCHEMA_PATH = Path(__file__).with_name("express.schema.json")
+EXPRESS_SCHEMA = json.loads(EXPRESS_SCHEMA_PATH.read_text(encoding="utf-8"))
+
 TRANSLATE_REQUIRED_FIELDS = ("prompt", "raw_text", "context")
 PLAN_REQUIRED_FIELDS = ("prompt", "raw_text", "context")
+# Express 表述层(设计文档 2026-08-07):Facts 是规则算好的结构化事实。
+EXPRESS_REQUIRED_FIELDS = ("prompt", "raw_text", "scene", "facts")
 
 app = FastAPI(title="analyze_bridge", version="1")
 
@@ -126,6 +131,32 @@ def build_plan_prompt(payload: dict, prev_errors: list[str]) -> str:
         parts += [
             "",
             "注意:你上一次的输出未通过 plan.schema.json 校验,错误如下。",
+            "这次只输出修正后的 JSON 对象本身,不要任何其他文本:",
+            *[f"- {e}" for e in prev_errors[-2:]],
+        ]
+    return "\n".join(parts)
+
+
+def build_express_prompt(payload: dict, prev_errors: list[str]) -> str:
+    """表述 prompt:平台 prompt 模板 + 场景 + 规则事实 + 用户原文 + (重试时)校验错误。
+
+    铁律在 prompt 里强调:只能引用 Facts 里的信息,禁止编造;事实冲突以 Facts 为准。
+    """
+    parts = [
+        payload["prompt"],
+        "",
+        f"场景(scene): {payload['scene']}",
+        "",
+        "规则算好的事实 JSON(facts):",
+        json.dumps(payload["facts"], ensure_ascii=False),
+        "",
+        "用户原话:",
+        payload["raw_text"],
+    ]
+    if prev_errors:
+        parts += [
+            "",
+            "注意:你上一次的输出未通过 express.schema.json 校验,错误如下。",
             "这次只输出修正后的 JSON 对象本身,不要任何其他文本:",
             *[f"- {e}" for e in prev_errors[-2:]],
         ]
@@ -218,6 +249,18 @@ def run_planning(payload: dict) -> dict:
     return run_with_schema(payload, PLAN_SCHEMA, build_plan_prompt, log_ok, log_retry, "降级人工规划")
 
 
+def run_expression(payload: dict) -> dict:
+    """表述层(Smart Reply):规则事实 + LLM 表述。校验失败 → 调用方降级规则文本。"""
+
+    def log_ok(attempt: int) -> None:
+        log.info("express ok: scene=%s attempt=%d", payload.get("scene"), attempt)
+
+    def log_retry(attempt: int, err: str) -> None:
+        log.warning("express attempt %d 校验失败: %s", attempt, err)
+
+    return run_with_schema(payload, EXPRESS_SCHEMA, build_express_prompt, log_ok, log_retry, "降级规则文本")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -276,4 +319,24 @@ async def plan(req: Request):
         return await run_in_threadpool(run_planning, payload)
     except BridgeError as e:
         log.error("plan failed: %s", e.msg)
+        return JSONResponse({"error": e.msg}, status_code=e.status)
+
+
+@app.post("/express")
+async def express(req: Request):
+    """表述层(Smart Reply,设计文档 2026-08-07):规则算好 Facts,LLM 只负责
+    表述与洞察。输出受 express.schema.json 封闭结构约束(summary/sections/footer);
+    校验不过 → 打回重试,仍失败 → 502 由调用方降级规则文本。"""
+    if err := check_auth(req):
+        return err
+    try:
+        payload = await req.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "请求体不是合法 JSON"}, status_code=400)
+    if not isinstance(payload, dict) or any(k not in payload for k in EXPRESS_REQUIRED_FIELDS):
+        return JSONResponse({"error": f"缺少必填字段: {EXPRESS_REQUIRED_FIELDS}"}, status_code=400)
+    try:
+        return await run_in_threadpool(run_expression, payload)
+    except BridgeError as e:
+        log.error("express failed: %s", e.msg)
         return JSONResponse({"error": e.msg}, status_code=e.status)

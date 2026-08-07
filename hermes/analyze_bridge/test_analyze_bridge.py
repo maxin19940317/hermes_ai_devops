@@ -194,7 +194,7 @@ def test_schema_copy_matches_contracts():
 # ---------------------------------------------------------------------------
 
 TRANSLATE_VALID = {
-    "translation_version": 2,
+    "translation_version": 4,
     "command": "devices",
     "args": [],
     "confidence": 0.95,
@@ -270,3 +270,51 @@ def test_translate_rejects_old_translation_version(client, fake_hermes):
     )
     r = client.post("/translate", json=TRANSLATE_PAYLOAD, headers=auth())
     assert r.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# /express — 表述层(Smart Reply,设计文档 2026-08-07)
+# ---------------------------------------------------------------------------
+
+EXPRESS_VALID = {
+    "summary": "当前 2 台在线设备",
+    "sections": ["QCS6490 可测 SNPE", "RK3568 可测 RKNN"],
+    "footer": "接入高通 Android 板可补测",
+}
+
+EXPRESS_PAYLOAD = {
+    "prompt": "你是设备测试系统的智能助手……",
+    "raw_text": "查询当前在线设备",
+    "scene": "devices",
+    "facts": {"online": [{"id": "825485946"}]},
+}
+
+
+def test_express_missing_fields(client):
+    r = client.post("/express", json={"prompt": "x"}, headers=auth())
+    assert r.status_code == 400
+
+
+def test_express_ok(client, fake_hermes):
+    put(fake_hermes, "resp_default.json", EXPRESS_VALID)
+    r = client.post("/express", json=EXPRESS_PAYLOAD, headers=auth())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["summary"] == "当前 2 台在线设备"
+    assert len(body["sections"]) == 2
+
+
+def test_express_rejects_extra_field(client, fake_hermes):
+    # 输出含 facts 字段(封闭结构禁止)→ 打回重试 → 耗尽 502
+    put(fake_hermes, "resp_default.json", {**EXPRESS_VALID, "facts": {"x": 1}})
+    r = client.post("/express", json=EXPRESS_PAYLOAD, headers=auth())
+    assert r.status_code == 502
+
+
+def test_express_passes_facts_and_scene(client, fake_hermes):
+    put(fake_hermes, "resp_default.json", EXPRESS_VALID)
+    client.post("/express", json=EXPRESS_PAYLOAD, headers=auth())
+    calls = fake_hermes.parent.joinpath("calls.log").read_text(encoding="utf-8")
+    # prompt 里应含场景与 facts(scene/facts 拼进 prompt)
+    assert "devices" in calls
+    assert "825485946" in calls
