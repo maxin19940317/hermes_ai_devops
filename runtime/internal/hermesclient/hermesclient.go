@@ -40,10 +40,10 @@ type Client interface {
 }
 
 // Translation 与 contracts/command.schema.json 字段一一对应,是意图翻译的结构化输出。
-// Command 是封闭枚举(status|devices|rerun|unquarantine|none);none 表示信息不足
+// Command 是封闭枚举(status|devices|test|rerun|unquarantine|none);none 表示信息不足
 // 或输入根本不是指令。
 type Translation struct {
-	TranslationVersion int      `json:"translation_version"` // 当前契约固定为 2
+	TranslationVersion int      `json:"translation_version"` // 当前契约固定为 3(v3 起含 test 命令)
 	Command            string   `json:"command"`
 	Args               []string `json:"args,omitempty"`
 	Confidence         float64  `json:"confidence"`

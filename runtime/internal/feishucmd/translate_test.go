@@ -79,7 +79,7 @@ func TestRenderParseUnicodeWhitespaceIsNotIdentity(t *testing.T) {
 
 func TestTranslateReadOnlyCommandExecutesDirectly(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "devices", Confidence: 0.95, Reason: "询问设备状态",
+		TranslationVersion: 3, Command: "devices", Confidence: 0.95, Reason: "询问设备状态",
 	}}
 	st := store.NewMemStore()
 	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "看下设备状态")
@@ -95,7 +95,7 @@ func TestTranslateSideEffectCommandNeedsConfirm(t *testing.T) {
 	st := store.NewMemStore()
 	run := recordTranslationWorkflowRun(t, st)
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "rerun",
+		TranslationVersion: 3, Command: "rerun",
 		Args: []string{run.WorkflowID, run.Variants[0]}, Confidence: 0.92,
 	}}
 	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑昨天那个")
@@ -111,7 +111,7 @@ func TestTranslateRejectsUnknownVariant(t *testing.T) {
 	st := store.NewMemStore()
 	run := recordTranslationWorkflowRun(t, st)
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "rerun",
+		TranslationVersion: 3, Command: "rerun",
 		Args: []string{run.WorkflowID, "aarch64_Android_RKNN_9.9"}, Confidence: 0.95,
 	}}
 	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑那个")
@@ -122,7 +122,7 @@ func TestTranslateRejectsUnknownVariant(t *testing.T) {
 
 func TestTranslateRejectsLowConfidence(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "devices", Confidence: 0.5,
+		TranslationVersion: 3, Command: "devices", Confidence: 0.5,
 	}}
 	res := newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "嗯")
 	if res.OK || res.Outcome != store.OutcomeRejectedLowConfidence {
@@ -135,7 +135,7 @@ func TestTranslateRejectsLowConfidence(t *testing.T) {
 
 func TestTranslateNone(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "none", Confidence: 0.9, Reason: "与设备测试无关",
+		TranslationVersion: 3, Command: "none", Confidence: 0.9, Reason: "与设备测试无关",
 	}}
 	res := newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "今天天气怎么样")
 	if res.OK || res.Outcome != store.OutcomeRejectedNone {
@@ -172,7 +172,7 @@ func TestTranslateSchemaInvalidError(t *testing.T) {
 // 按快照 devices 成员判定(设计文档 §5.3),而不只是校验参数个数。
 func TestTranslateRejectsUnknownDevice(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "unquarantine", Args: []string{"dev-ghost"}, Confidence: 0.95,
+		TranslationVersion: 3, Command: "unquarantine", Args: []string{"dev-ghost"}, Confidence: 0.95,
 	}}
 	st := store.NewMemStore()
 	if err := st.UpsertClientDevices(context.Background(), store.Client{ClientID: "c1"},
@@ -187,7 +187,7 @@ func TestTranslateRejectsUnknownDevice(t *testing.T) {
 
 func TestTranslateSnapshotCarriesNow(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "devices", Confidence: 0.9,
+		TranslationVersion: 3, Command: "devices", Confidence: 0.9,
 	}}
 	newTranslator(f, store.NewMemStore()).Translate(context.Background(), "ou_1", "设备")
 	var snap map[string]any
@@ -226,7 +226,7 @@ func TestTranslateSnapshotCarriesAuthoritativeWorkflowIdentity(t *testing.T) {
 	st := store.NewMemStore()
 	run := recordTranslationWorkflowRun(t, st)
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "devices", Confidence: 0.9,
+		TranslationVersion: 3, Command: "devices", Confidence: 0.9,
 	}}
 	newTranslator(f, st).Translate(context.Background(), "ou_1", "设备")
 
@@ -249,7 +249,7 @@ func TestTranslateAcceptsAuthoritativeWorkflowRerun(t *testing.T) {
 	st := store.NewMemStore()
 	run := recordTranslationWorkflowRun(t, st)
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "rerun",
+		TranslationVersion: 3, Command: "rerun",
 		Args: []string{run.WorkflowID, run.Variants[0]}, Confidence: 0.95,
 	}}
 	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑上次失败的 SNPE")
@@ -262,7 +262,7 @@ func TestTranslateRejectsFabricatedWorkflowID(t *testing.T) {
 	st := store.NewMemStore()
 	recordTranslationWorkflowRun(t, st)
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "rerun",
+		TranslationVersion: 3, Command: "rerun",
 		Args: []string{"device-test-grp/fabricated-gdeadbeef-p99"}, Confidence: 0.95,
 	}}
 	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑")
@@ -289,7 +289,7 @@ func TestTranslateRejectsLegacyFallbackRerun(t *testing.T) {
 		}},
 	}
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "rerun", Args: []string{workflowID}, Confidence: 0.95,
+		TranslationVersion: 3, Command: "rerun", Args: []string{workflowID}, Confidence: 0.95,
 	}}
 	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑")
 	if res.OK || res.Outcome != store.OutcomeRejectedArgs {
@@ -328,7 +328,7 @@ func TestTranslateRejectsVariantOutsideSourceRun(t *testing.T) {
 		t.Fatalf("RecordWorkflowRun B: %v", err)
 	}
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "rerun",
+		TranslationVersion: 3, Command: "rerun",
 		Args: []string{runA.WorkflowID, runB.Variants[0]}, Confidence: 0.95,
 	}}
 	res := newTranslator(f, st).Translate(context.Background(), "ou_1", "重跑 RKNN")
@@ -354,7 +354,7 @@ func (erroringSnapshotStore) RecentRuns(context.Context, int) ([]store.RecentRun
 
 func TestTranslateDegradesWhenStoreErrors(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "devices", Confidence: 0.9,
+		TranslationVersion: 3, Command: "devices", Confidence: 0.9,
 	}}
 	st := erroringSnapshotStore{MemStore: store.NewMemStore()}
 	tr := newTranslator(f, st)
@@ -384,7 +384,7 @@ func TestTranslateDegradesWhenStoreErrors(t *testing.T) {
 
 func TestTranslateAuditsEveryOutcome(t *testing.T) {
 	f := &fakeTranslator{out: &hermesclient.Translation{
-		TranslationVersion: 2, Command: "none", Confidence: 0.2,
+		TranslationVersion: 3, Command: "none", Confidence: 0.2,
 	}}
 	st := store.NewMemStore()
 	newTranslator(f, st).Translate(context.Background(), "ou_1", "什么鬼")

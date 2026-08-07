@@ -22,7 +22,7 @@ class TestCommandSchema:
         for args in ([workflow_id], [workflow_id, "aarch64_Android_SNPE_1.68"]):
             validators["command"].validate(
                 {
-                    "translation_version": 2,
+                    "translation_version": 3,
                     "command": "rerun",
                     "args": args,
                     "confidence": 0.9,
@@ -53,7 +53,7 @@ class TestCommandSchema:
     )
     def test_command_arities_are_exact(self, validators, command, args, valid):
         doc = {
-            "translation_version": 2,
+            "translation_version": 3,
             "command": command,
             "args": args,
             "confidence": 0.9,
@@ -77,7 +77,7 @@ class TestCommandSchema:
     )
     def test_args_omission_matches_command_contract(self, validators, command, valid):
         doc = {
-            "translation_version": 2,
+            "translation_version": 3,
             "command": command,
             "confidence": 0.9,
         }
@@ -103,7 +103,7 @@ class TestCommandSchema:
         with pytest.raises(ValidationError):
             validators["command"].validate(
                 {
-                    "translation_version": 2,
+                    "translation_version": 3,
                     "command": "rerun",
                     "args": [arg],
                     "confidence": 0.9,

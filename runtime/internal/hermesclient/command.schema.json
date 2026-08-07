@@ -1,16 +1,29 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hermes-devops/contracts/command.schema.json",
-  "title": "command.json v2",
+  "title": "command.json v3",
   "description": "飞书指令层 LLM 意图翻译输出(CLAUDE.md §12 Phase 2)。command 为封闭枚举,args 禁空白字符以保证渲染成一行指令文本后可被 strings.Fields 无损切回。",
   "type": "object",
   "additionalProperties": false,
-  "required": ["translation_version", "command", "confidence"],
+  "required": [
+    "translation_version",
+    "command",
+    "confidence"
+  ],
   "properties": {
-    "translation_version": { "const": 2 },
+    "translation_version": {
+      "const": 3
+    },
     "command": {
       "type": "string",
-      "enum": ["status", "devices", "test", "rerun", "unquarantine", "none"],
+      "enum": [
+        "status",
+        "devices",
+        "test",
+        "rerun",
+        "unquarantine",
+        "none"
+      ],
       "description": "none = 信息不足或输入根本不是指令"
     },
     "args": {
@@ -19,49 +32,108 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 512,
-        "not": { "pattern": "\\s" }
+        "not": {
+          "pattern": "\\s"
+        }
       }
     },
-    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-    "reason": { "type": "string", "maxLength": 200 }
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "reason": {
+      "type": "string",
+      "maxLength": 200
+    }
   },
   "allOf": [
     {
       "if": {
-        "properties": { "command": { "const": "rerun" } },
-        "required": ["command"]
+        "properties": {
+          "command": {
+            "const": "rerun"
+          }
+        },
+        "required": [
+          "command"
+        ]
       },
       "then": {
-        "required": ["args"],
-        "properties": { "args": { "minItems": 1, "maxItems": 2 } }
+        "required": [
+          "args"
+        ],
+        "properties": {
+          "args": {
+            "minItems": 1,
+            "maxItems": 2
+          }
+        }
       }
     },
     {
       "if": {
-        "properties": { "command": { "enum": ["status", "devices", "none"] } },
-        "required": ["command"]
+        "properties": {
+          "command": {
+            "enum": [
+              "status",
+              "devices",
+              "none"
+            ]
+          }
+        },
+        "required": [
+          "command"
+        ]
       },
       "then": {
-        "properties": { "args": { "maxItems": 0 } }
+        "properties": {
+          "args": {
+            "maxItems": 0
+          }
+        }
       }
     },
     {
       "if": {
-        "properties": { "command": { "const": "unquarantine" } },
-        "required": ["command"]
+        "properties": {
+          "command": {
+            "const": "unquarantine"
+          }
+        },
+        "required": [
+          "command"
+        ]
       },
       "then": {
-        "properties": { "args": { "maxItems": 1 } }
+        "properties": {
+          "args": {
+            "maxItems": 1
+          }
+        }
       }
     },
     {
       "if": {
-        "properties": { "command": { "const": "test" } },
-        "required": ["command"]
+        "properties": {
+          "command": {
+            "const": "test"
+          }
+        },
+        "required": [
+          "command"
+        ]
       },
       "then": {
-        "required": ["args"],
-        "properties": { "args": { "minItems": 1, "maxItems": 2 } }
+        "required": [
+          "args"
+        ],
+        "properties": {
+          "args": {
+            "minItems": 1,
+            "maxItems": 2
+          }
+        }
       }
     }
   ]

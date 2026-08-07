@@ -1,3 +1,3 @@
-{ "translation_version": 2, "command": "rerun",
+{ "translation_version": 3, "command": "rerun",
   "args": ["device-test-grp/algo-super-sdk-g9da3b9d9-p56", "aarch64_Android_SNPE_1.68"],
   "confidence": 0.92, "reason": "指代最近一次 SNPE 1.68 的失败运行" }
