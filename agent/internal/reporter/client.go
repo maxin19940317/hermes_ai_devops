@@ -63,6 +63,9 @@ type DeviceProps struct {
 	ABI          string   `json:"abi,omitempty"`
 	Android      string   `json:"android,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
+	// MemTotalMB 是设备物理内存总量(MB,来自 /proc/meminfo MemTotal)。
+	// 指针:探测失败省略,不谎报 0。
+	MemTotalMB *int64 `json:"mem_total_mb,omitempty"`
 }
 
 // DeviceInfo 是心跳载荷中的单台设备。WorkdirFreeMB 为指针:

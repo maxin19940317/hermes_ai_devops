@@ -63,7 +63,9 @@ CREATE TABLE IF NOT EXISTS devices (
     abi          TEXT        NOT NULL DEFAULT '',
     capabilities TEXT[]      NOT NULL DEFAULT '{}',
     status       TEXT        NOT NULL DEFAULT 'IDLE',
-    fail_streak  INTEGER     NOT NULL DEFAULT 0
+    fail_streak  INTEGER     NOT NULL DEFAULT 0,
+    -- 物理内存总量(MB,Agent 从 /proc/meminfo 探测;展示信息,非调度必要条件)
+    mem_total_mb BIGINT
 );
 
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT '';

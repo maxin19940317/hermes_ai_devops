@@ -139,6 +139,9 @@ type heartbeatReq struct {
 			SOC          string   `json:"soc"`
 			ABI          string   `json:"abi"`
 			Capabilities []string `json:"capabilities"`
+			// MemTotalMB 是设备物理内存总量(MB,Agent 从 /proc/meminfo 探测)。
+			// 指针:旧 Agent 不上报 → 空;展示信息,不是调度必要条件。
+			MemTotalMB *int64 `json:"mem_total_mb"`
 		} `json:"props"`
 	} `json:"devices"`
 	// ActiveTaskIDs 过渡期双格式(差距 #15):元素为对象 = 携带租约所有权凭据
@@ -203,6 +206,7 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		devs = append(devs, store.Device{
 			DeviceID: d.Serial, Serial: d.Serial, DisplayName: displayName, ClientID: req.ClientID,
 			ReportedState: d.State, OS: os, SOC: soc, ABI: d.Props.ABI, Capabilities: caps,
+			MemTotalMB: d.Props.MemTotalMB,
 		})
 	}
 	if err := h.store.UpsertClientDevices(r.Context(), store.Client{

@@ -108,6 +108,7 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 			dev.Props = &DeviceProps{OS: "linux", SOC: soc, ABI: abi, Capabilities: p.capabilitiesFor(serial, soc, allowLegacyCaps)}
 			dev.DisplayName = strings.ToUpper(soc) + "-" + serial
 			p.logf("probe: %s is non-Android Linux (%s/%s); reporting IDLE", serial, soc, abi)
+			p.probeMemTotal(ctx, transport, dev.Props)
 			return dev
 		}
 		dev.State = DeviceOffline
@@ -139,6 +140,7 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 	}
 	props.Capabilities = p.capabilitiesFor(serial, soc, allowLegacyCaps)
 	dev.Props = props
+	p.probeMemTotal(ctx, transport, props)
 
 	if res, err := p.Runner.Run(ctx, adb.DiskFreeKB(transport, p.deviceWorkdir())); err == nil && res.ExitCode == 0 {
 		if kb, err := ParseDFAvailableKB(res.Stdout); err == nil && kb >= 0 {
@@ -147,6 +149,21 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		}
 	}
 	return dev
+}
+
+// probeMemTotal 探测设备物理内存总量(/proc/meminfo MemTotal),写入 props。
+// 失败静默(内存是展示信息,不是调度必要条件)。
+func (p *Prober) probeMemTotal(ctx context.Context, transport string, props *DeviceProps) {
+	res, err := p.Runner.Run(ctx, adb.MemTotalKB(transport))
+	if err != nil || res.ExitCode != 0 {
+		return
+	}
+	kb, err := ParseMemTotalKB(res.Stdout)
+	if err != nil || kb <= 0 {
+		return
+	}
+	mb := kb / 1024
+	props.MemTotalMB = &mb
 }
 
 // validSerial 校验 adb serial 形态:USB serial 为字母数字(可含 - _),
@@ -278,6 +295,28 @@ func ParseDFAvailableKB(out string) (int64, error) {
 		return 0, fmt.Errorf("parse df available: %w", err)
 	}
 	return kb, nil
+}
+
+// ParseMemTotalKB 解析 /proc/meminfo 的 MemTotal 行("MemTotal:       5150140 kB"),
+// 返回 kB;格式不符返回错误。内存总量是设备基本信息(飞书设备列表展示)。
+func ParseMemTotalKB(out string) (int64, error) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		// "MemTotal:" "5150140" "kB"
+		if len(fields) < 2 {
+			return 0, fmt.Errorf("unexpected MemTotal line: %q", line)
+		}
+		kb, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse MemTotal: %w", err)
+		}
+		return kb, nil
+	}
+	return 0, fmt.Errorf("meminfo 无 MemTotal 行")
 }
 
 // resolveUnknownSerial 尝试解析 transport 为 "?" 的设备的真实序列号。

@@ -54,6 +54,9 @@ type Device struct {
 	SOC           string
 	ABI           string
 	Capabilities  []string
+	// MemTotalMB 是设备物理内存总量(MB,Agent 从 /proc/meminfo 探测上报;
+	// 2026-08-07 起)。指针:旧 Agent/探测失败 → nil;展示信息,非调度必要条件。
+	MemTotalMB *int64
 }
 
 // 设备状态(§11):IDLE|BUSY|OFFLINE|QUARANTINED。

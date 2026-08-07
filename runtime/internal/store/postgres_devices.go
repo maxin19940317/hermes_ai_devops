@@ -40,13 +40,15 @@ func (s *PGStore) UpsertClientDevices(ctx context.Context, c Client, devs []Devi
 			caps = []string{}
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO devices (device_id, serial, display_name, client_id, os, soc, abi, capabilities, status, fail_streak)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0)
+			INSERT INTO devices (device_id, serial, display_name, client_id, os, soc, abi, capabilities, mem_total_mb, status, fail_streak)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0)
 			ON CONFLICT (device_id) DO UPDATE SET
 				serial = EXCLUDED.serial, display_name = EXCLUDED.display_name, client_id = EXCLUDED.client_id,
 				os = EXCLUDED.os, soc = EXCLUDED.soc, abi = EXCLUDED.abi, capabilities = EXCLUDED.capabilities,
+				mem_total_mb = EXCLUDED.mem_total_mb,
 				status = CASE WHEN devices.status IN ('IDLE', 'OFFLINE') THEN EXCLUDED.status ELSE devices.status END`,
-			d.DeviceID, d.Serial, d.DisplayName, d.ClientID, d.OS, d.SOC, d.ABI, pq.Array(caps), availableState(d.ReportedState)); err != nil {
+			d.DeviceID, d.Serial, d.DisplayName, d.ClientID, d.OS, d.SOC, d.ABI, pq.Array(caps),
+			d.MemTotalMB, availableState(d.ReportedState)); err != nil {
 			return fmt.Errorf("upsert device %s: %w", d.DeviceID, err)
 		}
 	}

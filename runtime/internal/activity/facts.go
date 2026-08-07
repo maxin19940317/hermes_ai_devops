@@ -29,6 +29,8 @@ type DeviceFact struct {
 	ID            string   `json:"id"`
 	OS            string   `json:"os"`
 	SOC           string   `json:"soc"`
+	ABI           string   `json:"abi"`
+	MemTotalMB    *int64   `json:"mem_total_mb,omitempty"`
 	Capabilities  []string `json:"capabilities"`
 	CanTest       []string `json:"can_test"`
 	CanTestCount  int      `json:"can_test_count"`
@@ -74,7 +76,8 @@ func ComputeDeviceFacts(
 			f.Quarantined = append(f.Quarantined, d.DeviceID)
 		default: // IDLE/BUSY = 在线
 			fact := DeviceFact{
-				ID: d.DeviceID, OS: d.OS, SOC: d.SOC,
+				ID: d.DeviceID, OS: d.OS, SOC: d.SOC, ABI: d.ABI,
+				MemTotalMB:    d.MemTotalMB,
 				Capabilities: append([]string(nil), d.Capabilities...),
 				CanTest:      []string{},
 			}

@@ -92,6 +92,12 @@ func DiskFreeKBLinux(serial, path string) []string {
 	return withSerial(serial, "shell", "df", "-k", path)
 }
 
+// MemTotalKB 读取 /proc/meminfo 的 MemTotal 行(Android/Linux 通用)。
+// 无外部参数,仅用于设备基本信息上报,不构成任意 shell 接口。
+func MemTotalKB(serial string) []string {
+	return withSerial(serial, "shell", "cat", "/proc/meminfo")
+}
+
 func Push(serial, local, remote string) []string {
 	return withSerial(serial, "push", local, remote)
 }

@@ -298,3 +298,74 @@ func TestProbeDevicesRejectsShellErrorSerialResolution(t *testing.T) {
 		t.Fatalf("devices = %+v, want shell-error serial device skipped", devices)
 	}
 }
+
+// ---- 内存上报(2026-08-07)----
+
+func TestParseMemTotalKB(t *testing.T) {
+	cases := []struct {
+		out  string
+		want int64
+		err  bool
+	}{
+		{"MemTotal:       5150140 kB\nMemFree: 1000000 kB", 5150140, false},
+		{"MemTotal:   8192000 kB\n", 8192000, false},
+		{"MemFree: 100 kB\n", 0, true},        // 无 MemTotal 行
+		{"", 0, true},                          // 空输出
+		{"MemTotal: abc kB\n", 0, true},        // 非法数字
+	}
+	for _, c := range cases {
+		got, err := ParseMemTotalKB(c.out)
+		if c.err {
+			if err == nil {
+				t.Errorf("ParseMemTotalKB(%q) = %d, want error", c.out, got)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("ParseMemTotalKB(%q) = %d, %v; want %d", c.out, got, err, c.want)
+		}
+	}
+}
+
+func TestProbeDevicesReportsMemTotal(t *testing.T) {
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\n513cd3de device product:trinket\n"},
+		"-s 513cd3de shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-s 513cd3de shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
+		"-s 513cd3de shell /system/bin/getprop ro.board.platform":        {Stdout: "trinket\n"},
+		"-s 513cd3de shell /system/bin/df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+			"/dev/block/dm-0 10000000 100 1000000 1% /data\n"},
+		"-s 513cd3de shell cat /proc/meminfo": {Stdout: "MemTotal:       5150140 kB\nMemFree: 1000 kB\n"},
+	}}
+	p := &Prober{Runner: runner, SOCAliases: map[string]string{"trinket": "QCM6125"}}
+
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 1 {
+		t.Fatalf("devices = %+v", devices)
+	}
+	mb := devices[0].Props.MemTotalMB
+	if mb == nil || *mb != 5029 { // 5150140/1024 = 5029
+		t.Errorf("MemTotalMB = %v, want 5029", mb)
+	}
+}
+
+func TestProbeDevicesOmitsMemTotalOnFailure(t *testing.T) {
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\n513cd3de device product:trinket\n"},
+		"-s 513cd3de shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-s 513cd3de shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
+		"-s 513cd3de shell /system/bin/getprop ro.board.platform":        {Stdout: "trinket\n"},
+		"-s 513cd3de shell /system/bin/df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+			"/dev/block/dm-0 10000000 100 1000000 1% /data\n"},
+		"-s 513cd3de shell cat /proc/meminfo": {ExitCode: 1},
+	}}
+	p := &Prober{Runner: runner, SOCAliases: map[string]string{"trinket": "QCM6125"}}
+
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 1 {
+		t.Fatalf("devices = %+v", devices)
+	}
+	if devices[0].Props.MemTotalMB != nil {
+		t.Errorf("MemTotalMB = %v, want nil(探测失败省略)", devices[0].Props.MemTotalMB)
+	}
+}
