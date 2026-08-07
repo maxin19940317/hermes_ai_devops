@@ -384,17 +384,24 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 	// notify-card 版本分支(设计文档 §5):在途 workflow(重放旧 history)必须原样
 	// 发纯文本,新 workflow 一律发交互卡片。buildNotification 两个分支都要调用——
 	// 旧分支直接发送,新分支作为卡片的降级文本随载荷下发,因此不是死代码。
-	if workflow.GetVersion(ctx, "notify-card", workflow.DefaultVersion, 1) == workflow.DefaultVersion {
-		if err := workflow.ExecuteActivity(ctx, "Notify", buildNotification(in, out)).Get(ctx, nil); err != nil {
-			workflow.GetLogger(ctx).Error("notify failed", "error", err)
-		}
-	} else {
-		req := NotifyCardRequest{
-			Card:         buildNotificationCard(in, out, actualID),
-			FallbackText: buildNotification(in, out),
-		}
-		if err := workflow.ExecuteActivity(ctx, "NotifyCard", req).Get(ctx, nil); err != nil {
-			workflow.GetLogger(ctx).Error("notify card failed", "error", err)
+	// 方案 A(2026-08-06,bundle-silent 版本分支):bundle workflow(Scope 空)只测
+	// 不通知——补测 kick 漏掉的变体,结果落 tasks/decisions 表可追溯;通知由
+	// 变体级 workflow(kick,Scope 非空)承担,避免 13 条/流水线的重复轰炸。
+	// GetVersion 门:重放改动前 history(无此分支)走原路径;新 workflow 才按
+	// Scope 判定(bundle 静默)。不得用裸 in.Scope 判断——那会破坏重放。
+	if workflow.GetVersion(ctx, "bundle-silent", workflow.DefaultVersion, 1) != workflow.DefaultVersion && in.Scope != "" {
+		if workflow.GetVersion(ctx, "notify-card", workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+			if err := workflow.ExecuteActivity(ctx, "Notify", buildNotification(in, out)).Get(ctx, nil); err != nil {
+				workflow.GetLogger(ctx).Error("notify failed", "error", err)
+			}
+		} else {
+			req := NotifyCardRequest{
+				Card:         buildNotificationCard(in, out, actualID),
+				FallbackText: buildNotification(in, out),
+			}
+			if err := workflow.ExecuteActivity(ctx, "NotifyCard", req).Get(ctx, nil); err != nil {
+				workflow.GetLogger(ctx).Error("notify card failed", "error", err)
+			}
 		}
 	}
 	return out, nil

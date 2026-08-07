@@ -242,19 +242,41 @@ func spec1() TestSpec {
 
 func newEnv(t *testing.T, f *fakeActs) *testsuite.TestWorkflowEnvironment {
 	t.Helper()
+	return newEnvID(t, f, wfID)
+}
+
+// newEnvID 用指定 workflow ID 创建环境(变体级输入的 workflow ID 带 -scope 后缀,
+// 与 wfID 常量不同;方案 A 通知门控测试用它)。
+func newEnvID(t *testing.T, f *fakeActs, id string) *testsuite.TestWorkflowEnvironment {
+	t.Helper()
 	var ts testsuite.WorkflowTestSuite
 	env := ts.NewTestWorkflowEnvironment()
-	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: wfID})
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: id})
 	env.RegisterWorkflow(DeviceTestWorkflow)
 	env.RegisterActivity(f)
 	return env
 }
 
+// input 是测试主路径输入(2026-08-06 方案 A):Scope 空 = bundle 形态,workflow ID
+// 与 wfID 常量一致。依赖通知的测试用 inputVariant()(变体级 kick,Scope 非空)。
 func input() DeviceTestInput {
 	return DeviceTestInput{Project: "grp/p", Commit: "abcd1234", PipelineID: 42, Version: "1.2.3"}
 }
 
+// inputVariant 返回变体级 kick 输入(Scope 非空):workflow ID 带 -scope 后缀,
+// 通知门控(2026-08-06 方案 A:只有变体级才通知)放行。
+// 注意:其 WorkflowID() 与 wfID 常量不同,使用处必须 SetStartWorkflowOptions 或
+// 用 WorkflowID() 派生 ID。
+func inputVariant() DeviceTestInput {
+	in := input()
+	in.Scope = "aarch64_Android_SNPE_2.21"
+	return in
+}
+
 func taskID(attempt string) string { return wfID + ":t1:" + attempt }
+
+// taskIDFor 按指定 workflow ID 派生 task_id(变体级输入的 workflow ID 带 scope 后缀)。
+func taskIDFor(wf, attempt string) string { return wf + ":t1:" + attempt }
 
 func passResult(id string) TaskResultSignal {
 	return TaskResultSignal{TaskID: id, Status: "COMPLETED", ExitCode: 0, DurationSec: 12, CasesTotal: 10,
@@ -263,14 +285,16 @@ func passResult(id string) TaskResultSignal {
 
 func TestHappyPathPassed(t *testing.T) {
 	f := &fakeActs{specs: []TestSpec{spec1()}}
-	env := newEnv(t, f)
+	in := inputVariant() // 变体级 kick:通知门控放行(方案 A)
+	env := newEnvID(t, f, in.WorkflowID())
+	tid := taskIDFor(in.WorkflowID(), "a1")
 	// 30s 时回传结果(期间无需心跳,未超 120s 租约)
-	seedResult(f, passResult(taskID("a1")))
+	seedResult(f, passResult(tid))
 	env.RegisterDelayedCallback(func() {
-		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
+		env.SignalWorkflow(SignalTaskResult, passResult(tid))
 	}, 30*time.Second)
 
-	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
 	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
 		t.Fatalf("workflow err: %v", env.GetWorkflowError())
 	}
@@ -281,7 +305,7 @@ func TestHappyPathPassed(t *testing.T) {
 	if len(out.Tasks) != 1 || out.Tasks[0].Verdict != "PASSED" || out.Tasks[0].Attempt != 1 {
 		t.Errorf("tasks = %+v", out.Tasks)
 	}
-	if len(f.dispatched) != 1 || f.dispatched[0].IdempotencyKey != taskID("a1") ||
+	if len(f.dispatched) != 1 || f.dispatched[0].IdempotencyKey != tid ||
 		f.dispatched[0].DeviceSerial != "513cd3de" {
 		t.Errorf("dispatched = %+v", f.dispatched)
 	}
@@ -331,15 +355,17 @@ func TestHappyPathPassed(t *testing.T) {
 // 运行的 ExtractEvidence 里,metrics 表恒空),且随通知透出。
 func TestHappyPathPassedSavesMetrics(t *testing.T) {
 	f := &fakeActs{specs: []TestSpec{spec1()}}
-	env := newEnv(t, f)
-	res := passResult(taskID("a1"))
+	in := inputVariant()
+	env := newEnvID(t, f, in.WorkflowID())
+	tid := taskIDFor(in.WorkflowID(), "a1")
+	res := passResult(tid)
 	res.Metrics = map[string]float64{"ocr_test.inference_ms_avg": 1451.39}
 	seedResult(f, res)
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(SignalTaskResult, res)
 	}, 30*time.Second)
 
-	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
 	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
 		t.Fatalf("workflow err: %v", env.GetWorkflowError())
 	}
@@ -357,7 +383,7 @@ func TestHappyPathPassedSavesMetrics(t *testing.T) {
 		t.Fatalf("SaveMetrics 调用 = %d 次, want 1", len(f.savedMetrics))
 	}
 	sm := f.savedMetrics[0]
-	if sm.TaskID != taskID("a1") || sm.Project != "grp/p" || sm.Variant != spec1().Variant ||
+	if sm.TaskID != tid || sm.Project != "grp/p" || sm.Variant != spec1().Variant ||
 		sm.Metrics["ocr_test.inference_ms_avg"] != 1451.39 {
 		t.Errorf("SaveMetrics req = %+v", sm)
 	}
@@ -420,6 +446,44 @@ func TestWorkflowRecordRetriesPastDefaultMaximum(t *testing.T) {
 	}
 }
 
+// TestBundleWorkflowSilent:方案 A(2026-08-06)——bundle workflow(Scope 空)
+// 只测不通知,补测 kick 漏掉的变体;通知由变体级 workflow(kick)承担,
+// 避免 13 条/流水线的重复轰炸。bundle 仍正常执行测试并落库。
+func TestBundleWorkflowSilent(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}, skipped: []SkippedSpec{}}
+	env := newEnv(t, f)
+	seedResult(f, passResult(taskID("a1")))
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
+	}, 30*time.Second)
+
+	bundleIn := input()
+	bundleIn.Scope = "" // bundle 全量(webhook):只测不通知
+	env.ExecuteWorkflow(DeviceTestWorkflow, bundleIn)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	// bundle 仍执行测试(变体跑完,结果落 out)
+	if len(out.Tasks) != 1 || out.Tasks[0].Verdict != "PASSED" {
+		t.Errorf("bundle 仍应执行测试: %+v", out.Tasks)
+	}
+	// 但不发任何通知(bundle 静默)
+	if len(f.notifyCards) != 0 {
+		t.Errorf("bundle workflow 不应发通知卡片: %+v", f.notifyCards)
+	}
+	if len(f.notifications) != 0 {
+		t.Errorf("bundle workflow 不应发纯文本通知: %+v", f.notifications)
+	}
+	// 落库照常(decisions rule 裁决)
+	if len(f.decisions) != 1 || f.decisions[0].Actor != "rule" {
+		t.Errorf("bundle 结果应落 decisions: %+v", f.decisions)
+	}
+}
+
 func TestWorkflowRecordPermanentFailureBlocksSelect(t *testing.T) {
 	permanent := temporal.NewNonRetryableApplicationError(
 		"immutable conflict", "WorkflowRunPermanent", errBoom)
@@ -471,13 +535,15 @@ func TestWorkflowRecordUsesActualExecutionID(t *testing.T) {
 // 对同一输入的输出逐字节相同——降级文本只能有一个真源,不许 activity 侧另拼一份。
 func TestWorkflowSendsCardWithVerbatimFallback(t *testing.T) {
 	f := &fakeActs{specs: []TestSpec{spec1()}}
-	env := newEnv(t, f)
-	seedResult(f, passResult(taskID("a1")))
+	in := inputVariant()
+	env := newEnvID(t, f, in.WorkflowID())
+	tid := taskIDFor(in.WorkflowID(), "a1")
+	seedResult(f, passResult(tid))
 	env.RegisterDelayedCallback(func() {
-		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
+		env.SignalWorkflow(SignalTaskResult, passResult(tid))
 	}, 30*time.Second)
 
-	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
 	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
 		t.Fatalf("workflow err: %v", env.GetWorkflowError())
 	}
@@ -485,7 +551,7 @@ func TestWorkflowSendsCardWithVerbatimFallback(t *testing.T) {
 	if err := env.GetWorkflowResult(&out); err != nil {
 		t.Fatal(err)
 	}
-	want := buildNotification(input(), &out)
+	want := buildNotification(in, &out)
 
 	if len(f.notifications) != 0 {
 		t.Errorf("Notify 调用次数 = %d, want 0(新 workflow 不应再走纯文本分支): %v", len(f.notifications), f.notifications)
@@ -498,7 +564,7 @@ func TestWorkflowSendsCardWithVerbatimFallback(t *testing.T) {
 	}
 	// 只查 FallbackText 查不出 workflow 是否真把卡片本体传下去了——
 	// Card 字段单独断言,确保"接线"这条线真的被覆盖。
-	if got, wantCard := f.notifyCards[0].Card, buildNotificationCard(input(), &out, ""); !reflect.DeepEqual(got, wantCard) {
+	if got, wantCard := f.notifyCards[0].Card, buildNotificationCard(in, &out, ""); !reflect.DeepEqual(got, wantCard) {
 		t.Errorf("Card = %+v, want 与 buildNotificationCard 同源 %+v", got, wantCard)
 	}
 }
@@ -698,13 +764,15 @@ func TestSkippedVariantInOutputAndNotification(t *testing.T) {
 		specs:   []TestSpec{spec1()},
 		skipped: []SkippedSpec{{Variant: "aarch64_Android_RKNN_2.3.2", Reason: "no capable device registered (soc=[RK3588 RK3566] capabilities=[rknpu])"}},
 	}
-	env := newEnv(t, f)
-	seedResult(f, passResult(taskID("a1")))
+	in := inputVariant()
+	env := newEnvID(t, f, in.WorkflowID())
+	tid := taskIDFor(in.WorkflowID(), "a1")
+	seedResult(f, passResult(tid))
 	env.RegisterDelayedCallback(func() {
-		env.SignalWorkflow(SignalTaskResult, passResult(taskID("a1")))
+		env.SignalWorkflow(SignalTaskResult, passResult(tid))
 	}, 30*time.Second)
 
-	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
 	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
 		t.Fatalf("workflow err: %v", env.GetWorkflowError())
 	}
@@ -750,9 +818,11 @@ func TestAnalysisSavedOnFailure(t *testing.T) {
 		},
 		snapshotID: "snap-1", // evidence 已持久化(差距 #6)
 	}
-	env := newEnv(t, f)
+	in := inputVariant()
+	env := newEnvID(t, f, in.WorkflowID())
+	tid := taskIDFor(in.WorkflowID(), "a1")
 	sig := TaskResultSignal{
-		TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 0,
+		TaskID: tid, Status: "COMPLETED", ExitCode: 0,
 		SignaturesHit: []string{"cpu_fallback"},
 	}
 	seedResult(f, sig)
@@ -760,7 +830,7 @@ func TestAnalysisSavedOnFailure(t *testing.T) {
 		env.SignalWorkflow(SignalTaskResult, sig)
 	}, 10*time.Second)
 
-	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
 	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
 		t.Fatalf("workflow err: %v", env.GetWorkflowError())
 	}
@@ -1061,9 +1131,11 @@ func TestEscalateFailureKeepsMainFlow(t *testing.T) {
 		analysis:    &hermesclient.Analysis{AnalysisVersion: 1, Summary: "s", Confidence: 0.9},
 		escErr:      errBoom,
 	}
-	env := newEnv(t, f)
+	in := inputVariant()
+	env := newEnvID(t, f, in.WorkflowID())
+	tid := taskIDFor(in.WorkflowID(), "a1")
 	sig := TaskResultSignal{
-		TaskID: taskID("a1"), Status: "COMPLETED", ExitCode: 0,
+		TaskID: tid, Status: "COMPLETED", ExitCode: 0,
 		SignaturesHit: []string{"dsp_unavailable"},
 	}
 	seedResult(f, sig)
@@ -1071,7 +1143,7 @@ func TestEscalateFailureKeepsMainFlow(t *testing.T) {
 		env.SignalWorkflow(SignalTaskResult, sig)
 	}, 10*time.Second)
 
-	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
 	var out DeviceTestOutput
 	if err := env.GetWorkflowResult(&out); err != nil {
 		t.Fatal(err)
