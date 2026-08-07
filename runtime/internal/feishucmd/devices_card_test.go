@@ -7,8 +7,9 @@ import (
 	"hermes-devops/runtime/internal/store"
 )
 
-// TestRenderDeviceTableCard:卡片 = markdown 多行,每行一台设备(加粗设备名 + 分隔)。
-// column_set 在此飞书版本被拍平,table 组件不可用——改用 markdown 多行(2026-08-07)。
+// TestRenderDeviceTableCard:卡片 = plain_text div 逐行,每行一台设备。
+// lark_md 对"设备名-数字"连字符解析异常(serial 被吞),column_set 被拍平,
+// table 组件不可用——用 plain_text div 行(2026-08-07)。
 func TestRenderDeviceTableCard(t *testing.T) {
 	rows := []deviceTableRow{
 		{"QCS6490-825485946", "Linux", "arm64-v8a", "7.1GB"},
@@ -22,20 +23,23 @@ func TestRenderDeviceTableCard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// markdown 元素,每行含加粗设备名
-	if !strings.Contains(js, `"tag":"markdown"`) {
-		t.Errorf("卡片缺 markdown 元素: %s", js[:300])
+	// div + plain_text 元素,设备名完整(含 serial,不被 markdown 吞)
+	if !strings.Contains(js, `"tag":"div"`) {
+		t.Errorf("卡片缺 div 元素: %s", js[:300])
 	}
-	if !strings.Contains(js, "**QCS6490-825485946**") || !strings.Contains(js, "**QCM6125-513cd3de**") {
-		t.Errorf("卡片缺加粗设备名: %s", js[:400])
+	if !strings.Contains(js, `"tag":"plain_text"`) {
+		t.Errorf("卡片缺 plain_text: %s", js[:300])
+	}
+	if !strings.Contains(js, "QCS6490-825485946") || !strings.Contains(js, "QCM6125-513cd3de") {
+		t.Errorf("卡片缺完整设备名(含 serial): %s", js[:400])
 	}
 	// 每行含 · 分隔的系统/架构/内存
 	if !strings.Contains(js, "Linux · arm64-v8a · 7.1GB") {
 		t.Errorf("卡片缺属性分隔: %s", js[:400])
 	}
-	// 不用 column_set
-	if strings.Contains(js, "column_set") {
-		t.Errorf("卡片不应含 column_set: %s", js[:400])
+	// 不用 markdown/column_set(避免连字符解析问题)
+	if strings.Contains(js, `"markdown"`) || strings.Contains(js, "column_set") {
+		t.Errorf("卡片不应含 markdown/column_set: %s", js[:400])
 	}
 	// 空列表 → 空卡片(调用方回纯文本)
 	empty, err := renderDeviceTableCard(nil)
