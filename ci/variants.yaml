@@ -4,7 +4,8 @@
 #   - env 值中的 {workdir} 占位符由 Client Agent 部署时替换,此处原样保留。
 #   - Linux 变体已接入设备测试链路(Phase 4);soc/capabilities 为设备调度约束。
 #   - workdir_linux 不能用 /opt:RK3568 固件 rootfs 整体只读(2026-08-04 实机:
-#     /opt、/root 均 Read-only),/data 是其可写分区,与 Android 同父目录。
+#     /opt、/root 均 Read-only)。2026-08-07 起用 /tmp(/data 在 QCS6490 是 noexec,
+#     run.sh 无法执行;QCS ext4 与 RK3568 tmpfs 的 /tmp 均可写可执行)。
 #   - 2026-08-06 包名变更(pipeline 1109):SNPE/TFLite 变体名编码目标 SoC,
 #     与业务仓库 ci/hermes/variants.yaml 保持一致;Android SNPE 2.21 目标
 #     SoC 从 QCM6125 改为 QCM6490(仅变体名与 soc 变化,签名/环境不变)。
@@ -12,7 +13,10 @@
 defaults:
   deploy:
     workdir_android: /data/local/tmp/algo-super-sdk
-    workdir_linux: /data/local/tmp/algo-super-sdk
+    # 2026-08-07:workdir_linux 改 /tmp——QCS6490 的 /data 挂 noexec,run.sh
+    # 无法执行(实测 Permission denied);/tmp 在 QCS(ext4)与 RK3568(tmpfs)
+    # 均可写可执行。Android 保持 /data/local/tmp 不变。
+    workdir_linux: /tmp/algo-super-sdk
   test:
     entry: ./run.sh
     timeout_sec: 900
