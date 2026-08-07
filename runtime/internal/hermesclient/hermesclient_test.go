@@ -394,11 +394,12 @@ func TestCommandSchemaCopyMatchesContracts(t *testing.T) {
 	}
 }
 
-func TestTranslateUsesV2PromptAndContract(t *testing.T) {
-	if PromptVersionTranslate != "cmd_translate_v2" {
-		t.Fatalf("PromptVersionTranslate = %q, want cmd_translate_v2", PromptVersionTranslate)
+func TestTranslateUsesV3PromptAndContract(t *testing.T) {
+	if PromptVersionTranslate != "cmd_translate_v3" {
+		t.Fatalf("PromptVersionTranslate = %q, want cmd_translate_v3", PromptVersionTranslate)
 	}
 	for _, want := range []string{
+		"test <variant> [commit]",
 		"rerun <source_workflow_id> [variant]",
 		"authoritative:true",
 	} {

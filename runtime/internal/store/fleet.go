@@ -95,6 +95,28 @@ func (s *MemStore) ListArtifacts(
 	return out, nil
 }
 
+// LatestArtifactForVariant 返回指定变体最近登记的产物(按登记序,模拟 created_at
+// 最新,不限 project);无记录返回 nil,nil。供 test 命令缺省 commit 时定位
+// "最近构建"——project 从 artifact 自身带出。
+func (s *MemStore) LatestArtifactForVariant(
+	_ context.Context, variant string,
+) (*Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best *Artifact
+	var bestSeq int64 = -1
+	for _, a := range s.rows {
+		if a.Variant != variant {
+			continue
+		}
+		if seq := s.rowSeq[artifactKey(a.Project, a.CommitSHA, a.PipelineID, a.Variant)]; seq > bestSeq {
+			bestSeq = seq
+			best = &a
+		}
+	}
+	return best, nil
+}
+
 // NextWorkflowAttemptAll 把指定 project/commit/pipeline 的全部变体推进到
 // 当前最大值的下一水位，确保 bundle 与变体级 retry 共用单调序号空间。
 func (s *MemStore) NextWorkflowAttemptAll(

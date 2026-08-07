@@ -89,6 +89,28 @@ func (s *PGStore) ListArtifacts(
 	return out, nil
 }
 
+// LatestArtifactForVariant 返回指定变体最近一次构建(按 created_at 最新,不限
+// project);无记录返回 (nil, nil)。供 test 命令缺省 commit 时定位"最近构建"。
+func (s *PGStore) LatestArtifactForVariant(
+	ctx context.Context, variant string,
+) (*Artifact, error) {
+	row := s.DB.QueryRowContext(ctx, `
+		SELECT project, commit_sha, pipeline_id, variant, build_type, url, sha256, size, manifest_digest
+		FROM artifacts WHERE variant = $1
+		ORDER BY created_at DESC, artifact_id DESC LIMIT 1`,
+		variant)
+	var a Artifact
+	err := row.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
+		&a.BuildType, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("latest artifact %s: %w", variant, err)
+	}
+	return &a, nil
+}
+
 // NextWorkflowAttemptAll 锁定指定 project/commit/pipeline 的全部变体，把它们
 // 原子推进到当前最大值的下一水位，确保并发分配不会复用序号。
 func (s *PGStore) NextWorkflowAttemptAll(

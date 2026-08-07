@@ -36,6 +36,10 @@ class TestCommandSchema:
             ("rerun", ["wf"], True),
             ("rerun", ["wf", "variant"], True),
             ("rerun", ["wf", "variant", "extra"], False),
+            ("test", [], False),
+            ("test", ["aarch64_Android_SNPE_1.68"], True),
+            ("test", ["aarch64_Android_SNPE_1.68", "9da3b9d9"], True),
+            ("test", ["aarch64_Android_SNPE_1.68", "9da3b9d9", "extra"], False),
             ("status", [], True),
             ("status", ["extra"], False),
             ("devices", [], True),
@@ -64,6 +68,7 @@ class TestCommandSchema:
         ("command", "valid"),
         [
             ("rerun", False),
+            ("test", False),
             ("status", True),
             ("devices", True),
             ("none", True),

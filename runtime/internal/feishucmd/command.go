@@ -12,14 +12,15 @@ import (
 
 // Command 是一条解析后的指令(封闭枚举;Name 未知时恒为 help)。
 type Command struct {
-	Name string   // status | devices | rerun | unquarantine | help
-	Args []string // rerun: <source_workflow_id> [variant];unquarantine: [device_id]
+	Name string   // status | devices | rerun | unquarantine | test | help
+	Args []string // rerun: <source_workflow_id> [variant];test: <variant> [commit]
 }
 
 // usage 是帮助文本(空/未知指令的应答)。
 const usage = `可用指令:
   status                        运行中 workflow / 设备状态 / 活跃租约
   devices                       设备列表(serial/soc/status/fail_streak)
+  test <variant> [commit]       测试指定变体(最近构建或指定 commit)
   rerun <source_workflow_id> [variant]  重跑权威终态运行的失败变体(可指定一个变体)
   unquarantine [device_id]      解除设备隔离(多台时需指定 id)
   plan <需求描述>                自然语言规划:生成可执行的测试计划 Plan DSL`
@@ -34,7 +35,7 @@ func Parse(text string) Command {
 	parts := strings.SplitN(trimmed, " ", 2)
 	name := strings.ToLower(parts[0])
 	switch name {
-	case "status", "devices", "rerun", "unquarantine":
+	case "status", "devices", "rerun", "unquarantine", "test":
 		args := []string{}
 		if len(parts) > 1 {
 			args = strings.Fields(parts[1])

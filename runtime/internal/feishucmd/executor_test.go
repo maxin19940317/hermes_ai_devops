@@ -1125,3 +1125,138 @@ func TestRerunExplicitVariantBlockedWhileInFlight(t *testing.T) {
 		t.Errorf("StartDeviceTest 调用 %d 次, want 0", got)
 	}
 }
+
+// ---- test 命令 ----
+
+func runTest(t *testing.T, e *Executor, args ...string) string {
+	t.Helper()
+	got, err := e.testCmd(ctx, args)
+	if err != nil {
+		t.Fatalf("test(%v): %v", args, err)
+	}
+	return got
+}
+
+// newTestFixture 返回带 variant 表 + 已登记产物(grp/p @ abcd1234 p42)的执行器。
+func newTestFixture(t *testing.T, variants ...string) (*store.MemStore, *fakeStarter, *Executor) {
+	t.Helper()
+	mem := store.NewMemStore()
+	if variants == nil {
+		variants = []string{"v1", "v2"}
+	}
+	seedArtifacts(t, mem, variants...)
+	starter := &fakeStarter{started: true}
+	e := newExec(mem, starter, nil)
+	e.Variants = variants
+	return mem, starter, e
+}
+
+func TestTestCmdUsage(t *testing.T) {
+	mem, starter, e := newTestFixture(t)
+	for _, args := range [][]string{nil, {"a", "b", "c"}} {
+		got := runTest(t, e, args...)
+		if got != "用法: test <variant> [commit]" {
+			t.Fatalf("test(%v) = %q", args, got)
+		}
+		if len(starter.inputs) != 0 {
+			t.Fatalf("bad arg count started workflow: %+v", starter.inputs)
+		}
+	}
+	_ = mem
+}
+
+func TestTestCmdUnknownVariant(t *testing.T) {
+	mem, starter, e := newTestFixture(t, "v1", "v2")
+	got := runTest(t, e, "ghost")
+	if !strings.Contains(got, "未知变体") || !strings.Contains(got, "v1, v2") {
+		t.Fatalf("reply = %q", got)
+	}
+	if len(starter.inputs) != 0 {
+		t.Fatal("unknown variant started workflow")
+	}
+	_ = mem
+}
+
+func TestTestCmdBadCommitShape(t *testing.T) {
+	_, starter, e := newTestFixture(t)
+	got := runTest(t, e, "v1", "NOT-A-SHA!")
+	if !strings.Contains(got, "commit 形态不合法") {
+		t.Fatalf("reply = %q", got)
+	}
+	if len(starter.inputs) != 0 {
+		t.Fatal("bad commit started workflow")
+	}
+}
+
+func TestTestCmdNoArtifact(t *testing.T) {
+	mem := store.NewMemStore() // 无产物
+	starter := &fakeStarter{started: true}
+	e := newExec(mem, starter, nil)
+	e.Variants = []string{"v1"}
+	got := runTest(t, e, "v1")
+	if !strings.Contains(got, "暂无构建记录") {
+		t.Fatalf("reply = %q", got)
+	}
+	if len(starter.inputs) != 0 {
+		t.Fatal("no artifact started workflow")
+	}
+}
+
+func TestTestCmdStartsVariantWorkflow(t *testing.T) {
+	_, starter, e := newTestFixture(t)
+	got := runTest(t, e, "v2")
+	if !strings.Contains(got, "已启动") {
+		t.Fatalf("reply = %q", got)
+	}
+	if len(starter.inputs) != 1 {
+		t.Fatalf("inputs = %+v", starter.inputs)
+	}
+	in := starter.inputs[0]
+	if in.Scope != "v2" {
+		t.Errorf("Scope = %q, want v2", in.Scope)
+	}
+	if len(in.Packages) != 1 || in.Packages[0].Variant != "v2" {
+		t.Errorf("Packages = %+v", in.Packages)
+	}
+	if in.Attempt < 1 {
+		t.Errorf("Attempt = %d, want >= 1", in.Attempt)
+	}
+	// 缺省 commit:LatestArtifactForVariant → grp/p @ abcd1234 p42
+	if in.Project != "grp/p" || in.Commit != "abcd1234" || in.PipelineID != 42 {
+		t.Errorf("artifact = %s g%s p%d", in.Project, in.Commit, in.PipelineID)
+	}
+}
+
+func TestTestCmdSpecifiedCommit(t *testing.T) {
+	mem, starter, e := newTestFixture(t)
+	// 先登记一条 workflow run,使 RecentRuns 返回 commit abcd1234 的权威记录。
+	run := store.WorkflowRun{
+		WorkflowID: "device-test-grp/p-gabcd1234-p42", Project: "grp/p",
+		CommitSHA: "abcd1234", PipelineID: 42, Version: "1.2.3",
+		RuleVersion: "verdict-rules-v7", Scope: "v2", Variants: []string{"v2"},
+	}
+	if err := mem.RecordWorkflowRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	got := runTest(t, e, "v2", "abcd1234")
+	if !strings.Contains(got, "已启动") {
+		t.Fatalf("reply = %q", got)
+	}
+	if len(starter.inputs) != 1 {
+		t.Fatalf("inputs = %+v", starter.inputs)
+	}
+	if in := starter.inputs[0]; in.Commit != "abcd1234" || in.Scope != "v2" {
+		t.Errorf("input = %+v", in)
+	}
+}
+
+func TestTestCmdCommitWithoutVariant(t *testing.T) {
+	_, starter, e := newTestFixture(t) // 只有 v1/v2,无其他 commit
+	got := runTest(t, e, "v1", "deadbeef")
+	if !strings.Contains(got, "无变体 v1 的构建记录") {
+		t.Fatalf("reply = %q", got)
+	}
+	if len(starter.inputs) != 0 {
+		t.Fatal("missing commit started workflow")
+	}
+}

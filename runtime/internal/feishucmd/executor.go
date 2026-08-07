@@ -27,6 +27,10 @@ type Store interface {
 	FleetOverview(ctx context.Context) (*store.FleetOverview, error)
 	UnquarantineDevice(ctx context.Context, deviceID string) (bool, error)
 	ListArtifacts(ctx context.Context, project, commitSHA string, pipelineID int) ([]store.Artifact, error)
+	// LatestArtifactForVariant 返回指定变体最近一次构建的 artifact(按 created_at
+	// 取最新,不限 project);无记录返回 nil,nil。供 test 命令缺省 commit 时定位
+	// "最近构建"——project 从 artifact 自身带出,不依赖 workflow run。
+	LatestArtifactForVariant(ctx context.Context, variant string) (*store.Artifact, error)
 	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	CurrentWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	NextWorkflowAttemptAll(ctx context.Context, project, commitSHA string, pipelineID int) (int, error)
@@ -287,6 +291,8 @@ func (e *Executor) execute(ctx context.Context, cmd Command) (string, error) {
 		return e.status(ctx)
 	case "devices":
 		return e.devices(ctx)
+	case "test":
+		return e.testCmd(ctx, cmd.Args)
 	case "rerun":
 		return e.rerun(ctx, cmd.Args)
 	case "unquarantine":
@@ -462,6 +468,101 @@ func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
 	return fmt.Sprintf("已启动: %s(%d 个变体)", id, len(in.Packages)), nil
 }
 
+// testCmd 实现 test <variant> [commit]:校验变体名 → 解析 artifact(指定 commit
+// 或该变体最近构建)→ 启动单变体 workflow(scope=variant)。与 rerun 同链路
+// (NextWorkflowAttempt + StartDeviceTest)。设计见
+// docs/superpowers/specs/2026-08-07-feishu-test-command-design.md。
+func (e *Executor) testCmd(ctx context.Context, args []string) (string, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return "用法: test <variant> [commit]", nil
+	}
+	variant := args[0]
+	valid := false
+	for _, v := range e.Variants {
+		if v == variant {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return fmt.Sprintf("未知变体 %s。可用变体: %s", variant, strings.Join(e.Variants, ", ")), nil
+	}
+	commit := ""
+	if len(args) == 2 {
+		if validateSHA(args[1]) != nil {
+			return fmt.Sprintf("commit 形态不合法(7-40 位小写 hex): %s", args[1]), nil
+		}
+		commit = args[1]
+	}
+
+	var art *store.Artifact
+	if commit != "" {
+		// 指定 commit:从最近 runs 找含该 commit 且含该变体的 run,取其 artifact。
+		runs, err := e.Store.RecentRuns(ctx, 50)
+		if err != nil {
+			return "", err
+		}
+		for _, r := range runs {
+			if r.Commit != commit || !containsVariant(r, variant) {
+				continue
+			}
+			arts, err := e.Store.ListArtifacts(ctx, r.Project, r.Commit, r.PipelineID)
+			if err != nil {
+				return "", err
+			}
+			for _, a := range arts {
+				if a.Variant == variant {
+					art = &a
+					break
+				}
+			}
+			if art != nil {
+				break
+			}
+		}
+		if art == nil {
+			return fmt.Sprintf("commit %s 无变体 %s 的构建记录", commit, variant), nil
+		}
+	} else {
+		// 缺省 commit:该变体最近一次构建(project 从 artifact 自身带出)。
+		latest, err := e.Store.LatestArtifactForVariant(ctx, variant)
+		if err != nil {
+			return "", err
+		}
+		if latest == nil {
+			return fmt.Sprintf("变体 %s 暂无构建记录", variant), nil
+		}
+		art = latest
+	}
+
+	n, err := e.Store.NextWorkflowAttempt(ctx, art.Project, art.CommitSHA, art.PipelineID, variant)
+	if err != nil {
+		return "", fmt.Errorf("next workflow attempt: %w", err)
+	}
+	in := wf.DeviceTestInput{
+		Project: art.Project, Commit: art.CommitSHA, PipelineID: art.PipelineID,
+		// Version 从 artifact 无来源(artifacts 表无版本列);test 命令不展示版本。
+		Packages:    []wf.PackageRef{pkgRef(*art)},
+		Scope:       variant,
+		RuleVersion: rules.DefaultVersion,
+		Attempt:     n,
+	}
+	id, started, err := e.Starter.StartDeviceTest(ctx, in)
+	if err != nil {
+		return "", fmt.Errorf("start workflow: %w", err)
+	}
+	if !started {
+		return fmt.Sprintf("workflow 已存在，本次 attempt 未启动: %s", id), nil
+	}
+	return fmt.Sprintf("已启动: %s\n变体 %s (%s g%s p%d)", id, variant, art.BuildType,
+		art.CommitSHA, art.PipelineID), nil
+}
+
+// containsVariant 判断某 run 是否就是指定变体(RecentRun 是单变体行)。
+func containsVariant(r store.RecentRun, variant string) bool {
+	return r.Variant == variant
+}
+
 func isPositiveInt(s string) bool {
 	n, err := strconv.Atoi(s)
 	return err == nil && n > 0
@@ -534,8 +635,9 @@ func (e *Executor) retryVariant(
 	in := wf.DeviceTestInput{
 		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
 		Version: source.Version, RuleVersion: source.RuleVersion,
-		Scope: variant, SourceWorkflowID: source.WorkflowID, Attempt: n,
-		Packages: []wf.PackageRef{ref},
+		Scope:      variant,
+		Attempt:    n,
+		Packages:   []wf.PackageRef{ref},
 	}
 	id, started, err := e.Starter.StartDeviceTest(ctx, in)
 	if err != nil {

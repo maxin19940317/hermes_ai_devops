@@ -8,7 +8,7 @@ import (
 //go:embed prompts/analyze_v1.md
 var PromptAnalyze string
 
-//go:embed prompts/cmd_translate_v2.md
+//go:embed prompts/cmd_translate_v3.md
 var PromptTranslate string
 
 //go:embed prompts/plan_v1.md
@@ -18,7 +18,7 @@ var PromptPlan string
 const PromptVersionAnalyze = "analyze_v1"
 
 // PromptVersionTranslate 是意图翻译当前 prompt 版本号。
-const PromptVersionTranslate = "cmd_translate_v2"
+const PromptVersionTranslate = "cmd_translate_v3"
 
 // PromptVersionPlan 是规划器当前 prompt 版本号。
 const PromptVersionPlan = "plan_v1"

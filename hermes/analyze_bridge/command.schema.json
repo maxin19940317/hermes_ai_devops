@@ -10,7 +10,7 @@
     "translation_version": { "const": 2 },
     "command": {
       "type": "string",
-      "enum": ["status", "devices", "rerun", "unquarantine", "none"],
+      "enum": ["status", "devices", "test", "rerun", "unquarantine", "none"],
       "description": "none = 信息不足或输入根本不是指令"
     },
     "args": {
@@ -52,6 +52,16 @@
       },
       "then": {
         "properties": { "args": { "maxItems": 1 } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "command": { "const": "test" } },
+        "required": ["command"]
+      },
+      "then": {
+        "required": ["args"],
+        "properties": { "args": { "minItems": 1, "maxItems": 2 } }
       }
     }
   ]

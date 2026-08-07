@@ -23,7 +23,9 @@ const minConfidence = 0.75
 const recentRunsLimit = 10
 
 // sideEffect 标记需要二次确认的指令:LLM 猜错参数的代价是白跑一轮设备测试。
-var sideEffect = map[string]bool{"rerun": true, "unquarantine": true}
+// 直接输入命令本身(如 "test xxx")视为用户明确意图,不经过确认;只有翻译旁路
+// (LLM 从自然语言猜出指令)才需要确认,防误触发设备测试。
+var sideEffect = map[string]bool{"rerun": true, "unquarantine": true, "test": true}
 
 // TranslateResult 是一次翻译的完整结论。OK=false 时 Reply 即最终回复文本。
 type TranslateResult struct {
