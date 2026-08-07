@@ -351,8 +351,18 @@ func (e *Executor) precheckAndroid(ctx context.Context, serial string, m *manife
 				}
 				// 平台代号 → SoC 型号别名(trinket → QCM6125):
 				// 固件只暴露代号,manifest 约束用型号
-				if alias, ok := e.SOCAliases[got]; ok && strings.EqualFold(alias, want) {
-					matched = alias
+				if alias, ok := e.SOCAliases[got]; ok {
+					// 防御脏配置:alias 值可能带分号/逗号(历史上配错过,
+					// 如 "QCM6125;idp:QCS6490"),按分隔符拆分成多个候选,
+					// 任一命中即视为匹配(与服务器端 SOC 清洗语义一致)。
+					for _, cand := range strings.FieldsFunc(alias, func(r rune) bool {
+						return r == ';' || r == ',' || r == ' '
+					}) {
+						if strings.EqualFold(cand, want) {
+							matched = cand
+							break
+						}
+					}
 				}
 			}
 		}

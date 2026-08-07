@@ -102,6 +102,8 @@ func parseDeviceCapabilities(raw string) (map[string][]string, error) {
 
 // parseSOCAliases 解析 "trinket:QCM6125,kalama:SM8550" 形式的
 // 平台代号→SoC 型号别名表(AGENT_SOC_ALIASES)。空串返回 nil。
+// value 含 ;/,/空格 视为非法(历史上配成 "QCM6125;idp:QCS6490" 的脏值,
+// 会导致 precheck soc mismatch——见 executor.precheckAndroid 的防御拆分)。
 func parseSOCAliases(raw string) (map[string]string, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil
@@ -111,6 +113,9 @@ func parseSOCAliases(raw string) (map[string]string, error) {
 		from, to, ok := strings.Cut(strings.TrimSpace(pair), ":")
 		if !ok || from == "" || strings.TrimSpace(to) == "" {
 			return nil, fmt.Errorf("AGENT_SOC_ALIASES 项 %q 非法(要 from:to)", pair)
+		}
+		if strings.ContainsAny(to, ";, ") {
+			return nil, fmt.Errorf("AGENT_SOC_ALIASES 项 %q 非法(value 含分隔符)", pair)
 		}
 		aliases[from] = strings.TrimSpace(to)
 	}

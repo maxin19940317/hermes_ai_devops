@@ -101,6 +101,11 @@ func TestParseSOCAliases(t *testing.T) {
 		{"trinket", nil, true},
 		{"trinket:", nil, true},
 		{":QCM6125", nil, true},
+		// 脏值防御:value 含分隔符 → 拒绝(历史上配成 "QCM6125;idp:QCS6490" 导致
+		// precheck soc mismatch,2026-08-07 实机)
+		{"trinket:QCM6125;idp:QCS6490", nil, true},
+		{"trinket:QCM6125,idp", nil, true},
+		{"trinket: QCM6125", nil, true},
 	}
 	for _, c := range cases {
 		got, err := parseSOCAliases(c.raw)
