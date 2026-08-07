@@ -335,13 +335,12 @@ func (e *Executor) status(ctx context.Context) (string, error) {
 		return "", err
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "运行中 workflow: %d\n活跃租约: %d\n设备(%d):", ov.InflightWorkflows, ov.ActiveLeases, len(ov.Devices))
+	b.WriteString("📊 运行概览\n")
+	fmt.Fprintf(&b, "🔄 运行中 workflow: %d\n", ov.InflightWorkflows)
+	fmt.Fprintf(&b, "🔑 活跃租约: %d\n", ov.ActiveLeases)
+	fmt.Fprintf(&b, "📱 设备(%d 台):", len(ov.Devices))
 	for _, d := range ov.Devices {
-		fmt.Fprintf(&b, "\n  %s serial=%s soc=%s %s fail_streak=%d client=%s client_fail=%d",
-			deviceDisplayName(d), d.Serial, d.SOC, d.Status, d.FailStreak, d.ClientID, d.ClientFailStreak)
-		if d.LeaseTaskID != "" {
-			fmt.Fprintf(&b, " lease=%s", d.LeaseTaskID)
-		}
+		b.WriteString("\n  " + formatDeviceLine(d))
 	}
 	return b.String(), nil
 }
@@ -383,14 +382,14 @@ func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
 		}
 	}
 	if len(matched) == 0 {
-		return fmt.Sprintf("无 %s 设备", scope), nil
+		return fmt.Sprintf("📱 无%s", scopeTitle(scope)), nil
 	}
 	var b strings.Builder
+	fmt.Fprintf(&b, "📱 %s(%d 台)", scopeTitle(scope), len(matched))
 	for _, d := range matched {
-		fmt.Fprintf(&b, "%s  serial=%s soc=%s status=%s fail_streak=%d client=%s client_fail=%d\n",
-			deviceDisplayName(d), d.Serial, d.SOC, d.Status, d.FailStreak, d.ClientID, d.ClientFailStreak)
+		b.WriteString("\n" + formatDeviceLine(d))
 	}
-	return strings.TrimRight(b.String(), "\n"), nil
+	return b.String(), nil
 }
 
 func deviceDisplayName(d store.DeviceStatus) string {
@@ -1228,4 +1227,49 @@ func formatEnded(t time.Time, now time.Time) string {
 	default:
 		return fmt.Sprintf("%.0fd前", d.Hours()/24)
 	}
+}
+
+// deviceStatusEmoji 把设备状态映射为视觉符号(纯文本回复美化)。
+func deviceStatusEmoji(status string) string {
+	switch status {
+	case store.DeviceIdle:
+		return "🟢"
+	case store.DeviceBusy:
+		return "🟠"
+	case store.DeviceOffline:
+		return "⚪"
+	case store.DeviceQuarantined:
+		return "🔴"
+	default:
+		return "❔"
+	}
+}
+
+// scopeTitle 是 devices 指令各 scope 的中文标题。
+func scopeTitle(scope string) string {
+	switch scope {
+	case "all":
+		return "全部设备"
+	case "offline":
+		return "离线设备"
+	case "quarantined":
+		return "隔离设备"
+	default:
+		return "在线设备"
+	}
+}
+
+// formatDeviceLine 渲染一台设备的单行美观摘要:
+// "🟢 IDP-825485946  SoC=idp · 失败=0 · client=c1(client_fail=0) [· 租约=task]"
+func formatDeviceLine(d store.DeviceStatus) string {
+	core := fmt.Sprintf("SoC=%s · 失败=%d", d.SOC, d.FailStreak)
+	client := ""
+	if d.ClientID != "" {
+		client = fmt.Sprintf(" · client=%s(client_fail=%d)", d.ClientID, d.ClientFailStreak)
+	}
+	lease := ""
+	if d.LeaseTaskID != "" {
+		lease = " · 租约=" + d.LeaseTaskID
+	}
+	return fmt.Sprintf("%s %s  %s%s%s", deviceStatusEmoji(d.Status), deviceDisplayName(d), core, client, lease)
 }

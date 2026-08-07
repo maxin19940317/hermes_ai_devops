@@ -196,14 +196,14 @@ func TestStatusAndDevicesReply(t *testing.T) {
 	}
 	if !strings.Contains(sender.texts[0], "运行中 workflow: 0") ||
 		!strings.Contains(sender.texts[0], "dev1") ||
-		!strings.Contains(sender.texts[0], "IDLE") {
+		!strings.Contains(sender.texts[0], "🟢") {
 		t.Errorf("status 回复 = %q", sender.texts[0])
 	}
 
 	sender.texts = nil
 	exec.HandleMessage(ctx, wlOpenID, "devices")
-	if !strings.Contains(sender.texts[0], "dev1") || !strings.Contains(sender.texts[0], "soc=QCM6125") ||
-		!strings.Contains(sender.texts[0], "fail_streak=0") {
+	if !strings.Contains(sender.texts[0], "dev1") || !strings.Contains(sender.texts[0], "SoC=QCM6125") ||
+		!strings.Contains(sender.texts[0], "失败=0") {
 		t.Errorf("devices 回复 = %q", sender.texts[0])
 	}
 }
