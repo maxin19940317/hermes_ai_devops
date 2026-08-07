@@ -19,6 +19,7 @@ type Config struct {
 	CallbacksAddr      string
 	VariantsConfigPath string
 	DeviceCapabilities map[string][]string // 服务端权威能力表(键=soc/serial,小写)
+	DeviceSOCAliases   map[string]string   // 服务端权威平台代号→型号表(键=代号,小写)
 	Activity           activity.Config
 	SpecDefaults       activity.SpecDefaults
 }
@@ -49,6 +50,27 @@ func parseDeviceCapabilities(raw string) (map[string][]string, error) {
 			norm = append(norm, c)
 		}
 		out[key] = norm
+	}
+	return out, nil
+}
+
+// parseSOCAliasMap 解析 DEVICE_SOC_ALIASES(JSON {"代号":"型号"}),键归一为小写。
+// 空串 = 空表(不启用);非法 JSON = fail fast。与 parseDeviceCapabilities 同形态。
+func parseSOCAliasMap(raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, fmt.Errorf("DEVICE_SOC_ALIASES 不是合法 JSON 对象: %w", err)
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		key := strings.ToLower(strings.TrimSpace(k))
+		if key == "" || strings.TrimSpace(v) == "" {
+			return nil, fmt.Errorf("DEVICE_SOC_ALIASES 项 %q 非法(要 \"代号\":\"型号\")", k)
+		}
+		out[key] = strings.TrimSpace(v)
 	}
 	return out, nil
 }
@@ -145,6 +167,12 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("DEVICE_CAPABILITIES_MAP: %w", err)
 	}
+	// 服务端平台代号→型号表(2026-08-07):Agent 服务模式读系统 env,ps1 的
+	// $env: 不生效,代号(idp/bengal)在服务端兜底归一化。JSON {"代号":"型号"}。
+	socAliases, err := parseSOCAliasMap(getenv("DEVICE_SOC_ALIASES"))
+	if err != nil {
+		return Config{}, fmt.Errorf("DEVICE_SOC_ALIASES: %w", err)
+	}
 	hermesTimeoutSec, err := envInt("HERMES_TIMEOUT_SEC", 60)
 	if err != nil {
 		return Config{}, err
@@ -167,6 +195,7 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		CallbacksAddr:      env("WORKER_CALLBACKS_ADDR", ":8091"),
 		VariantsConfigPath: variantsPath,
 		DeviceCapabilities: deviceCaps,
+		DeviceSOCAliases:   socAliases,
 		Activity: activity.Config{
 			LeaseSeconds:         leaseSeconds,
 			QuarantineAfter:      quarantineAfter,

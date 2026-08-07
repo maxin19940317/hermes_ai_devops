@@ -67,6 +67,13 @@ type Handler struct {
 	// capabilities:命中服务端表 → 覆盖 Agent 上报值;未命中 → 保留上报值
 	// (向后兼容,平滑迁移)。nil = 不启用校准。
 	DeviceCaps map[string][]string
+
+	// SOCAliases 是服务端权威的平台代号→SoC 型号表(2026-08-07):
+	// 键 = Agent 上报的平台代号(如 idp/bengal,小写),值 = 标准型号
+	// (如 QCS6490)。心跳注册设备时把 soc 与显示名归一化为型号——Agent 服务
+	// 模式读系统 env,start-agent.ps1 的 $env: 不生效,alias 在服务端兜底。
+	// 与 DeviceCaps 同机制:命中 → 覆盖;未命中 → 保留上报值。nil = 不启用。
+	SOCAliases map[string]string
 }
 
 func New(s Store, sig Signaler, log *zerolog.Logger, leaseSeconds int) *Handler {
@@ -83,6 +90,12 @@ func New(s Store, sig Signaler, log *zerolog.Logger, leaseSeconds int) *Handler 
 // WithDeviceCaps 注入服务端权威能力表(方案 B)。
 func (h *Handler) WithDeviceCaps(caps map[string][]string) *Handler {
 	h.DeviceCaps = caps
+	return h
+}
+
+// WithSOCAliases 注入服务端权威的平台代号→型号表。
+func (h *Handler) WithSOCAliases(aliases map[string]string) *Handler {
+	h.SOCAliases = aliases
 	return h
 }
 
@@ -161,6 +174,17 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		if os == "" {
 			os = "android" // 兼容旧 Agent 心跳:旧版无 OS 字段,默认 android
 		}
+		// 服务端 soc 归一化(2026-08-07):Agent 服务模式读系统 env,ps1 的
+		// $env: 不生效,平台代号(idp/bengal)可能没被 Agent 侧 alias。
+		// 命中服务端表 → soc 与显示名统一为型号;未命中 → 保留上报值。
+		soc := d.Props.SOC
+		displayName := d.DisplayName
+		if alias, ok := h.SOCAliases[strings.ToLower(soc)]; ok {
+			soc = alias
+			displayName = strings.ToUpper(soc) + "-" + d.Serial
+			h.log.Debug().Str("serial", d.Serial).Str("raw_soc", d.Props.SOC).
+				Str("soc", soc).Msg("heartbeat: soc normalized by server table")
+		}
 		// 方案 B(2026-08-06):能力以服务端表为权威。按 serial(优先,支持
 		// 单板覆盖)或 soc 命中服务端表 → 覆盖 Agent 上报值;未命中 → 保留
 		// 上报值(向后兼容,平滑迁移)。
@@ -168,17 +192,17 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		if len(h.DeviceCaps) > 0 {
 			var capsByKey []string
 			if capsByKey = h.DeviceCaps[strings.ToLower(d.Serial)]; capsByKey == nil {
-				capsByKey = h.DeviceCaps[strings.ToLower(d.Props.SOC)]
+				capsByKey = h.DeviceCaps[strings.ToLower(soc)]
 			}
 			if capsByKey != nil {
 				caps = append([]string(nil), capsByKey...)
-				h.log.Debug().Str("serial", d.Serial).Str("soc", d.Props.SOC).
+				h.log.Debug().Str("serial", d.Serial).Str("soc", soc).
 					Strs("caps", caps).Msg("heartbeat: capabilities calibrated by server table")
 			}
 		}
 		devs = append(devs, store.Device{
-			DeviceID: d.Serial, Serial: d.Serial, DisplayName: d.DisplayName, ClientID: req.ClientID,
-			ReportedState: d.State, OS: os, SOC: d.Props.SOC, ABI: d.Props.ABI, Capabilities: caps,
+			DeviceID: d.Serial, Serial: d.Serial, DisplayName: displayName, ClientID: req.ClientID,
+			ReportedState: d.State, OS: os, SOC: soc, ABI: d.Props.ABI, Capabilities: caps,
 		})
 	}
 	if err := h.store.UpsertClientDevices(r.Context(), store.Client{

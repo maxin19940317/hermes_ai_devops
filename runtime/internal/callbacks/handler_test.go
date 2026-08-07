@@ -425,3 +425,80 @@ func TestHeartbeatCalibratesCapabilitiesFromServerTable(t *testing.T) {
 		}
 	})
 }
+
+// TestHeartbeatNormalizesSOCFromServerTable(2026-08-07):Agent 服务模式读系统
+// env,start-agent.ps1 的 $env: 不生效,平台代号(idp/bengal)在服务端兜底
+// 归一化为型号。命中 → soc 与显示名统一;未命中 → 保留上报值。
+func TestHeartbeatNormalizesSOCFromServerTable(t *testing.T) {
+	t.Run("idp 命中归一化为 QCS6490", func(t *testing.T) {
+		s := store.NewMemStore()
+		sig := &fakeSignaler{}
+		h := New(s, sig, nil, 120).WithSOCAliases(map[string]string{"idp": "QCS6490"})
+		srv := httptest.NewServer(h.Mux())
+		defer srv.Close()
+		resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
+			"client_id": "c1", "agent_version": "0.12.0",
+			"devices": []map[string]any{
+				{"serial": "825485946", "state": "IDLE",
+					"props": map[string]any{"os": "linux", "soc": "idp", "abi": "arm64-v8a", "capabilities": []string{}}},
+			},
+			"active_task_ids": []string{},
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		devs, _ := s.ListFleet(ctx)
+		if len(devs) != 1 || devs[0].SOC != "QCS6490" {
+			t.Fatalf("devices = %+v, want soc=QCS6490", devs)
+		}
+		if devs[0].DisplayName != "QCS6490-825485946" {
+			t.Errorf("display_name = %q, want QCS6490-825485946", devs[0].DisplayName)
+		}
+	})
+	t.Run("未命中保留上报代号", func(t *testing.T) {
+		s := store.NewMemStore()
+		sig := &fakeSignaler{}
+		h := New(s, sig, nil, 120).WithSOCAliases(map[string]string{"idp": "QCS6490"})
+		srv := httptest.NewServer(h.Mux())
+		defer srv.Close()
+		resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
+			"client_id": "c1", "agent_version": "0.12.0",
+			"devices": []map[string]any{
+				{"serial": "2a7359cf", "state": "IDLE",
+					"props": map[string]any{"os": "android", "soc": "bengal", "abi": "arm64-v8a", "capabilities": []string{}}},
+			},
+			"active_task_ids": []string{},
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		devs, _ := s.ListFleet(ctx)
+		if len(devs) != 1 || devs[0].SOC != "bengal" {
+			t.Errorf("devices = %+v, want 未命中保留 bengal", devs)
+		}
+	})
+	t.Run("soc 归一化后能力按型号校准", func(t *testing.T) {
+		s := store.NewMemStore()
+		sig := &fakeSignaler{}
+		h := New(s, sig, nil, 120).
+			WithSOCAliases(map[string]string{"idp": "QCS6490"}).
+			WithDeviceCaps(map[string][]string{"qcs6490": {"hexagon", "adreno"}})
+		srv := httptest.NewServer(h.Mux())
+		defer srv.Close()
+		resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
+			"client_id": "c1", "agent_version": "0.12.0",
+			"devices": []map[string]any{
+				{"serial": "825485946", "state": "IDLE",
+					"props": map[string]any{"os": "linux", "soc": "idp", "abi": "arm64-v8a", "capabilities": []string{}}},
+			},
+			"active_task_ids": []string{},
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		devs, _ := s.ListFleet(ctx)
+		if len(devs) != 1 || len(devs[0].Capabilities) != 2 || devs[0].Capabilities[0] != "hexagon" {
+			t.Errorf("devices = %+v, want 归一化后按 QCS6490 校准 hexagon+adreno", devs)
+		}
+	})
+}
