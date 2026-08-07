@@ -8,10 +8,9 @@ import (
 "hermes-devops/runtime/internal/store"
 )
 
-// ---- 设备列表卡片(plain_text 逐行,2026-08-07) ----
-// 飞书 lark_md 对 "设备名-数字" 的连字符解析异常(serial 被吞,如
-// "QCS6490-825485946" 显示成 "QCS6490-");column_set 被拍平,table 组件不可用。
-// 最可靠:纯文本(plain_text)元素,每行一台设备,不做任何 markdown 解析。
+// ---- 设备列表卡片(column_set 表格布局,2026-08-07) ----
+// 用户实测确认 column_set 并排布局效果正确(此前竖排/截断的根因是
+// ListFleet 漏选 serial/display_name,导致设备名 fallback 成 "SOC-")。
 
 // deviceCard 是飞书 interactive 卡片的顶层结构。
 type deviceCard struct {
@@ -29,21 +28,49 @@ Title    deviceCardText `json:"title"`
 Template string         `json:"template"`
 }
 
-// deviceCardElement 是卡片元素:div 文本块(每行一台设备)。
+// deviceCardElement 是卡片元素:column_set(一行多列)。
 type deviceCardElement struct {
-Tag  string         `json:"tag"` // 恒为 div
+Tag      string         `json:"tag"` // 恒为 column_set
+FlexMode string         `json:"flex_mode"` // none
+Columns  []deviceColumn `json:"columns"`
+}
+
+type deviceColumn struct {
+Tag           string          `json:"tag"` // 恒为 column
+Width         string          `json:"width"` // weighted
+Weight        int             `json:"weight"`
+VerticalAlign string          `json:"vertical_align"` // top
+Elements      []deviceColElem `json:"elements"`
+}
+
+type deviceColElem struct {
+Tag  string         `json:"tag"` // div
 Text deviceCardText `json:"text"`
 }
 
 type deviceCardText struct {
-Tag     string `json:"tag"` // plain_text(不做 markdown 解析,防连字符被吞)
+Tag     string `json:"tag"` // plain_text(不解析 markdown,防连字符被吞)
 Content string `json:"content"`
 }
 
-// deviceTableRow 是表格一行(按列顺序:设备/系统/架构/内存)。
+// deviceTableColumn 定义一列:标题 + 权重(控制宽度)。
+type deviceTableColumn struct {
+Title  string
+Weight int
+}
+
+// deviceTableRow 是表格一行(按列顺序)。
 type deviceTableRow []string
 
-// renderDeviceTableCard 渲染设备列表为飞书卡片(plain_text 逐行)。
+// deviceColumns 是设备表格的列定义(设备/系统/架构/内存)。
+var deviceColumns = []deviceTableColumn{
+{"设备", 3},
+{"系统", 2},
+{"架构", 2},
+{"内存", 1},
+}
+
+// renderDeviceTableCard 渲染设备列表为飞书卡片(column_set 表格)。
 // 返回卡片 JSON(直接作 SendCard 的 card 参数);空列表 → 返回空(调用方回纯文本)。
 func renderDeviceTableCard(rows []deviceTableRow) (any, error) {
 if len(rows) == 0 {
@@ -57,18 +84,39 @@ Template: "blue",
 },
 Elements: []deviceCardElement{},
 }
-for _, r := range rows {
-// 每行一台设备:设备名 + 系统 · 架构 · 内存
-line := r[0]
-if len(r) > 1 {
-line += "  " + strings.Join(r[1:], " · ")
+// 表头行 + 数据行,全部用 column_set。
+all := make([]deviceTableRow, 0, len(rows)+1)
+header := make(deviceTableRow, 0, len(deviceColumns))
+for _, c := range deviceColumns {
+header = append(header, c.Title)
 }
-card.Elements = append(card.Elements, deviceCardElement{
-Tag:  "div",
-Text: deviceCardText{Tag: "plain_text", Content: line},
-})
+all = append(all, header)
+all = append(all, rows...)
+
+for _, r := range all {
+card.Elements = append(card.Elements, buildColumnSetRow(r))
 }
 return card, nil
+}
+
+// buildColumnSetRow 把一行单元格渲染为一个 column_set。
+func buildColumnSetRow(row deviceTableRow) deviceCardElement {
+cols := make([]deviceColumn, 0, len(deviceColumns))
+for i, c := range deviceColumns {
+content := ""
+if i < len(row) {
+content = row[i]
+}
+cols = append(cols, deviceColumn{
+Tag: "column", Width: "weighted", Weight: c.Weight,
+VerticalAlign: "top",
+Elements: []deviceColElem{{
+Tag:  "div",
+Text: deviceCardText{Tag: "plain_text", Content: content},
+}},
+})
+}
+return deviceCardElement{Tag: "column_set", FlexMode: "none", Columns: cols}
 }
 
 // deviceRowFromStatus 把一台设备转成表格行(设备名/系统/架构/内存)。
