@@ -189,6 +189,18 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 			soc = strings.TrimSpace(head)
 		}
 		displayName := d.DisplayName
+		// 显示名同样可能被 alias 串污染(Agent 端用脏 soc 拼的
+		// "QCM6125;IDP:QCS6490-513cd3de"):含分号时取首段。
+		if strings.Contains(displayName, ";") {
+			head, _, _ := strings.Cut(displayName, ";")
+			displayName = strings.TrimSpace(head)
+		}
+		// 显示名若缺 serial 后缀(如清洗后只剩 soc 名),按当前 soc 重拼。
+		if displayName == "" || !strings.HasSuffix(displayName, "-"+d.Serial) {
+			if soc != "" {
+				displayName = strings.ToUpper(soc) + "-" + d.Serial
+			}
+		}
 		// 服务端型号归一化:命中 SOCAliases 表 → soc 与显示名统一为型号。
 		if alias, ok := h.SOCAliases[strings.ToLower(soc)]; ok {
 			soc = alias

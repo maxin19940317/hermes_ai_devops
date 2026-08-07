@@ -509,11 +509,11 @@ func TestHeartbeatNormalizesSOCFromServerTable(t *testing.T) {
 		srv := httptest.NewServer(h.Mux())
 		defer srv.Close()
 		// 旧 AGENT_SOC_ALIASES="trinket:QCM6125;idp:QCS6490"(分号,与代码逗号不符)
-		// 导致整串被存进 soc → 心跳清洗取首段 trinket → 归一化 QCM6125
+		// 导致整串被存进 soc 与 display_name → 心跳清洗取首段 → 归一化 QCM6125
 		resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
 			"client_id": "c1", "agent_version": "0.12.0",
 			"devices": []map[string]any{
-				{"serial": "513cd3de", "state": "IDLE",
+				{"serial": "513cd3de", "state": "IDLE", "display_name": "QCM6125;IDP:QCS6490-513cd3de",
 					"props": map[string]any{"os": "android", "soc": "QCM6125;idp:QCS6490", "abi": "arm64-v8a", "capabilities": []string{}}},
 			},
 			"active_task_ids": []string{},
