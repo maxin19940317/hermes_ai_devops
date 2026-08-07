@@ -12,11 +12,13 @@ datasources:
     isDefault: true
     editable: false
     url: postgres:5432
-    database: hermes_runtime
     user: ${RUNTIME_DB_USER}
     secureJsonData:
       password: ${RUNTIME_DB_PASSWORD}
     jsonData:
+      # Grafana 13:database 必须在 jsonData 里(顶层字段已被移除,否则前端报
+      # "no default database configured",面板查询直接不发)。
+      database: hermes_runtime
       sslmode: disable
       postgresVersion: 1500
       timescaledb: false

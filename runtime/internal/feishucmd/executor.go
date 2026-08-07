@@ -76,6 +76,10 @@ type Executor struct {
 	// CardSender 可选:非 nil 且发送方支持时,devices 等查询用卡片(表格布局)回复。
 	// nil = 纯文本回复。worker 装配时从 feishuSender 类型断言得到。
 	CardSender feishu.CardSender
+	// TextOnly 强制文本回复(2026-08-07):受控命令接口 cmdapi 用独立的
+	// Executor 副本且 TextOnly=true,devices 等卡片优先指令返回文本而非
+	// 发卡片(卡片通道只属于飞书 listener)。独立实例 → 无并发竞态。
+	TextOnly bool
 
 	// Translator 非 nil 时启用自然语言翻译旁路(设计文档 §3.1);
 	// nil = 未启用,未知输入回 usage(改动前的行为)。
@@ -347,6 +351,15 @@ func (e *Executor) execute(ctx context.Context, cmd Command) (string, error) {
 	}
 }
 
+// ExecuteCommand 是 execute 的公开封装,供受控命令 HTTP 接口(cmdapi)复用。
+// 与飞书指令共用同一套执行逻辑;不经过待确认流程(调用方自行决定是否确认,
+// 例如 MCP bridge 对 test/rerun 等副作用指令由 hermes-agent 侧确认)。
+// cmdapi 装配的是 TextOnly=true 的独立 Executor 副本(无卡片、无飞书发送),
+// 因此这里无需再做任何状态切换,天然无并发竞态。
+func (e *Executor) ExecuteCommand(ctx context.Context, cmd Command) (string, error) {
+	return e.execute(ctx, cmd)
+}
+
 func (e *Executor) status(ctx context.Context) (string, error) {
 	ov, err := e.Store.FleetOverview(ctx)
 	if err != nil {
@@ -405,7 +418,8 @@ func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
 	// 卡片优先(2026-08-07):CardSender 可用时,devices 用 column_set 表格卡片
 	// 展示(ID/设备/系统/架构/内存,规则数据,不经 LLM——设备查询要的是确定性的表)。
 	// 无卡片能力 → 回落纯文本(online 且表述层可用 → Smart Reply)。
-	if e.CardSender != nil {
+	// TextOnly 时跳过卡片(cmdapi 是文本通道,不往飞书发卡片)。
+	if e.CardSender != nil && !e.TextOnly {
 		fleet, err := e.Store.ListFleet(ctx)
 		if err != nil {
 			return "", err
@@ -443,13 +457,13 @@ func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
 
 // replyCard 发送卡片回复(失败降级纯文本提示,不阻塞)。
 func (e *Executor) replyCard(ctx context.Context, card any) {
-if e.CardSender == nil {
-return
-}
-if err := e.CardSender.SendCard(ctx, card); err != nil {
-log := e.log()
-log.Error().Err(err).Msg("feishu cmd card reply failed")
-}
+	if e.CardSender == nil {
+		return
+	}
+	if err := e.CardSender.SendCard(ctx, card); err != nil {
+		log := e.log()
+		log.Error().Err(err).Msg("feishu cmd card reply failed")
+	}
 }
 
 func deviceDisplayName(d store.DeviceStatus) string {

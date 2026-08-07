@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# start-mcp-bridge — MCP bridge 启动脚本(与 start-analyze-bridge 同构)。
+# 幂等:已在跑则 no-op。env 文件(含密钥,勿入 git)由部署时写入。
+set -euo pipefail
+
+BRIDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${MCP_BRIDGE_ENV_FILE:-/opt/data/bin/mcp_bridge.env}"
+PORT="${MCP_BRIDGE_PORT:-8645}"
+LOG_FILE="/opt/data/logs/mcp_bridge.log"
+PID_FILE="/opt/data/logs/mcp_bridge.pid"
+
+# env 文件里可覆盖 MCP_BRIDGE_PORT / RUNTIME_CMD_API_URL / RUNTIME_CMD_API_TOKEN 等。
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  set -a  # 自动 export source 的变量
+  . "$ENV_FILE"
+  set +a
+fi
+
+# 已在跑 → no-op
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  echo "mcp_bridge already running (pid $(cat "$PID_FILE"))"
+  exit 0
+fi
+
+PYTHON_BIN="${MCP_BRIDGE_PYTHON:-/opt/hermes/.venv/bin/python}"
+cd "$BRIDGE_DIR"
+nohup "$PYTHON_BIN" mcp_bridge.py >>"$LOG_FILE" 2>&1 &
+echo $! > "$PID_FILE"
+echo "mcp_bridge started (pid $(cat "$PID_FILE"), port ${MCP_BRIDGE_PORT:-$PORT})"

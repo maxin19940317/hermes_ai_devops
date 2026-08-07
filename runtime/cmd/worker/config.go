@@ -237,6 +237,9 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			HermesModel:     getenv("HERMES_MODEL"),
 			// 表述层专用模型;空 = 回落 HermesModel(worker 装配时决定)。
 			HermesExpressModel: getenv("HERMES_EXPRESS_MODEL"),
+			// 受控命令接口(MCP bridge 调 POST /api/v1/cmd)的 Bearer 共享密钥;
+			// 空 = 接口未启用(401)。
+			CmdAPIToken: getenv("CMD_API_TOKEN"),
 			HermesTimeout:   time.Duration(hermesTimeoutSec) * time.Second,
 		},
 		SpecDefaults: activity.SpecDefaults{

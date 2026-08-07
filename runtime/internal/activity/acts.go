@@ -78,6 +78,10 @@ type Config struct {
 	// HermesExpressModel 是表述层(Express)专用模型(设计文档 §4.3 评审定稿):
 	// 表述在交互路径上对延迟最敏感,独立配置;空 = 回落 HermesModel。
 	HermesExpressModel string
+	// CmdAPIToken 是受控命令接口(cmdapi POST /api/v1/cmd)的 Bearer 共享密钥,
+	// 供 MCP bridge(hermes-agent 平台侧)调用。空 = 接口未启用(401)。
+	// 与飞书 open_id 白名单正交:这是机器对机器的结构化指令通道,无 LLM 参与。
+	CmdAPIToken string
 	HermesTimeout   time.Duration
 	// §12 Phase 2 / 设计文档 §3.1:飞书指令层自然语言翻译旁路总开关(缺省关,灰度)。
 	// 启用需三者合取:FeishuCmdNL && HermesEndpoint 非空 && 指令 listener 本身已启用

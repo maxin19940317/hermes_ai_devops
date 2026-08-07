@@ -63,6 +63,7 @@ import (
 
 	"hermes-devops/runtime/internal/activity"
 	"hermes-devops/runtime/internal/callbacks"
+	"hermes-devops/runtime/internal/cmdapi"
 	"hermes-devops/runtime/internal/feishu"
 	"hermes-devops/runtime/internal/feishucmd"
 	"hermes-devops/runtime/internal/hermesclient"
@@ -163,18 +164,26 @@ func main() {
 	acts.Feishu = feishuSender
 	log.Info().Str("mode", feishuMode).Msg("feishu notify mode")
 
+	// ---- 飞书指令执行器(飞书 listener 与受控命令接口 cmdapi 共用) ----
+	// Executor 是全部指令逻辑的唯一实现:只读查询(status/devices/runs/result/
+	// metrics/artifacts)与副作用指令(test/rerun/quarantine/unquarantine/cancel)
+	// 都在这里。飞书 listener 走 open_id 白名单;cmdapi 走 Bearer Token,二者
+	// 复用同一 execute 路径,保证行为一致(2026-08-07)。
+	exec := &feishucmd.Executor{
+		Store: st, Log: &log,
+		Starter:  &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
+		Variants: specCfg.VariantNames(),
+		SpecCfg:  specCfg,
+	}
+
 	// ---- 飞书指令 listener:白名单(FEISHU_CMD_WHITELIST)非空才启动;
 	// 需要 app 凭据(与通知共用)——长连接事件订阅只收白名单 open_id 的单聊指令 ----
 	if wl := feishucmd.ParseWhitelist(cfg.Activity.FeishuCmdWhitelist); len(wl) > 0 {
 		if cfg.Activity.FeishuAppID == "" || cfg.Activity.FeishuAppSecret == "" {
 			log.Warn().Msg("FEISHU_CMD_WHITELIST 已配置但缺 FEISHU_APP_ID/SECRET,listener=disabled")
 		} else {
-			exec := &feishucmd.Executor{
-				Store: st, Sender: feishuSender, Log: &log, Whitelist: wl,
-				Starter:  &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
-				Variants: specCfg.VariantNames(),
-				SpecCfg:  specCfg,
-			}
+			exec.Sender = feishuSender
+			exec.Whitelist = wl
 			// 卡片回复能力(app/webhook 发送方都实现 CardSender;类型断言失败 → nil,
 			// devices 等查询回落纯文本)。
 			if cs, ok := feishuSender.(feishu.CardSender); ok {
@@ -294,9 +303,26 @@ func main() {
 		cb.Presign = signer
 	}
 	cb.UploadMaxFiles = cfg.Activity.UploadMaxFiles
+
+	// ---- 受控命令接口(cmdapi):Hermes/MCP 侧的结构化指令通道(2026-08-07) ----
+	// POST /api/v1/cmd {command,args} → 复用 feishucmd.Executor 执行逻辑。
+	// Bearer 鉴权(CMD_API_TOKEN);Token 空 = 接口未启用(401)。
+	// 挂在 callbacks 同一 listener 上(共享 8091 端口与 mTLS),避免新增暴露面。
+	// cmdapi 用独立的 TextOnly Executor 副本:无卡片、无飞书发送(devices 等
+	// 卡片优先指令返回文本),与飞书 listener 的共享 exec 零竞态。
+	cmdExec := *exec
+	cmdExec.TextOnly = true
+	cmdExec.CardSender = nil
+	cmdExec.Sender = nil
+	cmdExec.Whitelist = nil
+	cmdMux := cb.Mux()
+	cmdMux.Handle("/api/v1/cmd", &cmdapi.Handler{
+		Token: cfg.Activity.CmdAPIToken,
+		Exec:  &cmdExec,
+	})
 	callbackSrv := &http.Server{
 		Addr:              cfg.CallbacksAddr,
-		Handler:           cb.Mux(),
+		Handler:           cmdMux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

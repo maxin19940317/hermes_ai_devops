@@ -12,7 +12,7 @@
         "name": "variant",
         "type": "query",
         "datasource": { "uid": "hermes-runtime", "type": "postgres" },
-        "query": "SELECT DISTINCT variant AS __text, variant AS __value FROM tasks ORDER BY variant",
+        "query": "SELECT DISTINCT unnest(variants) AS __text, unnest(variants) AS __value FROM workflow_runs ORDER BY 1",
         "refresh": 1,
         "includeAll": true,
         "multi": true,
