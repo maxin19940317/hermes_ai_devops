@@ -7,11 +7,12 @@ import (
 	"hermes-devops/runtime/internal/store"
 )
 
-// TestRenderDeviceTableCardIncludesIDColumn:卡片表格必须含 ID 列(用户要求最左加 ID)。
-func TestRenderDeviceTableCardIncludesIDColumn(t *testing.T) {
+// TestRenderDeviceTableCard:卡片表格列 = 设备/系统/架构/内存(2026-08-07 用户
+// 反馈 ID 列效果不好,去掉)。
+func TestRenderDeviceTableCard(t *testing.T) {
 	rows := []deviceTableRow{
-		{"825485946", "QCS6490-825485946", "Linux", "arm64-v8a", "7.3GB"},
-		{"513cd3de", "QCM6125-513cd3de", "Android", "arm64-v8a", "3.5GB"},
+		{"QCS6490-825485946", "Linux", "arm64-v8a", "7.1GB"},
+		{"QCM6125-513cd3de", "Android", "arm64-v8a", "3.5GB"},
 	}
 	card, err := renderDeviceTableCard(rows)
 	if err != nil {
@@ -21,13 +22,18 @@ func TestRenderDeviceTableCardIncludesIDColumn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 表头含 ID 列
-	if !strings.Contains(js, "**ID**") {
-		t.Errorf("卡片缺 ID 列表头: %s", js[:200])
+	// 表头:设备/系统/架构/内存(无 ID)
+	for _, col := range []string{"**设备**", "**系统**", "**架构**", "**内存**"} {
+		if !strings.Contains(js, col) {
+			t.Errorf("卡片缺表头 %q: %s", col, js[:300])
+		}
 	}
-	// 数据含设备 ID
-	if !strings.Contains(js, "825485946") || !strings.Contains(js, "513cd3de") {
-		t.Errorf("卡片缺设备 ID 数据: %s", js[:300])
+	if strings.Contains(js, "**ID**") {
+		t.Errorf("卡片不应含 ID 列表头: %s", js[:300])
+	}
+	// 数据含设备名
+	if !strings.Contains(js, "QCS6490-825485946") || !strings.Contains(js, "QCM6125-513cd3de") {
+		t.Errorf("卡片缺设备数据: %s", js[:300])
 	}
 	// 结构:column_set 行数 = 表头 + 2 数据
 	if strings.Count(js, `"column_set"`) != 3 {
@@ -40,7 +46,7 @@ func TestRenderDeviceTableCardIncludesIDColumn(t *testing.T) {
 	}
 }
 
-// TestDeviceRowFromStatus:完整 FleetDevice → 表格行(含 ID/显示名/系统/架构/内存)。
+// TestDeviceRowFromStatus:完整 FleetDevice → 表格行(显示名/系统/架构/内存)。
 func TestDeviceRowFromStatus(t *testing.T) {
 	mb := int64(7304)
 	d := store.FleetDevice{
@@ -51,7 +57,7 @@ func TestDeviceRowFromStatus(t *testing.T) {
 		Status: store.DeviceIdle,
 	}
 	row := deviceRowFromStatus(d)
-	want := []string{"825485946", "QCS6490-825485946", "Linux", "arm64-v8a", "7.1GB"}
+	want := []string{"QCS6490-825485946", "Linux", "arm64-v8a", "7.1GB"}
 	if len(row) != len(want) {
 		t.Fatalf("row = %v, want %d 列", row, len(want))
 	}

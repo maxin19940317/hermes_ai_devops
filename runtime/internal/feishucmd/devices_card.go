@@ -65,7 +65,6 @@ type deviceTableRow []string
 
 // deviceColumns 是设备表格的列定义(与 devices 回复一致)。
 var deviceColumns = []deviceTableColumn{
-	{"**ID**", 1},
 	{"**设备**", 3},
 	{"**系统**", 2},
 	{"**架构**", 2},
@@ -134,7 +133,6 @@ func escapeMD(s string) string {
 // deviceRowFromStatus 把一台设备转成表格行。
 func deviceRowFromStatus(d store.FleetDevice) deviceTableRow {
 	return deviceTableRow{
-		d.DeviceID,
 		deviceDisplayNameFromFleet(d),
 		osCN2(d.OS),
 		d.ABI,
