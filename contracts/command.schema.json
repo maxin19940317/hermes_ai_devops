@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hermes-devops/contracts/command.schema.json",
-  "title": "command.json v3",
-  "description": "飞书指令层 LLM 意图翻译输出(CLAUDE.md §12 Phase 2)。command 为封闭枚举,args 禁空白字符以保证渲染成一行指令文本后可被 strings.Fields 无损切回。",
+  "title": "command.json v4",
+  "description": "飞书指令层 LLM 意图翻译输出(CLAUDE.md §12 Phase 2)。command 为封闭枚举,args 禁空白字符以保证渲染成一行指令文本后可被 strings.Fields 无损切回。v4 起含 11 个指令(2026-08-07)。",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,7 +12,7 @@
   ],
   "properties": {
     "translation_version": {
-      "const": 3
+      "const": 4
     },
     "command": {
       "type": "string",
@@ -22,6 +22,12 @@
         "test",
         "rerun",
         "unquarantine",
+        "quarantine",
+        "runs",
+        "result",
+        "metrics",
+        "artifacts",
+        "cancel",
         "none"
       ],
       "description": "none = 信息不足或输入根本不是指令"
@@ -75,9 +81,31 @@
       "if": {
         "properties": {
           "command": {
+            "const": "test"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "then": {
+        "required": [
+          "args"
+        ],
+        "properties": {
+          "args": {
+            "minItems": 1,
+            "maxItems": 2
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {
             "enum": [
               "status",
-              "devices",
               "none"
             ]
           }
@@ -90,6 +118,28 @@
         "properties": {
           "args": {
             "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {
+            "enum": [
+              "devices",
+              "runs"
+            ]
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "then": {
+        "properties": {
+          "args": {
+            "maxItems": 1
           }
         }
       }
@@ -117,7 +167,31 @@
       "if": {
         "properties": {
           "command": {
-            "const": "test"
+            "const": "quarantine"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "then": {
+        "properties": {
+          "args": {
+            "maxItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {
+            "enum": [
+              "result",
+              "metrics",
+              "artifacts",
+              "cancel"
+            ]
           }
         },
         "required": [
@@ -131,7 +205,7 @@
         "properties": {
           "args": {
             "minItems": 1,
-            "maxItems": 2
+            "maxItems": 1
           }
         }
       }

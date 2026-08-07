@@ -73,3 +73,18 @@ func (s *TemporalStarter) WorkflowResult(
 	}
 	return &out, nil
 }
+
+// TerminateWorkflow 取消运行中的 workflow(飞书指令 cancel)。
+// 已终态/不存在的 workflow 幂等返回 nil(Temporal Terminate 对 closed
+// workflow 返回 NotFound,归一化为成功——取消的语义是"确保不再运行")。
+func (s *TemporalStarter) TerminateWorkflow(ctx context.Context, workflowID, reason string) error {
+	err := s.Client.TerminateWorkflow(ctx, workflowID, "", reason, nil)
+	if err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return nil // 已终态或不存在:无需取消
+		}
+		return fmt.Errorf("terminate workflow %s: %w", workflowID, err)
+	}
+	return nil
+}

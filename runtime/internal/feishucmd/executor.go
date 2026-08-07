@@ -26,15 +26,26 @@ import (
 type Store interface {
 	FleetOverview(ctx context.Context) (*store.FleetOverview, error)
 	UnquarantineDevice(ctx context.Context, deviceID string) (bool, error)
+	// QuarantineDevice 手动隔离设备(与 UnquarantineDevice 对称,飞书指令
+	// quarantine):BUSY 运行中不隔离;设备不存在返回 (false, nil)。
+	QuarantineDevice(ctx context.Context, deviceID string) (bool, error)
 	ListArtifacts(ctx context.Context, project, commitSHA string, pipelineID int) ([]store.Artifact, error)
+	// MetricsForVariant 返回指定变体最近 limit 条指标点(created_at 倒序,跨
+	// project/suite/metric)。供 metrics 指令展示性能概况。
+	MetricsForVariant(ctx context.Context, variant string, limit int) ([]store.MetricPoint, error)
 	// LatestArtifactForVariant 返回指定变体最近一次构建的 artifact(按 created_at
 	// 取最新,不限 project);无记录返回 nil,nil。供 test 命令缺省 commit 时定位
 	// "最近构建"——project 从 artifact 自身带出,不依赖 workflow run。
 	LatestArtifactForVariant(ctx context.Context, variant string) (*store.Artifact, error)
+	// ListArtifactsForVariant 返回指定变体最近 limit 条构建(created_at 倒序,
+	// 不限 project)。供 artifacts 指令查构建历史。
+	ListArtifactsForVariant(ctx context.Context, variant string, limit int) ([]store.Artifact, error)
 	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	CurrentWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	NextWorkflowAttemptAll(ctx context.Context, project, commitSHA string, pipelineID int) (int, error)
 	GetWorkflowRun(ctx context.Context, workflowID string) (*store.WorkflowRun, error)
+	GetTask(ctx context.Context, taskID string) (*wf.TaskRow, error)
+	GetResult(ctx context.Context, taskID string) (*wf.ResultRecord, error)
 	LatestTaskIDForVariant(ctx context.Context, workflowID, variant string) (string, error)
 	// 以下三个供意图翻译层使用(设计文档 §3.1)
 	RecentRuns(ctx context.Context, limit int) ([]store.RecentRun, error)
@@ -47,6 +58,8 @@ type WorkflowStarter interface {
 	StartDeviceTest(ctx context.Context, in wf.DeviceTestInput) (workflowID string, started bool, err error)
 	WorkflowClosed(ctx context.Context, workflowID string) (bool, error)
 	WorkflowResult(ctx context.Context, workflowID string) (*wf.DeviceTestOutput, error)
+	// TerminateWorkflow 取消运行中的 workflow(Temporal Terminate;已终态幂等)。
+	TerminateWorkflow(ctx context.Context, workflowID, reason string) error
 }
 
 // Executor 是指令执行体:鉴权(白名单)→ 解析 → 执行 → 文本回复。
@@ -290,13 +303,25 @@ func (e *Executor) execute(ctx context.Context, cmd Command) (string, error) {
 	case "status":
 		return e.status(ctx)
 	case "devices":
-		return e.devices(ctx)
+		return e.devices(ctx, cmd.Args)
 	case "test":
 		return e.testCmd(ctx, cmd.Args)
 	case "rerun":
 		return e.rerun(ctx, cmd.Args)
 	case "unquarantine":
 		return e.unquarantine(ctx, cmd.Args)
+	case "quarantine":
+		return e.quarantine(ctx, cmd.Args)
+	case "runs":
+		return e.runs(ctx, cmd.Args)
+	case "result":
+		return e.resultCmd(ctx, cmd.Args)
+	case "metrics":
+		return e.metrics(ctx, cmd.Args)
+	case "artifacts":
+		return e.artifacts(ctx, cmd.Args)
+	case "cancel":
+		return e.cancel(ctx, cmd.Args)
 	case "plan":
 		return e.planCmd(ctx, cmd.Args)
 	default:
@@ -321,16 +346,47 @@ func (e *Executor) status(ctx context.Context) (string, error) {
 	return b.String(), nil
 }
 
-func (e *Executor) devices(ctx context.Context) (string, error) {
+func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
+	scope := "online"
+	if len(args) > 1 {
+		return "用法: devices [online|all|offline|quarantined]", nil
+	}
+	if len(args) == 1 {
+		switch args[0] {
+		case "online", "all", "offline", "quarantined":
+			scope = args[0]
+		default:
+			return "用法: devices [online|all|offline|quarantined]", nil
+		}
+	}
 	ov, err := e.Store.FleetOverview(ctx)
 	if err != nil {
 		return "", err
 	}
-	if len(ov.Devices) == 0 {
-		return "fleet 无注册设备", nil
+	var matched []store.DeviceStatus
+	for _, d := range ov.Devices {
+		switch scope {
+		case "all":
+			matched = append(matched, d)
+		case "online":
+			if d.Status == store.DeviceIdle || d.Status == store.DeviceBusy {
+				matched = append(matched, d)
+			}
+		case "offline":
+			if d.Status == store.DeviceOffline {
+				matched = append(matched, d)
+			}
+		case "quarantined":
+			if d.Status == store.DeviceQuarantined {
+				matched = append(matched, d)
+			}
+		}
+	}
+	if len(matched) == 0 {
+		return fmt.Sprintf("无 %s 设备", scope), nil
 	}
 	var b strings.Builder
-	for _, d := range ov.Devices {
+	for _, d := range matched {
 		fmt.Fprintf(&b, "%s  serial=%s soc=%s status=%s fail_streak=%d client=%s client_fail=%d\n",
 			deviceDisplayName(d), d.Serial, d.SOC, d.Status, d.FailStreak, d.ClientID, d.ClientFailStreak)
 	}
@@ -921,4 +977,255 @@ func truncStr(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// quarantine 与 unquarantine 对称:手动隔离设备(BUSY 运行中不隔离)。
+func (e *Executor) quarantine(ctx context.Context, args []string) (string, error) {
+	if len(args) > 1 {
+		return "用法: quarantine [device_id]", nil
+	}
+	if len(args) == 1 {
+		ok, err := e.Store.QuarantineDevice(ctx, args[0])
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return fmt.Sprintf("无法隔离 %s(不存在或运行中)", args[0]), nil
+		}
+		return fmt.Sprintf("已隔离: %s", args[0]), nil
+	}
+	ov, err := e.Store.FleetOverview(ctx)
+	if err != nil {
+		return "", err
+	}
+	switch len(ov.Devices) {
+	case 0:
+		return "fleet 无注册设备", nil
+	case 1:
+		d := ov.Devices[0]
+		ok, err := e.Store.QuarantineDevice(ctx, d.DeviceID)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return fmt.Sprintf("无法隔离 %s(运行中)", d.DeviceID), nil
+		}
+		return fmt.Sprintf("已隔离: %s(唯一设备,自动选定)", d.DeviceID), nil
+	default:
+		var b strings.Builder
+		b.WriteString("多台设备,请指定 id: quarantine <device_id>\n")
+		for _, d := range ov.Devices {
+			fmt.Fprintf(&b, "  %s status=%s\n", d.DeviceID, d.Status)
+		}
+		return strings.TrimRight(b.String(), "\n"), nil
+	}
+}
+
+// runs [n] 展示最近运行历史(RecentRuns 权威优先)。
+func (e *Executor) runs(ctx context.Context, args []string) (string, error) {
+	limit := 5
+	if len(args) > 1 {
+		return "用法: runs [n]", nil
+	}
+	if len(args) == 1 {
+		n, err := strconv.Atoi(args[0])
+		if err != nil || n < 1 || n > 20 {
+			return "用法: runs [n],n 为 1-20 的整数", nil
+		}
+		limit = n
+	}
+	runs, err := e.Store.RecentRuns(ctx, limit)
+	if err != nil {
+		return "", err
+	}
+	if len(runs) == 0 {
+		return "暂无运行记录", nil
+	}
+	var b strings.Builder
+	for _, r := range runs {
+		mark := "?"
+		switch r.Verdict {
+		case "PASSED":
+			mark = "✅"
+		case "TEST_FAILED", "INFRA_ERROR", "TIMEOUT":
+			mark = "❌"
+		case wf.VerdictSkipped:
+			mark = "⏭"
+		}
+		authority := ""
+		if r.Authoritative {
+			authority = "*"
+		}
+		verdict := r.Verdict
+		if verdict == "" {
+			verdict = "运行中"
+		}
+		fmt.Fprintf(&b, "%s%s %s %s g%s p%d %s %s\n",
+			mark, authority, r.Variant, verdict, r.Commit, r.PipelineID,
+			r.WorkflowID, formatEnded(r.EndedAt, e.nowFn()))
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// result <workflow_id> 展示单次运行各变体结论(task verdict + 指标)。
+func (e *Executor) resultCmd(ctx context.Context, args []string) (string, error) {
+	if len(args) != 1 {
+		return "用法: result <workflow_id>", nil
+	}
+	wfid := args[0]
+	run, err := e.Store.GetWorkflowRun(ctx, wfid)
+	if errors.Is(err, store.ErrWorkflowRunNotFound) {
+		return fmt.Sprintf("查无 workflow: %s", wfid), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if run == nil {
+		return fmt.Sprintf("查无 workflow: %s", wfid), nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\ng%s p%d v%s %s", run.WorkflowID, run.CommitSHA, run.PipelineID,
+		run.Version, run.RuleVersion)
+	for _, v := range run.Variants {
+		taskID, err := e.Store.LatestTaskIDForVariant(ctx, wfid, v)
+		if err != nil {
+			return "", err
+		}
+		if taskID == "" {
+			fmt.Fprintf(&b, "\n  %s 无任务", v)
+			continue
+		}
+		task, err := e.Store.GetTask(ctx, taskID)
+		if err != nil {
+			return "", err
+		}
+		status := "?"
+		if task != nil {
+			status = task.Status
+		}
+		fmt.Fprintf(&b, "\n  %s [%s]", v, status)
+		if rec, err := e.Store.GetResult(ctx, taskID); err != nil {
+			return "", err
+		} else if rec != nil {
+			rs := rec.Result
+			fmt.Fprintf(&b, " exit=%d dur=%.0fs cases=%d/%d", rs.ExitCode, rs.DurationSec,
+				rs.CasesTotal-rs.CasesFailed, rs.CasesTotal)
+			if len(rs.Metrics) > 0 {
+				names := make([]string, 0, len(rs.Metrics))
+				for m := range rs.Metrics {
+					names = append(names, m)
+				}
+				sort.Strings(names)
+				fmt.Fprintf(&b, " |")
+				for _, m := range names {
+					fmt.Fprintf(&b, " %s=%.1f", shortMetric(m), rs.Metrics[m])
+				}
+			}
+			if len(rs.Attachments) > 0 {
+				fmt.Fprintf(&b, " | 附件 %d", len(rs.Attachments))
+			}
+		}
+	}
+	return b.String(), nil
+}
+
+// metrics <variant> 展示某变体最近性能指标(metrics 表,§9 基线数据源)。
+func (e *Executor) metrics(ctx context.Context, args []string) (string, error) {
+	if len(args) != 1 {
+		return "用法: metrics <variant>", nil
+	}
+	points, err := e.Store.MetricsForVariant(ctx, args[0], 30)
+	if err != nil {
+		return "", err
+	}
+	if len(points) == 0 {
+		return fmt.Sprintf("变体 %s 暂无指标记录", args[0]), nil
+	}
+	// 按 metric 聚合为"最近值 + 均值",按 metric 名排序。注意 MetricsForVariant
+	// 从最新往旧排,latest 只在首次(最新)赋值。
+	latest := map[string]float64{}
+	sum := map[string]float64{}
+	count := map[string]int{}
+	order := []string{}
+	seen := map[string]bool{}
+	for _, p := range points {
+		if !seen[p.MetricName] {
+			seen[p.MetricName] = true
+			order = append(order, p.MetricName)
+			latest[p.MetricName] = p.Value
+		}
+		sum[p.MetricName] += p.Value
+		count[p.MetricName]++
+	}
+	sort.Strings(order)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s 最近 %d 条指标:", args[0], len(points))
+	for _, m := range order {
+		avg := sum[m] / float64(count[m])
+		fmt.Fprintf(&b, "\n  %s: 最新 %.1f / 均值 %.1f (n=%d)", shortMetric(m), latest[m], avg, count[m])
+	}
+	return b.String(), nil
+}
+
+// artifacts <variant> 展示某变体最近构建历史(最近 10 条)。
+func (e *Executor) artifacts(ctx context.Context, args []string) (string, error) {
+	if len(args) != 1 {
+		return "用法: artifacts <variant>", nil
+	}
+	arts, err := e.Store.ListArtifactsForVariant(ctx, args[0], 10)
+	if err != nil {
+		return "", err
+	}
+	if len(arts) == 0 {
+		return fmt.Sprintf("变体 %s 暂无构建记录", args[0]), nil
+	}
+	var b strings.Builder
+	for _, a := range arts {
+		fmt.Fprintf(&b, "%s v%s g%s p%d\n", a.Project, a.Version, a.CommitSHA, a.PipelineID)
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// cancel <workflow_id> 取消运行中的 workflow(Temporal Terminate;已终态幂等)。
+func (e *Executor) cancel(ctx context.Context, args []string) (string, error) {
+	if len(args) != 1 {
+		return "用法: cancel <workflow_id>", nil
+	}
+	closed, err := e.Starter.WorkflowClosed(ctx, args[0])
+	if err != nil {
+		return "", err
+	}
+	if closed {
+		return fmt.Sprintf("workflow 已终态,无需取消: %s", args[0]), nil
+	}
+	if err := e.Starter.TerminateWorkflow(ctx, args[0], "feishu cancel command"); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("已取消: %s", args[0]), nil
+}
+
+// shortMetric 截断过长的 metric 名(如 xxx_test.inference_ms_avg → 保留前 24 字符)。
+func shortMetric(m string) string {
+	if len(m) <= 24 {
+		return m
+	}
+	return m[:21] + "..."
+}
+
+// formatEnded 格式化 UTC 时间,零值返回 "—"。
+func formatEnded(t time.Time, now time.Time) string {
+	if t.IsZero() {
+		return "—"
+	}
+	d := now.Sub(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%.0fs前", d.Seconds())
+	case d < time.Hour:
+		return fmt.Sprintf("%.0fm前", d.Minutes())
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%.0fh前", d.Hours())
+	default:
+		return fmt.Sprintf("%.0fd前", d.Hours()/24)
+	}
 }

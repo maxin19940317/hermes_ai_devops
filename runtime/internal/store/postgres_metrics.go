@@ -40,6 +40,38 @@ func (s *PGStore) SaveMetrics(ctx context.Context, points []MetricPoint) error {
 	return nil
 }
 
+// MetricsForVariant 返回指定变体最近 limit 条指标点(created_at 倒序,跨
+// project/suite/metric)。供飞书指令 metrics 展示该变体性能概况。
+func (s *PGStore) MetricsForVariant(
+	ctx context.Context, variant string, limit int,
+) ([]MetricPoint, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 30
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT project, variant, suite, metric_name, value, task_id
+		FROM metrics WHERE variant = $1
+		ORDER BY created_at DESC, id DESC LIMIT $2`,
+		variant, limit)
+	if err != nil {
+		return nil, fmt.Errorf("metrics for variant %s: %w", variant, err)
+	}
+	defer rows.Close()
+	out := []MetricPoint{}
+	for rows.Next() {
+		var p MetricPoint
+		if err := rows.Scan(&p.Project, &p.Variant, &p.Suite, &p.MetricName,
+			&p.Value, &p.TaskID); err != nil {
+			return nil, fmt.Errorf("metrics for variant %s: scan: %w", variant, err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("metrics for variant %s: %w", variant, err)
+	}
+	return out, nil
+}
+
 // Baseline 返回指定键最近 n 条记录的中位数(PG 实现)。
 // N < 3 → nil(基线不可信)。
 func (s *PGStore) Baseline(

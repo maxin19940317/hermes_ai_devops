@@ -25,7 +25,9 @@ const recentRunsLimit = 10
 // sideEffect 标记需要二次确认的指令:LLM 猜错参数的代价是白跑一轮设备测试。
 // 直接输入命令本身(如 "test xxx")视为用户明确意图,不经过确认;只有翻译旁路
 // (LLM 从自然语言猜出指令)才需要确认,防误触发设备测试。
-var sideEffect = map[string]bool{"rerun": true, "unquarantine": true, "test": true}
+var sideEffect = map[string]bool{
+	"rerun": true, "unquarantine": true, "quarantine": true, "cancel": true, "test": true,
+}
 
 // TranslateResult 是一次翻译的完整结论。OK=false 时 Reply 即最终回复文本。
 type TranslateResult struct {
@@ -250,12 +252,86 @@ func (t *Translator) checkArgs(cmd Command, runs []snapshotRun, devices []snapsh
 		if len(cmd.Args) == 1 && !containsDevice(devices, cmd.Args[0]) {
 			return fmt.Sprintf("设备 %s 不在快照设备名单内", cmd.Args[0])
 		}
-	case "status", "devices":
+	case "quarantine":
+		if len(cmd.Args) > 1 {
+			return "quarantine 最多一个 device_id"
+		}
+		if len(cmd.Args) == 1 && !containsDevice(devices, cmd.Args[0]) {
+			return fmt.Sprintf("设备 %s 不在快照设备名单内", cmd.Args[0])
+		}
+	case "cancel":
+		if len(cmd.Args) != 1 {
+			return "cancel 需要 <workflow_id>"
+		}
+		for _, run := range runs {
+			if run.WorkflowID == cmd.Args[0] {
+				return ""
+			}
+		}
+		return fmt.Sprintf("workflow %s 不在运行快照内", cmd.Args[0])
+	case "test":
+		if len(cmd.Args) < 1 || len(cmd.Args) > 2 {
+			return "test 需要 <variant> [commit]"
+		}
+		if !containsVariantStr(t.Variants, cmd.Args[0]) {
+			return fmt.Sprintf("变体 %s 不在合法变体名单内", cmd.Args[0])
+		}
+		if len(cmd.Args) == 2 {
+			if err := validateSHA(cmd.Args[1]); err != nil {
+				return fmt.Sprintf("commit 形态非法: %v", err)
+			}
+			found := false
+			for _, run := range runs {
+				if run.Commit == cmd.Args[1] && run.Variant == cmd.Args[0] {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Sprintf("commit %s 无变体 %s 的运行记录", cmd.Args[1], cmd.Args[0])
+			}
+		}
+	case "runs":
+		if len(cmd.Args) > 1 {
+			return "runs 最多一个数字参数"
+		}
+	case "result":
+		if len(cmd.Args) != 1 {
+			return "result 需要 <workflow_id>"
+		}
+	case "metrics", "artifacts":
+		if len(cmd.Args) != 1 {
+			return cmd.Name + " 需要 <variant>"
+		}
+		if !containsVariantStr(t.Variants, cmd.Args[0]) {
+			return fmt.Sprintf("变体 %s 不在合法变体名单内", cmd.Args[0])
+		}
+	case "status":
 		if len(cmd.Args) != 0 {
 			return cmd.Name + " 不接受参数"
 		}
+	case "devices":
+		if len(cmd.Args) > 1 {
+			return "devices 最多一个 scope(online|all|offline|quarantined)"
+		}
+		if len(cmd.Args) == 1 {
+			switch cmd.Args[0] {
+			case "online", "all", "offline", "quarantined":
+			default:
+				return fmt.Sprintf("devices scope 非法: %s", cmd.Args[0])
+			}
+		}
 	}
 	return ""
+}
+
+func containsVariantStr(variants []string, variant string) bool {
+	for _, v := range variants {
+		if v == variant {
+			return true
+		}
+	}
+	return false
 }
 
 // containsDevice 判定 device_id 是否在快照设备列表内(unquarantine 的存在性校验)。

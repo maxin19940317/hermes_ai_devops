@@ -78,6 +78,7 @@ type fakeStarter struct {
 	startResults []bool
 	result       *wf.DeviceTestOutput
 	resultErr    error
+	terminateErr error
 	calls        []string
 	trace        *[]string
 }
@@ -115,6 +116,20 @@ func (f *fakeStarter) WorkflowResult(_ context.Context, workflowID string) (*wf.
 	return f.result, f.resultErr
 }
 
+func (f *fakeStarter) TerminateWorkflow(_ context.Context, workflowID, reason string) error {
+	f.calls = append(f.calls, "TerminateWorkflow:"+workflowID)
+	if f.trace != nil {
+		*f.trace = append(*f.trace, "TerminateWorkflow")
+	}
+	if f.closedByID != nil {
+		// 测试里 cancel 对"已终态"返回 nil(幂等),运行中记录一次
+		if closed := f.closedByID[workflowID]; !closed {
+			f.closedByID[workflowID] = true
+		}
+	}
+	return f.terminateErr
+}
+
 type fakeSender struct{ texts []string }
 
 func (f *fakeSender) SendText(_ context.Context, text string) error {
@@ -122,7 +137,7 @@ func (f *fakeSender) SendText(_ context.Context, text string) error {
 	return nil
 }
 
-const wlOpenID = "ou_9530871ffdd8ce6997417413c22623d9"
+const wlOpenID = "ou_9530871ffdd8ce6997417413c22622d9"
 
 func newExec(st Store, starter *fakeStarter, sender *fakeSender) *Executor {
 	return &Executor{
@@ -978,7 +993,7 @@ func TestStatusAndDevicesShowClientFailStreak(t *testing.T) {
 	seedQuarantinedDevice(t, st, "dev-1")
 	sender := &fakeSender{}
 	e := newExec(st, &fakeStarter{}, sender)
-	for _, cmd := range []string{"status", "devices"} {
+	for _, cmd := range []string{"status", "devices all"} {
 		sender.texts = nil
 		e.HandleMessage(context.Background(), wlOpenID, cmd)
 		got := lastText(sender)
@@ -1327,5 +1342,262 @@ func TestTestCmdRaceAlreadyRunning(t *testing.T) {
 	}
 	if len(starter.inputs) != 1 {
 		t.Fatalf("inputs = %+v, want 仅一次尝试", starter.inputs)
+	}
+}
+
+// ---- 新指令(2026-08-07):runs/result/metrics/artifacts/quarantine/cancel ----
+
+func TestRunsCommand(t *testing.T) {
+	mem := store.NewMemStore()
+	run := store.WorkflowRun{
+		WorkflowID: "device-test-grp/p-gabcd1234-p42", Project: "grp/p",
+		CommitSHA: "abcd1234", PipelineID: 42, Version: "1.2.3",
+		RuleVersion: "verdict-rules-v7", Scope: "v1", Variants: []string{"v1"},
+	}
+	if err := mem.RecordWorkflowRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.CreateTask(ctx, wf.TaskRow{
+		TaskID: "t1", WorkflowID: run.WorkflowID, TestID: "v1", Attempt: 1,
+		Status: "COMPLETED",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.FinishTask(ctx, wf.FinishRequest{
+		TaskID: "t1", Status: "COMPLETED", Verdict: "PASSED",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e := newExec(mem, &fakeStarter{}, &fakeSender{})
+
+	got, err := e.runs(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "v1") || !strings.Contains(got, "PASSED") || !strings.Contains(got, "gabcd1234") {
+		t.Errorf("runs = %q", got)
+	}
+	// 非法参数
+	if got, _ := e.runs(ctx, []string{"abc"}); !strings.Contains(got, "用法") {
+		t.Errorf("runs abc = %q", got)
+	}
+}
+
+func TestRunsCommandBadLimit(t *testing.T) {
+	e := newExec(store.NewMemStore(), &fakeStarter{}, &fakeSender{})
+	for _, arg := range []string{"0", "-1", "21", "abc"} {
+		got, _ := e.runs(ctx, []string{arg})
+		if !strings.Contains(got, "用法") {
+			t.Errorf("runs %s = %q, want usage", arg, got)
+		}
+	}
+}
+
+func TestResultCommand(t *testing.T) {
+	mem := store.NewMemStore()
+	run := store.WorkflowRun{
+		WorkflowID: "device-test-grp/p-gabcd1234-p42", Project: "grp/p",
+		CommitSHA: "abcd1234", PipelineID: 42, Version: "1.2.3",
+		RuleVersion: "verdict-rules-v7", Scope: "v1", Variants: []string{"v1", "v2"},
+	}
+	if err := mem.RecordWorkflowRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.CreateTask(ctx, wf.TaskRow{
+		TaskID: "t1", WorkflowID: run.WorkflowID, TestID: "v1", Attempt: 1, Status: "COMPLETED",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mem.SaveResult(ctx, wf.ResultRecord{TaskID: "t1", Result: wf.TaskResultSignal{
+		Status: "COMPLETED", ExitCode: 0, DurationSec: 10, CasesTotal: 3,
+		Metrics: map[string]float64{"a_test": 1.5},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	e := newExec(mem, &fakeStarter{}, &fakeSender{})
+
+	got, err := e.resultCmd(ctx, []string{run.WorkflowID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "v1") || !strings.Contains(got, "COMPLETED") ||
+		!strings.Contains(got, "a_test") {
+		t.Errorf("result = %q", got)
+	}
+	// 查无此 workflow
+	if got, _ := e.resultCmd(ctx, []string{"ghost"}); !strings.Contains(got, "查无") {
+		t.Errorf("result ghost = %q", got)
+	}
+	// 参数错误
+	if got, _ := e.resultCmd(ctx, nil); !strings.Contains(got, "用法") {
+		t.Errorf("result = %q", got)
+	}
+}
+
+func TestMetricsCommand(t *testing.T) {
+	mem := store.NewMemStore()
+	mem.SaveMetrics(ctx, []store.MetricPoint{
+		{Project: "grp/p", Variant: "v1", Suite: "s", MetricName: "a", Value: 1.0, TaskID: "t1"},
+		{Project: "grp/p", Variant: "v1", Suite: "s", MetricName: "a", Value: 3.0, TaskID: "t2"},
+		{Project: "grp/p", Variant: "v1", Suite: "s", MetricName: "b", Value: 5.0, TaskID: "t3"},
+	})
+	e := newExec(mem, &fakeStarter{}, &fakeSender{})
+
+	got, err := e.metrics(ctx, []string{"v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "a: 最新 3.0 / 均值 2.0") || !strings.Contains(got, "b: 最新 5.0") {
+		t.Errorf("metrics = %q", got)
+	}
+	// 无指标
+	got, _ = e.metrics(ctx, []string{"ghost"})
+	if !strings.Contains(got, "暂无指标") {
+		t.Errorf("metrics ghost = %q", got)
+	}
+}
+
+func TestArtifactsCommand(t *testing.T) {
+	_, _, e := newTestFixture(t, "v1", "v2")
+	got, err := e.artifacts(ctx, []string{"v2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "grp/p") || !strings.Contains(got, "abcd1234") {
+		t.Errorf("artifacts = %q", got)
+	}
+	got, _ = e.artifacts(ctx, []string{"ghost"})
+	if !strings.Contains(got, "暂无构建") {
+		t.Errorf("artifacts ghost = %q", got)
+	}
+}
+
+func TestQuarantineCommand(t *testing.T) {
+	st := store.NewMemStore()
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1"},
+		[]store.Device{{DeviceID: "dev-1", Serial: "dev-1", ClientID: "c1"}}); err != nil {
+		t.Fatal(err)
+	}
+	e := newExec(st, &fakeStarter{}, &fakeSender{})
+
+	got, err := e.quarantine(ctx, []string{"dev-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "已隔离") {
+		t.Errorf("quarantine = %q", got)
+	}
+	// 已隔离幂等
+	got, _ = e.quarantine(ctx, []string{"dev-1"})
+	if !strings.Contains(got, "已隔离") {
+		t.Errorf("quarantine repeat = %q", got)
+	}
+	// 不存在
+	got, _ = e.quarantine(ctx, []string{"ghost"})
+	if !strings.Contains(got, "无法隔离") {
+		t.Errorf("quarantine ghost = %q", got)
+	}
+	// 参数错误
+	got, _ = e.quarantine(ctx, []string{"a", "b"})
+	if !strings.Contains(got, "用法") {
+		t.Errorf("quarantine 2 args = %q", got)
+	}
+}
+
+func TestQuarantineRejectsBusy(t *testing.T) {
+	st := store.NewMemStore()
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1"},
+		[]store.Device{{DeviceID: "dev-1", Serial: "dev-1", ClientID: "c1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AcquireDevice(ctx, wf.DeviceSelector{}, "busy-task", 120); err != nil {
+		t.Fatal(err)
+	}
+	e := newExec(st, &fakeStarter{}, &fakeSender{})
+	got, _ := e.quarantine(ctx, []string{"dev-1"})
+	if !strings.Contains(got, "无法隔离") {
+		t.Errorf("quarantine busy = %q, want 拒绝", got)
+	}
+}
+
+func TestCancelCommand(t *testing.T) {
+	mem := store.NewMemStore()
+	run := store.WorkflowRun{
+		WorkflowID: "device-test-grp/p-gabcd1234-p42", Project: "grp/p",
+		CommitSHA: "abcd1234", PipelineID: 42, Version: "1.2.3",
+		RuleVersion: "verdict-rules-v7", Scope: "v1", Variants: []string{"v1"},
+	}
+	if err := mem.RecordWorkflowRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	starter := &fakeStarter{closedByID: map[string]bool{"device-test-grp/p-gabcd1234-p42": false}}
+	e := newExec(mem, starter, &fakeSender{})
+
+	got, err := e.cancel(ctx, []string{run.WorkflowID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "已取消") {
+		t.Errorf("cancel = %q", got)
+	}
+	if len(starter.calls) == 0 || starter.calls[len(starter.calls)-1] != "TerminateWorkflow:"+run.WorkflowID {
+		t.Errorf("calls = %v, want TerminateWorkflow", starter.calls)
+	}
+}
+
+func TestCancelCommandAlreadyTerminal(t *testing.T) {
+	mem := store.NewMemStore()
+	run := store.WorkflowRun{
+		WorkflowID: "device-test-grp/p-gabcd1234-p42", Project: "grp/p",
+		CommitSHA: "abcd1234", PipelineID: 42, Version: "1.2.3",
+		RuleVersion: "verdict-rules-v7", Scope: "v1", Variants: []string{"v1"},
+	}
+	if err := mem.RecordWorkflowRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	starter := &fakeStarter{closedByID: map[string]bool{"device-test-grp/p-gabcd1234-p42": true}}
+	e := newExec(mem, starter, &fakeSender{})
+
+	got, err := e.cancel(ctx, []string{run.WorkflowID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "已终态") {
+		t.Errorf("cancel terminal = %q", got)
+	}
+	if len(starter.calls) != 1 || starter.calls[0] != "WorkflowClosed:"+run.WorkflowID {
+		t.Errorf("calls = %v, want 只查不 terminate", starter.calls)
+	}
+}
+
+func TestDevicesScopeFilter(t *testing.T) {
+	st := store.NewMemStore()
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1"}, []store.Device{
+		{DeviceID: "idle-1", Serial: "idle-1", ClientID: "c1"},
+		{DeviceID: "quar-1", Serial: "quar-1", ClientID: "c1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 隔离 quar-1
+	if _, err := st.QuarantineDevice(ctx, "quar-1"); err != nil {
+		t.Fatal(err)
+	}
+	e := newExec(st, &fakeStarter{}, &fakeSender{})
+
+	online, _ := e.devices(ctx, nil)
+	if !strings.Contains(online, "idle-1") || strings.Contains(online, "quar-1") {
+		t.Errorf("devices online = %q, 应只含 idle", online)
+	}
+	all, _ := e.devices(ctx, []string{"all"})
+	if !strings.Contains(all, "quar-1") {
+		t.Errorf("devices all = %q, 应含隔离设备", all)
+	}
+	q, _ := e.devices(ctx, []string{"quarantined"})
+	if !strings.Contains(q, "quar-1") || strings.Contains(q, "idle-1") {
+		t.Errorf("devices quarantined = %q", q)
+	}
+	bad, _ := e.devices(ctx, []string{"bogus"})
+	if !strings.Contains(bad, "用法") {
+		t.Errorf("devices bogus = %q, want usage", bad)
 	}
 }

@@ -12,17 +12,23 @@ import (
 
 // Command 是一条解析后的指令(封闭枚举;Name 未知时恒为 help)。
 type Command struct {
-	Name string   // status | devices | rerun | unquarantine | test | help
+	Name string   // status | devices | test | rerun | unquarantine | quarantine | runs | result | metrics | artifacts | cancel | plan | help
 	Args []string // rerun: <source_workflow_id> [variant];test: <variant> [commit]
 }
 
 // usage 是帮助文本(空/未知指令的应答)。
 const usage = `可用指令:
   status                        运行中 workflow / 设备状态 / 活跃租约
-  devices                       设备列表(serial/soc/status/fail_streak)
+  devices [online|all|offline|quarantined]  设备列表(缺省 online)
+  runs [n]                      最近运行历史(缺省 5 条)
+  result <workflow_id>          单次运行的各变体结论
+  metrics <variant>             某变体性能基线(过去 5 次 PASSED 中位数)
+  artifacts <variant>           某变体最近构建历史
   test <variant> [commit]       测试指定变体(最近构建或指定 commit)
   rerun <source_workflow_id> [variant]  重跑权威终态运行的失败变体(可指定一个变体)
+  quarantine [device_id]        手动隔离设备(多台时需指定 id;BUSY 不隔离)
   unquarantine [device_id]      解除设备隔离(多台时需指定 id)
+  cancel <workflow_id>          取消运行中的 workflow
   plan <需求描述>                自然语言规划:生成可执行的测试计划 Plan DSL`
 
 // Parse 解析一条消息文本:trim 后按空白切分,命令名大小写不敏感;
@@ -35,7 +41,8 @@ func Parse(text string) Command {
 	parts := strings.SplitN(trimmed, " ", 2)
 	name := strings.ToLower(parts[0])
 	switch name {
-	case "status", "devices", "rerun", "unquarantine", "test":
+	case "status", "devices", "test", "rerun", "unquarantine", "quarantine",
+		"runs", "result", "metrics", "artifacts", "cancel":
 		args := []string{}
 		if len(parts) > 1 {
 			args = strings.Fields(parts[1])

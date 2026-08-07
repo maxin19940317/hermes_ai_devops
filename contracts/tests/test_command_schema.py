@@ -22,7 +22,7 @@ class TestCommandSchema:
         for args in ([workflow_id], [workflow_id, "aarch64_Android_SNPE_1.68"]):
             validators["command"].validate(
                 {
-                    "translation_version": 3,
+                    "translation_version": 4,
                     "command": "rerun",
                     "args": args,
                     "confidence": 0.9,
@@ -43,7 +43,28 @@ class TestCommandSchema:
             ("status", [], True),
             ("status", ["extra"], False),
             ("devices", [], True),
-            ("devices", ["extra"], False),
+            ("devices", ["online"], True),
+            ("devices", ["all"], True),
+            ("devices", ["offline"], True),
+            ("devices", ["quarantined"], True),
+            ("devices", ["online", "all"], False),
+            ("runs", [], True),
+            ("runs", ["5"], True),
+            ("runs", ["5", "6"], False),
+            ("result", [], False),
+            ("result", ["wf-1"], True),
+            ("result", ["wf-1", "wf-2"], False),
+            ("metrics", [], False),
+            ("metrics", ["aarch64_Android_SNPE_1.68"], True),
+            ("metrics", ["aarch64_Android_SNPE_1.68", "x"], False),
+            ("artifacts", [], False),
+            ("artifacts", ["aarch64_Android_SNPE_1.68"], True),
+            ("cancel", [], False),
+            ("cancel", ["wf-1"], True),
+            ("cancel", ["wf-1", "wf-2"], False),
+            ("quarantine", [], True),
+            ("quarantine", ["dev-1"], True),
+            ("quarantine", ["dev-1", "dev-2"], False),
             ("none", [], True),
             ("none", ["extra"], False),
             ("unquarantine", [], True),
@@ -53,7 +74,7 @@ class TestCommandSchema:
     )
     def test_command_arities_are_exact(self, validators, command, args, valid):
         doc = {
-            "translation_version": 3,
+            "translation_version": 4,
             "command": command,
             "args": args,
             "confidence": 0.9,
@@ -69,15 +90,21 @@ class TestCommandSchema:
         [
             ("rerun", False),
             ("test", False),
+            ("result", False),
+            ("metrics", False),
+            ("artifacts", False),
+            ("cancel", False),
             ("status", True),
             ("devices", True),
+            ("runs", True),
             ("none", True),
             ("unquarantine", True),
+            ("quarantine", True),
         ],
     )
     def test_args_omission_matches_command_contract(self, validators, command, valid):
         doc = {
-            "translation_version": 3,
+            "translation_version": 4,
             "command": command,
             "confidence": 0.9,
         }
@@ -103,7 +130,7 @@ class TestCommandSchema:
         with pytest.raises(ValidationError):
             validators["command"].validate(
                 {
-                    "translation_version": 3,
+                    "translation_version": 4,
                     "command": "rerun",
                     "args": [arg],
                     "confidence": 0.9,

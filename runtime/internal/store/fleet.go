@@ -79,6 +79,23 @@ func (s *MemStore) UnquarantineDevice(_ context.Context, deviceID string) (bool,
 	return true, nil
 }
 
+// QuarantineDevice 手动隔离(飞书指令 quarantine):status=QUARANTINED。
+// 设备不存在返回 (false, nil);已隔离幂等返回 true(状态不变)。
+// 与 UnquarantineDevice 对称,用于人工把疑似故障设备摘出调度。
+func (s *MemStore) QuarantineDevice(_ context.Context, deviceID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.devices[deviceID]
+	if !ok {
+		return false, nil
+	}
+	if row.Status == DeviceBusy {
+		return false, nil // 运行中设备不隔离(防打断进行中的测试)
+	}
+	row.Status = DeviceQuarantined
+	return true, nil
+}
+
 // ListArtifacts 返回指定 project/commit/pipeline 的全部产物。
 func (s *MemStore) ListArtifacts(
 	_ context.Context, project, commitSHA string, pipelineID int,
@@ -92,6 +109,39 @@ func (s *MemStore) ListArtifacts(
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Variant < out[j].Variant })
+	return out, nil
+}
+
+// ListArtifactsForVariant 返回指定变体全部产物(按登记序倒序=最近优先,不限
+// project)。供飞书指令 artifacts 查询构建历史;MemStore 用 rowSeq 模拟 created_at。
+func (s *MemStore) ListArtifactsForVariant(
+	_ context.Context, variant string, limit int,
+) ([]Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	type keyed struct {
+		art Artifact
+		seq int64
+	}
+	all := make([]keyed, 0, len(s.rows))
+	for _, a := range s.rows {
+		if a.Variant == variant {
+			all = append(all, keyed{art: a, seq: s.rowSeq[artifactKey(a.Project, a.CommitSHA, a.PipelineID, a.Variant)]})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].seq != all[j].seq {
+			return all[i].seq > all[j].seq
+		}
+		return all[i].art.Project > all[j].art.Project
+	})
+	if limit <= 0 || limit > len(all) {
+		limit = len(all)
+	}
+	out := make([]Artifact, 0, limit)
+	for _, k := range all[:limit] {
+		out = append(out, k.art)
+	}
 	return out, nil
 }
 

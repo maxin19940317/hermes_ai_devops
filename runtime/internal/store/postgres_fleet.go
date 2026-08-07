@@ -61,6 +61,22 @@ func (s *PGStore) UnquarantineDevice(ctx context.Context, deviceID string) (bool
 	return n > 0, nil
 }
 
+// QuarantineDevice 手动隔离(飞书指令 quarantine):status='QUARANTINED'。
+// 设备不存在返回 (false, nil);运行中(BUSY)不隔离返回 false;已隔离幂等。
+func (s *PGStore) QuarantineDevice(ctx context.Context, deviceID string) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `
+		UPDATE devices SET status = 'QUARANTINED'
+		WHERE device_id = $1 AND status <> 'BUSY'`, deviceID)
+	if err != nil {
+		return false, fmt.Errorf("quarantine device %s: %w", deviceID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("quarantine device %s: rows affected: %w", deviceID, err)
+	}
+	return n > 0, nil
+}
+
 // ListArtifacts 返回指定 project/commit/pipeline 的全部产物。
 func (s *PGStore) ListArtifacts(
 	ctx context.Context, project, commitSHA string, pipelineID int,
@@ -85,6 +101,38 @@ func (s *PGStore) ListArtifacts(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list artifacts %s/%s/%d: %w", project, commitSHA, pipelineID, err)
+	}
+	return out, nil
+}
+
+// ListArtifactsForVariant 返回指定变体最近 limit 条产物(created_at 倒序,不限
+// project)。供飞书指令 artifacts 查询构建历史。
+func (s *PGStore) ListArtifactsForVariant(
+	ctx context.Context, variant string, limit int,
+) ([]Artifact, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20 // 防滥用:飞书指令最多看 20 条
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest
+		FROM artifacts WHERE variant = $1
+		ORDER BY created_at DESC, artifact_id DESC LIMIT $2`,
+		variant, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list artifacts for variant %s: %w", variant, err)
+	}
+	defer rows.Close()
+	out := []Artifact{}
+	for rows.Next() {
+		var a Artifact
+		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
+			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest); err != nil {
+			return nil, fmt.Errorf("list artifacts for variant %s: scan: %w", variant, err)
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list artifacts for variant %s: %w", variant, err)
 	}
 	return out, nil
 }

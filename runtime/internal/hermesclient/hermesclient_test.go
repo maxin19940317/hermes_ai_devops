@@ -247,7 +247,7 @@ func TestTranslateOK(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
-		_, _ = w.Write([]byte(`{"translation_version":3,"command":"devices","args":[],"confidence":0.95}`))
+		_, _ = w.Write([]byte(`{"translation_version":4,"command":"devices","args":[],"confidence":0.95}`))
 	}))
 	defer srv.Close()
 	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
@@ -268,7 +268,7 @@ func TestTranslateOK(t *testing.T) {
 func TestTranslateRejectsInvalidSchema(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// command 不在闭枚举内:必须被本地 Schema 校验挡下(跨进程边界不信任对端)
-		_, _ = w.Write([]byte(`{"translation_version":3,"command":"reboot","confidence":0.9}`))
+		_, _ = w.Write([]byte(`{"translation_version":4,"command":"reboot","confidence":0.9}`))
 	}))
 	defer srv.Close()
 	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
@@ -289,7 +289,7 @@ func TestTranslateRejectsInvalidSchema(t *testing.T) {
 func TestTranslateSchemaInvalidIncludesBodySnippet(t *testing.T) {
 	const marker = "reboot-xyz-distinctive-marker"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"translation_version":3,"command":"` + marker + `","confidence":0.9}`))
+		_, _ = w.Write([]byte(`{"translation_version":4,"command":"` + marker + `","confidence":0.9}`))
 	}))
 	defer srv.Close()
 	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze"})
@@ -327,7 +327,7 @@ func TestTranslateNon2xx(t *testing.T) {
 // 非法。companion 的 anchor-free "not" 约束必须让两侧行为一致地拒绝它;这里独立
 // 验证 Go 侧(contracts/tests/test_command_schema.py 用同一份 fixture 验证 Python 侧)。
 func TestCommandSchemaRejectsArgTrailingNewline(t *testing.T) {
-	raw := []byte(`{"translation_version":3,"command":"unquarantine","args":["9da3b9d9\n"],"confidence":0.9}`)
+	raw := []byte(`{"translation_version":4,"command":"unquarantine","args":["9da3b9d9\n"],"confidence":0.9}`)
 	var doc any
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("unmarshal fixture: %v", err)
@@ -394,11 +394,17 @@ func TestCommandSchemaCopyMatchesContracts(t *testing.T) {
 	}
 }
 
-func TestTranslateUsesV3PromptAndContract(t *testing.T) {
-	if PromptVersionTranslate != "cmd_translate_v3" {
-		t.Fatalf("PromptVersionTranslate = %q, want cmd_translate_v3", PromptVersionTranslate)
+func TestTranslateUsesV4PromptAndContract(t *testing.T) {
+	if PromptVersionTranslate != "cmd_translate_v4" {
+		t.Fatalf("PromptVersionTranslate = %q, want cmd_translate_v4", PromptVersionTranslate)
 	}
 	for _, want := range []string{
+		"runs [n]",
+		"result <workflow_id>",
+		"metrics <variant>",
+		"artifacts <variant>",
+		"quarantine [device_id]",
+		"cancel <workflow_id>",
 		"test <variant> [commit]",
 		"rerun <source_workflow_id> [variant]",
 		"authoritative:true",

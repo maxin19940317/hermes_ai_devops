@@ -173,6 +173,22 @@ type MetricPoint struct {
 	TaskID     string
 }
 
+// MetricsForVariant 返回指定变体最近 limit 条指标点(created_at 倒序,跨
+// project/suite/metric)。供飞书指令 metrics 展示该变体性能概况。
+func (s *MemStore) MetricsForVariant(
+	_ context.Context, variant string, limit int,
+) ([]MetricPoint, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]MetricPoint, 0, limit)
+	for i := len(s.metrics) - 1; i >= 0 && len(out) < limit; i-- {
+		if s.metrics[i].point.Variant == variant {
+			out = append(out, s.metrics[i].point)
+		}
+	}
+	return out, nil
+}
+
 // MetricBaseline 是过去 N 次 PASSED 运行的中位数基线。
 type MetricBaseline struct {
 	Median float64
