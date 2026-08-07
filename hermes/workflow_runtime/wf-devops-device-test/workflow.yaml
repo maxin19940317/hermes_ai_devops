@@ -36,6 +36,28 @@ execution:
     required_steps:
       - 03-report
 
+publication:
+  auto_start:
+    phrases:
+      - 设备测试
+      - 触发设备测试
+      - 跑设备测试
+    defaults:
+      variant: ""
+  targets:
+    - id: device-test
+      label: DevOps 设备测试
+      match:
+        required_term_groups:
+          - - 设备测试
+            - devops
+            - 测试
+      inputs: {}
+  tags:
+    - devops
+    - device-test
+    - automated
+
 steps:
   - id: 01-validate
     name: 校验输入
@@ -44,7 +66,10 @@ steps:
       校验 variant 是合法变体名(可先用 devops_devices / devops_runs 查看可用
       变体与设备,确认目标变体存在、有匹配设备)。不可用则终止并说明缺测原因。
     deterministic:
-      kind: input_check
+      kind: plan_check
+      supported_models: []
+      benchmark_backends: []
+      runs: 1
       contract:
         required_inputs: [variant]
         required_metrics: [variant_valid, device_available]
