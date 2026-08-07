@@ -22,7 +22,8 @@ $env:AGENT_BASE_URL             = "http://${AGENT_BASE_IP}:8480"
 $env:AGENT_ADB_PATH             = $ADB
 # 2026-08-07:QCS Ubuntu 板设备树上报 idp(平台代号),约束用 QCS6490——
 # alias 让 soc 上报为 QCS6490,Linux_Qualcomm_TFLite 的 soc 约束才能匹配。
-$env:AGENT_SOC_ALIASES          = "trinket:QCM6125;idp:QCS6490"
+# 注意:分隔符必须用逗号(与 Agent parseSOCAliases 一致),不能用分号。
+$env:AGENT_SOC_ALIASES          = "trinket:QCM6125,idp:QCS6490"
 # 方案 B(2026-08-06):设备能力表已迁移到 Runtime 统一管理(服务端权威,
 # deploy/.env 的 DEVICE_CAPABILITIES_MAP)。新板接入只改服务端配置即可,
 # 不再需要改本脚本。下面这行保留仅作 Agent 侧兜底(服务端未配置该板时

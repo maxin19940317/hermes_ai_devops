@@ -181,12 +181,23 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		// $env: 不生效,平台代号(idp/bengal)可能没被 Agent 侧 alias。
 		// 命中服务端表 → soc 与显示名统一为型号;未命中 → 保留上报值。
 		soc := d.Props.SOC
+		// 防 alias 串污染:旧配置曾用 "trinket:QCM6125;idp:QCS6490"(分号分隔,
+		// 与代码逗号分隔不符),整串被存进 soc。若 soc 含分号(非法字符),
+		// 取分号前的首段作真实平台代号再归一化。
+		if strings.Contains(soc, ";") {
+			head, _, _ := strings.Cut(soc, ";")
+			soc = strings.TrimSpace(head)
+		}
 		displayName := d.DisplayName
+		// 服务端型号归一化:命中 SOCAliases 表 → soc 与显示名统一为型号。
 		if alias, ok := h.SOCAliases[strings.ToLower(soc)]; ok {
 			soc = alias
 			displayName = strings.ToUpper(soc) + "-" + d.Serial
 			h.log.Debug().Str("serial", d.Serial).Str("raw_soc", d.Props.SOC).
 				Str("soc", soc).Msg("heartbeat: soc normalized by server table")
+		} else if displayName == "" && soc != "" {
+			// 清洗/归一化后显示名仍缺:按 soc 兜底生成。
+			displayName = strings.ToUpper(soc) + "-" + d.Serial
 		}
 		// 方案 B(2026-08-06):能力以服务端表为权威。按 serial(优先,支持
 		// 单板覆盖)或 soc 命中服务端表 → 覆盖 Agent 上报值;未命中 → 保留

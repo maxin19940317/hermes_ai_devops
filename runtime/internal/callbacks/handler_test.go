@@ -501,4 +501,32 @@ func TestHeartbeatNormalizesSOCFromServerTable(t *testing.T) {
 			t.Errorf("devices = %+v, want 归一化后按 QCS6490 校准 hexagon+adreno", devs)
 		}
 	})
+	t.Run("alias 串污染清洗:分号分隔的旧配置取首段", func(t *testing.T) {
+		s := store.NewMemStore()
+		sig := &fakeSignaler{}
+		h := New(s, sig, nil, 120).
+			WithSOCAliases(map[string]string{"trinket": "QCM6125"})
+		srv := httptest.NewServer(h.Mux())
+		defer srv.Close()
+		// 旧 AGENT_SOC_ALIASES="trinket:QCM6125;idp:QCS6490"(分号,与代码逗号不符)
+		// 导致整串被存进 soc → 心跳清洗取首段 trinket → 归一化 QCM6125
+		resp := post(t, srv.URL+"/callbacks/v1/heartbeat", map[string]any{
+			"client_id": "c1", "agent_version": "0.12.0",
+			"devices": []map[string]any{
+				{"serial": "513cd3de", "state": "IDLE",
+					"props": map[string]any{"os": "android", "soc": "QCM6125;idp:QCS6490", "abi": "arm64-v8a", "capabilities": []string{}}},
+			},
+			"active_task_ids": []string{},
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		devs, _ := s.ListFleet(ctx)
+		if len(devs) != 1 || devs[0].SOC != "QCM6125" {
+			t.Fatalf("devices = %+v, want soc 清洗+归一化为 QCM6125", devs)
+		}
+		if devs[0].DisplayName != "QCM6125-513cd3de" {
+			t.Errorf("display_name = %q, want QCM6125-513cd3de", devs[0].DisplayName)
+		}
+	})
 }
