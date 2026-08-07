@@ -73,6 +73,10 @@ type Executor struct {
 	Log       *zerolog.Logger // 可选;nil 用 Nop
 	Whitelist map[string]bool
 
+	// CardSender 可选:非 nil 且发送方支持时,devices 等查询用卡片(表格布局)回复。
+	// nil = 纯文本回复。worker 装配时从 feishuSender 类型断言得到。
+	CardSender feishu.CardSender
+
 	// Translator 非 nil 时启用自然语言翻译旁路(设计文档 §3.1);
 	// nil = 未启用,未知输入回 usage(改动前的行为)。
 	Translator *Translator

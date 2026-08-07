@@ -175,6 +175,12 @@ func main() {
 				Variants: specCfg.VariantNames(),
 				SpecCfg:  specCfg,
 			}
+			// 卡片回复能力(app/webhook 发送方都实现 CardSender;类型断言失败 → nil,
+			// devices 等查询回落纯文本)。
+			if cs, ok := feishuSender.(feishu.CardSender); ok {
+				exec.CardSender = cs
+				log.Info().Msg("feishu cmd card reply=enabled")
+			}
 			// 表述层(Express,Smart Reply):HERMES_ENDPOINT 已配时启用
 			// (独立 hermes client,与翻译共用端点/认证);模型独立配置,空回落翻译层模型。
 			if cfg.Activity.HermesEndpoint != "" {
