@@ -1326,6 +1326,24 @@ func deviceStatusEmoji(status string) string {
 	}
 }
 
+// deviceStatusText 返回设备状态的明确中文词(2026-08-07)。
+// 供 LLM 消费(MCP bridge 的 devops_status/devops_devices):emoji 对 LLM 无
+// 确定语义,必须配文字,否则 hermes 会把 OFFLINE 的 ⚪ 脑补成"空闲"。
+func deviceStatusText(status string) string {
+	switch status {
+	case store.DeviceIdle:
+		return "在线"
+	case store.DeviceBusy:
+		return "测试中"
+	case store.DeviceOffline:
+		return "离线"
+	case store.DeviceQuarantined:
+		return "隔离"
+	default:
+		return "未知"
+	}
+}
+
 // scopeTitle 是 devices 指令各 scope 的中文标题。
 func scopeTitle(scope string) string {
 	switch scope {
@@ -1341,7 +1359,7 @@ func scopeTitle(scope string) string {
 }
 
 // formatDeviceLine 渲染一台设备的单行美观摘要:
-// "🟢 IDP-825485946  SoC=idp · 失败=0 · client=c1(client_fail=0) [· 租约=task]"
+// "🟢 IDP-825485946  [在线] SoC=idp · 失败=0 · client=c1(client_fail=0) [· 租约=task]"
 func formatDeviceLine(d store.DeviceStatus) string {
 	core := fmt.Sprintf("SoC=%s · 失败=%d", d.SOC, d.FailStreak)
 	client := ""
@@ -1352,5 +1370,7 @@ func formatDeviceLine(d store.DeviceStatus) string {
 	if d.LeaseTaskID != "" {
 		lease = " · 租约=" + d.LeaseTaskID
 	}
-	return fmt.Sprintf("%s %s  %s%s%s", deviceStatusEmoji(d.Status), deviceDisplayName(d), core, client, lease)
+	return fmt.Sprintf("%s %s  [%s] %s%s%s",
+		deviceStatusEmoji(d.Status), deviceDisplayName(d), deviceStatusText(d.Status),
+		core, client, lease)
 }
