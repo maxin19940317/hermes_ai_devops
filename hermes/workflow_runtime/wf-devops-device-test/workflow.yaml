@@ -1,0 +1,94 @@
+id: wf-devops-device-test
+name: DevOps 设备测试
+version: 1.0.0
+owner: pm
+status: stable
+
+description: >
+  通过 DevOps 系统的受控接口(Hermes MCP hermes_devops)触发设备测试并汇报结果。
+  这是合规封装:执行全部走 Runtime(确定性),本 workflow 只编排 LLM 调用
+  devops_* 工具,不直接操作 ADB/设备(CLAUDE.md §3.3/§14 红线)。
+
+inputs:
+  variant:
+    required: true
+    description: >
+      目标变体名(如 aarch64_Android_QCM6125_SNPE_1.68)。
+      必须来自 devops_devices/devops_runs 输出的合法变体。
+  commit:
+    required: false
+    description: 可选 commit(short sha);缺省测试该变体最近一次构建。
+  workflow_id:
+    required: false
+    description: 可选:重跑指定的权威终态运行(source_workflow_id)。
+
+environment:
+  mcp_servers:
+    - hermes_devops   # 合规受控接口(调 Runtime /api/v1/cmd),不是 local_device
+
+entrypoints:
+  - feishu
+  - hermes
+  - cli
+
+execution:
+  completion:
+    required_steps:
+      - 03-report
+
+steps:
+  - id: 01-validate
+    name: 校验输入
+    agent: developer
+    description: >
+      校验 variant 是合法变体名(可先用 devops_devices / devops_runs 查看可用
+      变体与设备,确认目标变体存在、有匹配设备)。不可用则终止并说明缺测原因。
+    deterministic:
+      kind: input_check
+      contract:
+        required_inputs: [variant]
+        required_metrics: [variant_valid, device_available]
+    inputs:
+      variant: "{{ variant }}"
+    outputs:
+      - variant_valid
+      - device_available
+    success_criteria:
+      - variant_valid
+      - device_available
+
+  - id: 02-trigger
+    name: 触发设备测试
+    agent: developer
+    depends_on:
+      - 01-validate
+    description: >
+      调用 devops_test 工具触发测试(variant 必填;commit 可选)。
+      workflow_id 提供时改用 devops_rerun(重跑权威终态的失败变体)。
+      这是副作用操作,执行前向用户确认意图。
+    inputs:
+      variant: "{{ variant }}"
+      commit: "{{ commit }}"
+      workflow_id: "{{ workflow_id }}"
+    outputs:
+      - test_triggered
+      - workflow_id
+    success_criteria:
+      - test_triggered
+
+  - id: 03-report
+    name: 汇报结果
+    agent: tester
+    depends_on:
+      - 02-trigger
+    description: >
+      测试触发后,用 devops_status / devops_runs 查询运行状态与结果,
+      汇总:触发的 workflow_id、变体、当前状态/verdict、设备占用。
+      若在运行中,说明预计等待时间;若已终态,给出 verdict 与后续建议。
+      不得编造结果——一切以工具返回为准。
+    inputs:
+      workflow_id: "{{ workflow_id }}"
+    outputs:
+      - summary
+    success_criteria:
+      - summary_generated
