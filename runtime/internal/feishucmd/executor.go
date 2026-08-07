@@ -1042,7 +1042,7 @@ func (e *Executor) runs(ctx context.Context, args []string) (string, error) {
 	}
 	var b strings.Builder
 	for _, r := range runs {
-		mark := "⏳" // 缺省:运行中/无终态
+		mark := "⏳" // 缺省:运行中/待调度
 		switch r.Verdict {
 		case "PASSED":
 			mark = "✅"
@@ -1055,9 +1055,16 @@ func (e *Executor) runs(ctx context.Context, args []string) (string, error) {
 		if r.Authoritative {
 			authority = "*"
 		}
+		// verdict 空时区分两种:有 task(真运行中,可能含 bundle 已调度但未终态)
+		// vs 无 task(bundle 声明但从未 kick 调度 → 待调度,不是运行中)。
 		verdict := r.Verdict
 		if verdict == "" {
-			verdict = "运行中"
+			if r.HasTask {
+				verdict = "运行中"
+			} else {
+				verdict = "待调度"
+				mark = "⏸"
+			}
 		}
 		fmt.Fprintf(&b, "%s%s %s %s g%s p%d %s %s\n",
 			mark, authority, r.Variant, verdict, r.Commit, r.PipelineID,

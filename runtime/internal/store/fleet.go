@@ -208,6 +208,9 @@ type RecentRun struct {
 	Verdict       string
 	EndedAt       time.Time
 	Authoritative bool
+	// HasTask 该 workflow+变体是否有 task 记录。false + Verdict 空 =
+	// bundle 声明但从未调度(kick 未匹配设备),展示为"待调度"而非"运行中"。
+	HasTask bool
 }
 
 // RecentRuns 优先返回 workflow_runs 的权威运行记录，再补充尚未被 registry
@@ -261,6 +264,7 @@ func (s *MemStore) RecentRuns(_ context.Context, limit int) ([]RecentRun, error)
 			}
 			if best != nil {
 				recent.Verdict, recent.EndedAt = best.verdict, best.endedAt
+				recent.HasTask = true
 			}
 			out = append(out, recent)
 			if len(out) == limit {

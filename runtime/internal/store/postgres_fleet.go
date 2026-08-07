@@ -241,12 +241,13 @@ func (s *PGStore) recentRuns(
 	rows, err := tx.QueryContext(ctx, `
 		SELECT wr.workflow_id, wr.project, wr.commit_sha, wr.pipeline_id,
 		       wr.version, wr.rule_version, expanded.variant,
-		       COALESCE(task.verdict, ''), task.ended_at
+		       COALESCE(task.verdict, ''), task.ended_at,
+		       (task.task_id IS NOT NULL)
 		FROM workflow_runs wr
 		CROSS JOIN LATERAL unnest(wr.variants) WITH ORDINALITY
 			AS expanded(variant, ord)
 		LEFT JOIN LATERAL (
-			SELECT verdict, ended_at
+			SELECT task_id, verdict, ended_at
 			FROM tasks
 			WHERE workflow_id = wr.workflow_id
 			  AND test_id = expanded.variant
@@ -263,9 +264,10 @@ func (s *PGStore) recentRuns(
 	for rows.Next() {
 		var r RecentRun
 		var endedAt sql.NullTime
+		var hasTask bool
 		if err := rows.Scan(
 			&r.WorkflowID, &r.Project, &r.Commit, &r.PipelineID,
-			&r.Version, &r.RuleVersion, &r.Variant, &r.Verdict, &endedAt,
+			&r.Version, &r.RuleVersion, &r.Variant, &r.Verdict, &endedAt, &hasTask,
 		); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("recent runs: authoritative scan: %w", err)
@@ -274,6 +276,7 @@ func (s *PGStore) recentRuns(
 			r.EndedAt = endedAt.Time.UTC()
 		}
 		r.Authoritative = true
+		r.HasTask = hasTask
 		out = append(out, r)
 	}
 	rows.Close()
