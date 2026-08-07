@@ -119,6 +119,9 @@ services:
       # JSON {"<soc|serial>":["<cap>"]};空 = 回退 Agent 上报能力。
       # 新板接入只需在此加一行 + 重启 worker,无需改 Windows Agent。
       DEVICE_CAPABILITIES_MAP: ${DEVICE_CAPABILITIES_MAP:-}
+      # 平台代号→型号表(2026-08-07):Agent 服务模式读系统 env,ps1 的 $env:
+      # 不生效,代号(idp/bengal)在服务端兜底归一化。JSON {"代号":"型号"}。
+      DEVICE_SOC_ALIASES: ${DEVICE_SOC_ALIASES:-}
       DEVICE_WAIT_ROUNDS: ${DEVICE_WAIT_ROUNDS:-20}
       DEVICE_WAIT_SECONDS: ${DEVICE_WAIT_SECONDS:-30}
       CALLBACK_BASE_URL: ${CALLBACK_BASE_URL:-http://127.0.0.1:18091}
