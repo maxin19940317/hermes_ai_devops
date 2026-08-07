@@ -7,8 +7,8 @@ import (
 	"hermes-devops/runtime/internal/store"
 )
 
-// TestRenderDeviceTableCard:卡片表格列 = 设备/系统/架构/内存(2026-08-07 用户
-// 反馈 ID 列效果不好,去掉)。
+// TestRenderDeviceTableCard:卡片 = markdown 多行,每行一台设备(加粗设备名 + 分隔)。
+// column_set 在此飞书版本被拍平,table 组件不可用——改用 markdown 多行(2026-08-07)。
 func TestRenderDeviceTableCard(t *testing.T) {
 	rows := []deviceTableRow{
 		{"QCS6490-825485946", "Linux", "arm64-v8a", "7.1GB"},
@@ -22,22 +22,20 @@ func TestRenderDeviceTableCard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 表头:设备/系统/架构/内存(无 ID)
-	for _, col := range []string{"**设备**", "**系统**", "**架构**", "**内存**"} {
-		if !strings.Contains(js, col) {
-			t.Errorf("卡片缺表头 %q: %s", col, js[:300])
-		}
+	// markdown 元素,每行含加粗设备名
+	if !strings.Contains(js, `"tag":"markdown"`) {
+		t.Errorf("卡片缺 markdown 元素: %s", js[:300])
 	}
-	if strings.Contains(js, "**ID**") {
-		t.Errorf("卡片不应含 ID 列表头: %s", js[:300])
+	if !strings.Contains(js, "**QCS6490-825485946**") || !strings.Contains(js, "**QCM6125-513cd3de**") {
+		t.Errorf("卡片缺加粗设备名: %s", js[:400])
 	}
-	// 数据含设备名
-	if !strings.Contains(js, "QCS6490-825485946") || !strings.Contains(js, "QCM6125-513cd3de") {
-		t.Errorf("卡片缺设备数据: %s", js[:300])
+	// 每行含 · 分隔的系统/架构/内存
+	if !strings.Contains(js, "Linux · arm64-v8a · 7.1GB") {
+		t.Errorf("卡片缺属性分隔: %s", js[:400])
 	}
-	// 结构:column_set 行数 = 表头 + 2 数据
-	if strings.Count(js, `"column_set"`) != 3 {
-		t.Errorf("column_set 行数 = %d, want 3", strings.Count(js, `"column_set"`))
+	// 不用 column_set
+	if strings.Contains(js, "column_set") {
+		t.Errorf("卡片不应含 column_set: %s", js[:400])
 	}
 	// 空列表 → 空卡片(调用方回纯文本)
 	empty, err := renderDeviceTableCard(nil)

@@ -1,182 +1,131 @@
 package feishucmd
 
 import (
-	"encoding/json"
-	"fmt"
-	"strings"
+"encoding/json"
+"fmt"
+"strings"
 
-	"hermes-devops/runtime/internal/store"
+"hermes-devops/runtime/internal/store"
 )
 
-// ---- 设备列表卡片(column_set 表格布局,2026-08-07) ----
-// 飞书卡片 markdown 不支持表格语法(降级 text),table 组件配置复杂;
-// 用 column_set 多列布局实现类表格:每行一个 column_set,每列一个 div。
-// 列:ID / 设备 / 系统 / 架构 / 内存。
+// ---- 设备列表卡片(markdown 多行,2026-08-07) ----
+// 飞书卡片 column_set 在此版本被拍平(columns 竖排),table 组件不可用
+// ("table columns is empty");markdown 表格降级 text 原样显示符号。
+// 最可靠:单个 markdown 元素多行,每行一台设备(设备名加粗 + · 分隔)。
 
 // deviceCard 是飞书 interactive 卡片的顶层结构。
 type deviceCard struct {
-	Config   deviceCardConfig    `json:"config"`
-	Header   deviceCardHeader    `json:"header"`
-	Elements []deviceCardElement `json:"elements"`
+Config   deviceCardConfig    `json:"config"`
+Header   deviceCardHeader    `json:"header"`
+Elements []deviceCardElement `json:"elements"`
 }
 
 type deviceCardConfig struct {
-	WideScreenMode bool `json:"wide_screen_mode"`
+WideScreenMode bool `json:"wide_screen_mode"`
 }
 
 type deviceCardHeader struct {
-	Title    deviceCardText `json:"title"`
-	Template string         `json:"template"`
+Title    deviceCardText `json:"title"`
+Template string         `json:"template"`
 }
 
-// deviceCardElement 是卡片元素:column_set(多列表格行)。
+// deviceCardElement 是卡片元素:markdown 多行文本。
 type deviceCardElement struct {
-	Tag      string           `json:"tag"` // 恒为 column_set
-	FlexMode string           `json:"flex_mode"` // none
-	Columns  []deviceColumn   `json:"columns"`
-}
-
-type deviceColumn struct {
-	Tag          string          `json:"tag"` // 恒为 column
-	Width        string          `json:"width"` // weighted
-	Weight       int             `json:"weight"`
-	VerticalAlign string         `json:"vertical_align"` // top
-	Elements     []deviceColElem `json:"elements"`
-}
-
-type deviceColElem struct {
-	Tag  string         `json:"tag"` // div
-	Text deviceCardText `json:"text"`
+Tag     string `json:"tag"` // 恒为 markdown
+Content string `json:"content"`
 }
 
 type deviceCardText struct {
-	Tag     string `json:"tag"` // lark_md
-	Content string `json:"content"`
+Tag     string `json:"tag"` // plain_text | lark_md
+Content string `json:"content"`
 }
 
-// deviceTableColumn 定义一列:标题 + 权重(控制宽度)。
-type deviceTableColumn struct {
-	Title  string
-	Weight int
-}
-
-// deviceTableRow 是表格一行(按列顺序)。
+// deviceTableRow 是表格一行(按列顺序:设备/系统/架构/内存)。
 type deviceTableRow []string
 
-// deviceColumns 是设备表格的列定义(与 devices 回复一致)。
-var deviceColumns = []deviceTableColumn{
-	{"**设备**", 3},
-	{"**系统**", 2},
-	{"**架构**", 2},
-	{"**内存**", 1},
-}
-
-// renderDeviceTableCard 渲染设备列表为飞书卡片(column_set 表格)。
-// matched 是展示的设备(已按 scope 过滤);ID 取自 DeviceID,设备名取 DisplayName。
+// renderDeviceTableCard 渲染设备列表为飞书卡片(markdown 多行,每行一台设备)。
 // 返回卡片 JSON(直接作 SendCard 的 card 参数);空列表 → 返回空(调用方回纯文本)。
 func renderDeviceTableCard(rows []deviceTableRow) (any, error) {
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	card := deviceCard{
-		Config: deviceCardConfig{WideScreenMode: true},
-		Header: deviceCardHeader{
-			Title:    deviceCardText{Tag: "lark_md", Content: "**📱 在线设备**"},
-			Template: "blue",
-		},
-		Elements: []deviceCardElement{},
-	}
-	// 表头行 + 数据行,全部用 column_set。
-	all := make([]deviceTableRow, 0, len(rows)+1)
-	header := make(deviceTableRow, 0, len(deviceColumns))
-	for _, c := range deviceColumns {
-		header = append(header, c.Title)
-	}
-	all = append(all, header)
-	all = append(all, rows...)
-
-	for _, r := range all {
-		card.Elements = append(card.Elements, buildColumnSetRow(r))
-	}
-	return card, nil
+if len(rows) == 0 {
+return nil, nil
+}
+var lines []string
+for _, r := range rows {
+// 每行: **设备名**  系统 · 架构 · 内存
+line := "**" + escapeMD(r[0]) + "**"
+if len(r) > 1 {
+line += "  " + escapeMD(strings.Join(r[1:], " · "))
+}
+lines = append(lines, line)
+}
+card := deviceCard{
+Config: deviceCardConfig{WideScreenMode: true},
+Header: deviceCardHeader{
+Title:    deviceCardText{Tag: "plain_text", Content: "📱 在线设备"},
+Template: "blue",
+},
+Elements: []deviceCardElement{
+{Tag: "markdown", Content: strings.Join(lines, "\n")},
+},
+}
+return card, nil
 }
 
-// buildColumnSetRow 把一行单元格渲染为一个 column_set。
-func buildColumnSetRow(row deviceTableRow) deviceCardElement {
-	cols := make([]deviceColumn, 0, len(deviceColumns))
-	for i, c := range deviceColumns {
-		content := ""
-		if i < len(row) {
-			content = row[i]
-		}
-		// 表头行(第一行)灰底区分。
-		cols = append(cols, deviceColumn{
-			Tag: "column", Width: "weighted", Weight: c.Weight,
-			VerticalAlign: "top",
-			Elements: []deviceColElem{{
-				Tag:  "div",
-				Text: deviceCardText{Tag: "lark_md", Content: escapeMD(content)},
-			}},
-		})
-	}
-	return deviceCardElement{Tag: "column_set", FlexMode: "none", Columns: cols}
-}
-
-// escapeMD 转义 lark_md 特殊字符(防动态文本破坏表格/加粗语法)。
+// escapeMD 转义 lark_md 特殊字符(防动态文本破坏加粗/列表语法)。
 func escapeMD(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	return s
+s = strings.ReplaceAll(s, "&", "&amp;")
+s = strings.ReplaceAll(s, "<", "&lt;")
+s = strings.ReplaceAll(s, ">", "&gt;")
+return s
 }
 
-// deviceRowFromStatus 把一台设备转成表格行。
+// deviceRowFromStatus 把一台设备转成表格行(设备名/系统/架构/内存)。
 func deviceRowFromStatus(d store.FleetDevice) deviceTableRow {
-	return deviceTableRow{
-		deviceDisplayNameFromFleet(d),
-		osCN2(d.OS),
-		d.ABI,
-		memText(d.MemTotalMB),
-	}
+return deviceTableRow{
+deviceDisplayNameFromFleet(d),
+osCN2(d.OS),
+d.ABI,
+memText(d.MemTotalMB),
+}
 }
 
 // deviceDisplayNameFromFleet 取设备显示名(Device.DisplayName 或 soc-serial 兜底)。
 func deviceDisplayNameFromFleet(d store.FleetDevice) string {
-	if d.DisplayName != "" {
-		return d.DisplayName
-	}
-	if d.SOC != "" {
-		return strings.ToUpper(d.SOC) + "-" + d.Serial
-	}
-	return "UNKNOWN-" + d.Serial
+if d.DisplayName != "" {
+return d.DisplayName
+}
+if d.SOC != "" {
+return strings.ToUpper(d.SOC) + "-" + d.Serial
+}
+return "UNKNOWN-" + d.Serial
 }
 
 // osCN2 系统名中文化(Android/Linux 展示用)。
 func osCN2(os string) string {
-	switch strings.ToLower(os) {
-	case "android":
-		return "Android"
-	case "linux":
-		return "Linux"
-	default:
-		return os
-	}
+switch strings.ToLower(os) {
+case "android":
+return "Android"
+case "linux":
+return "Linux"
+default:
+return os
+}
 }
 
 // memText 把 MB 换成人类可读文本(≥1024MB 显示 GB,保留 1 位小数)。
 func memText(mb *int64) string {
-	if mb == nil {
-		return "-"
-	}
-	m := float64(*mb)
-	if m >= 1024 {
-		return fmt.Sprintf("%.1fGB", m/1024)
-	}
-	return fmt.Sprintf("%dMB", *mb)
+if mb == nil {
+return "-"
+}
+m := float64(*mb)
+if m >= 1024 {
+return fmt.Sprintf("%.1fGB", m/1024)
+}
+return fmt.Sprintf("%dMB", *mb)
 }
 
 // cardJSON 把卡片结构序列化(供测试断言)。
 func cardJSON(card any) (string, error) {
-	b, err := json.Marshal(card)
-	return string(b), err
+b, err := json.Marshal(card)
+return string(b), err
 }
