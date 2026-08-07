@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# start-workflow-bridge — workflow_runtime_bridge 启动脚本(rocklin 容器内)。
+# 幂等:已在跑则 no-op。env 文件(含密钥)由部署时写入 /opt/data/bin/。
+set -euo pipefail
+
+BRIDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${WORKFLOW_BRIDGE_ENV_FILE:-/opt/data/bin/workflow_bridge.env}"
+LOG_FILE="/opt/data/logs/workflow_bridge.log"
+PID_FILE="/opt/data/logs/workflow_bridge.pid"
+
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  echo "workflow_bridge already running (pid $(cat "$PID_FILE"))"
+  exit 0
+fi
+
+PYTHON_BIN="${WORKFLOW_BRIDGE_PYTHON:-/opt/hermes/.venv/bin/python}"
+cd "$BRIDGE_DIR"
+nohup "$PYTHON_BIN" workflow_bridge.py >>"$LOG_FILE" 2>&1 &
+echo $! > "$PID_FILE"
+echo "workflow_bridge started (pid $(cat "$PID_FILE"), port ${WORKFLOW_BRIDGE_PORT:-8646})"

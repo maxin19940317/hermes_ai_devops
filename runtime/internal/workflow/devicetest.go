@@ -404,6 +404,19 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 			}
 		}
 	}
+	// 回填 hermes workflow_runtime(方案 B,2026-08-07):真实测试结果同步到
+	// workflow-assets 排行榜。fire-and-forget 旁路:失败只记日志,不阻断主链路。
+	// GetVersion 门:重放改动前 history(无此活动调用)走原路径,不调度新活动;
+	// 新 workflow 才同步。与 bundle-silent/notify-card 同一模式(重放安全)。
+	if workflow.GetVersion(ctx, "sync-workflow-runs", workflow.DefaultVersion, 1) != workflow.DefaultVersion {
+		if err := workflow.ExecuteActivity(ctx, "SyncWorkflowRuns", SyncWorkflowRunsRequest{
+			WorkflowID: actualID,
+			Project:    in.Project,
+			Tasks:      out.Tasks,
+		}).Get(ctx, nil); err != nil {
+			workflow.GetLogger(ctx).Error("sync workflow runs failed", "error", err)
+		}
+	}
 	return out, nil
 }
 
@@ -1043,6 +1056,15 @@ type ButtonValue struct {
 type NotifyCardRequest struct {
 	Card         NotificationCard `json:"card"`
 	FallbackText string           `json:"fallback_text"`
+}
+
+// SyncWorkflowRunsRequest 是 SyncWorkflowRuns 活动的输入(2026-08-07 方案 B):
+// workflow 结束后把每个 task 结果回填 hermes workflow_runtime,让
+// workflow-assets 排行榜反映真实测试次数。
+type SyncWorkflowRunsRequest struct {
+	WorkflowID string        `json:"workflow_id"`
+	Project    string        `json:"project"`
+	Tasks      []TaskSummary `json:"tasks"`
 }
 
 // cardByteBudget 是卡片序列化后的总大小上限(设计 §4.5)。

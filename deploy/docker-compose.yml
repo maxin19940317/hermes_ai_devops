@@ -14,6 +14,10 @@ x-runtime-common: &runtime-common
     # 受控命令接口(MCP bridge 调 POST /api/v1/cmd 的 Bearer 密钥,2026-08-07);
     # 空 = 接口未启用(401)。
     CMD_API_TOKEN: ${CMD_API_TOKEN:-}
+    # 测试结果回填 hermes workflow_runtime 的桥(方案 B,2026-08-07);
+    # URL 空 = 跳过(开发模式)。worker 经 hermes-runtime 网络访问 rocklin。
+    WORKFLOW_BRIDGE_URL: ${WORKFLOW_BRIDGE_URL:-}
+    WORKFLOW_BRIDGE_TOKEN: ${WORKFLOW_BRIDGE_TOKEN:-}
     DATABASE_URL: >-
       host=postgres port=5432 user=${RUNTIME_DB_USER:-hermes_runtime}
       password=${RUNTIME_DB_PASSWORD:?RUNTIME_DB_PASSWORD is required}

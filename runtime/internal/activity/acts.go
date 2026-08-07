@@ -82,6 +82,11 @@ type Config struct {
 	// 供 MCP bridge(hermes-agent 平台侧)调用。空 = 接口未启用(401)。
 	// 与飞书 open_id 白名单正交:这是机器对机器的结构化指令通道,无 LLM 参与。
 	CmdAPIToken string
+	// WorkflowBridgeURL/Token 是测试结果回填 hermes workflow_runtime 的桥
+	// (2026-08-07 方案 B):workflow 结束后 SyncWorkflowRuns 活动调用它,
+	// 让 workflow-assets 排行榜反映真实测试次数。空 = 跳过(开发模式)。
+	WorkflowBridgeURL   string
+	WorkflowBridgeToken string
 	HermesTimeout   time.Duration
 	// §12 Phase 2 / 设计文档 §3.1:飞书指令层自然语言翻译旁路总开关(缺省关,灰度)。
 	// 启用需三者合取:FeishuCmdNL && HermesEndpoint 非空 && 指令 listener 本身已启用

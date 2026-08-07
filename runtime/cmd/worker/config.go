@@ -240,6 +240,10 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			// 受控命令接口(MCP bridge 调 POST /api/v1/cmd)的 Bearer 共享密钥;
 			// 空 = 接口未启用(401)。
 			CmdAPIToken: getenv("CMD_API_TOKEN"),
+			// 测试结果回填 hermes workflow_runtime 的桥(方案 B,2026-08-07);
+			// URL 空 = 跳过(开发模式)。
+			WorkflowBridgeURL:   getenv("WORKFLOW_BRIDGE_URL"),
+			WorkflowBridgeToken: getenv("WORKFLOW_BRIDGE_TOKEN"),
 			HermesTimeout:   time.Duration(hermesTimeoutSec) * time.Second,
 		},
 		SpecDefaults: activity.SpecDefaults{
