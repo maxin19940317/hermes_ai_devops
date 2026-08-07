@@ -191,12 +191,15 @@ func TestValidSOCRejectsShellErrors(t *testing.T) {
 		{"rk3588", true},
 		{"msm8953", true},
 		{"tegra", true},
+		// 大写真实型号(2026-08-07 自动探测:ro.soc.model 如 SM6225/SM8250)
+		{"QCM6125", true},
+		{"SM6225", true},
+		{"SM8250", true},
 		// shell 报错文本
 		{"/bin/bash: line 1: /system/bin/getprop: No such file or directory", false},
 		{"/system/bin/sh: getprop: not found", false},
 		{"-bash: /system/bin/getprop: No such file or directory", false},
-		// 空格/大写/特殊字符
-		{"QCM6125", false},
+		// 空格/特殊字符
 		{"qcm 6125", false},
 		{"qcm\n6125", false},
 		// 空字符串
@@ -367,5 +370,87 @@ func TestProbeDevicesOmitsMemTotalOnFailure(t *testing.T) {
 	}
 	if devices[0].Props.MemTotalMB != nil {
 		t.Errorf("MemTotalMB = %v, want nil(探测失败省略)", devices[0].Props.MemTotalMB)
+	}
+}
+
+// ---- 自动 SOC 探测(2026-08-07)----
+
+// TestProbeAndroidSOCAutoDetectsModel:新设备提供 ro.soc.model → 自动得到真实
+// 型号(SM6225),无需手动 alias 表。
+func TestProbeAndroidSOCAutoDetectsModel(t *testing.T) {
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\nNEW1 device product:n model:n device:d\n"},
+		"-s NEW1 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-s NEW1 shell /system/bin/getprop ro.build.version.release": {Stdout: "14\n"},
+		"-s NEW1 shell /system/bin/getprop ro.soc.model":             {Stdout: "SM6225\n"},
+		"-s NEW1 shell /system/bin/getprop ro.chipname":              {Stdout: "sm6225\n"},
+		"-s NEW1 shell /system/bin/getprop ro.board.platform":        {Stdout: "bengal\n"},
+		"-s NEW1 shell cat /proc/meminfo":                            {Stdout: "MemTotal: 8192000 kB\n"},
+	}}
+	// 无 SOCAliases:验证自动探测本身
+	p := &Prober{Runner: runner}
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 1 {
+		t.Fatalf("devices = %+v", devices)
+	}
+	if devices[0].Props.SOC != "SM6225" {
+		t.Errorf("soc = %q, want 自动探测 SM6225(ro.soc.model)", devices[0].Props.SOC)
+	}
+	if devices[0].DisplayName != "SM6225-NEW1" {
+		t.Errorf("display_name = %q, want SM6225-NEW1", devices[0].DisplayName)
+	}
+}
+
+// TestProbeAndroidSOCFallsBackToChipname:无 ro.soc.model → ro.chipname。
+func TestProbeAndroidSOCFallsBackToChipname(t *testing.T) {
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\nNEW2 device product:n model:m\n"},
+		"-s NEW2 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-s NEW2 shell /system/bin/getprop ro.build.version.release": {Stdout: "14\n"},
+		"-s NEW2 shell /system/bin/getprop ro.soc.model":             {ExitCode: 1},
+		"-s NEW2 shell /system/bin/getprop ro.chipname":              {Stdout: "sdm845\n"},
+		"-s NEW2 shell /system/bin/getprop ro.board.platform":        {Stdout: "sdm845\n"},
+	}}
+	p := &Prober{Runner: runner}
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 1 {
+		t.Fatalf("devices = %+v", devices)
+	}
+	if devices[0].Props.SOC != "sdm845" {
+		t.Errorf("soc = %q, want 回退 ro.chipname sdm845", devices[0].Props.SOC)
+	}
+}
+
+// TestProbeAndroidSOCFallsBackToPlatform:无真实型号属性 → 平台代号 + alias 兜底。
+func TestProbeAndroidSOCFallsBackToPlatform(t *testing.T) {
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\nNEW3 device product:n\n"},
+		"-s NEW3 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-s NEW3 shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
+		"-s NEW3 shell /system/bin/getprop ro.soc.model":             {ExitCode: 1},
+		"-s NEW3 shell /system/bin/getprop ro.chipname":              {ExitCode: 1},
+		"-s NEW3 shell /system/bin/getprop ro.board.platform":        {Stdout: "trinket\n"},
+	}}
+	p := &Prober{Runner: runner, SOCAliases: map[string]string{"trinket": "QCM6125"}}
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 1 {
+		t.Fatalf("devices = %+v", devices)
+	}
+	if devices[0].Props.SOC != "QCM6125" {
+		t.Errorf("soc = %q, want 平台代号 trinket + alias QCM6125", devices[0].Props.SOC)
+	}
+}
+
+// TestValidSOCAcceptsModelNumbers:大写真实型号(SM6225)应通过形态校验。
+func TestValidSOCAcceptsModelNumbers(t *testing.T) {
+	for _, s := range []string{"SM6225", "SM8250", "sdm845", "bengal", "trinket", "rk3568", "QCM6125"} {
+		if !validSOC(s) {
+			t.Errorf("validSOC(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "/bin/bash: line 1: not found", "a b", "SM6225!"} {
+		if validSOC(s) {
+			t.Errorf("validSOC(%q) = true, want false", s)
+		}
 	}
 }

@@ -119,17 +119,7 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 	if release, err := p.getprop(ctx, transport, "ro.build.version.release"); err == nil {
 		props.Android = release
 	}
-	soc, _ := p.getprop(ctx, transport, "ro.board.platform")
-	if soc == "" || !validSOC(soc) {
-		if soc != "" {
-			p.logf("probe: %s ro.board.platform=%q rejected by validSOC, falling back", serial, soc)
-		}
-		soc, _ = p.getprop(ctx, transport, "ro.product.board")
-	}
-	if soc != "" && !validSOC(soc) {
-		p.logf("probe: %s ro.product.board=%q rejected by validSOC, SOC cleared", serial, soc)
-		soc = ""
-	}
+	soc := p.probeAndroidSOC(ctx, transport)
 	if alias, ok := p.SOCAliases[soc]; ok {
 		p.logf("probe: %s soc %s -> %s (alias)", serial, soc, alias)
 		soc = alias
@@ -166,6 +156,33 @@ func (p *Prober) probeMemTotal(ctx context.Context, transport string, props *Dev
 	props.MemTotalMB = &mb
 }
 
+// probeAndroidSOC 自动探测 Android 设备的 SoC(2026-08-07):
+// 探测链(按真实度优先):
+//  1. ro.soc.model    真实 SoC 型号(如 SM6225、SM8250、SDM845)
+//  2. ro.chipname     部分高通设备提供(如 sdm845、sm8350)
+//  3. ro.board.platform  平台代号(如 bengal、trinket、idp)
+//  4. ro.product.board   板名(兜底)
+// 每步经 validSOC 内容形态校验;取到合法值即返回(不继续降级)。
+// 目标:新设备接入即自动得到真实型号,无需手动维护 alias 表;
+// SOCAliases 仍保留为探测链之后的最后兜底(兼容旧设备代号映射)。
+func (p *Prober) probeAndroidSOC(ctx context.Context, transport string) string {
+	for _, prop := range []string{"ro.soc.model", "ro.chipname", "ro.board.platform", "ro.product.board"} {
+		soc, err := p.getprop(ctx, transport, prop)
+		if err != nil || soc == "" {
+			continue
+		}
+		if !validSOC(soc) {
+			p.logf("probe: %s %s=%q rejected by validSOC, trying next", transport, prop, soc)
+			continue
+		}
+		if prop != "ro.board.platform" && prop != "ro.product.board" {
+			p.logf("probe: %s %s=%q (auto-detected model)", transport, prop, soc)
+		}
+		return soc
+	}
+	return ""
+}
+
 // validSerial 校验 adb serial 形态:USB serial 为字母数字(可含 - _),
 // 网络设备为 host:port。空串、"?"、含空白或路径符的一律非法。
 func validSerial(s string) bool {
@@ -198,16 +215,18 @@ func androidABI(s string) bool {
 	return true
 }
 
-// validSOC 校验 getprop ro.board.platform / ro.product.board 的内容形态,
-// 拒绝 shell 错误文本被当做 SoC 型号(老 adbd 合并 stderr 到 stdout 且不回传远程退出码,
-// getprop 不存在时 stdout 是 "/bin/bash: line N: /system/bin/getprop: No such file" 等)。
-// SoC 型号恒为小写字母数字开头,仅含小写字母、数字、下划线、连字符、点。
+// validSOC 校验 getprop ro.board.platform / ro.product.board / ro.soc.model 的
+// 内容形态,拒绝 shell 错误文本被当做 SoC 型号(老 adbd 合并 stderr 到 stdout 且
+// 不回传远程退出码,getprop 不存在时 stdout 是 "/bin/bash: line N: /system/bin/
+// getprop: No such file" 等)。
+// SoC 型号可含大写(真实型号如 SM6225、SM8250)或小写(平台代号如 bengal、trinket),
+// 仅含字母数字与点、下划线、连字符。
 func validSOC(s string) bool {
 	if s == "" {
 		return false
 	}
 	for i, r := range s {
-		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
 			(i > 0 && (r == '.' || r == '_' || r == '-'))
 		if !ok {
 			return false
