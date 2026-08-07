@@ -91,6 +91,9 @@ services:
       <<: *runtime-environment
       TRIGGER_ADDR: :8090
       TRIGGER_WEBHOOK_SECRET: ${TRIGGER_WEBHOOK_SECRET:?TRIGGER_WEBHOOK_SECRET is required}
+      # kick 已接(变体级触发,§6.3):false 关闭 pipeline success webhook 触发语义
+      # (webhook 仅记录,不再起 bundle workflow,防与 kick 双跑)。
+      TRIGGER_PIPELINE_WEBHOOK: ${TRIGGER_PIPELINE_WEBHOOK:-true}
       TRIGGER_REFS: ${TRIGGER_REFS:-master}
       GITLAB_BASE_URL: ${GITLAB_BASE_URL:-https://gitlab2.quectel.com}
       GITLAB_TOKEN: ${GITLAB_TOKEN:?GITLAB_TOKEN is required}

@@ -279,7 +279,7 @@ sequenceDiagram
 | 10 | 失败归因 device/client 分离 + 明确重置规则 | **已实现**(2026-07-29):四值归因 ok/device/client/none,Runtime 自身故障不再计入任何一方 | 遗留:`device` 无信号源(rules.CategoryDevice 无人产出),故设备隔离暂不触发,恢复路径见 `docs/superpowers/specs/2026-07-29-fail-streak-attribution-design.md` §7 |
 | 11 | Workflow ID 冲突策略精细化(失败仅显式 retry) | AllowDuplicateFailedOnly:失败 workflow 可被 webhook 重放自动重启 | Trigger 侧区分显式 retry 与普通重放 |
 | 12 | Client 只读 Deploy Token(原则 5) | bearer PAT(高权限) | 配置变更:read_package_registry Deploy Token 替换 `ARTIFACT_AUTH_TOKEN` |
-| 13 | kick 精确产物地址(原则 4) | `/kick` 与 `ci/kick.py` 已实现;业务仓库 CI 未接线;webhook 兜底保留 | 业务仓库 CI 接 `kick.py` + 配 `TRIGGER_KICK_URL/TOKEN` |
+| 13 | kick 精确产物地址(原则 4) | **已实现**(2026-08-07):`/kick` + `ci/kick.py` 已接线进业务仓库 `.gitlab-ci.yml`(仅 master 分支,上传成功后直发);`TRIGGER_KICK_URL`(http://10.88.118.251:18090/kick)与 `TRIGGER_KICK_TOKEN` 已配为 GitLab CI/CD 变量且与 Trigger 共享密钥一致;端点实测鉴权/校验正常 | 遗留:`TRIGGER_PIPELINE_WEBHOOK=false` 已配置(kick 模式关闭 pipeline success webhook 触发语义,防 bundle/变体双跑);webhook 仍保留记录 bundle 完整性断言 |
 | 14 | task_id 由 Workflow 确定性生成 | **已对齐**(devicetest.go:`{workflow_id}:{test_id}:a{attempt}`) | 无 |
 | 15 | 心跳续租校验所有权(lease_id/task/attempt/client/generation) | RenewLease 仅按 device_id+task_id 匹配 | **改造**:device_leases 扩 lease_id/generation/released_at,心跳载荷与 WHERE 条件对齐,失配返回 LEASE_NOT_OWNED |
 
