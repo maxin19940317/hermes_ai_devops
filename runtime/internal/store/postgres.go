@@ -78,13 +78,13 @@ func (s *PGStore) CurrentWorkflowAttempt(
 // RegisterArtifacts 幂等登记:同 (project,commit,pipeline,variant) 冲突时忽略。
 func (s *PGStore) RegisterArtifacts(ctx context.Context, arts []Artifact) error {
 	const q = `INSERT INTO artifacts
-		(project, commit_sha, pipeline_id, variant, build_type, url, sha256, size, manifest_digest)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		(project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		ON CONFLICT ON CONSTRAINT artifacts_project_key DO NOTHING`
 	for _, a := range arts {
 		if _, err := s.DB.ExecContext(ctx, q,
 			a.Project, a.CommitSHA, a.PipelineID, a.Variant, a.BuildType,
-			a.URL, a.SHA256, a.Size, a.ManifestDigest); err != nil {
+			a.Version, a.URL, a.SHA256, a.Size, a.ManifestDigest); err != nil {
 			return fmt.Errorf("register artifact %s: %w", a.Variant, err)
 		}
 	}

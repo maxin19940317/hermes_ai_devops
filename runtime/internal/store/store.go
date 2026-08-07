@@ -23,10 +23,14 @@ type Artifact struct {
 	PipelineID     int    // CI_PIPELINE_IID
 	Variant        string
 	BuildType      string
-	URL            string
-	SHA256         string
-	Size           int64
-	ManifestDigest string // 派单时透传给 Client 核对(§8.1)
+	// Version 包版本(X.Y.Z,bundle.version / kick.version)。2026-08-07 起登记时
+	// 写入;旧行由迁移从 workflow_runs 回填,兜底 '0.0.0'。test 命令用它填充
+	// workflow_runs.version(必填)。
+	Version         string
+	URL             string
+	SHA256          string
+	Size            int64
+	ManifestDigest  string // 派单时透传给 Client 核对(§8.1)
 	// WorkflowAttempt 显式 retry 计数(差距 #11):>0 时 workflow ID 加 -r{N}。
 	WorkflowAttempt int
 }

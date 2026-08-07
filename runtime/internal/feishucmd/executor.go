@@ -541,7 +541,8 @@ func (e *Executor) testCmd(ctx context.Context, args []string) (string, error) {
 	}
 	in := wf.DeviceTestInput{
 		Project: art.Project, Commit: art.CommitSHA, PipelineID: art.PipelineID,
-		// Version 从 artifact 无来源(artifacts 表无版本列);test 命令不展示版本。
+		// Version 来自 artifact 登记的包版本(bundle/kick 写入;workflow_runs 必填)。
+		Version:     art.Version,
 		Packages:    []wf.PackageRef{pkgRef(*art)},
 		Scope:       variant,
 		RuleVersion: rules.DefaultVersion,
@@ -634,7 +635,7 @@ func (e *Executor) retryVariant(
 	}
 	in := wf.DeviceTestInput{
 		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
-		Version: source.Version, RuleVersion: source.RuleVersion,
+		Version:     source.Version,
 		Scope:      variant,
 		Attempt:    n,
 		Packages:   []wf.PackageRef{ref},

@@ -140,7 +140,8 @@ func (h *Handler) HandleKick(w http.ResponseWriter, r *http.Request) {
 	art := store.Artifact{
 		Project: p.Project, CommitSHA: p.Commit, PipelineID: p.PipelineID,
 		Variant: p.Variant, BuildType: "Release", // 见 store.Artifact 的 CONTRACT-ISSUE
-		URL: p.URL, SHA256: p.SHA256, Size: p.Size, ManifestDigest: p.ManifestDigest,
+		Version: p.Version, URL: p.URL, SHA256: p.SHA256, Size: p.Size,
+		ManifestDigest: p.ManifestDigest,
 	}
 	if err := h.store.RegisterArtifacts(r.Context(), []store.Artifact{art}); err != nil {
 		log.Error().Err(err).Msg("register artifacts")

@@ -66,7 +66,7 @@ func (s *PGStore) ListArtifacts(
 	ctx context.Context, project, commitSHA string, pipelineID int,
 ) ([]Artifact, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT project, commit_sha, pipeline_id, variant, build_type, url, sha256, size, manifest_digest
+		SELECT project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest
 		FROM artifacts WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3 ORDER BY variant`,
 		project, commitSHA, pipelineID)
 	if err != nil {
@@ -77,7 +77,7 @@ func (s *PGStore) ListArtifacts(
 	for rows.Next() {
 		var a Artifact
 		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
-			&a.BuildType, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest); err != nil {
+			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest); err != nil {
 			return nil, fmt.Errorf("list artifacts %s/%s/%d: scan: %w",
 				project, commitSHA, pipelineID, err)
 		}
@@ -95,13 +95,13 @@ func (s *PGStore) LatestArtifactForVariant(
 	ctx context.Context, variant string,
 ) (*Artifact, error) {
 	row := s.DB.QueryRowContext(ctx, `
-		SELECT project, commit_sha, pipeline_id, variant, build_type, url, sha256, size, manifest_digest
+		SELECT project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest
 		FROM artifacts WHERE variant = $1
 		ORDER BY created_at DESC, artifact_id DESC LIMIT 1`,
 		variant)
 	var a Artifact
 	err := row.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
-		&a.BuildType, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest)
+		&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

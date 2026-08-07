@@ -179,7 +179,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		arts = append(arts, store.Artifact{
 			Project: b.Project, CommitSHA: b.Commit, PipelineID: b.PipelineID,
 			Variant: p.Variant, BuildType: "Release", // 见 store.Artifact 的 CONTRACT-ISSUE
-			URL: p.URL, SHA256: p.SHA256, Size: p.Size, ManifestDigest: p.ManifestDigest,
+			Version: b.Version, URL: p.URL, SHA256: p.SHA256, Size: p.Size,
+			ManifestDigest: p.ManifestDigest,
 		})
 	}
 	if err := h.store.RegisterArtifacts(r.Context(), arts); err != nil {

@@ -6,6 +6,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
     pipeline_id     INTEGER     NOT NULL,   -- CI_PIPELINE_IID
     variant         TEXT        NOT NULL,
     build_type      TEXT        NOT NULL,
+    -- 包版本(X.Y.Z,bundle.version / kick.version)。2026-08-07 起登记时写入;
+    -- 旧行由迁移从 workflow_runs 回填,兜底 '0.0.0'。test 命令用它填充
+    -- workflow_runs.version(必填)。
+    version         TEXT        NOT NULL DEFAULT '',
     url             TEXT        NOT NULL,
     sha256          TEXT        NOT NULL,
     size            BIGINT      NOT NULL,
