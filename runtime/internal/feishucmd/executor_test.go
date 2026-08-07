@@ -73,10 +73,13 @@ type fakeStarter struct {
 	// closedByID 非 nil 时按 workflow ID 返回关闭状态(缺省 false=未关闭),
 	// 用于区分源 workflow 已关闭与上一次重试仍在运行两类场景。
 	closedByID map[string]bool
-	result     *wf.DeviceTestOutput
-	resultErr  error
-	calls      []string
-	trace      *[]string
+	// startResults 非 nil 时按调用序号返回 started 值(消费式),
+	// 用于模拟"已终态残留 ID → 自动推进 → 最终启动成功"。
+	startResults []bool
+	result       *wf.DeviceTestOutput
+	resultErr    error
+	calls        []string
+	trace        *[]string
 }
 
 func (f *fakeStarter) StartDeviceTest(_ context.Context, in wf.DeviceTestInput) (string, bool, error) {
@@ -85,6 +88,11 @@ func (f *fakeStarter) StartDeviceTest(_ context.Context, in wf.DeviceTestInput) 
 		*f.trace = append(*f.trace, "StartDeviceTest")
 	}
 	f.inputs = append(f.inputs, in)
+	if f.startResults != nil {
+		started := f.startResults[0]
+		f.startResults = f.startResults[1:]
+		return in.WorkflowID(), started, f.startErr
+	}
 	return in.WorkflowID(), f.started, f.startErr
 }
 
@@ -1258,5 +1266,66 @@ func TestTestCmdCommitWithoutVariant(t *testing.T) {
 	}
 	if len(starter.inputs) != 0 {
 		t.Fatal("missing commit started workflow")
+	}
+}
+
+// 已终态残留 ID(如手动启动的历史 workflow)应被自动跳过并推进到下一 attempt。
+func TestTestCmdAdvancesPastTerminalLeftover(t *testing.T) {
+	_, starter, e := newTestFixture(t)
+	// r1 已终态(closed),r2 可启动:第一次 StartDeviceTest 返回未启动,
+	// WorkflowClosed(r1)=true → 推进 attempt → 第二次启动成功。
+	starter.closedByID = map[string]bool{"device-test-grp/p-gabcd1234-p42-v1-r1": true}
+	starter.startResults = []bool{false, true}
+
+	got := runTest(t, e, "v1")
+	if !strings.Contains(got, "已启动") {
+		t.Fatalf("reply = %q, want 推进后启动成功", got)
+	}
+	if len(starter.inputs) != 2 {
+		t.Fatalf("inputs = %+v, want 两次启动尝试", starter.inputs)
+	}
+	if a1, a2 := starter.inputs[0].Attempt, starter.inputs[1].Attempt; a2 != a1+1 {
+		t.Errorf("attempt %d → %d, want 单调递增", a1, a2)
+	}
+}
+
+// 最新 attempt 的 workflow 仍在运行:拒绝重复派发。
+func TestTestCmdRejectsInFlight(t *testing.T) {
+	mem, starter, e := newTestFixture(t)
+	// 先推进一次,使 attempt 水位=1(模拟已分配过一版)。
+	if _, err := mem.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1"); err != nil {
+		t.Fatal(err)
+	}
+	// attempt 1 未关闭 → testInFlight 命中 → 拒绝。
+	starter.closedByID = map[string]bool{"device-test-grp/p-gabcd1234-p42-v1-r1": false}
+
+	got := runTest(t, e, "v1")
+	if !strings.Contains(got, "测试正在进行中") {
+		t.Fatalf("reply = %q, want 进行中拒绝", got)
+	}
+	if len(starter.inputs) != 0 {
+		t.Fatalf("in-flight 拒绝后不应启动: %+v", starter.inputs)
+	}
+}
+
+// 已存在 ID 且为运行中(并发竞态):提示进行中,不重复派发。
+func TestTestCmdRaceAlreadyRunning(t *testing.T) {
+	mem, starter, e := newTestFixture(t)
+	if _, err := mem.NextWorkflowAttempt(ctx, "grp/p", "abcd1234", 42, "v1"); err != nil {
+		t.Fatal(err)
+	}
+	// 第一次 StartDeviceTest 撞上已存在的运行中 workflow(attempt 2 被并发占用)。
+	starter.closedByID = map[string]bool{
+		"device-test-grp/p-gabcd1234-p42-v1-r1": true, // 水位 1 已终态 → 放行
+		"device-test-grp/p-gabcd1234-p42-v1-r2": false, // 竞态占用的 r2 运行中
+	}
+	starter.startResults = []bool{false}
+
+	got := runTest(t, e, "v1")
+	if !strings.Contains(got, "测试正在进行中") {
+		t.Fatalf("reply = %q, want 进行中提示", got)
+	}
+	if len(starter.inputs) != 1 {
+		t.Fatalf("inputs = %+v, want 仅一次尝试", starter.inputs)
 	}
 }

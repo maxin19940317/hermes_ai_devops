@@ -535,28 +535,49 @@ func (e *Executor) testCmd(ctx context.Context, args []string) (string, error) {
 		art = latest
 	}
 
-	n, err := e.Store.NextWorkflowAttempt(ctx, art.Project, art.CommitSHA, art.PipelineID, variant)
-	if err != nil {
-		return "", fmt.Errorf("next workflow attempt: %w", err)
+	// 防连点:该变体最新 attempt 的 workflow 仍在运行则拒绝(与 rerun 的
+	// retryInFlight 同语义,避免用户连发 test 命令启动多个重复测试)。
+	if id := e.testInFlight(ctx, art, variant); id != "" {
+		return fmt.Sprintf("测试正在进行中: %s", id), nil
 	}
-	in := wf.DeviceTestInput{
-		Project: art.Project, Commit: art.CommitSHA, PipelineID: art.PipelineID,
-		// Version 来自 artifact 登记的包版本(bundle/kick 写入;workflow_runs 必填)。
-		Version:     art.Version,
-		Packages:    []wf.PackageRef{pkgRef(*art)},
-		Scope:       variant,
-		RuleVersion: rules.DefaultVersion,
-		Attempt:     n,
+
+	// 启动;遇到已存在 ID 时区分两种情况:已终态(如手动启动的历史残留)
+	// 自动推进到下一 attempt 重试;运行中(并发启动的竞态)则提示,不重复派发。
+	maxAdvance := 5
+	for {
+		n, err := e.Store.NextWorkflowAttempt(ctx, art.Project, art.CommitSHA, art.PipelineID, variant)
+		if err != nil {
+			return "", fmt.Errorf("next workflow attempt: %w", err)
+		}
+		in := wf.DeviceTestInput{
+			Project: art.Project, Commit: art.CommitSHA, PipelineID: art.PipelineID,
+			// Version 来自 artifact 登记的包版本(bundle/kick 写入;workflow_runs 必填)。
+			Version:     art.Version,
+			Packages:    []wf.PackageRef{pkgRef(*art)},
+			Scope:       variant,
+			RuleVersion: rules.DefaultVersion,
+			Attempt:     n,
+		}
+		id, started, err := e.Starter.StartDeviceTest(ctx, in)
+		if err != nil {
+			return "", fmt.Errorf("start workflow: %w", err)
+		}
+		if started {
+			return fmt.Sprintf("已启动: %s\n变体 %s (%s g%s p%d)", id, variant, art.BuildType,
+				art.CommitSHA, art.PipelineID), nil
+		}
+		closed, err := e.Starter.WorkflowClosed(ctx, id)
+		if err != nil {
+			return "", fmt.Errorf("workflow closed check %s: %w", id, err)
+		}
+		if !closed {
+			return fmt.Sprintf("测试正在进行中: %s", id), nil
+		}
+		maxAdvance--
+		if maxAdvance <= 0 {
+			return fmt.Sprintf("workflow 已存在且均为终态,推进超限,请稍后重试: %s", id), nil
+		}
 	}
-	id, started, err := e.Starter.StartDeviceTest(ctx, in)
-	if err != nil {
-		return "", fmt.Errorf("start workflow: %w", err)
-	}
-	if !started {
-		return fmt.Sprintf("workflow 已存在，本次 attempt 未启动: %s", id), nil
-	}
-	return fmt.Sprintf("已启动: %s\n变体 %s (%s g%s p%d)", id, variant, art.BuildType,
-		art.CommitSHA, art.PipelineID), nil
 }
 
 // containsVariant 判断某 run 是否就是指定变体(RecentRun 是单变体行)。
@@ -593,6 +614,26 @@ func (e *Executor) retryInFlight(ctx context.Context, source *store.WorkflowRun,
 	}
 	latestID := wf.DeviceTestInput{
 		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
+		Scope: variant, Attempt: cur,
+	}.WorkflowID()
+	closed, err := e.Starter.WorkflowClosed(ctx, latestID)
+	if err != nil || closed {
+		return ""
+	}
+	return latestID
+}
+
+// testInFlight 防连点认领(test 命令用):指定变体最新 attempt 的 workflow
+// 未关闭时返回其 ID,否则返回 ""。查询失败按"无"处理——test 是显式人工
+// 动作,宁可放行也不阻塞用户(与 retryInFlight 一致)。
+func (e *Executor) testInFlight(ctx context.Context, art *store.Artifact, variant string) string {
+	cur, err := e.Store.CurrentWorkflowAttempt(
+		ctx, art.Project, art.CommitSHA, art.PipelineID, variant)
+	if err != nil || cur < 1 {
+		return ""
+	}
+	latestID := wf.DeviceTestInput{
+		Project: art.Project, Commit: art.CommitSHA, PipelineID: art.PipelineID,
 		Scope: variant, Attempt: cur,
 	}.WorkflowID()
 	closed, err := e.Starter.WorkflowClosed(ctx, latestID)
