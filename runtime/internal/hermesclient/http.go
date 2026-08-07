@@ -46,6 +46,12 @@ var planSchemaJSON string
 // planSchema 是编译期嵌入的 contracts/plan.schema.json(Draft2020)。
 var planSchema = mustCompileSchema("plan.schema.json", planSchemaJSON)
 
+//go:embed express.schema.json
+var expressSchemaJSON string
+
+// expressSchema 是编译期嵌入的 contracts/express.schema.json(Draft2020)。
+var expressSchema = mustCompileSchema("express.schema.json", expressSchemaJSON)
+
 func mustCompileSchema(name, body string) *jsonschema.Schema {
 	c := jsonschema.NewCompiler()
 	c.Draft = jsonschema.Draft2020
@@ -348,4 +354,96 @@ func (c *HTTPClient) Plan(ctx context.Context, req PlanRequest) (json.RawMessage
 	return raw, nil
 }
 
+// expressURL 由 Endpoint(指向 /analyze)推导出同一 bridge 的 /express:
+// 替换路径最后一段。与 translateURL/planURL 同构。
+func expressURL(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("hermesclient: Endpoint 不是合法 URL: %w", err)
+	}
+	p := strings.TrimRight(u.Path, "/")
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		u.Path = p[:i] + "/express"
+	} else {
+		u.Path = "/express"
+	}
+	return u.String(), nil
+}
+
+// expressPayload 是发往 bridge 的表述请求格式。Facts 是规则算好的结构化事实,
+// Scene 标识场景(命令无关,status 等下一轮平铺复用)。
+type expressPayload struct {
+	PromptVersion string          `json:"prompt_version"`
+	Model         string          `json:"model,omitempty"`
+	Prompt        string          `json:"prompt"`
+	RawText       string          `json:"raw_text"`
+	Scene         string          `json:"scene"`
+	Facts         json.RawMessage `json:"facts"`
+}
+
+// Express 调用 bridge 执行一次表述:响应经内嵌 express.schema.json 校验后
+// 解析;校验不过或非 2xx 均返回 wrapped error,由调用方降级规则文本。
+func (c *HTTPClient) Express(ctx context.Context, req ExpressRequest) (*ExpressResponse, error) {
+	endpoint, err := expressURL(c.cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	facts := req.Facts
+	if len(facts) == 0 {
+		facts = json.RawMessage(`{}`)
+	}
+	body, err := json.Marshal(expressPayload{
+		PromptVersion: PromptVersionExpress,
+		Model:         req.Model,
+		Prompt:        PromptExpress,
+		RawText:       req.RawText,
+		Scene:         req.Scene,
+		Facts:         facts,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 编码表述请求失败: %w", err)
+	}
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 构造表述请求失败: %w", err)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	if c.cfg.AuthToken != "" {
+		hreq.Header.Set("Authorization", "Bearer "+c.cfg.AuthToken)
+	}
+	resp, err := c.hc.Do(hreq)
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 调用 %s 失败: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("hermesclient: 读取表述响应失败: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		snippet := string(raw)
+		if len(snippet) > errBodyLimit {
+			snippet = snippet[:errBodyLimit] + "..."
+		}
+		return nil, fmt.Errorf("hermesclient: 平台返回 %d: %s", resp.StatusCode, snippet)
+	}
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("hermesclient: 表述响应不是合法 JSON: %w", err)
+	}
+	if err := expressSchema.Validate(doc); err != nil {
+		snippet := string(raw)
+		if len(snippet) > errBodyLimit {
+			snippet = snippet[:errBodyLimit] + "..."
+		}
+		return nil, fmt.Errorf("hermesclient: 响应不符合 express.schema.json(视为表述失败): %w: %w: body=%s", ErrSchemaInvalid, err, snippet)
+	}
+	var out ExpressResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("hermesclient: 解析 Express 失败: %w", err)
+	}
+	return &out, nil
+}
+
 var _ Planner = (*HTTPClient)(nil)
+var _ Express = (*HTTPClient)(nil)

@@ -33,6 +33,8 @@ type Store interface {
 	// MetricsForVariant 返回指定变体最近 limit 条指标点(created_at 倒序,跨
 	// project/suite/metric)。供 metrics 指令展示性能概况。
 	MetricsForVariant(ctx context.Context, variant string, limit int) ([]store.MetricPoint, error)
+	// ListFleet 返回全部已注册设备(含状态),供 DeviceFacts 计算与缺口分析。
+	ListFleet(ctx context.Context) ([]store.FleetDevice, error)
 	// LatestArtifactForVariant 返回指定变体最近一次构建的 artifact(按 created_at
 	// 取最新,不限 project);无记录返回 nil,nil。供 test 命令缺省 commit 时定位
 	// "最近构建"——project 从 artifact 自身带出,不依赖 workflow run。
@@ -77,6 +79,18 @@ type Executor struct {
 	// Planner 非 nil 时启用自然语言规划(Phase 2 Planner v1);
 	// nil = 未启用,plan 命令返回"未启用"。
 	Planner hermesclient.Planner
+	// Express 非 nil 时启用表述层(Smart Reply):devices 等只读命令的回答先由
+	// 规则算 Facts,交给 LLM 组织人性化表述;LLM 挂 → 降级规则文本。
+	// nil = 不启用表述层,回答保持规则拼接。
+	Express hermesclient.Express
+	// SpecCfg 是变体配置(variants.yaml 运行时视图),供 DeviceFacts 计算
+	// "某台设备可测哪些变体";nil = 无法计算 can_test(表述层不启用)。
+	SpecCfg interface {
+		VariantNames() []string
+		VariantSelector(variant string) wf.DeviceSelector
+	}
+	// ExpressModel 是表述层使用的模型;空 = 回落翻译层同款配置(worker 装配时决定)。
+	ExpressModel string
 	// Variants 是合法变体名单(来自 specCfg),供 plan 上下文快照使用。
 	Variants []string
 	// Now 可注入,便于测试待确认 TTL;nil 用 time.Now().UTC()。
@@ -383,6 +397,11 @@ func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
 	}
 	if len(matched) == 0 {
 		return fmt.Sprintf("📱 无%s", scopeTitle(scope)), nil
+	}
+	// 缺省 online:表述层可用时走 Smart Reply(规则 Facts + LLM 表述),
+	// LLM 挂/未启用 → 规则文本(在 expressDevices 内部降级)。
+	if scope == "online" && e.Express != nil && e.SpecCfg != nil {
+		return e.expressDevices(ctx, matched)
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "📱 %s(%d 台)", scopeTitle(scope), len(matched))

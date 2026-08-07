@@ -89,6 +89,28 @@ func (c *SpecConfig) VariantNames() []string {
 	return out
 }
 
+// VariantSelector 返回变体的调度 selector(与 SelectTestSpecs 同源,
+// os 缺省 android)。供 DeviceFacts 计算"某台设备可测哪些变体"复用
+// 同一匹配语义(防漂移)。
+func (c *SpecConfig) VariantSelector(variant string) wf.DeviceSelector {
+	if c == nil {
+		return wf.DeviceSelector{}
+	}
+	v, ok := c.file.Variants[variant]
+	if !ok {
+		return wf.DeviceSelector{}
+	}
+	os := v.Requirements.OS
+	if os == "" {
+		os = "android"
+	}
+	return wf.DeviceSelector{
+		OS:           os,
+		SOC:          v.Requirements.SOC,
+		Capabilities: v.Requirements.Capabilities,
+	}
+}
+
 // SignaturesForVariant 合并 defaults.signatures_common_android 与
 // variants.<name>.signatures(同 id 变体覆盖,与 SelectTestSpecs 的
 // SignatureCategory 合并逻辑一致),按声明序返回,供证据提取使用。

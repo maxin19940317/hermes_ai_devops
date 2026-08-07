@@ -14,6 +14,9 @@ var PromptTranslate string
 //go:embed prompts/plan_v1.md
 var PromptPlan string
 
+//go:embed prompts/express_v1.md
+var PromptExpress string
+
 // PromptVersionAnalyze 是 Analyzer 当前 prompt 版本号,随请求发送便于平台侧追踪。
 const PromptVersionAnalyze = "analyze_v1"
 
@@ -22,6 +25,9 @@ const PromptVersionTranslate = "cmd_translate_v4"
 
 // PromptVersionPlan 是规划器当前 prompt 版本号。
 const PromptVersionPlan = "plan_v1"
+
+// PromptVersionExpress 是表述层(Express)当前 prompt 版本号。
+const PromptVersionExpress = "express_v1"
 
 // PromptPlanWithVariants 用给定的变体列表渲染 plan prompt 中的 {{variants}} 占位符。
 func PromptPlanWithVariants(variants []string) string {

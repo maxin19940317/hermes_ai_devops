@@ -1,0 +1,3 @@
+{ "summary": "当前 2 台在线设备,可覆盖 6 个变体。",
+  "sections": ["QCS6490-825485946 可测 SNPE 2.21 等 3 个变体", "RK3568-ac6dcbcbfc640f3a 可测 RKNN 3 个变体"],
+  "footer": "接入高通 Android 板可补测 2 个待调度变体" }

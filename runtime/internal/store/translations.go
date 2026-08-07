@@ -14,6 +14,12 @@ const (
 	OutcomeRejectedArgs          = "rejected_args"
 	OutcomeRejectedLowConfidence = "rejected_low_confidence"
 	OutcomeTranslatorError       = "translator_error"
+	// Express 表述层 outcome(设计文档 2026-08-07-feishu-smart-reply-design.md
+	// §4.3):LLM 表述成功 → express_ok;LLM 挂/超时/不合 Schema → express_fallback
+	// (规则文本)。追加式,复用 command_translations 一张表串起
+	// "原话 → 翻译 → 表述"完整证据链。
+	OutcomeExpressOK       = "express_ok"
+	OutcomeExpressFallback = "express_fallback"
 )
 
 // outputLimit 是 output 列的落库上限(4KB)。Schema 校验失败时平台可能返回任意

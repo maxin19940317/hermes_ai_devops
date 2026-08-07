@@ -235,6 +235,8 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			HermesEndpoint:  getenv("HERMES_ENDPOINT"),
 			HermesAuthToken: getenv("HERMES_AUTH_TOKEN"),
 			HermesModel:     getenv("HERMES_MODEL"),
+			// 表述层专用模型;空 = 回落 HermesModel(worker 装配时决定)。
+			HermesExpressModel: getenv("HERMES_EXPRESS_MODEL"),
 			HermesTimeout:   time.Duration(hermesTimeoutSec) * time.Second,
 		},
 		SpecDefaults: activity.SpecDefaults{

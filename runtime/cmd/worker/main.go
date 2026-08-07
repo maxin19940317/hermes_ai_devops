@@ -173,6 +173,22 @@ func main() {
 				Store: st, Sender: feishuSender, Log: &log, Whitelist: wl,
 				Starter:  &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
 				Variants: specCfg.VariantNames(),
+				SpecCfg:  specCfg,
+			}
+			// 表述层(Express,Smart Reply):HERMES_ENDPOINT 已配时启用
+			// (独立 hermes client,与翻译共用端点/认证);模型独立配置,空回落翻译层模型。
+			if cfg.Activity.HermesEndpoint != "" {
+				expressModel := cfg.Activity.HermesExpressModel
+				if expressModel == "" {
+					expressModel = cfg.Activity.HermesModel
+				}
+				exec.Express = hermesclient.NewHTTPClient(hermesclient.Config{
+					Endpoint:  cfg.Activity.HermesEndpoint,
+					AuthToken: cfg.Activity.HermesAuthToken,
+					Timeout:   cfg.Activity.FeishuCmdNLTimeout,
+				})
+				exec.ExpressModel = expressModel
+				log.Info().Str("model", expressModel).Msg("feishu cmd express=enabled")
 			}
 			// 自然语言翻译旁路(设计文档 §3.1):三个条件合取才启用——
 			// 开关打开、bridge 端点已配、指令 listener 本身已启用。

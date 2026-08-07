@@ -75,6 +75,9 @@ type Config struct {
 	HermesEndpoint  string
 	HermesAuthToken string
 	HermesModel     string // 可选透传;模型主体由平台配置
+	// HermesExpressModel 是表述层(Express)专用模型(设计文档 §4.3 评审定稿):
+	// 表述在交互路径上对延迟最敏感,独立配置;空 = 回落 HermesModel。
+	HermesExpressModel string
 	HermesTimeout   time.Duration
 	// §12 Phase 2 / 设计文档 §3.1:飞书指令层自然语言翻译旁路总开关(缺省关,灰度)。
 	// 启用需三者合取:FeishuCmdNL && HermesEndpoint 非空 && 指令 listener 本身已启用

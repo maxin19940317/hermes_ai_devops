@@ -394,23 +394,75 @@ func TestCommandSchemaCopyMatchesContracts(t *testing.T) {
 	}
 }
 
-func TestTranslateUsesV4PromptAndContract(t *testing.T) {
-	if PromptVersionTranslate != "cmd_translate_v4" {
-		t.Fatalf("PromptVersionTranslate = %q, want cmd_translate_v4", PromptVersionTranslate)
+func TestExpressSchemaCopyMatchesContracts(t *testing.T) {
+	src, err := os.ReadFile("../../../contracts/express.schema.json")
+	if err != nil {
+		t.Fatalf("read contracts copy: %v", err)
 	}
-	for _, want := range []string{
-		"runs [n]",
-		"result <workflow_id>",
-		"metrics <variant>",
-		"artifacts <variant>",
-		"quarantine [device_id]",
-		"cancel <workflow_id>",
-		"test <variant> [commit]",
-		"rerun <source_workflow_id> [variant]",
-		"authoritative:true",
-	} {
-		if !strings.Contains(PromptTranslate, want) {
-			t.Errorf("PromptTranslate 缺少 %q", want)
+	if string(src) != expressSchemaJSON {
+		t.Error("express.schema.json 与 contracts/ 不一致,请同步副本")
+	}
+}
+
+// ---- Express 表述层 ----
+
+const validExpress = `{
+  "summary": "当前 2 台在线设备",
+  "sections": ["QCS6490 可测 SNPE", "RK3568 可测 RKNN"],
+  "footer": "接入高通 Android 板可补测"
+}`
+
+func TestExpress(t *testing.T) {
+	// 请求体规范:prompt_version=express_v1、scene、facts 透传
+	var got expressPayload
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/express" {
+			t.Errorf("path = %q, want /express", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(validExpress))
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze", Timeout: 5 * time.Second})
+	resp, err := c.Express(context.Background(), ExpressRequest{
+		RawText: "查询当前在线设备", Scene: "devices",
+		Facts: json.RawMessage(`{"online":[{"id":"825485946"}]}`),
+	})
+	if err != nil {
+		t.Fatalf("express: %v", err)
+	}
+	if got.PromptVersion != "express_v1" || got.Scene != "devices" || got.RawText != "查询当前在线设备" {
+		t.Errorf("payload = %+v", got)
+	}
+	if resp.Summary == "" || len(resp.Sections) != 2 {
+		t.Errorf("resp = %+v", resp)
+	}
+}
+
+func TestExpressRejectsSchemaViolation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"summary":"缺 sections 和 footer"}`))
+	}))
+	defer srv.Close()
+	c := NewHTTPClient(Config{Endpoint: srv.URL + "/analyze", Timeout: 5 * time.Second})
+	_, err := c.Express(context.Background(), ExpressRequest{Scene: "devices", Facts: json.RawMessage(`{}`)})
+	if !errors.Is(err, ErrSchemaInvalid) {
+		t.Fatalf("err = %v, want ErrSchemaInvalid", err)
+	}
+}
+
+func TestExpressUsesV1Prompt(t *testing.T) {
+	if PromptVersionExpress != "express_v1" {
+		t.Fatalf("PromptVersionExpress = %q, want express_v1", PromptVersionExpress)
+	}
+	for _, want := range []string{"summary", "sections", "footer"} {
+		if !strings.Contains(PromptExpress, want) {
+			t.Errorf("PromptExpress 缺少 %q", want)
 		}
 	}
 }

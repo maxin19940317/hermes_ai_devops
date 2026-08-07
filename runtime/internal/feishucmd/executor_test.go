@@ -1423,3 +1423,169 @@ func TestRunsDistinguishesPendingFromRunning(t *testing.T) {
 		t.Errorf("v2 无 task 应显示待调度, got %q", got)
 	}
 }
+
+// ---- 表述层(Express,2026-08-07)----
+
+type fakeExpress struct {
+	out    *hermesclient.ExpressResponse
+	err    error
+	calls  int
+	gotReq hermesclient.ExpressRequest
+}
+
+func (f *fakeExpress) Express(_ context.Context, req hermesclient.ExpressRequest) (*hermesclient.ExpressResponse, error) {
+	f.calls++
+	f.gotReq = req
+	return f.out, f.err
+}
+
+// fakeSpecCfg 是 Executor.SpecCfg 的测试桩(用 MemStore 不需要真 SpecConfig)。
+type fakeSpecCfg struct {
+	variants []string
+	sel      map[string]wf.DeviceSelector
+}
+
+func (f *fakeSpecCfg) VariantNames() []string { return f.variants }
+
+func (f *fakeSpecCfg) VariantSelector(variant string) wf.DeviceSelector {
+	return f.sel[variant]
+}
+
+// newExpressExec 构造启用表述层的 Executor(设备 + SpecCfg + fake Express)。
+func newExpressExec(t *testing.T, express *fakeExpress) (*store.MemStore, *Executor) {
+	t.Helper()
+	st := store.NewMemStore()
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1"}, []store.Device{
+		{DeviceID: "825485946", Serial: "825485946", ClientID: "c1", OS: "linux", SOC: "QCS6490",
+			Capabilities: []string{"hexagon", "adreno"}},
+		{DeviceID: "ac6dcbcbfc640f3a", Serial: "ac6dcbcbfc640f3a", ClientID: "c1", OS: "android", SOC: "rk3568",
+			Capabilities: []string{"rknpu"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sel := map[string]wf.DeviceSelector{
+		"aarch64_Linux_QCS6490_SNPE_2.21": {OS: "linux", SOC: []string{"QCS6490"}, Capabilities: []string{"hexagon"}},
+		"aarch64_Android_RK3568_RKNN_2.3.2": {OS: "android", SOC: []string{"rk3568"}, Capabilities: []string{"rknpu"}},
+		"aarch64_Android_QCM6125_SNPE_1.68": {OS: "android", SOC: []string{"QCM6125"}, Capabilities: []string{"hexagon"}},
+	}
+	e := newExec(st, &fakeStarter{}, &fakeSender{})
+	e.Express = express
+	e.SpecCfg = &fakeSpecCfg{
+		variants: []string{"aarch64_Android_QCM6125_SNPE_1.68", "aarch64_Android_RK3568_RKNN_2.3.2", "aarch64_Linux_QCS6490_SNPE_2.21"},
+		sel:      sel,
+	}
+	return st, e
+}
+
+// LLM 正常 → 结构化回答 + 审计 express_ok。
+func TestDevicesReplyUsesExpress(t *testing.T) {
+	fake := &fakeExpress{out: &hermesclient.ExpressResponse{
+		Summary: "当前 2 台在线设备,可覆盖 2 个变体。",
+		Sections: []string{"QCS6490 可测 SNPE 2.21", "RK3568 可测 RKNN 2.3.2"},
+		Footer:   "接入高通 Android 板可补测 1 个变体",
+	}}
+	st, e := newExpressExec(t, fake)
+	got, err := e.devices(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "当前 2 台在线设备") || !strings.Contains(got, "QCS6490 可测") {
+		t.Errorf("reply = %q, want Express 结构化回答", got)
+	}
+	if fake.calls != 1 || fake.gotReq.Scene != "devices" {
+		t.Errorf("express calls=%d scene=%q", fake.calls, fake.gotReq.Scene)
+	}
+	// 审计:express_ok 一行,context_digest 非空
+	rows, err := st.ListCommandTranslations(ctx, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.Outcome == store.OutcomeExpressOK {
+			found = true
+			if r.ContextDigest == "" || len(r.Output) == 0 {
+				t.Errorf("express_ok 审计缺 context_digest/output: %+v", r)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("审计无 express_ok 行: %+v", rows)
+	}
+}
+
+// LLM 挂 → 规则文本 + 审计 express_fallback。
+func TestDevicesReplyDegradesToRuleText(t *testing.T) {
+	t.Run("Express 返回错误", func(t *testing.T) {
+		fake := &fakeExpress{err: errors.New("bridge down")}
+		st, e := newExpressExec(t, fake)
+		got, err := e.devices(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 降级文本:在线设备 + 缺口提示
+		if !strings.Contains(got, "在线设备") || !strings.Contains(got, "825485946") {
+			t.Errorf("fallback = %q, want 规则文本", got)
+		}
+		if !strings.Contains(got, "待测") {
+			t.Errorf("fallback 应含缺口提示: %q", got)
+		}
+		rows, _ := st.ListCommandTranslations(ctx, "", 10)
+		if !containsOutcome(rows, store.OutcomeExpressFallback) {
+			t.Errorf("审计无 express_fallback 行: %+v", rows)
+		}
+	})
+	t.Run("Express 返回 nil", func(t *testing.T) {
+		fake := &fakeExpress{out: nil}
+		_, e := newExpressExec(t, fake)
+		got, err := e.devices(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(got, "在线设备") {
+			t.Errorf("fallback = %q", got)
+		}
+	})
+}
+
+// Express 未启用(nil)→ 保持规则文本(行为不变)。
+func TestDevicesReplyWithoutExpress(t *testing.T) {
+	st := store.NewMemStore()
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1"},
+		[]store.Device{{DeviceID: "dev-1", Serial: "dev-1", ClientID: "c1"}}); err != nil {
+		t.Fatal(err)
+	}
+	e := newExec(st, &fakeStarter{}, &fakeSender{}) // Express=nil, SpecCfg=nil
+	got, err := e.devices(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "在线设备") || !strings.Contains(got, "dev-1") {
+		t.Errorf("reply = %q, want 规则文本(未启用表述层)", got)
+	}
+}
+
+// 非 online scope 不走表述层(规则文本)。
+func TestDevicesOfflineScopeSkipsExpress(t *testing.T) {
+	fake := &fakeExpress{out: &hermesclient.ExpressResponse{Summary: "s", Sections: []string{"x"}}}
+	_, e := newExpressExec(t, fake)
+	got, err := e.devices(ctx, []string{"all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.calls != 0 {
+		t.Errorf("express calls = %d, want 0(scope != online)", fake.calls)
+	}
+	if !strings.Contains(got, "全部设备") {
+		t.Errorf("reply = %q", got)
+	}
+}
+
+func containsOutcome(rows []store.CommandTranslation, outcome string) bool {
+	for _, r := range rows {
+		if r.Outcome == outcome {
+			return true
+		}
+	}
+	return false
+}

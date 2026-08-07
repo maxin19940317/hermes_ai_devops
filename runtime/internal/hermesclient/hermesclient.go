@@ -76,3 +76,29 @@ type PlanRequest struct {
 	Context json.RawMessage // 上下文快照(variants/devices/now)
 	Model   string          // 可选透传
 }
+
+// ExpressResponse 与 contracts/express.schema.json 字段一一对应,是表述层
+// (Smart Reply)的结构化输出。事实永远由规则计算,LLM 只负责表述与洞察:
+// summary 一句话总览, sections 分段, footer 可选建议。
+type ExpressResponse struct {
+	Summary  string   `json:"summary"`
+	Sections []string `json:"sections"`
+	Footer   string   `json:"footer"`
+}
+
+// ExpressRequest 是一次表述请求的入参。Facts 是规则算好的结构化事实
+// (如 DeviceFacts,json.RawMessage);Scene 是场景标识("devices"|"status"|...),
+// 命令无关——status 等下一轮可直接复用同一接口。Model 可选透传。
+type ExpressRequest struct {
+	RawText string
+	Scene   string
+	Facts   json.RawMessage
+	Model   string
+}
+
+// Express 是表述层能力抽象(设计文档 2026-08-07-feishu-smart-reply-design.md
+// §4.3)。实现需保证:尊重 ctx 超时;响应必须通过内嵌 express.schema.json 校验,
+// 否则返回错误(校验不过视为表述失败,调用方降级规则文本)。
+type Express interface {
+	Express(ctx context.Context, req ExpressRequest) (*ExpressResponse, error)
+}
