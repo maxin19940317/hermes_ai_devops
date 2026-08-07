@@ -1042,7 +1042,7 @@ func (e *Executor) runs(ctx context.Context, args []string) (string, error) {
 	}
 	var b strings.Builder
 	for _, r := range runs {
-		mark := "?"
+		mark := "⏳" // 缺省:运行中/无终态
 		switch r.Verdict {
 		case "PASSED":
 			mark = "✅"
