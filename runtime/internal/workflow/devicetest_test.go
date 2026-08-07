@@ -1706,6 +1706,27 @@ func TestBuildNotificationCardTruncatesChineseValidUTF8(t *testing.T) {
 	}
 }
 
+// TestFormatMetricsCard:卡片指标每行一个,指标名加粗 + 数值等宽;
+// 键排序确定性,`_inference_ms_avg` 后缀剥掉显示 ms。
+func TestFormatMetricsCard(t *testing.T) {
+	got := formatMetricsCard(map[string]float64{
+		"gesture_test.inference_ms_avg":    16.7,
+		"detect_face_attr_test.inference_ms_avg": 46.4,
+		"seg_crowd_test.inference_ms_avg":  18.0,
+	})
+	want := "detect_face_attr_test  **46.4ms**\n" +
+		"gesture_test  **16.7ms**\n" +
+		"seg_crowd_test  **18.0ms**"
+	if got != want {
+		t.Errorf("formatMetricsCard = %q, want %q", got, want)
+	}
+	// 非推理指标:保留原键,数值 3 位有效数字
+	got2 := formatMetricsCard(map[string]float64{"peak_rss_mb": 214.5})
+	if got2 != "peak_rss_mb  **214**" {
+		t.Errorf("formatMetricsCard 非推理指标 = %q", got2)
+	}
+}
+
 // TestCardReasonLinesListAndParagraph:原因按行拆分——`- ` 列表项与普通段落
 // 各自独立 div;空行跳过。
 func TestCardReasonLinesListAndParagraph(t *testing.T) {

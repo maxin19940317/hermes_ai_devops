@@ -527,6 +527,26 @@ func formatMetrics(m map[string]float64) string {
 	return strings.Join(parts, " ")
 }
 
+// formatMetricsCard 生成卡片 metrics 行的 lark_md(2026-08-07 优雅化):
+// 每指标一行,指标名加粗 + 数值等宽,比 formatMetrics 的 "a=1ms b=2ms" 单行
+// 挤 3 个可读性好得多。键按声明序(测试脚本产出序,非字典序——保持业务语义)。
+func formatMetricsCard(m map[string]float64) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // 保持确定性(与 formatMetrics 一致)
+	lines := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if name, ok := strings.CutSuffix(k, ".inference_ms_avg"); ok {
+			lines = append(lines, fmt.Sprintf("%s  **%.1fms**", escapeCardText(name), m[k]))
+		} else {
+			lines = append(lines, fmt.Sprintf("%s  **%.3g**", escapeCardText(k), m[k]))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVersion string, attempt int, resultCh workflow.ReceiveChannel) TaskSummary {
 	wfID := workflow.GetInfo(ctx).WorkflowExecution.ID
 	// 幂等键 = {workflow_id}:{test_id}:{attempt}(§12.6),task_id 同值
@@ -1226,12 +1246,17 @@ func buildCardVariantBlock(tk TaskSummary, workflowID string) cardVariantBlock {
 		m := mdCardDiv(strings.Join(parts, " · "))
 		blk.metric = &m
 	}
-	// 性能指标独立成行(2026-08-06 排版):不挤进耗时/用例行
+	// 性能指标独立成行(2026-08-06 排版):不挤进耗时/用例行。
+	// 2026-08-07:每指标一行 markdown bullet 列表,指标名加粗 + 数值等宽,
+	// 比 "a=1ms b=2ms" 单行挤 3 个可读性好。
 	if len(tk.Metrics) > 0 {
-		m := mdCardDiv(escapeCardText(formatMetrics(tk.Metrics)))
-		blk.metrics = &m
+		lines := formatMetricsCard(tk.Metrics)
+		md := CardElement{
+			Tag: "markdown", Content: lines,
+			ElementStyle: &CardElStyle{Display: "list", ListType: "bullet"},
+		}
+		blk.metrics = &md
 	}
-
 	if tk.Reason != "" {
 		blk.reason = cardReasonLines(tk.Reason)
 	}
