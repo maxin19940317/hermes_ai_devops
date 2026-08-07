@@ -402,6 +402,32 @@ func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
 	if len(matched) == 0 {
 		return fmt.Sprintf("📱 无%s", scopeTitle(scope)), nil
 	}
+	// 卡片优先(2026-08-07):CardSender 可用时,devices 用 column_set 表格卡片
+	// 展示(ID/设备/系统/架构/内存,规则数据,不经 LLM——设备查询要的是确定性的表)。
+	// 无卡片能力 → 回落纯文本(online 且表述层可用 → Smart Reply)。
+	if e.CardSender != nil {
+		fleet, err := e.Store.ListFleet(ctx)
+		if err != nil {
+			return "", err
+		}
+		// 按 matched 的 device_id 找完整 FleetDevice(含 ABI/MemTotalMB)。
+		want := map[string]bool{}
+		for _, d := range matched {
+			want[d.DeviceID] = true
+		}
+		rows := []deviceTableRow{}
+		for _, f := range fleet {
+			if want[f.DeviceID] {
+				rows = append(rows, deviceRowFromStatus(f))
+			}
+		}
+		if card, err := renderDeviceTableCard(rows); err != nil {
+			return "", err
+		} else if card != nil {
+			e.replyCard(ctx, card)
+			return "", nil // 卡片已发送,不重复文本
+	}
+	}
 	// 缺省 online:表述层可用时走 Smart Reply(规则 Facts + LLM 表述),
 	// LLM 挂/未启用 → 规则文本(在 expressDevices 内部降级)。
 	if scope == "online" && e.Express != nil && e.SpecCfg != nil {
@@ -413,6 +439,17 @@ func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
 		b.WriteString("\n" + formatDeviceLine(d))
 	}
 	return b.String(), nil
+}
+
+// replyCard 发送卡片回复(失败降级纯文本提示,不阻塞)。
+func (e *Executor) replyCard(ctx context.Context, card any) {
+if e.CardSender == nil {
+return
+}
+if err := e.CardSender.SendCard(ctx, card); err != nil {
+log := e.log()
+log.Error().Err(err).Msg("feishu cmd card reply failed")
+}
 }
 
 func deviceDisplayName(d store.DeviceStatus) string {
