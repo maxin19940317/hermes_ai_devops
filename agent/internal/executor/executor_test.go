@@ -33,10 +33,14 @@ func sha256hex(s string) string {
 
 // buildPackage 构造含 manifest.yaml 的合法测试包。
 func buildPackage(t *testing.T, timeoutSec int) string {
+	return buildPackageForSOC(t, timeoutSec, "QCM6125")
+}
+
+func buildPackageForSOC(t *testing.T, timeoutSec int, soc string) string {
 	t.Helper()
 	manifest := fmt.Sprintf(`manifest_version: 1
 artifact: {project: p, commit: deadbee1, pipeline_id: 1, platform: aarch64_Android_SNPE_2.21, build_type: Release}
-requirements: {os: android, abi: arm64-v8a, soc: [QCM6125], min_free_storage_mb: 100}
+requirements: {os: android, abi: arm64-v8a, soc: [%s], min_free_storage_mb: 100}
 deploy:
   workdir: %s
   files:
@@ -49,7 +53,7 @@ test:
   success: {exit_code: 0, require_files: [results/result.json]}
 collect: [results/result.json, results/*.json, logs/*.log]
 cleanup: {remove_workdir: true, keep_on_failure: true}
-`, workdir, sha256hex(runSh), timeoutSec)
+`, soc, workdir, sha256hex(runSh), timeoutSec)
 
 	path := filepath.Join(t.TempDir(), "pkg.tar.gz")
 	f, err := os.Create(path)
@@ -77,6 +81,27 @@ cleanup: {remove_workdir: true, keep_on_failure: true}
 	tw.Close()
 	gz.Close()
 	return path
+}
+
+func TestPrecheckUsesRealSOCModelBeforePlatform(t *testing.T) {
+	props := defaultProps()
+	props["ro.soc.model"] = "SM6225"
+	props["ro.board.platform"] = "bengal"
+	props["ro.product.board"] = "bengal"
+
+	f := &fakeADB{props: props, dfAvailKB: 1 << 20}
+	e, _ := newExecutor(f)
+	sum, err := e.Execute(context.Background(), Options{
+		PackagePath: buildPackageForSOC(t, 900, "SM6225"),
+		Serial:      serial,
+		OutDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("真实 SoC 型号与平台代号不同时预检应成功: %v", err)
+	}
+	if got := sum.Environment["soc"]; got != "SM6225" {
+		t.Fatalf("environment soc = %q, want SM6225", got)
+	}
 }
 
 // fakeADB 以 argv 模式匹配模拟设备行为,记录全部调用。
