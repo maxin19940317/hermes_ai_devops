@@ -145,7 +145,11 @@ func (a *Acts) AcquireDevice(ctx context.Context, req wf.AcquireRequest) (*wf.Le
 			_ = a.Store.ReleaseDevice(ctx, lease.DeviceID, req.TaskID, wf.FailScopeNone, a.Cfg.QuarantineAfter)
 			return nil, fmt.Errorf("acquire device: client %s version unknown: %w", lease.ClientID, err)
 		}
-		if compareVersion(cv, a.Cfg.MinAgentVersion) < 0 {
+		// dev 永远放行(CLAUDE.md §12 Phase 3)。未打 ldflags 的 Agent 上报 "dev",
+		// 而 compareVersion 把 dev 排在任何正式版本之下——不豁免的话,设了
+		// MIN_AGENT_VERSION 的部署会让开发/调试机每次 acquire 都占租约再释放,
+		// 重试耗尽后全部落 INFRA_ERROR,现象是"设备在线但全是基础设施错误"(A3)。
+		if cv != DevVersion && compareVersion(cv, a.Cfg.MinAgentVersion) < 0 {
 			a.warnf("acquire device: client %s version %s below minimum %s; releasing lease",
 				lease.ClientID, cv, a.Cfg.MinAgentVersion)
 			_ = a.Store.ReleaseDevice(ctx, lease.DeviceID, req.TaskID, wf.FailScopeNone, a.Cfg.QuarantineAfter)

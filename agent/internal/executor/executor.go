@@ -337,40 +337,38 @@ func (e *Executor) precheckAndroid(ctx context.Context, serial string, m *manife
 	}
 
 	if len(m.Requirements.SOC) > 0 {
-		// SoC 探测复用与心跳同一链(adb.ProbeAndroidSOC:ro.soc.model →
-		// ro.chipname → ro.board.platform → ro.product.board)。
+		// SoC 探测复用与心跳同一链(ro.soc.model → ro.chipname →
+		// ro.board.platform → ro.product.board)。
 		// 2026-08-08 Review P1:心跳按 ro.soc.model 调度成功、预检却只读
-		// ro.board.platform 会造成 soc mismatch(设备上报 SM6225、平台属性
-		// bengal 且无 alias 时)——两套身份判断必须同源。
-		soc := adb.ProbeAndroidSOC(ctx, e.Runner, serial)
+		// ro.board.platform 会造成 soc mismatch——两套身份判断必须同源。
+		//
+		// 2026-08-08 A1:匹配必须遍历**整条链**,不能只用首个命中值。
+		// 别名表按平台代号为键(trinket→QCM6125),而链的第一跳给的是型号串;
+		// 只查首个值时别名根本没机会参与,直接匹配又不上 → 误报 soc mismatch。
+		chain := adb.ProbeAndroidSOCChain(ctx, e.Runner, serial)
 		matched := ""
+	matchLoop:
 		for _, want := range m.Requirements.SOC {
-			if soc != "" && strings.EqualFold(soc, want) {
-				matched = soc
-				break
-			}
-			// 平台代号 → SoC 型号别名(trinket → QCM6125):
-			// 固件只暴露代号,manifest 约束用型号
-			if alias, ok := e.SOCAliases[soc]; ok {
-				// 防御脏配置:alias 值可能带分号/逗号(历史上配错过,
-				// 如 "QCM6125;idp:QCS6490"),按分隔符拆分成多个候选,
-				// 任一命中即视为匹配(与服务器端 SOC 清洗语义一致)。
-				for _, cand := range strings.FieldsFunc(alias, func(r rune) bool {
-					return r == ';' || r == ',' || r == ' '
-				}) {
-					if strings.EqualFold(cand, want) {
-						matched = cand
-						break
-					}
+			// 1) 链上任一候选直接匹配 manifest 要求
+			for _, soc := range chain {
+				if strings.EqualFold(soc, want) {
+					matched = soc
+					break matchLoop
 				}
-				if matched != "" {
-					break
+			}
+			// 2) 链上任一候选经别名表规范化后匹配
+			//    (脏配置拆分与服务端 SOC 清洗语义一致,见 ResolveSOCAlias)
+			for _, soc := range chain {
+				alias, ok := adb.ResolveSOCAlias([]string{soc}, e.SOCAliases)
+				if ok && strings.EqualFold(alias, want) {
+					matched = alias
+					break matchLoop
 				}
 			}
 		}
 		if matched == "" {
-			return fmt.Errorf("soc mismatch: device soc=%q, required one of %v",
-				soc, m.Requirements.SOC)
+			return fmt.Errorf("soc mismatch: device soc chain=%v, required one of %v",
+				chain, m.Requirements.SOC)
 		}
 		sum.Environment["soc"] = matched
 	}

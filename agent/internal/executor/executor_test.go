@@ -687,3 +687,77 @@ func TestCollectSkipsDisallowedPattern(t *testing.T) {
 		}
 	}
 }
+
+// A1:别名表按平台代号为键(trinket→QCM6125),而探测链第一跳 ro.soc.model
+// 给的是型号串(SM6225)。此前只拿首个命中值查别名 → 直接匹配不上、别名也
+// 查不到 → 误报 soc mismatch。修复后必须遍历整条链,让靠后的代号有机会经
+// 别名命中 manifest 要求。
+//
+// 这正是文档 A1 验收项要求的场景;既有的
+// TestPrecheckUsesRealSOCModelBeforePlatform 只覆盖了"型号直接匹配",不覆盖本例。
+func TestPrecheckResolvesAliasFromLaterChainEntry(t *testing.T) {
+	props := defaultProps()
+	props["ro.soc.model"] = "SM6225"       // 链第一跳:型号串,别名表里没有这个键
+	props["ro.board.platform"] = "trinket" // 链第三跳:代号,别名表的键
+	props["ro.product.board"] = "trinket"
+
+	f := &fakeADB{props: props, dfAvailKB: 1 << 20}
+	e, _ := newExecutor(f)
+	e.SOCAliases = map[string]string{"trinket": "QCM6125"}
+
+	sum, err := e.Execute(context.Background(), Options{
+		PackagePath: buildPackageForSOC(t, 900, "QCM6125"), // manifest 要求型号
+		Serial:      serial,
+		OutDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("代号别名在链靠后位置时预检应成功(A1): %v", err)
+	}
+	if got := sum.Environment["soc"]; got != "QCM6125" {
+		t.Fatalf("environment soc = %q, want QCM6125(别名规范化后的型号)", got)
+	}
+}
+
+// 别名值为脏配置(历史上配错过 "QCM6125;idp:QCS6490")时仍需拆分命中。
+func TestPrecheckResolvesDirtyAliasFromChain(t *testing.T) {
+	props := defaultProps()
+	props["ro.soc.model"] = "SM6225"
+	props["ro.board.platform"] = "trinket"
+	props["ro.product.board"] = "trinket"
+
+	f := &fakeADB{props: props, dfAvailKB: 1 << 20}
+	e, _ := newExecutor(f)
+	e.SOCAliases = map[string]string{"trinket": "QCM6125;idp:QCS6490"}
+
+	if _, err := e.Execute(context.Background(), Options{
+		PackagePath: buildPackageForSOC(t, 900, "QCM6125"),
+		Serial:      serial,
+		OutDir:      t.TempDir(),
+	}); err != nil {
+		t.Fatalf("脏 alias 值应按分隔符拆分后命中: %v", err)
+	}
+}
+
+// 链上任何候选都匹配不上时仍须失败,且错误信息要带出整条链(便于排障)。
+func TestPrecheckStillFailsWhenNoChainEntryMatches(t *testing.T) {
+	props := defaultProps()
+	props["ro.soc.model"] = "SM8250"
+	props["ro.board.platform"] = "kona"
+	props["ro.product.board"] = "kona"
+
+	f := &fakeADB{props: props, dfAvailKB: 1 << 20}
+	e, _ := newExecutor(f)
+	e.SOCAliases = map[string]string{"trinket": "QCM6125"}
+
+	_, err := e.Execute(context.Background(), Options{
+		PackagePath: buildPackageForSOC(t, 900, "QCM6125"),
+		Serial:      serial,
+		OutDir:      t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("链上无任何候选匹配时预检必须失败")
+	}
+	if !strings.Contains(err.Error(), "SM8250") || !strings.Contains(err.Error(), "kona") {
+		t.Errorf("错误信息应带出整条探测链便于排障, got: %v", err)
+	}
+}

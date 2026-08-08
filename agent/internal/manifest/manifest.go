@@ -7,11 +7,18 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
 	"gopkg.in/yaml.v3"
 )
+
+// envKeyPattern 与 contracts/manifest.schema.json 的 deploy.env propertyNames 同源。
+// Client 把 env 键**裸拼**进 adb shell 命令串(adb.ShellRunEntry:值加引号、键不加),
+// 所以除 Schema 之外再做一次纵深校验:即便 embed 的 Schema 被绕过或降级,
+// 非法键也不会到达设备(红线 §14:Client 不提供任意 shell)。
+var envKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // EmbeddedSchema 是 contracts/manifest.schema.json 的编译期副本;
 // 与源文件的一致性由 TestEmbeddedSchemaMatchesContract 防漂移。
@@ -103,6 +110,12 @@ func Load(path string) (*Manifest, error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&m); err != nil {
 		return nil, fmt.Errorf("decode manifest: %w", err)
+	}
+	// 纵深校验:env 键会被裸拼进设备 shell 命令,Schema 之外再挡一道(见 envKeyPattern)
+	for k := range m.Deploy.Env {
+		if !envKeyPattern.MatchString(k) {
+			return nil, fmt.Errorf("manifest deploy.env: illegal env key %q (must match %s)", k, envKeyPattern)
+		}
 	}
 	return &m, nil
 }

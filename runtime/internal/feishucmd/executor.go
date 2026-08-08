@@ -53,6 +53,13 @@ type Store interface {
 	RecentRuns(ctx context.Context, limit int) ([]store.RecentRun, error)
 	SaveCommandTranslation(ctx context.Context, row store.CommandTranslation) error
 	ListCommandTranslations(ctx context.Context, openID string, limit int) ([]store.CommandTranslation, error)
+	// SaveDecision 落 decisions 表(§11):人工卡片操作(actor="human")的裁决
+	// 必须可回放。2026-08-08(A7)从类型断言提进接口——此前断言失败会静默降级
+	// 成一条 Warn 日志并返回 nil,审计丢失而调用方无感;现在缺实现是编译错误。
+	SaveDecision(ctx context.Context, row wf.DecisionRow) error
+	// WriteAudit 落 audit_log(§3.7 总则:所有操作留痕)。与 activity 侧一致的
+	// fire-and-forget 语义:失败只记日志,不阻断主链路。
+	WriteAudit(ctx context.Context, entry store.AuditEntry) error
 }
 
 // WorkflowStarter 启动 DeviceTestWorkflow(trigger.TemporalStarter 满足)。
@@ -309,8 +316,13 @@ func (e *Executor) audit(ctx context.Context, openID, rawText, rendered, outcome
 }
 
 // reply 发送回复;Sender 为 nil 时只执行不回复(测试)。
+//
+// 空文本一律不发(A5):卡片路径成功后返回 ""(约定"已回过了"),
+// 若照发会在卡片后多出一条空气泡——飞书要么渲染空消息、要么拒收并让
+// 每次调用都记一条错误日志。prefix 非空时(如"已取消上一条待确认")文本
+// 不为空,仍会正常发出,不受此短路影响。
 func (e *Executor) reply(ctx context.Context, text string) {
-	if e.Sender == nil {
+	if e.Sender == nil || strings.TrimSpace(text) == "" {
 		return
 	}
 	if err := e.Sender.SendText(ctx, text); err != nil {
@@ -782,12 +794,17 @@ func (e *Executor) testInFlight(ctx context.Context, art *store.Artifact, varian
 // retryVariant 从已校验的 workflow run 与 variant 启动单变体重试。
 // 步骤:查 artifact → 取 attempt 号 → 构造 DeviceTestInput → StartDeviceTest。
 // source 不能 nil,已由调用方校验。
+//
+// 返回 (展示文本, 新 workflow ID, error)。newWorkflowID **仅在真正启动了新
+// workflow 时非空**——artifact 缺失 / 已在跑 / Temporal 去重这三种业务结果都
+// 返回空串。调用方据此判断要不要记 retry 决策,不要去反解析展示文本(A6:
+// 文案一改反解析就静默失效)。
 func (e *Executor) retryVariant(
 	ctx context.Context, source *store.WorkflowRun, variant string,
-) (string, error) {
+) (text string, newWorkflowID string, err error) {
 	arts, err := e.Store.ListArtifacts(ctx, source.Project, source.CommitSHA, source.PipelineID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	var ref wf.PackageRef
 	found := false
@@ -799,16 +816,16 @@ func (e *Executor) retryVariant(
 		}
 	}
 	if !found {
-		return fmt.Sprintf("变体 %s 的 artifact 不存在", variant), nil
+		return fmt.Sprintf("变体 %s 的 artifact 不存在", variant), "", nil
 	}
 	if id := e.retryInFlight(ctx, source, variant); id != "" {
-		return fmt.Sprintf("重试正在进行中: %s", id), nil
+		return fmt.Sprintf("重试正在进行中: %s", id), "", nil
 	}
 	n, err := e.Store.NextWorkflowAttempt(
 		ctx, source.Project, source.CommitSHA, source.PipelineID, variant,
 	)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	in := wf.DeviceTestInput{
 		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
@@ -819,12 +836,13 @@ func (e *Executor) retryVariant(
 	}
 	id, started, err := e.Starter.StartDeviceTest(ctx, in)
 	if err != nil {
-		return "", fmt.Errorf("start workflow: %w", err)
+		return "", "", fmt.Errorf("start workflow: %w", err)
 	}
 	if !started {
-		return fmt.Sprintf("workflow 已存在: %s", id), nil
+		// Temporal 去重命中:没有起新 workflow,不算一次人工重试决策
+		return fmt.Sprintf("workflow 已存在: %s", id), "", nil
 	}
-	return fmt.Sprintf("已启动重试 %s: %s", variant, id), nil
+	return fmt.Sprintf("已启动重试 %s: %s", variant, id), id, nil
 }
 
 // HandleCardAction 处理飞书交互卡片按钮点击(card.action.trigger 经 WS 送达)。
@@ -862,10 +880,36 @@ func (e *Executor) HandleCardAction(
 		if !closed {
 			return "workflow 尚未结束，无法重试", "info", nil
 		}
-		text, err = e.retryVariant(ctx, source, value.Variant)
-		if err != nil {
-			return "", "", err
+		text, newWorkflowID, rerr := e.retryVariant(ctx, source, value.Variant)
+		if rerr != nil {
+			return "", "", rerr
 		}
+		// 只有真正启动了新 workflow 才算一次人工重试决策(A6):artifact 缺失 /
+		// 已在跑 / Temporal 去重都没有产生新执行,记下来只会污染审计。
+		if newWorkflowID != "" {
+			taskID, terr := e.Store.LatestTaskIDForVariant(ctx, source.WorkflowID, value.Variant)
+			if terr != nil {
+				return "", "", fmt.Errorf("lookup task for %s/%s: %w", source.WorkflowID, value.Variant, terr)
+			}
+			// taskID 为空 = 该变体在此运行中无任务记录(decisions.task_id 有 FK
+			// 指向 tasks,写不进去)。重试本身已经成功,不因审计写不下而报错,
+			// 降级为一条 Warn。
+			if taskID == "" {
+				e.log().Warn().
+					Str("open_id", openID).
+					Str("workflow", value.SourceWorkflowID).
+					Str("variant", value.Variant).
+					Msg("card action: retry started but no task row to attach decision to")
+			} else if derr := e.saveCardActionDecision(ctx, taskID, openID, value, newWorkflowID); derr != nil {
+				return "", "", derr
+			}
+		}
+		e.log().Info().
+			Str("open_id", openID).
+			Str("workflow", value.SourceWorkflowID).
+			Str("variant", value.Variant).
+			Str("new_workflow", newWorkflowID).
+			Msg("card action: retry")
 		return text, "success", nil
 
 	case "ignore":
@@ -879,12 +923,7 @@ func (e *Executor) HandleCardAction(
 		if taskID == "" {
 			return "该变体在此运行中没有任务记录", "info", nil
 		}
-		output, _ := json.Marshal(value)
-		dec := wf.DecisionRow{
-			TaskID: taskID, Actor: "human",
-			Output: output,
-		}
-		if err := e.saveDecision(ctx, dec); err != nil {
+		if err := e.saveCardActionDecision(ctx, taskID, openID, value, ""); err != nil {
 			return "", "", err
 		}
 		e.log().Info().
@@ -899,17 +938,53 @@ func (e *Executor) HandleCardAction(
 	}
 }
 
-// saveDecision 落 decisions 表(actor="human" 的卡片操作)。
-// 重复插入(相同 task_id+actor)静默成功(幂等)。
-func (e *Executor) saveDecision(ctx context.Context, row wf.DecisionRow) error {
-	// Store 接口里没有 SaveDecision,需要通过类型断言;如果 store 不支持则降级记日志。
-	type decisionSaver interface {
-		SaveDecision(ctx context.Context, row wf.DecisionRow) error
+// cardActionDecision 是卡片操作落 decisions 表的 output 载荷。
+//
+// 为什么不直接存 wf.ButtonValue:它只有 action / source_workflow_id / variant,
+// **不含操作者身份**,而 actor="human" 只是角色——存了也回答不了"谁干的"。
+// open_id 在 HandleCardAction 的形参里现成可用,显式带上(A6)。
+type cardActionDecision struct {
+	Action           string `json:"action"`
+	SourceWorkflowID string `json:"source_workflow_id"`
+	Variant          string `json:"variant"`
+	OpenID           string `json:"open_id"`
+	// NewWorkflowID 仅 retry 且**真正启动了新 workflow** 时非空;
+	// artifact 缺失 / 已在跑 / Temporal 去重这三种结果不填(也不记 decision)。
+	NewWorkflowID string `json:"new_workflow_id,omitempty"`
+}
+
+// saveCardActionDecision 落 decisions 表(actor="human" 的卡片操作)+ audit_log。
+//
+// 注意:decisions 表**没有**唯一约束(schema.sql 只有 decision_id BIGSERIAL
+// PRIMARY KEY),PGStore.SaveDecision 是普通 INSERT——重复点击会写多行,
+// 本函数不做幂等承诺(此前 godoc 声称"重复插入静默成功(幂等)"是不成立的,A7)。
+func (e *Executor) saveCardActionDecision(
+	ctx context.Context, taskID, openID string, value wf.ButtonValue, newWorkflowID string,
+) error {
+	output, err := json.Marshal(cardActionDecision{
+		Action:           value.Action,
+		SourceWorkflowID: value.SourceWorkflowID,
+		Variant:          value.Variant,
+		OpenID:           openID,
+		NewWorkflowID:    newWorkflowID,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal card action decision: %w", err)
 	}
-	if ds, ok := e.Store.(decisionSaver); ok {
-		return ds.SaveDecision(ctx, row)
+	if err := e.Store.SaveDecision(ctx, wf.DecisionRow{
+		TaskID: taskID, Actor: "human", Output: output,
+	}); err != nil {
+		return err
 	}
-	e.log().Warn().Str("task_id", row.TaskID).Msg("store does not support SaveDecision, card action unrecorded")
+	// audit_log:与 activity 侧一致的 fire-and-forget——审计失败不该让用户的
+	// 按钮操作失败(§3.7 要求留痕,但留痕不是主链路)。
+	if err := e.Store.WriteAudit(ctx, store.AuditEntry{
+		Actor:  "human:" + openID,
+		Action: "card_" + value.Action,
+		Target: taskID,
+	}); err != nil {
+		e.log().Warn().Err(err).Str("task_id", taskID).Msg("write audit for card action failed")
+	}
 	return nil
 }
 

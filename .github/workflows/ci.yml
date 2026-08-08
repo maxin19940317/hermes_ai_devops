@@ -1,0 +1,58 @@
+# 本仓库此前没有任何 CI(A11 第三层根因):ci/gitlab-ci.example.yml 是给业务仓库
+# algo-super-sdk 用的模板,不跑本仓库的测试。结果是守卫 §3/§14 红线的断言
+# "写了但从未被执行过"——包括 mcp_bridge 里"不允许出现直连 ADB 工具"那条。
+#
+# 这份 workflow 只做一件事:让所有已有的红线测试真的跑起来。
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  go:
+    name: Go (runtime + agent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          # 两个 module 各自的 go.sum
+          cache-dependency-path: |
+            runtime/go.sum
+            agent/go.sum
+
+      # 与本地门禁同一套检查(scripts/lint.sh:gofmt + go vet + go test),
+      # 保证"本地过了 CI 也过"。
+      - name: lint + vet + test
+        run: bash scripts/lint.sh
+
+  python:
+    name: Python (contracts + ci + hermes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r contracts/tests/requirements.txt
+          pip install -r hermes/requirements.txt
+
+      # 契约正反例 + CI 脚本 + 三个 bridge。
+      # -p no:randomly 保证顺序稳定;--strict-markers 防止 marker 拼错被静默忽略。
+      - name: pytest
+        run: python -m pytest contracts/tests ci/tests hermes -q --strict-markers
+
+      # 红线断言必须真的执行到,不能因为依赖缺失被 collect error 跳过(A11)。
+      # 断言这条用例存在且通过——它守的是"MCP 工具里不得出现 adb_* 直连工具"。
+      - name: assert red-line test actually ran
+        run: |
+          python -m pytest hermes/mcp_bridge/test_mcp_bridge.py::test_tools_registered \
+            -q --no-header | tee /tmp/redline.txt
+          grep -q "1 passed" /tmp/redline.txt

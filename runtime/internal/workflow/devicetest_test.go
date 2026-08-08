@@ -1711,21 +1711,25 @@ func TestBuildNotificationCardTruncatesChineseValidUTF8(t *testing.T) {
 
 // TestFormatMetricsCard:卡片指标每行一个,指标名加粗 + 数值等宽;
 // 键排序确定性,`_inference_ms_avg` 后缀剥掉显示 ms。
+//
+// 2026-08-08(A9):期望值补上 "- " 前缀。此前这里锁定的是无前缀格式,
+// 而该元素以 display=list/bullet 构造——飞书在缺前缀时只按普通文本逐行显示,
+// 即本用例把一个渲染 bug 固化成了期望值。
 func TestFormatMetricsCard(t *testing.T) {
 	got := formatMetricsCard(map[string]float64{
 		"gesture_test.inference_ms_avg":          16.7,
 		"detect_face_attr_test.inference_ms_avg": 46.4,
 		"seg_crowd_test.inference_ms_avg":        18.0,
 	})
-	want := "detect_face_attr_test  **46.4ms**\n" +
-		"gesture_test  **16.7ms**\n" +
-		"seg_crowd_test  **18.0ms**"
+	want := "- detect_face_attr_test  **46.4ms**\n" +
+		"- gesture_test  **16.7ms**\n" +
+		"- seg_crowd_test  **18.0ms**"
 	if got != want {
 		t.Errorf("formatMetricsCard = %q, want %q", got, want)
 	}
 	// 非推理指标:保留原键,数值 3 位有效数字
 	got2 := formatMetricsCard(map[string]float64{"peak_rss_mb": 214.5})
-	if got2 != "peak_rss_mb  **214**" {
+	if got2 != "- peak_rss_mb  **214**" {
 		t.Errorf("formatMetricsCard 非推理指标 = %q", got2)
 	}
 }
@@ -1771,5 +1775,28 @@ func TestCardReasonLinesListAndParagraph(t *testing.T) {
 	if len(els2) != 3 || els2[1].Tag != "markdown" ||
 		els2[1].Content != "- 甲\n- 乙\n- 丙" {
 		t.Errorf("连续列表行未归并/前缀丢失: %+v", els2)
+	}
+}
+
+// A9:metrics 块以 display=list / bullet 构造,飞书要求 content 每行保留 "- "
+// 前缀才渲染圆点列表;缺前缀会退化成普通多行文本(实测 2026-08-06 r8)。
+// cardReasonLines 早已遵守该规则,formatMetricsCard 之前漏了。
+func TestFormatMetricsCardKeepsBulletPrefix(t *testing.T) {
+	got := formatMetricsCard(map[string]float64{
+		"ocr_test.inference_ms_avg": 1451.39,
+		"peak_rss_mb":               214,
+	})
+	lines := strings.Split(got, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("行数 = %d, want 2: %q", len(lines), got)
+	}
+	for _, ln := range lines {
+		if !strings.HasPrefix(ln, "- ") {
+			t.Errorf("metrics 行缺 %q 前缀,display=list 下不会渲染为圆点列表: %q", "- ", ln)
+		}
+	}
+	// 排序确定性 + 指标名与数值仍在
+	if !strings.Contains(lines[0], "ocr_test") || !strings.Contains(lines[0], "1451.4ms") {
+		t.Errorf("首行内容异常: %q", lines[0])
 	}
 }

@@ -23,21 +23,65 @@ var socProbeChain = []string{
 	"ro.product.board",
 }
 
-// ProbeAndroidSOC 按 socProbeChain 探测设备 SoC,返回第一个通过 validSOC
-// 校验的值;全部取不到返回 ""。与 reporter.probeAndroidSOC 同一语义——
-// 这是两套设备身份判断(心跳 vs 预检)的唯一共享实现。
-func ProbeAndroidSOC(ctx context.Context, runner Runner, serial string) string {
+// ProbeAndroidSOCChain 按 socProbeChain 探测,返回**所有**通过 ValidSOC 校验的
+// 值(保持链上顺序,去重);全部取不到返回空切片。
+//
+// 为什么要返回整条链而不是首个命中(2026-08-08 A1):别名表(AGENT_SOC_ALIASES /
+// 服务端 DEVICE_SOC_ALIASES)按惯例以**平台代号**为键(trinket→QCM6125),
+// 而链的第一跳 ro.soc.model 给的是**型号串**。只拿首个值去查别名,会出现
+// "别名本可以救、却没机会参与"的情况:直接匹配不上、别名也查不到,
+// 于是预检报 soc mismatch、心跳注册的 soc 匹配不上任何 manifest(变体被静默
+// 判 SKIPPED)。调用方必须对每个候选依次尝试"直接匹配 → 别名匹配"。
+func ProbeAndroidSOCChain(ctx context.Context, runner Runner, serial string) []string {
+	var out []string
+	seen := map[string]bool{}
 	for _, prop := range socProbeChain {
 		soc, err := getPropQuiet(ctx, runner, serial, prop)
 		if err != nil || soc == "" {
 			continue
 		}
-		if !ValidSOC(soc) {
+		if !ValidSOC(soc) || seen[soc] {
 			continue
 		}
-		return soc
+		seen[soc] = true
+		out = append(out, soc)
 	}
-	return ""
+	return out
+}
+
+// ProbeAndroidSOC 返回链上第一个有效值(设备身份的展示/上报缺省值);
+// 全部取不到返回 ""。**做匹配判断时不要用它**——用 ProbeAndroidSOCChain
+// 遍历整条链,理由见其 doc comment。
+func ProbeAndroidSOC(ctx context.Context, runner Runner, serial string) string {
+	chain := ProbeAndroidSOCChain(ctx, runner, serial)
+	if len(chain) == 0 {
+		return ""
+	}
+	return chain[0]
+}
+
+// ResolveSOCAlias 在候选链上依次尝试别名表,返回第一个命中的**规范化型号**与 true。
+// alias 值可能是脏配置(历史上配错过 "QCM6125;idp:QCS6490"),按 ; , 空格拆分,
+// 取第一个非空片段——与服务端 SOC 清洗语义一致。
+func ResolveSOCAlias(chain []string, aliases map[string]string) (string, bool) {
+	for _, soc := range chain {
+		alias, ok := aliases[soc]
+		if !ok {
+			// 别名表键可能按小写代号归一(服务端语义),再试一次
+			alias, ok = aliases[strings.ToLower(soc)]
+		}
+		if !ok {
+			continue
+		}
+		for _, cand := range strings.FieldsFunc(alias, func(r rune) bool {
+			return r == ';' || r == ',' || r == ' '
+		}) {
+			if cand != "" {
+				return cand, true
+			}
+		}
+	}
+	return "", false
 }
 
 // ValidSOC 校验 getprop 返回的 SoC 内容形态,拒绝 shell 错误文本被当做

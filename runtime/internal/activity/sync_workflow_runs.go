@@ -52,7 +52,14 @@ func (a *Acts) SyncWorkflowRuns(ctx context.Context, req wf.SyncWorkflowRunsRequ
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
-		resp, err := a.HTTP.Do(httpReq)
+		// a.HTTP 可能未注入(非 cmd/worker 的装配路径、测试夹具):兜底 DefaultClient,
+		// 与 postEscalation 保持一致。裸解引用会 panic → Temporal 重试耗尽,
+		// 而 DeviceTestWorkflow 正阻塞在本活动的 .Get() 上,整个 run 卡在最后一步(A10)。
+		hc := a.HTTP
+		if hc == nil {
+			hc = http.DefaultClient
+		}
+		resp, err := hc.Do(httpReq)
 		cancel()
 		if err != nil {
 			a.warnf("sync workflow run %s: %v", tk.Variant, err)

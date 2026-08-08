@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,5 +137,67 @@ undeclared_field: should_be_rejected
 	errMsg := err.Error()
 	if !strings.Contains(errMsg, "unknown field") && !strings.Contains(errMsg, "undeclared") {
 		t.Errorf("err = %v, want mention of unknown/undeclared field", err)
+	}
+}
+
+// env 键会被 adb.ShellRunEntry 裸拼进设备 shell 命令串(值加引号、键不加),
+// 所以非法键必须在 Load 阶段就被拒(红线 §14:Client 不提供任意 shell)。
+// Schema 的 propertyNames 与 Load 里的 envKeyPattern 是两道独立防线,
+// 本用例覆盖两者中先触发的那道。
+func TestLoadRejectsShellInjectionInEnvKey(t *testing.T) {
+	manifestTmpl := `manifest_version: 1
+artifact:
+  project: test
+  commit: abc1234
+  pipeline_id: 1
+  platform: aarch64_Android_SNPE_2.21
+  build_type: Release
+requirements:
+  os: android
+  abi: arm64-v8a
+deploy:
+  workdir: /data/local/tmp/test
+  files:
+    - src: run.sh
+      dst: run.sh
+      mode: "0755"
+      sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  env:
+    %q: "x"
+test:
+  entry: ./run.sh
+  timeout_sec: 300
+  success:
+    exit_code: 0
+collect:
+  - results/*.json
+`
+	badKeys := []string{
+		"LD_LIBRARY_PATH=x; rm -rf /data/local/tmp; X", // 命令分隔符注入
+		"A B",              // 空格拆出新 argv
+		"A$(id)",           // 命令替换
+		"A`id`",            // 反引号替换
+		"A&&id",            // 逻辑连接符
+		"0STARTS_WITH_NUM", // 非法首字符(POSIX 环境变量名不得以数字开头)
+	}
+	for _, k := range badKeys {
+		t.Run(k, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "manifest.yaml")
+			if err := os.WriteFile(path, []byte(fmt.Sprintf(manifestTmpl, k)), 0644); err != nil {
+				t.Fatalf("write test manifest: %v", err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("env key %q was accepted; it can inject arbitrary device commands", k)
+			}
+		})
+	}
+}
+
+// 合法的 POSIX 环境变量名不能被上面的约束误伤(防止修红线时把正常变体打挂)。
+func TestLoadAcceptsPosixEnvKeys(t *testing.T) {
+	for _, k := range []string{"LD_LIBRARY_PATH", "ADSP_LIBRARY_PATH", "_UNDERSCORE_LEAD", "A1"} {
+		if !envKeyPattern.MatchString(k) {
+			t.Errorf("legit env key %q rejected by envKeyPattern", k)
+		}
 	}
 }
