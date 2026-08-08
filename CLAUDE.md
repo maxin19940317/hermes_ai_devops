@@ -267,7 +267,10 @@ audit_log(actor, action, target, payload_digest, ts)
 legacy artifacts/tasks 回填。`RecentRuns` 中无 `workflow_runs` 身份的 legacy 行只用于
 展示，不可触发副作用。人工重跑语法固定为
 `rerun <source_workflow_id> [variant]`；每条文本指令都会分配新的 attempt，不能把
-Temporal `RejectDuplicate` 当作指令幂等。按钮操作(重试/忽略)经 WS card.action.trigger 回调送达,在 feishucmd.Executor.HandleCardAction 执行;忽略记 decisions 表(actor="human")供审计。
+Temporal `RejectDuplicate` 当作指令幂等。按钮操作(重试/忽略)经 WS card.action.trigger 回调送达,在 feishucmd.Executor.HandleCardAction 执行;
+**两个按钮都记 decisions 表**(actor="human",output 含 `open_id`——只有 actor 回答不了"谁触发的")并写 audit_log,与 §3.7 总则一致
+(2026-08-08 起;此前只有忽略记 decisions 且不含操作者身份)。重试仅在**真正启动了新 workflow** 时记录:artifact 缺失/已在跑/Temporal 去重
+这三种结果没有产生新执行,记下来只会污染审计。注意 `decisions` 表无唯一约束,重复点击会写多行,不提供幂等。
 
 Client 本地 SQLite:`tasks(task_id, idempotency_key, state, manifest_path, started_at, ...)` + `events(seq, ...)`,每次状态迁移单事务落盘,崩溃重启后据此恢复。
 
@@ -314,7 +317,8 @@ CLAUDE.md §4 卡片状态已同步。
 mTLS 双向 + Client 身份签发✅(2026-08-04 上线,仅 Agent→Runtime 回调方向 18091 强制客户端证书;
 Runtime→Agent 派单方向 8480 仍为测试子网纯 HTTP,待 Agent TLS listener);
 全链路幂等键核验✅ + ≥10 场景故障注入矩阵✅(runtime/internal/workflow/fault_injection_test.go);
-审计完备✅(audit_log 表,dispatched/device_leased/device_released/escalated 四类动作,fire-and-forget 不阻断主链路);
+审计完备✅(audit_log 表,dispatched/device_leased/device_released/escalated 四类活动动作 + card_retry/card_ignore 两类人工动作
+(2026-08-08 补,actor="human:{open_id}"),fire-and-forget 不阻断主链路。§3.7 总则"所有操作落 audit_log"是目标态,此处列举为当前已实现范围);
 MinIO 生命周期✅(Temporal Schedule `evidence-lifecycle-daily` 每日 UTC 3:00:runs/ PASSED 7 天、失败 90 天;
 evidence/ 快照不过期,是 decisions 的回放依据);
 Agent 版本上报 + 最低版本门禁✅(ldflags 注入版本,`MIN_AGENT_VERSION` 空=不启用,dev 永远放行);

@@ -17,7 +17,7 @@ hermes-runtime 网络内的 hermes-devops-analyzer 容器(与 analyze_bridge 同
 feishucmd.Executor(worker 内),本 bridge 只做信封翻译,无 LLM、无状态。
 
 配置(环境变量):
-  RUNTIME_CMD_API_URL     Runtime 受控接口,缺省 http://trigger:8090/api/v1/cmd
+  RUNTIME_CMD_API_URL     Runtime 受控接口,缺省 https://worker:8091/api/v1/cmd
   RUNTIME_CMD_API_TOKEN   Runtime CMD_API_TOKEN(Bearer)
   MCP_BRIDGE_PORT         监听端口,缺省 8645
 """
@@ -37,7 +37,9 @@ RUNTIME_CMD_API_URL = os.environ.get("RUNTIME_CMD_API_URL", "https://worker:8091
 RUNTIME_CMD_API_TOKEN = os.environ.get("RUNTIME_CMD_API_TOKEN", "")
 # mTLS(Phase 3):Runtime callbacks listener 要求客户端证书(Agent→Runtime 方向
 # 18091 强制)。MCP bridge 用专用客户端证书(client-mcp-bridge)访问 worker:8091。
-# CA 证书用于校验服务端;cert 是客户端证书+私钥合体。三件套任一空 → 纯 HTTP。
+# 两个配置项:MTLS_CA_FILE 用于校验服务端;MTLS_CLIENT_CERT 是客户端证书+私钥
+# 合体的单个文件。两项任一为空 → 纯 HTTP(此前这里写"三件套"与同句的"合体"
+# 自相矛盾,且会让人去找并不存在的第三个环境变量)。
 MTLS_CA_FILE = os.environ.get("MTLS_CA_FILE", "")
 MTLS_CLIENT_CERT = os.environ.get("MTLS_CLIENT_CERT", "")
 PORT = int(os.environ.get("MCP_BRIDGE_PORT", "8645"))

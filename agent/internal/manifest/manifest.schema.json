@@ -80,6 +80,10 @@
         "env": {
           "type": "object",
           "additionalProperties": { "type": "string" },
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "description": "环境变量名(POSIX 字符集)。Client 在 adb shell 命令串中**裸拼**此键(不加引号),故必须在契约层限死字符集,否则可注入任意设备端命令(红线 §14)"
+          },
           "description": "值中 {workdir} 由 Client 在部署时替换为实际 workdir"
         }
       }

@@ -119,9 +119,14 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 	if release, err := p.getprop(ctx, transport, "ro.build.version.release"); err == nil {
 		props.Android = release
 	}
+	// 别名解析必须遍历**整条**探测链(2026-08-08 A1):别名表按平台代号为键
+	// (trinket→QCM6125),而链的第一跳 ro.soc.model 给的是型号串。只拿首个值
+	// 查别名时别名永不命中,设备会以型号串注册 → SelectTestSpecs 找不到匹配
+	// 设备 → 变体被静默判 SKIPPED(无错误、无告警,最难排查的那种)。
+	chain := adb.ProbeAndroidSOCChain(ctx, p.Runner, transport)
 	soc := p.probeAndroidSOC(ctx, transport)
-	if alias, ok := p.SOCAliases[soc]; ok {
-		p.logf("probe: %s soc %s -> %s (alias)", serial, soc, alias)
+	if alias, ok := adb.ResolveSOCAlias(chain, p.SOCAliases); ok {
+		p.logf("probe: %s soc chain %v -> %s (alias)", serial, chain, alias)
 		soc = alias
 	}
 	props.SOC = soc

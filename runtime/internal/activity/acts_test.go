@@ -114,3 +114,59 @@ func TestReleaseDeviceScopeTranslation(t *testing.T) {
 		})
 	}
 }
+
+// storeWithClientVersion 注册一台设备并指定 client 上报的版本。
+func storeWithClientVersion(t *testing.T, version string) *store.MemStore {
+	t.Helper()
+	s := store.NewMemStore()
+	err := s.UpsertClientDevices(ctx,
+		store.Client{ClientID: "c1", BaseURL: "https://client:8443", Version: version},
+		[]store.Device{{DeviceID: "513cd3de", Serial: "513cd3de", ClientID: "c1",
+			SOC: "QCM6125", ABI: "arm64-v8a", Capabilities: []string{"hexagon"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// A3:CLAUDE.md §12 Phase 3 明文 "MIN_AGENT_VERSION 空=不启用,dev 永远放行"。
+// compareVersion 把 dev 排在任何正式版本之下,所以门禁必须显式豁免;
+// 否则未打 ldflags 的 Agent 在设了 MIN_AGENT_VERSION 的部署上每次 acquire
+// 都占租约再释放,重试耗尽后全部落 INFRA_ERROR。
+func TestAcquireDeviceVersionGate(t *testing.T) {
+	cases := []struct {
+		name      string
+		clientVer string
+		minVer    string
+		wantLease bool
+	}{
+		{"dev 永远放行", "dev", "0.1.0", true},
+		{"门禁未启用时放行任意版本", "0.0.1", "", true},
+		{"正式版本达标放行", "0.2.0", "0.1.0", true},
+		{"正式版本过低拒绝", "0.0.9", "0.1.0", false},
+		// git describe --always 在无 tag 仓库上给出裸 commit hash,
+		// 会被解析成 0.0.0——这不是 dev,应照常被门禁拦下。
+		{"裸 commit hash 按 0.0.0 处理并拒绝", "abc1234", "0.1.0", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := storeWithClientVersion(t, tc.clientVer)
+			a := &Acts{Store: s, Cfg: Config{
+				LeaseSeconds: 120, QuarantineAfter: 3, MinAgentVersion: tc.minVer,
+			}}
+			l, err := a.AcquireDevice(ctx, wf.AcquireRequest{TaskID: "t1",
+				Selector: wf.DeviceSelector{SOC: []string{"QCM6125"}}})
+			if tc.wantLease {
+				if err != nil || l == nil {
+					t.Fatalf("client version %q / min %q 应放行, got lease=%+v err=%v",
+						tc.clientVer, tc.minVer, l, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("client version %q / min %q 应被拒绝, got lease=%+v",
+					tc.clientVer, tc.minVer, l)
+			}
+		})
+	}
+}

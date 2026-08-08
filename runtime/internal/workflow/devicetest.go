@@ -550,11 +550,14 @@ func formatMetricsCard(m map[string]float64) string {
 	}
 	sort.Strings(keys) // 保持确定性(与 formatMetrics 一致)
 	lines := make([]string, 0, len(keys))
+	// "- " 前缀必须保留:元素以 display=list/bullet 构造,飞书只有在 content
+	// 每行带 "- " 时才渲染圆点列表,否则退化为普通多行文本(实测 2026-08-06 r8,
+	// 见 cardReasonLines 的同款注释)。前缀不参与 escapeCardText——只转义动态字段。
 	for _, k := range keys {
 		if name, ok := strings.CutSuffix(k, ".inference_ms_avg"); ok {
-			lines = append(lines, fmt.Sprintf("%s  **%.1fms**", escapeCardText(name), m[k]))
+			lines = append(lines, fmt.Sprintf("- %s  **%.1fms**", escapeCardText(name), m[k]))
 		} else {
-			lines = append(lines, fmt.Sprintf("%s  **%.3g**", escapeCardText(k), m[k]))
+			lines = append(lines, fmt.Sprintf("- %s  **%.3g**", escapeCardText(k), m[k]))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -1443,12 +1446,14 @@ func runParallelSpecs(ctx workflow.Context, sel SpecSelection, in DeviceTestInpu
 
 	// 按 spec 声明顺序收集结果 → 输出顺序确定性
 	// 取消时 Await 返回 err:spec goroutine 可能还没写 sums[idx],
-	// 此时填 FAILED 摘要避免 nil deref → workflow panic → 无限重试。
+	// 此时填占位摘要避免 nil deref → workflow panic → 无限重试。
+	// verdict 必须取自枚举(§9);"CANCELED → INCONCLUSIVE" 是 §9 明文规则,
+	// 早先这里写的 "FAILED" 是枚举外的值(A4a)。
 	for i := range specs {
 		if err := workflow.Await(ctx, func() bool { return sums[i] != nil }); err != nil || sums[i] == nil {
 			out.Tasks = append(out.Tasks, TaskSummary{
 				TestID: specs[i].TestID, Variant: specs[i].Variant,
-				Verdict: "FAILED", Reason: "workflow canceled",
+				Verdict: string(rules.VerdictInconclusive), Reason: "workflow canceled",
 			})
 			continue
 		}

@@ -249,3 +249,56 @@ func TestFaultInjectionSelectSpecsFailed(t *testing.T) {
 		t.Error("dispatch must not be called when SelectTestSpecs fails")
 	}
 }
+
+// ---- A4a: 取消并发 spec 时,占位摘要的 verdict 必须取自 §9 枚举 ----
+// 早先此处写死 "FAILED"(枚举外的值),会被下游按"业务失败"处理。
+// §9 明文:CANCELED → INCONCLUSIVE。
+// 本用例只断言 verdict 值本身——卡片配色与 rerun 候选语义属 A4b 的产品决策,
+// 未定之前不在此固化。
+func TestCanceledParallelSpecUsesInconclusiveVerdict(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1(), specParallel2()}}
+	env := newEnv(t, f)
+	// 不投递任何结果 signal → spec 卡在 awaitResult;在 dispatch 之后、
+	// 租约到期(120s)之前取消,迫使 runParallelSpecs 走 sums[i] == nil 的占位分支。
+	env.RegisterDelayedCallback(func() { env.CancelWorkflow() }, 10*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+
+	var out DeviceTestOutput
+	_ = env.GetWorkflowResult(&out) // 取消时 GetWorkflowResult 可能返回 canceled error
+
+	valid := map[string]bool{
+		string(rules.VerdictPassed):       true,
+		string(rules.VerdictTestFailed):   true,
+		string(rules.VerdictPerfRegress):  true,
+		string(rules.VerdictInfraError):   true,
+		string(rules.VerdictInconclusive): true,
+		VerdictSkipped:                    true,
+	}
+	placeholders := 0
+	for _, tk := range out.Tasks {
+		if !valid[tk.Verdict] {
+			t.Errorf("variant %s: verdict %q 不在 §9 枚举内", tk.Variant, tk.Verdict)
+		}
+		if tk.Reason == "workflow canceled" {
+			placeholders++
+			if tk.Verdict != string(rules.VerdictInconclusive) {
+				t.Errorf("variant %s: 取消占位 verdict = %q, want INCONCLUSIVE(§9)", tk.Variant, tk.Verdict)
+			}
+		}
+	}
+	// 断言占位分支确实被走到:否则本用例会在分支不可达时静默空过,
+	// 看起来绿但什么都没验证。
+	if placeholders == 0 {
+		t.Fatalf("没有任何 task 走到取消占位分支(tasks=%d),本用例已失去意义——"+
+			"请检查取消时机或 runParallelSpecs 的 sums[i]==nil 分支是否仍可达", len(out.Tasks))
+	}
+}
+
+// specParallel2 是第二个 spec,用于触发 runParallelSpecs(并发路径)。
+func specParallel2() TestSpec {
+	s := spec1()
+	s.TestID = "t2"
+	s.Variant = "aarch64_Android_QCM6490_SNPE_2.21"
+	return s
+}

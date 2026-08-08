@@ -2,6 +2,7 @@ package feishucmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -1588,4 +1589,113 @@ func containsOutcome(rows []store.CommandTranslation, outcome string) bool {
 		}
 	}
 	return false
+}
+
+// A6:retry 按钮此前零记录(无 decisions、无 audit_log,成功路径连日志都没有),
+// 而 ignore 分支虽落了 decisions,存的 ButtonValue 也不含操作者身份。
+// 现在两者都必须能从库里回答"谁触发的"。
+func TestHandleCardActionRetryRecordsDecisionWithOpenID(t *testing.T) {
+	ms := store.NewMemStore()
+	seedRetrySource(t, ms)
+	if err := ms.CreateTask(ctx, wf.TaskRow{
+		TaskID: "w-1:v1:a1", WorkflowID: "w-1", TestID: "v1", Attempt: 1, IdempotencyKey: "w-1:v1:a1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r1ID := wf.DeviceTestInput{
+		Project: "grp/p", Commit: "abcd1234", PipelineID: 42, Scope: "v1", Attempt: 1,
+	}.WorkflowID()
+	starter := &fakeStarter{started: true, closedByID: map[string]bool{"w-1": true, r1ID: true}}
+	exec := newExec(ms, starter, &fakeSender{})
+
+	_, toast, err := exec.HandleCardAction(ctx,
+		wf.ButtonValue{Action: "retry", SourceWorkflowID: "w-1", Variant: "v1"}, wlOpenID)
+	if err != nil || toast != "success" {
+		t.Fatalf("retry err=%v toast=%q", err, toast)
+	}
+
+	decs, err := ms.ListDecisions(ctx, "w-1:v1:a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decs) != 1 {
+		t.Fatalf("decisions = %d, want 1(retry 必须留裁决)", len(decs))
+	}
+	if decs[0].Actor != "human" {
+		t.Errorf("actor = %q, want human", decs[0].Actor)
+	}
+	var got cardActionDecision
+	if err := json.Unmarshal(decs[0].Output, &got); err != nil {
+		t.Fatalf("output 不是 cardActionDecision: %v (%s)", err, decs[0].Output)
+	}
+	if got.OpenID != wlOpenID {
+		t.Errorf("open_id = %q, want %q —— 只有 actor=human 回答不了'谁触发的'", got.OpenID, wlOpenID)
+	}
+	if got.Action != "retry" || got.Variant != "v1" || got.SourceWorkflowID != "w-1" {
+		t.Errorf("decision 载荷字段不全: %+v", got)
+	}
+	if got.NewWorkflowID == "" {
+		t.Error("new_workflow_id 为空:应记录本次真正启动的 workflow(不靠反解析展示文本)")
+	}
+}
+
+// ignore 分支同样要能追溯操作者(此前存的 ButtonValue 不含身份)。
+func TestHandleCardActionIgnoreRecordsOpenID(t *testing.T) {
+	ms := store.NewMemStore()
+	seedRetrySource(t, ms)
+	if err := ms.CreateTask(ctx, wf.TaskRow{
+		TaskID: "w-1:v1:a1", WorkflowID: "w-1", TestID: "v1", Attempt: 1, IdempotencyKey: "w-1:v1:a1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	exec := newExec(ms, &fakeStarter{}, &fakeSender{})
+
+	if _, _, err := exec.HandleCardAction(ctx,
+		wf.ButtonValue{Action: "ignore", SourceWorkflowID: "w-1", Variant: "v1"}, wlOpenID); err != nil {
+		t.Fatal(err)
+	}
+	decs, _ := ms.ListDecisions(ctx, "w-1:v1:a1")
+	if len(decs) != 1 {
+		t.Fatalf("decisions = %d, want 1", len(decs))
+	}
+	var got cardActionDecision
+	if err := json.Unmarshal(decs[0].Output, &got); err != nil {
+		t.Fatalf("output 不是 cardActionDecision: %v", err)
+	}
+	if got.OpenID != wlOpenID {
+		t.Errorf("ignore 的 open_id = %q, want %q", got.OpenID, wlOpenID)
+	}
+	if got.NewWorkflowID != "" {
+		t.Errorf("ignore 不该带 new_workflow_id, got %q", got.NewWorkflowID)
+	}
+}
+
+// 未真正启动新 workflow 的业务结果(Temporal 去重命中)不得记 retry 决策,
+// 否则"没跑成"也会被算作一次人工重试,污染审计。
+func TestHandleCardActionRetryDeduplicatedRecordsNoDecision(t *testing.T) {
+	ms := store.NewMemStore()
+	seedRetrySource(t, ms)
+	if err := ms.CreateTask(ctx, wf.TaskRow{
+		TaskID: "w-1:v1:a1", WorkflowID: "w-1", TestID: "v1", Attempt: 1, IdempotencyKey: "w-1:v1:a1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r1ID := wf.DeviceTestInput{
+		Project: "grp/p", Commit: "abcd1234", PipelineID: 42, Scope: "v1", Attempt: 1,
+	}.WorkflowID()
+	// started=false 模拟 Temporal RejectDuplicate:workflow 已存在,没起新的
+	starter := &fakeStarter{started: false, closedByID: map[string]bool{"w-1": true, r1ID: true}}
+	exec := newExec(ms, starter, &fakeSender{})
+
+	text, _, err := exec.HandleCardAction(ctx,
+		wf.ButtonValue{Action: "retry", SourceWorkflowID: "w-1", Variant: "v1"}, wlOpenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "已存在") {
+		t.Fatalf("text = %q, want 去重提示(本用例未走到目标分支)", text)
+	}
+	if decs, _ := ms.ListDecisions(ctx, "w-1:v1:a1"); len(decs) != 0 {
+		t.Errorf("去重命中却记了 %d 条 retry 决策, want 0", len(decs))
+	}
 }

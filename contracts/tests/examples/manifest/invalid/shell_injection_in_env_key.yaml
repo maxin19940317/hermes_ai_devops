@@ -1,0 +1,26 @@
+# env 键会被 Client 裸拼进 adb shell 命令串(agent/internal/adb ShellRunEntry),
+# 故 Schema 必须限死键的字符集。本例的键含 ; 与空格,可在设备上执行任意命令,
+# 必须被 propertyNames 拒绝(红线 §14:Client 不提供任意 shell)。
+manifest_version: 1
+artifact:
+  project: algo-super-sdk
+  commit: a1b2c3d
+  pipeline_id: 4321
+  platform: aarch64_Android_QCM6490_SNPE_2.21
+  build_type: Release
+requirements:
+  os: android
+  abi: arm64-v8a
+deploy:
+  workdir: /data/local/tmp/algo-super-sdk
+  files:
+    - { src: run.sh, dst: run.sh, mode: "0755", sha256: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef }
+  env:
+    "LD_LIBRARY_PATH=x; rm -rf /data/local/tmp; X": "{workdir}/lib"
+test:
+  entry: ./run.sh
+  timeout_sec: 600
+  success:
+    exit_code: 0
+collect:
+  - results/result.json

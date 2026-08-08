@@ -131,3 +131,51 @@ func TestMemText(t *testing.T) {
 }
 
 func ptr(n int64) *int64 { return &n }
+
+// okCardSender 卡片与文本都成功,用于观察"卡片成功后是否还多发了文本"。
+type okCardSender struct {
+	texts []string
+	cards int
+}
+
+func (s *okCardSender) SendText(_ context.Context, text string) error {
+	s.texts = append(s.texts, text)
+	return nil
+}
+
+func (s *okCardSender) SendCard(context.Context, any) error {
+	s.cards++
+	return nil
+}
+
+// A5:卡片发送成功后,devices 返回 ""(约定"已回过了"),HandleMessage 不得
+// 再发一条空文本消息——否则每次成功调用都在卡片后多出一个空气泡,
+// 或被飞书拒收并刷错误日志。
+func TestDevicesCardSuccessSendsNoTrailingEmptyText(t *testing.T) {
+	st := store.NewMemStore()
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1"}, []store.Device{{
+		DeviceID:    "dev-1",
+		Serial:      "dev-1",
+		DisplayName: "SM6225-dev-1",
+		ClientID:    "c1",
+		SOC:         "SM6225",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	sender := &okCardSender{}
+	e := &Executor{
+		Store:      st,
+		Sender:     sender,
+		CardSender: sender,
+		Whitelist:  map[string]bool{"ou_1": true},
+	}
+	e.HandleMessage(ctx, "ou_1", "devices")
+
+	if sender.cards != 1 {
+		t.Fatalf("SendCard 调用 %d 次, want 1(卡片路径未生效,本用例无从断言)", sender.cards)
+	}
+	if len(sender.texts) != 0 {
+		t.Errorf("卡片成功后仍发了 %d 条文本: %q; want 0", len(sender.texts), sender.texts)
+	}
+}
