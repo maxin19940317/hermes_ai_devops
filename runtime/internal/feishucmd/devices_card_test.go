@@ -1,11 +1,53 @@
 package feishucmd
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"hermes-devops/runtime/internal/store"
 )
+
+type failingDeviceCardSender struct {
+	err   error
+	texts []string
+}
+
+func (s *failingDeviceCardSender) SendText(_ context.Context, text string) error {
+	s.texts = append(s.texts, text)
+	return nil
+}
+
+func (s *failingDeviceCardSender) SendCard(context.Context, any) error {
+	return s.err
+}
+
+func TestDevicesFallsBackToTextWhenCardSendFails(t *testing.T) {
+	st := store.NewMemStore()
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1"}, []store.Device{{
+		DeviceID:    "dev-1",
+		Serial:      "dev-1",
+		DisplayName: "SM6225-dev-1",
+		ClientID:    "c1",
+		SOC:         "SM6225",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	sender := &failingDeviceCardSender{err: errors.New("card API unavailable")}
+	e := &Executor{Store: st, CardSender: sender}
+	got, err := e.devices(ctx, nil)
+	if err != nil {
+		t.Fatalf("devices: %v", err)
+	}
+	if strings.TrimSpace(got) == "" {
+		t.Fatal("卡片发送失败后 devices 返回空文本")
+	}
+	if !strings.Contains(got, "SM6225-dev-1") {
+		t.Fatalf("降级文本未包含设备名: %q", got)
+	}
+}
 
 // TestRenderDeviceTableCard:卡片 = column_set 表格(用户实测确认并排效果正确)。
 // 列 = 设备/系统/架构/内存;设备名必须完整含 serial(ListFleet 漏选 serial 曾导致
