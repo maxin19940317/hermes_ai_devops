@@ -253,11 +253,11 @@ func TestProbeDevicesRejectsShellErrorSOCWithValidABI(t *testing.T) {
 func TestProbeDevicesResolvesLinuxSerialViaDeviceTree(t *testing.T) {
 	runner := &fakeRunner{responses: map[string]adb.Result{
 		"devices -l": {Stdout: "List of devices attached\n? device product:rk3568-linux model:Nexus_4\n"},
-		"-s ? shell /system/bin/getprop ro.serialno":                     {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
-		"-s ? shell /bin/cat /proc/device-tree/serial-number":            {Stdout: "rk3568-evb-1\x00\n", ExitCode: 0}, // 设备树字符串 NUL 结尾(真机实测)
-		"-s ? shell /system/bin/getprop ro.product.cpu.abi":              {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
-		"-s ? shell /bin/cat /proc/device-tree/compatible":               {Stdout: "rockchip,rk3568\n", ExitCode: 0},
-		"-s ? shell uname -m":                                            {Stdout: "aarch64\n"},
+		"-s ? shell /system/bin/getprop ro.serialno":          {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-s ? shell /bin/cat /proc/device-tree/serial-number": {Stdout: "rk3568-evb-1\x00\n", ExitCode: 0}, // 设备树字符串 NUL 结尾(真机实测)
+		"-s ? shell /system/bin/getprop ro.product.cpu.abi":   {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-s ? shell /bin/cat /proc/device-tree/compatible":    {Stdout: "rockchip,rk3568\n", ExitCode: 0},
+		"-s ? shell uname -m":                                 {Stdout: "aarch64\n"},
 	}}
 	p := &Prober{Runner: runner}
 
@@ -312,9 +312,9 @@ func TestParseMemTotalKB(t *testing.T) {
 	}{
 		{"MemTotal:       5150140 kB\nMemFree: 1000000 kB", 5150140, false},
 		{"MemTotal:   8192000 kB\n", 8192000, false},
-		{"MemFree: 100 kB\n", 0, true},        // 无 MemTotal 行
-		{"", 0, true},                          // 空输出
-		{"MemTotal: abc kB\n", 0, true},        // 非法数字
+		{"MemFree: 100 kB\n", 0, true},  // 无 MemTotal 行
+		{"", 0, true},                   // 空输出
+		{"MemTotal: abc kB\n", 0, true}, // 非法数字
 	}
 	for _, c := range cases {
 		got, err := ParseMemTotalKB(c.out)

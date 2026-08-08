@@ -162,25 +162,24 @@ func (p *Prober) probeMemTotal(ctx context.Context, transport string, props *Dev
 //  2. ro.chipname     部分高通设备提供(如 sdm845、sm8350)
 //  3. ro.board.platform  平台代号(如 bengal、trinket、idp)
 //  4. ro.product.board   板名(兜底)
+//
 // 每步经 validSOC 内容形态校验;取到合法值即返回(不继续降级)。
 // 目标:新设备接入即自动得到真实型号,无需手动维护 alias 表;
 // SOCAliases 仍保留为探测链之后的最后兜底(兼容旧设备代号映射)。
+// 实现委托给 adb.ProbeAndroidSOC——心跳与任务预检必须共用同一探测链
+// (2026-08-08 Review P1:两套身份判断不得漂移)。
 func (p *Prober) probeAndroidSOC(ctx context.Context, transport string) string {
-	for _, prop := range []string{"ro.soc.model", "ro.chipname", "ro.board.platform", "ro.product.board"} {
-		soc, err := p.getprop(ctx, transport, prop)
-		if err != nil || soc == "" {
-			continue
+	soc := adb.ProbeAndroidSOC(ctx, p.Runner, transport)
+	if soc != "" && soc != transport {
+		// 记录探测来源(仅日志;ro.board.platform 等代号级不额外标注)
+		for _, prop := range []string{"ro.soc.model", "ro.chipname"} {
+			if v, err := p.getprop(ctx, transport, prop); err == nil && v == soc {
+				p.logf("probe: %s %s=%q (auto-detected model)", transport, prop, soc)
+				break
+			}
 		}
-		if !validSOC(soc) {
-			p.logf("probe: %s %s=%q rejected by validSOC, trying next", transport, prop, soc)
-			continue
-		}
-		if prop != "ro.board.platform" && prop != "ro.product.board" {
-			p.logf("probe: %s %s=%q (auto-detected model)", transport, prop, soc)
-		}
-		return soc
 	}
-	return ""
+	return soc
 }
 
 // validSerial 校验 adb serial 形态:USB serial 为字母数字(可含 - _),

@@ -87,7 +87,7 @@ type Config struct {
 	// 让 workflow-assets 排行榜反映真实测试次数。空 = 跳过(开发模式)。
 	WorkflowBridgeURL   string
 	WorkflowBridgeToken string
-	HermesTimeout   time.Duration
+	HermesTimeout       time.Duration
 	// §12 Phase 2 / 设计文档 §3.1:飞书指令层自然语言翻译旁路总开关(缺省关,灰度)。
 	// 启用需三者合取:FeishuCmdNL && HermesEndpoint 非空 && 指令 listener 本身已启用
 	// (FeishuCmdWhitelist 非空)——装配逻辑见 cmd/worker/main.go。

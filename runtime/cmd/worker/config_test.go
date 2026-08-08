@@ -232,9 +232,9 @@ func TestDeviceCapabilitiesMapParsing(t *testing.T) {
 	})
 	t.Run("合法 JSON 键归一小写", func(t *testing.T) {
 		cfg, err := loadConfig(lookup(map[string]string{
-			"VARIANTS_CONFIG":          "../../ci/variants.yaml",
-			"CALLBACK_BASE_URL":        "https://runtime.example:8091",
-			"DEVICE_CAPABILITIES_MAP":  `{"QCM6125":["hexagon","GPU"],"rk3568":["rknpu"],"idp":["hexagon"]}`,
+			"VARIANTS_CONFIG":         "../../ci/variants.yaml",
+			"CALLBACK_BASE_URL":       "https://runtime.example:8091",
+			"DEVICE_CAPABILITIES_MAP": `{"QCM6125":["hexagon","GPU"],"rk3568":["rknpu"],"idp":["hexagon"]}`,
 		}))
 		if err != nil {
 			t.Fatalf("loadConfig: %v", err)

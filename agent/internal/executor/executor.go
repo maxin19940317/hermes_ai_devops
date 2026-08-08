@@ -337,38 +337,40 @@ func (e *Executor) precheckAndroid(ctx context.Context, serial string, m *manife
 	}
 
 	if len(m.Requirements.SOC) > 0 {
-		platform, _ := getprop("ro.board.platform")
-		board, _ := getprop("ro.product.board")
+		// SoC 探测复用与心跳同一链(adb.ProbeAndroidSOC:ro.soc.model →
+		// ro.chipname → ro.board.platform → ro.product.board)。
+		// 2026-08-08 Review P1:心跳按 ro.soc.model 调度成功、预检却只读
+		// ro.board.platform 会造成 soc mismatch(设备上报 SM6225、平台属性
+		// bengal 且无 alias 时)——两套身份判断必须同源。
+		soc := adb.ProbeAndroidSOC(ctx, e.Runner, serial)
 		matched := ""
 		for _, want := range m.Requirements.SOC {
-			for _, got := range []string{platform, board} {
-				if got == "" {
-					continue
-				}
-				if strings.EqualFold(got, want) {
-					matched = got
-					continue
-				}
-				// 平台代号 → SoC 型号别名(trinket → QCM6125):
-				// 固件只暴露代号,manifest 约束用型号
-				if alias, ok := e.SOCAliases[got]; ok {
-					// 防御脏配置:alias 值可能带分号/逗号(历史上配错过,
-					// 如 "QCM6125;idp:QCS6490"),按分隔符拆分成多个候选,
-					// 任一命中即视为匹配(与服务器端 SOC 清洗语义一致)。
-					for _, cand := range strings.FieldsFunc(alias, func(r rune) bool {
-						return r == ';' || r == ',' || r == ' '
-					}) {
-						if strings.EqualFold(cand, want) {
-							matched = cand
-							break
-						}
+			if soc != "" && strings.EqualFold(soc, want) {
+				matched = soc
+				break
+			}
+			// 平台代号 → SoC 型号别名(trinket → QCM6125):
+			// 固件只暴露代号,manifest 约束用型号
+			if alias, ok := e.SOCAliases[soc]; ok {
+				// 防御脏配置:alias 值可能带分号/逗号(历史上配错过,
+				// 如 "QCM6125;idp:QCS6490"),按分隔符拆分成多个候选,
+				// 任一命中即视为匹配(与服务器端 SOC 清洗语义一致)。
+				for _, cand := range strings.FieldsFunc(alias, func(r rune) bool {
+					return r == ';' || r == ',' || r == ' '
+				}) {
+					if strings.EqualFold(cand, want) {
+						matched = cand
+						break
 					}
+				}
+				if matched != "" {
+					break
 				}
 			}
 		}
 		if matched == "" {
-			return fmt.Errorf("soc mismatch: device platform=%q board=%q, required one of %v",
-				platform, board, m.Requirements.SOC)
+			return fmt.Errorf("soc mismatch: device soc=%q, required one of %v",
+				soc, m.Requirements.SOC)
 		}
 		sum.Environment["soc"] = matched
 	}

@@ -278,7 +278,7 @@ func TestExplainNoDevice(t *testing.T) {
 		}
 		a.Store = st
 		got, err := a.ExplainNoDevice(ctx, wf.ExplainNoDeviceRequest{
-			Variant: "aarch64_Android_Qualcomm_TFLite_2.21.0",
+			Variant:  "aarch64_Android_Qualcomm_TFLite_2.21.0",
 			Selector: wf.DeviceSelector{OS: "android", SOC: []string{"QCM6125", "QCM6490"}},
 		})
 		if err != nil {
@@ -310,7 +310,7 @@ func TestExplainNoDevice(t *testing.T) {
 		}
 		a.Store = st
 		got, err := a.ExplainNoDevice(ctx, wf.ExplainNoDeviceRequest{
-			Variant: "aarch64_Android_Qualcomm_TFLite_2.21.0",
+			Variant:  "aarch64_Android_Qualcomm_TFLite_2.21.0",
 			Selector: wf.DeviceSelector{OS: "android", SOC: []string{"QCM6125", "QCM6490"}},
 		})
 		if err != nil {

@@ -1578,7 +1578,10 @@ func TestBuildNotificationCardAttemptGating(t *testing.T) {
 func TestEscapeCardText(t *testing.T) {
 	cases := []struct{ name, in, want string }{
 		{"注入 at 提及", `<at user_id="all">所有人</at>`, "&lt;at user_id=\"all\"&gt;所有人&lt;/at&gt;"},
-		{"注入链接", "[点我](https://evil.example)", "[点我](https://evil.example)"},
+		// 2026-08-08 Review P2:lark_md 会渲染 [text](url) 为可点击链接,
+		// 方括号转全角,链接语法被破坏 → 退化为纯文本。
+		{"注入链接", "[点我](https://evil.example)", "［点我］(https://evil.example)"},
+		{"普通方括号保留语义", "[INFO] 构建成功", "［INFO］ 构建成功"},
 		{"尖括号标签", "a < b && c > d", "a &lt; b &amp;&amp; c &gt; d"},
 		{"安全语法保留", "**粗体** 和 `code`", "**粗体** 和 `code`"},
 		{"中文与换行", "行一\n行二", "行一\n行二"},
@@ -1710,9 +1713,9 @@ func TestBuildNotificationCardTruncatesChineseValidUTF8(t *testing.T) {
 // 键排序确定性,`_inference_ms_avg` 后缀剥掉显示 ms。
 func TestFormatMetricsCard(t *testing.T) {
 	got := formatMetricsCard(map[string]float64{
-		"gesture_test.inference_ms_avg":    16.7,
+		"gesture_test.inference_ms_avg":          16.7,
 		"detect_face_attr_test.inference_ms_avg": 46.4,
-		"seg_crowd_test.inference_ms_avg":  18.0,
+		"seg_crowd_test.inference_ms_avg":        18.0,
 	})
 	want := "detect_face_attr_test  **46.4ms**\n" +
 		"gesture_test  **16.7ms**\n" +

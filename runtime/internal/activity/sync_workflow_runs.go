@@ -27,15 +27,15 @@ func (a *Acts) SyncWorkflowRuns(ctx context.Context, req wf.SyncWorkflowRunsRequ
 		}
 		// run_id 用 workflow_id + variant 派生,同 workflow 同 variant 幂等去重。
 		payload := map[string]any{
-			"run_id":      fmt.Sprintf("wr-devops-%s-%s", sanitizeID(req.WorkflowID), sanitizeID(tk.Variant)),
-			"variant":     tk.Variant,
-			"status":      "COMPLETED",
-			"verdict":     tk.Verdict,
+			"run_id":       fmt.Sprintf("wr-devops-%s-%s", sanitizeID(req.WorkflowID), sanitizeID(tk.Variant)),
+			"variant":      tk.Variant,
+			"status":       "COMPLETED",
+			"verdict":      tk.Verdict,
 			"duration_sec": tk.DurationSec,
-			"cases_total": tk.CasesTotal,
+			"cases_total":  tk.CasesTotal,
 			"cases_failed": tk.CasesFailed,
-			"metrics":     tk.Metrics,
-			"project":     req.Project,
+			"metrics":      tk.Metrics,
+			"project":      req.Project,
 			"workflow_ref": req.WorkflowID,
 		}
 		body, err := json.Marshal(payload)

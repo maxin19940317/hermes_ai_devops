@@ -16,24 +16,24 @@ const canTestCap = 5
 // DeviceFacts 是 devices 指令的事实计算输出(设计文档 §4.2)。
 // 事实永远由规则计算,LLM 只负责表述与洞察——这个结构只含确定性信息。
 type DeviceFacts struct {
-	Now            string      `json:"now"`
-	Online         []DeviceFact `json:"online"`
-	OfflineCount   int         `json:"offline_count"`
-	Quarantined    []string    `json:"quarantined"`
-	Gaps           []GapFact   `json:"gaps"`
-	Suggestions    []string    `json:"suggestions"`
+	Now          string       `json:"now"`
+	Online       []DeviceFact `json:"online"`
+	OfflineCount int          `json:"offline_count"`
+	Quarantined  []string     `json:"quarantined"`
+	Gaps         []GapFact    `json:"gaps"`
+	Suggestions  []string     `json:"suggestions"`
 }
 
 // DeviceFact 是单台在线设备的事实(含可测变体)。
 type DeviceFact struct {
-	ID            string   `json:"id"`
-	OS            string   `json:"os"`
-	SOC           string   `json:"soc"`
-	ABI           string   `json:"abi"`
-	MemTotalMB    *int64   `json:"mem_total_mb,omitempty"`
-	Capabilities  []string `json:"capabilities"`
-	CanTest       []string `json:"can_test"`
-	CanTestCount  int      `json:"can_test_count"`
+	ID           string   `json:"id"`
+	OS           string   `json:"os"`
+	SOC          string   `json:"soc"`
+	ABI          string   `json:"abi"`
+	MemTotalMB   *int64   `json:"mem_total_mb,omitempty"`
+	Capabilities []string `json:"capabilities"`
+	CanTest      []string `json:"can_test"`
+	CanTestCount int      `json:"can_test_count"`
 }
 
 // GapFact 是一个调度缺口:某组变体无任何设备(任意状态)能匹配。
@@ -77,7 +77,7 @@ func ComputeDeviceFacts(
 		default: // IDLE/BUSY = 在线
 			fact := DeviceFact{
 				ID: d.DeviceID, OS: d.OS, SOC: d.SOC, ABI: d.ABI,
-				MemTotalMB:    d.MemTotalMB,
+				MemTotalMB:   d.MemTotalMB,
 				Capabilities: append([]string(nil), d.Capabilities...),
 				CanTest:      []string{},
 			}

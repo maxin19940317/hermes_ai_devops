@@ -381,8 +381,8 @@ func TestHeartbeatCalibratesCapabilitiesFromServerTable(t *testing.T) {
 		s := store.NewMemStore()
 		sig := &fakeSignaler{}
 		h := New(s, sig, nil, 120).WithDeviceCaps(map[string][]string{
-			"qcm6125":    {"hexagon"},
-			"513cd3de":   {"hexagon", "custom"},
+			"qcm6125":  {"hexagon"},
+			"513cd3de": {"hexagon", "custom"},
 		})
 		srv := httptest.NewServer(h.Mux())
 		defer srv.Close()

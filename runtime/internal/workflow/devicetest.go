@@ -1005,11 +1005,11 @@ type CardHeader struct {
 // 飞书 lark_md 的 div 文本不支持 `- ` 列表语法,只有 tag=markdown +
 // elementStyle.display=list 才渲染圆点列表)。
 type CardElement struct {
-	Tag          string         `json:"tag"`               // div | markdown | hr | action
-	Text         *CardText      `json:"text,omitempty"`    // tag=div|hr|action 用
-	Content      string         `json:"content,omitempty"` // tag=markdown 用:多行文本,\n 分隔
-	ElementStyle *CardElStyle   `json:"element_style,omitempty"`
-	Actions      []CardButton   `json:"actions,omitempty"` // tag=div|hr 时必须为 nil
+	Tag          string       `json:"tag"`               // div | markdown | hr | action
+	Text         *CardText    `json:"text,omitempty"`    // tag=div|hr|action 用
+	Content      string       `json:"content,omitempty"` // tag=markdown 用:多行文本,\n 分隔
+	ElementStyle *CardElStyle `json:"element_style,omitempty"`
+	Actions      []CardButton `json:"actions,omitempty"` // tag=div|hr 时必须为 nil
 }
 
 // CardElStyle 是 markdown 元素的样式(飞书卡片):display=list 时按行渲染列表,
@@ -1105,10 +1105,17 @@ func plainCardDiv(content string) CardElement {
 // 与 Hermes Summary 是模型/规则产物,必须先把 <、>、& 转成字面量,使注入
 // 链接/@提及退化为纯文本,同时保留 **粗体**、`code`、换行等安全语法。
 // 转义顺序:先 &(否则先转 < 会把 &lt; 再转成 &amp;lt;)再 < 再 >。
+// 2026-08-08 Review P2:lark_md 会把 [文本](URL) 渲染成可点击链接——
+// 转义 [ ] 为全角字符,破坏链接语法(普通含方括号文本不受影响),使
+// Markdown 链接退化为纯文本,与"链接退化为纯文本"的设计语义一致。
 func escapeCardText(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
+	// 破坏 Markdown 链接语法 [text](url):转义成不可渲染的字面量。
+	// 先转 ] 再转 [ 避免 [ 转义后影响 ] 匹配(无实际依赖,顺序固定即可)。
+	s = strings.ReplaceAll(s, "[", "［")
+	s = strings.ReplaceAll(s, "]", "］")
 	return s
 }
 
@@ -1132,8 +1139,8 @@ func cardReasonLines(reason string) []CardElement {
 			return
 		}
 		out = append(out, CardElement{
-			Tag:     "markdown",
-			Content: strings.Join(list, "\n"),
+			Tag:          "markdown",
+			Content:      strings.Join(list, "\n"),
 			ElementStyle: &CardElStyle{Display: "list", ListType: "bullet"},
 		})
 		list = nil

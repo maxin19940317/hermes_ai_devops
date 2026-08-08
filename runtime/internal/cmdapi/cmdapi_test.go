@@ -13,7 +13,7 @@ import (
 
 // fakeExec 记录收到的指令,返回固定回复(测试用)。
 type fakeExec struct {
-	got  feishucmd.Command
+	got   feishucmd.Command
 	reply string
 	err   error
 }

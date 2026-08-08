@@ -244,7 +244,7 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			// URL 空 = 跳过(开发模式)。
 			WorkflowBridgeURL:   getenv("WORKFLOW_BRIDGE_URL"),
 			WorkflowBridgeToken: getenv("WORKFLOW_BRIDGE_TOKEN"),
-			HermesTimeout:   time.Duration(hermesTimeoutSec) * time.Second,
+			HermesTimeout:       time.Duration(hermesTimeoutSec) * time.Second,
 		},
 		SpecDefaults: activity.SpecDefaults{
 			MaxInfraRetries:   maxInfraRetries,

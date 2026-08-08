@@ -308,17 +308,22 @@ func main() {
 	// POST /api/v1/cmd {command,args} → 复用 feishucmd.Executor 执行逻辑。
 	// Bearer 鉴权(CMD_API_TOKEN);Token 空 = 接口未启用(401)。
 	// 挂在 callbacks 同一 listener 上(共享 8091 端口与 mTLS),避免新增暴露面。
-	// cmdapi 用独立的 TextOnly Executor 副本:无卡片、无飞书发送(devices 等
+	// cmdapi 用独立的 TextOnly Executor:无卡片、无飞书发送(devices 等
 	// 卡片优先指令返回文本),与飞书 listener 的共享 exec 零竞态。
-	cmdExec := *exec
-	cmdExec.TextOnly = true
-	cmdExec.CardSender = nil
-	cmdExec.Sender = nil
-	cmdExec.Whitelist = nil
+	// **不能用 `*exec` 复制**(Executor 含 sync.Mutex,pending map 共享引用,
+	// go vet 报 copying locks);新建独立实例,只共享只读依赖
+	// (Store/Starter/SpecCfg/Variants,2026-08-08 Review P4 修复)。
+	cmdExec := &feishucmd.Executor{
+		Store: st, Log: &log,
+		Starter:  &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
+		Variants: specCfg.VariantNames(),
+		SpecCfg:  specCfg,
+		TextOnly: true,
+	}
 	cmdMux := cb.Mux()
 	cmdMux.Handle("/api/v1/cmd", &cmdapi.Handler{
 		Token: cfg.Activity.CmdAPIToken,
-		Exec:  &cmdExec,
+		Exec:  cmdExec,
 	})
 	callbackSrv := &http.Server{
 		Addr:              cfg.CallbacksAddr,

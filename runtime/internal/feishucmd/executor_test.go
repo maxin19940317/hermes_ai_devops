@@ -1331,7 +1331,7 @@ func TestTestCmdRaceAlreadyRunning(t *testing.T) {
 	}
 	// 第一次 StartDeviceTest 撞上已存在的运行中 workflow(attempt 2 被并发占用)。
 	starter.closedByID = map[string]bool{
-		"device-test-grp/p-gabcd1234-p42-v1-r1": true, // 水位 1 已终态 → 放行
+		"device-test-grp/p-gabcd1234-p42-v1-r1": true,  // 水位 1 已终态 → 放行
 		"device-test-grp/p-gabcd1234-p42-v1-r2": false, // 竞态占用的 r2 运行中
 	}
 	starter.startResults = []bool{false}
@@ -1464,7 +1464,7 @@ func newExpressExec(t *testing.T, express *fakeExpress) (*store.MemStore, *Execu
 		t.Fatal(err)
 	}
 	sel := map[string]wf.DeviceSelector{
-		"aarch64_Linux_QCS6490_SNPE_2.21": {OS: "linux", SOC: []string{"QCS6490"}, Capabilities: []string{"hexagon"}},
+		"aarch64_Linux_QCS6490_SNPE_2.21":   {OS: "linux", SOC: []string{"QCS6490"}, Capabilities: []string{"hexagon"}},
 		"aarch64_Android_RK3568_RKNN_2.3.2": {OS: "android", SOC: []string{"rk3568"}, Capabilities: []string{"rknpu"}},
 		"aarch64_Android_QCM6125_SNPE_1.68": {OS: "android", SOC: []string{"QCM6125"}, Capabilities: []string{"hexagon"}},
 	}
@@ -1480,7 +1480,7 @@ func newExpressExec(t *testing.T, express *fakeExpress) (*store.MemStore, *Execu
 // LLM 正常 → 结构化回答 + 审计 express_ok。
 func TestDevicesReplyUsesExpress(t *testing.T) {
 	fake := &fakeExpress{out: &hermesclient.ExpressResponse{
-		Summary: "当前 2 台在线设备,可覆盖 2 个变体。",
+		Summary:  "当前 2 台在线设备,可覆盖 2 个变体。",
 		Sections: []string{"QCS6490 可测 SNPE 2.21", "RK3568 可测 RKNN 2.3.2"},
 		Footer:   "接入高通 Android 板可补测 1 个变体",
 	}}

@@ -438,9 +438,12 @@ func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
 		if card, err := renderDeviceTableCard(rows); err != nil {
 			return "", err
 		} else if card != nil {
-			e.replyCard(ctx, card)
-			return "", nil // 卡片已发送,不重复文本
-	}
+			// 2026-08-08 Review P3:卡片发送失败必须降级文本(不能静默空回复)。
+			// replyCard 返回发送是否成功;失败则继续走下面的文本路径。
+			if e.replyCard(ctx, card) {
+				return "", nil // 卡片已发送,不重复文本
+			}
+		}
 	}
 	// 缺省 online:表述层可用时走 Smart Reply(规则 Facts + LLM 表述),
 	// LLM 挂/未启用 → 规则文本(在 expressDevices 内部降级)。
@@ -455,15 +458,19 @@ func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
 	return b.String(), nil
 }
 
-// replyCard 发送卡片回复(失败降级纯文本提示,不阻塞)。
-func (e *Executor) replyCard(ctx context.Context, card any) {
+// replyCard 发送卡片回复;返回是否成功。失败记日志并返回 false,
+// 调用方(devices 等)据此降级纯文本——不能静默空回复
+// (2026-08-08 Review P3:卡片失败用户必须得到降级文本)。
+func (e *Executor) replyCard(ctx context.Context, card any) bool {
 	if e.CardSender == nil {
-		return
+		return false
 	}
 	if err := e.CardSender.SendCard(ctx, card); err != nil {
 		log := e.log()
-		log.Error().Err(err).Msg("feishu cmd card reply failed")
+		log.Error().Err(err).Msg("feishu cmd card reply failed, falling back to text")
+		return false
 	}
+	return true
 }
 
 func deviceDisplayName(d store.DeviceStatus) string {
@@ -805,10 +812,10 @@ func (e *Executor) retryVariant(
 	}
 	in := wf.DeviceTestInput{
 		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
-		Version:     source.Version,
-		Scope:      variant,
-		Attempt:    n,
-		Packages:   []wf.PackageRef{ref},
+		Version:  source.Version,
+		Scope:    variant,
+		Attempt:  n,
+		Packages: []wf.PackageRef{ref},
 	}
 	id, started, err := e.Starter.StartDeviceTest(ctx, in)
 	if err != nil {
