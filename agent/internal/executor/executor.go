@@ -262,15 +262,26 @@ func (e *Executor) finishCanceled(sum *Summary) (*Summary, error) {
 	return sum, nil
 }
 
+// errAdbServer 标识 adb server / 宿主机级故障(非设备故障)。
+// 归因为 client(spec §5.1);包裹后用 errors.Is 判别。
+var errAdbServer = errors.New("adb server failure")
+
 // resolveTransport 把逻辑 serial(ro.serialno)解析为可寻址的 transport。
 // 快路径:serial 本身就在 devices 列表中,原样返回,零额外调用。
 // 慢路径:USB gadget serial 丢失(列表只有 "?" 或陌生 serial)时,逐个
 // transport 探测 ro.serialno,返回匹配者;Linux 设备无 getprop,再回退
-// /proc/device-tree/serial-number;全部不匹配报可见列表便于排查。
+// /proc/device-tree/serial-number;全部不匹配报可见列表便于排查
+// (这不代表设备故障——逻辑 serial 与 transport 允许不同,见 spec §5.3.1)。
 func (e *Executor) resolveTransport(ctx context.Context, logical string) (string, error) {
 	res, err := e.Runner.Run(ctx, adb.Devices())
 	if err != nil {
-		return "", fmt.Errorf("resolve serial: adb devices: %w", err)
+		return "", fmt.Errorf("resolve serial: adb devices: %w: %w", errAdbServer, err)
+	}
+	// 非零退出同样是 server 级故障:此前未检查,会让残缺 stdout 流向
+	// "device not found",把 server 故障伪装成设备不存在(spec §5.4 第 2 处)
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("resolve serial: adb devices exit=%d: %s: %w",
+			res.ExitCode, strings.TrimSpace(res.Stderr), errAdbServer)
 	}
 	transports := adb.ParseTransports(res.Stdout)
 	for _, t := range transports {

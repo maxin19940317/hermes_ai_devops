@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -123,6 +124,11 @@ type fakeADB struct {
 	serialnoByTransport         map[string]string
 	deviceTreeSerialByTransport map[string]string
 
+	// devicesExit/devicesStderr 模拟 adb server 级故障(adb devices 非零退出);
+	// 缺省 0/空,既有用例(快路径 devicesList)不受影响。
+	devicesExit   int
+	devicesStderr string
+
 	// mkdirFailSubstr 命中该子串的 mkdir 返回 exit=1 + stderr
 	// (模拟只读 rootfs 建子目录失败,2026-08-04 RK3568 实机)
 	mkdirFailSubstr string
@@ -148,6 +154,9 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 	// devices -l 不带 -s,必须在按位取 cmd 之前处理。
 	// 缺省只报告 serial(快路径,既有用例无感知)。
 	if args[0] == "devices" {
+		if f.devicesExit != 0 {
+			return adb.Result{ExitCode: f.devicesExit, Stderr: f.devicesStderr}, nil
+		}
 		out := f.devicesList
 		if out == "" {
 			out = "List of devices attached\n" + serial + "\tdevice\n"
@@ -633,6 +642,33 @@ func TestResolveTransportFallsBackToDeviceTreeSerial(t *testing.T) {
 	}
 	if got != "?" {
 		t.Errorf("transport = %q, want '?'", got)
+	}
+}
+
+// adb devices 非零退出是 server/宿主机问题,不能伪装成"设备不存在"
+func TestResolveTransportSurfacesServerFailure(t *testing.T) {
+	f := &fakeADB{props: defaultProps(), devicesExit: 1, devicesStderr: "cannot connect to daemon"}
+	e, _ := newExecutor(f)
+	_, err := e.resolveTransport(context.Background(), serial)
+	if err == nil {
+		t.Fatal("adb devices 非零退出必须报错")
+	}
+	if !errors.Is(err, errAdbServer) {
+		t.Fatalf("应标识为 server 级故障(归 client),got: %v", err)
+	}
+}
+
+// 逻辑 serial 与 transport 允许不同(RK3568/USB gadget),
+// 列表里没有同名项不等于设备不在(spec §5.3.1)
+func TestResolveTransportNoMatchIsNotServerFailure(t *testing.T) {
+	f := &fakeADB{props: defaultProps(), devicesList: "List of devices attached\nother1\tdevice\n"}
+	e, _ := newExecutor(f)
+	_, err := e.resolveTransport(context.Background(), serial)
+	if err == nil {
+		t.Fatal("无匹配应报错")
+	}
+	if errors.Is(err, errAdbServer) {
+		t.Fatal("无匹配不是 server 故障;它必须归 none 而非 client/device")
 	}
 }
 
