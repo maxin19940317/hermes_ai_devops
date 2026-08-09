@@ -64,6 +64,17 @@ type fakeActs struct {
 
 	leaseExpiry     *time.Time // CheckLease 的返回(模拟 device_leases.lease_expires_at);nil = 未续期
 	checkLeaseCalls []string
+
+	// quarantineAfter > 0 时启用简化版隔离记账(Task 12 端到端故障注入专用):
+	// 复刻 store.MemStore.ReleaseDevice 的记账语义(仅 device scope 计数、ok
+	// 清零、client/none 不动)。目的不是重新实现 Store——真正的隔离/outbox/
+	// audit 落地已由 Task 10 在 internal/store 的 conformance 测试覆盖——而是
+	// 证明 workflow 层连续算出的 FailScope 真的会驱动(或真的不会驱动)隔离,
+	// 不能只验证单次调用的返回值。quarantineAfter == 0(缺省)时零行为变化,
+	// 不影响任何既有测试。
+	quarantineAfter    int
+	deviceFailStreak   map[string]int  // 按 DeviceID 计数
+	quarantinedDevices map[string]bool // 按 DeviceID 记录已(模拟)隔离
 }
 
 var defaultLease = &Lease{DeviceID: "dev1", Serial: "513cd3de", ClientID: "c1", ClientBaseURL: "https://client:8443"}
@@ -95,6 +106,10 @@ func (f *fakeActs) AcquireDevice(_ context.Context, _ AcquireRequest) (*Lease, e
 		l := f.acquires[0]
 		f.acquires = f.acquires[1:]
 		return l, nil
+	}
+	if f.quarantinedDevices[defaultLease.DeviceID] {
+		// 模拟 store.MemStore:QUARANTINED 设备不可租(devices.go:leasable)。
+		return nil, nil
 	}
 	return defaultLease, nil
 }
@@ -134,6 +149,25 @@ func (f *fakeActs) ReleaseDevice(_ context.Context, r ReleaseRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.released = append(f.released, r)
+	if f.quarantineAfter > 0 {
+		if f.deviceFailStreak == nil {
+			f.deviceFailStreak = map[string]int{}
+		}
+		switch r.FailScope {
+		case FailScopeDevice:
+			f.deviceFailStreak[r.DeviceID]++
+			if f.deviceFailStreak[r.DeviceID] >= f.quarantineAfter {
+				if f.quarantinedDevices == nil {
+					f.quarantinedDevices = map[string]bool{}
+				}
+				f.quarantinedDevices[r.DeviceID] = true
+			}
+		case FailScopeOK:
+			f.deviceFailStreak[r.DeviceID] = 0
+		}
+		// FailScopeClient/FailScopeNone: 计数器不动,与 store.MemStore.ReleaseDevice
+		// 的记账语义一致(none/client 都不驱动设备级隔离)。
+	}
 	return nil
 }
 func (f *fakeActs) Notify(_ context.Context, msg string) error {

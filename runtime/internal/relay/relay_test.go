@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -225,6 +226,86 @@ func TestQuarantineEventBadPayloadMarksFailed(t *testing.T) {
 
 	if published(t, s, id) {
 		t.Fatal("payload 解码失败却标记已投递")
+	}
+}
+
+// TestDeviceQuarantineNotificationBacklogVisibleWhenNotifierUnconfigured 是
+// Task 12 补的第四条端到端场景(设计文档 §11 只列了三条,Task 11 评审要求补上
+// 这条:"Notifier 未配置时 outbox_backlog 视图应出现该行且 last_error 命中")。
+//
+// 与上面几条 TestQuarantineEvent* 的区别:那些用 quarantineEvent(t) 手工构造
+// payload,只验证 deliver() 内部对 ClaimUnpublished 的影响;这条改为真实驱动
+// store.MemStore.ReleaseDevice 连续 3 次 device scope 释放,让隔离事件由 Store
+// 自己在同一临界区产出(Task 10 的落地),再确认运维/Grafana 实际查询的
+// OutboxBacklog 视图(而不是 ClaimUnpublished)能看见这一行、且 last_error
+// 命中"未配置"提示——这才是"隔离事件产生 → 通知端未配置 → backlog 可见"这条
+// 完整链路,不是链路里某一段的单元测试。
+func TestDeviceQuarantineNotificationBacklogVisibleWhenNotifierUnconfigured(t *testing.T) {
+	s := store.NewMemStore()
+	if err := s.UpsertClientDevices(ctx,
+		store.Client{ClientID: "c1", BaseURL: "https://client:8443"},
+		[]store.Device{{DeviceID: "dev-1", Serial: "513cd3de", ClientID: "c1",
+			SOC: "QCM6125", ABI: "arm64-v8a"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	const quarantineAfter = 3
+	var deviceID string
+	for i := 0; i < quarantineAfter; i++ {
+		taskID := fmt.Sprintf("wf-1:t:a%d", i+1)
+		lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, taskID, 120)
+		if err != nil || lease == nil {
+			t.Fatalf("第 %d 次 acquire 失败: lease=%+v err=%v", i+1, lease, err)
+		}
+		deviceID = lease.DeviceID
+		if err := s.ReleaseDevice(ctx, lease.DeviceID, taskID, wf.FailScopeDevice, quarantineAfter); err != nil {
+			t.Fatalf("第 %d 次 release 失败: %v", i+1, err)
+		}
+	}
+
+	// 隔离本身不是本用例重点(Task 10 已覆盖),但没隔离的话后面全部空转——
+	// 先确认链路的第一环真的发生了。
+	ov, err := s.FleetOverview(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantined := false
+	for _, d := range ov.Devices {
+		if d.DeviceID == deviceID {
+			quarantined = d.Status == "QUARANTINED"
+		}
+	}
+	if !quarantined {
+		t.Fatalf("连续 %d 次 device scope 释放后设备未隔离: %+v", quarantineAfter, ov.Devices)
+	}
+
+	evs, err := s.ClaimUnpublished(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 || evs[0].EventType != store.EventTypeDeviceQuarantined {
+		t.Fatalf("outbox events = %+v, want 恰好 1 条 device-quarantined 事件", evs)
+	}
+
+	// Relay 未配置 Notifier(且未显式 RELAY_DEVICE_NOTIFY=off):必须投递失败,
+	// 不得静默 MarkPublished(spec §9.3)。
+	r := &Relay{Store: s}
+	r.deliver(ctx, evs[0])
+
+	// 关键断言:运维/Grafana 依赖的是 outbox_backlog 视图本身(OutboxBacklog
+	// 查询),不是 ClaimUnpublished——这条链路"可见"与否要在这一层验证。
+	backlog, err := s.OutboxBacklog(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backlog.Pending != 1 {
+		t.Fatalf("backlog.Pending = %d, want 1(未配置通知端的隔离事件应可见于 backlog)", backlog.Pending)
+	}
+	if backlog.Stuck != 1 {
+		t.Errorf("backlog.Stuck = %d, want 1(attempts=1 已达 stuckAttempts=1 阈值)", backlog.Stuck)
+	}
+	if !strings.Contains(backlog.SampleError, "notifier not configured") {
+		t.Errorf("backlog.SampleError = %q, want 命中未配置提示", backlog.SampleError)
 	}
 }
 

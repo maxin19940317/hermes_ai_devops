@@ -230,7 +230,7 @@ verdict (终态后判定):
 
 | category | 判定来源 | 缺省对策(Plan 可覆盖) |
 |---|---|---|
-| INFRA | Runtime 判定(下载失败/ADB 断连/离线/租约过期) | 机械重试 ≤2;设备连续 3 次 → QUARANTINED(2026-07-29 起 device 归因无信号源,该阈值暂不触发,见 docs/device-test-sequence.md 差距 #10) |
+| INFRA | Runtime 判定(下载失败/ADB 断连/离线/租约过期) | 机械重试 ≤2;设备连续 3 次 → QUARANTINED |
 | BUILD | GitLab pipeline 状态 | 不进设备测试;通知附编译错误摘要 |
 | CODE | 签名 native_crash / junit 失败 | 不重试;分析 + 通知;MR 场景阻断 |
 | MODEL/DELEGATE | 签名 cpu_fallback 等 | 不重试;分析 Delegate 分区;通知 |
@@ -240,7 +240,7 @@ verdict (终态后判定):
 
 ## 10. 关键参数缺省值(可配置,写入 config)
 
-心跳 10s;离线判定 3 次丢失;任务租约 120s(心跳续期);ADB 命令级重试 2 次间隔 3s(仅幂等命令);任务级机械重试 max 2(仅 INFRA);设备隔离阈值连续 3 次 INFRA(2026-07-29 起 device 归因无信号源,该阈值暂不触发,见 docs/device-test-sequence.md 差距 #10);产物下载超时 10min;私有 adb server 端口 **5137**(`ANDROID_ADB_SERVER_PORT`,Agent 内置固定版本 adb,自管生命周期,永不使用系统 5037)。
+心跳 10s;离线判定 3 次丢失;任务租约 120s(心跳续期);ADB 命令级重试 2 次间隔 3s(仅幂等命令);任务级机械重试 max 2(仅 INFRA);设备隔离阈值连续 3 次 INFRA;产物下载超时 10min;私有 adb server 端口 **5137**(`ANDROID_ADB_SERVER_PORT`,Agent 内置固定版本 adb,自管生命周期,永不使用系统 5037)。
 
 ## 11. 数据模型(PostgreSQL,Temporal 自身表之外)
 
