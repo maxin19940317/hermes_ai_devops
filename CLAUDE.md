@@ -49,7 +49,7 @@
 | 数据库 | PostgreSQL 15+(与 Temporal 共实例分库) | Client 本地用 SQLite(WAL) |
 | 附件/日志存储 | MinIO(S3 兼容),预签名 URL 直传 | 大文件不过 Runtime |
 | 产物仓库 | GitLab Generic Package Registry(现状沿用) | |
-| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 展示卡片已实现;重试/忽略按钮已实现(2026-08-03);隔离按钮因无设备级信号源暂不做,见差距 #10 |
+| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 展示卡片已实现;重试/忽略按钮已实现(2026-08-03);隔离按钮属 UI,留给单独一轮实现 |
 | 部署 | Docker Compose(服务器全套);Client 手动安装 MSI/exe | |
 | 日志 | 结构化日志(zerolog),UTC + 毫秒,全组件 NTP | |
 
@@ -309,7 +309,7 @@ Evidence Extractor 完整化✅(签名匹配 ±50 行上下文 + junit 失败 + 
 Analyzer 完善✅(LLM 分析 evidence → 结构化结论 → decisions 落库 + model 审计 + disagrees_with_rule 自洽校验;
 Hermes 超时/不可用 → 规则引擎保底);
 飞书交互卡片✅(展示卡片 2026-07-30 上线;重试/忽略按钮 2026-08-03 上线;
-按钮回调经 WS listener 执行而非 workflow signal;隔离按钮因无设备级信号源暂不做,见差距 #10);
+按钮回调经 WS listener 执行而非 workflow signal;隔离按钮属 UI,留给单独一轮实现);
 Planner v1✅(自然语言 → Plan DSL,经 analyze_bridge /plan 路由,Schema 校验不过打回重试 ≤3 次);
 CLAUDE.md §4 卡片状态已同步。
 

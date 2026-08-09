@@ -527,10 +527,13 @@ func failScope(site releaseSite, category rules.Category, resultStatus, verdict,
 			// 与 siteCanceled 保持一致:同一类事件不因谁先观察到而改变归因。
 			return FailScopeNone
 		case category == rules.CategoryDevice:
-			// 这个分支本身恒不可达(category 映射兜底,不是本次改动的入口):
-			// device 归因现在经由上方的 reportedScope 分支(Agent 主动上报)落地,
-			// 不再依赖 rules.CategoryDevice。device_fail_streak 已能真实增长
-			// (见 §5/§9,2026-08-09 设计文档);"因此恒为 0" 的旧论断已不成立。
+			// 这个分支是可达的映射兜底,不是本次改动的主要入口:device 归因现在
+			// 主要经由上方的 reportedScope 分支(Agent 主动上报)落地(见 §5/§9,
+			// 2026-08-09 设计文档)。今天 ci/variants.yaml 没有任何签名声明
+			// classify: DEVICE,所以这条路径实践中暂未被触发——但它是代码可达的
+			// 合法映射(DEVICE 是 manifest.schema.json 里 classify 的合法取值,
+			// rules.decideV1 的签名判定分支会产出 rules.CategoryDevice),一旦有人
+			// 声明这类签名就会生效,不要把它当死代码删掉。
 			return FailScopeDevice
 		case category == rules.CategoryInfra && resultStatus == "FAILED":
 			return FailScopeClient
