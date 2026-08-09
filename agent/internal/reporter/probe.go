@@ -123,7 +123,13 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 	// (trinket→QCM6125),而链的第一跳 ro.soc.model 给的是型号串。只拿首个值
 	// 查别名时别名永不命中,设备会以型号串注册 → SelectTestSpecs 找不到匹配
 	// 设备 → 变体被静默判 SKIPPED(无错误、无告警,最难排查的那种)。
-	chain := adb.ProbeAndroidSOCChain(ctx, p.Runner, transport)
+	chain, err := adb.ProbeAndroidSOCChain(ctx, p.Runner, transport)
+	if err != nil {
+		// 心跳探测是尽力而为(设计 §3.3):传输层失败按空链降级,不让
+		// 单次探测失败拖垮整轮心跳,只留一条日志供排障。
+		p.logf("probe: %s soc chain probe failed: %v", serial, err)
+		chain = nil
+	}
 	soc := p.probeAndroidSOC(ctx, transport)
 	if alias, ok := adb.ResolveSOCAlias(chain, p.SOCAliases); ok {
 		p.logf("probe: %s soc chain %v -> %s (alias)", serial, chain, alias)

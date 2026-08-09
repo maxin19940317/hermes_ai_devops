@@ -345,7 +345,13 @@ func (e *Executor) precheckAndroid(ctx context.Context, serial string, m *manife
 		// 2026-08-08 A1:匹配必须遍历**整条链**,不能只用首个命中值。
 		// 别名表按平台代号为键(trinket→QCM6125),而链的第一跳给的是型号串;
 		// 只查首个值时别名根本没机会参与,直接匹配又不上 → 误报 soc mismatch。
-		chain := adb.ProbeAndroidSOCChain(ctx, e.Runner, serial)
+		chain, err := adb.ProbeAndroidSOCChain(ctx, e.Runner, serial)
+		if err != nil {
+			// 空链 + 传输层失败:设备很可能已经掉线,不能把它当 soc
+			// mismatch 报——那会被归因体系误读成"配置问题"而非设备故障
+			// (Task 6 据此做归因判断)。原样把错误向上抛出。
+			return err
+		}
 		matched := ""
 	matchLoop:
 		for _, want := range m.Requirements.SOC {
