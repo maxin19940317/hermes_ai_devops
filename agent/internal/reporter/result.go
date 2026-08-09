@@ -88,6 +88,11 @@ type Result struct {
 	Environment   map[string]string  `json:"environment,omitempty"`
 	Artifact      *ArtifactInfo      `json:"artifact,omitempty"`
 	Attachments   []Attachment       `json:"attachments"`
+	// FailureScope/FailureStage 透传自 executor.Summary(Task 6),仅在
+	// executor 走 fail() 路径时两者同时非空;成功任务两字段均不填,
+	// 契约的 dependentRequired 要求成对出现(§6 防线 1)。
+	FailureScope string `json:"failure_scope,omitempty"`
+	FailureStage string `json:"failure_stage,omitempty"`
 }
 
 // deviceResult 是设备端脚本自产的 result.json 中 Client 采信的字段
@@ -253,6 +258,8 @@ func (r *ResultReporter) build(task store.Task, attachments []Attachment) ([]byt
 		Metrics:       map[string]float64{},
 		Attachments:   attachments,
 		Environment:   sum.Environment,
+		FailureScope:  sum.FailureScope,
+		FailureStage:  sum.FailureStage,
 	}
 	if res.Attachments == nil {
 		res.Attachments = []Attachment{}
