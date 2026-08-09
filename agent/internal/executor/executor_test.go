@@ -132,6 +132,14 @@ type fakeADB struct {
 	// mkdirFailSubstr 命中该子串的 mkdir 返回 exit=1 + stderr
 	// (模拟只读 rootfs 建子目录失败,2026-08-04 RK3568 实机)
 	mkdirFailSubstr string
+
+	// 两级存活复核(Task 6,spec §5.3)支持:
+	// getStateOut 是一级 `adb -s <transport> get-state` 的 stdout,
+	// 空串模拟该调用未返回 "device"(不区分是失败还是返回其它状态,
+	// classifyFailure 对两者一视同仁);devicesErr 非 nil 时二级
+	// `adb devices -l` 直接返回该错误,优先于 devicesExit/devicesList。
+	getStateOut string
+	devicesErr  error
 }
 
 func defaultProps() map[string]string {
@@ -154,6 +162,9 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 	// devices -l 不带 -s,必须在按位取 cmd 之前处理。
 	// 缺省只报告 serial(快路径,既有用例无感知)。
 	if args[0] == "devices" {
+		if f.devicesErr != nil {
+			return adb.Result{}, f.devicesErr
+		}
 		if f.devicesExit != 0 {
 			return adb.Result{ExitCode: f.devicesExit, Stderr: f.devicesStderr}, nil
 		}
@@ -166,6 +177,11 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 
 	cmd := args[2]
 	switch {
+	case cmd == "get-state":
+		// 一级存活复核(spec §5.3):getStateOut 为空模拟调用未确认设备存活
+		// (不区分是失败还是返回了非 "device" 状态,classifyFailure 对
+		// 两者一视同仁,故这里统一以 ExitCode=0 + 空/异常 stdout 表达)。
+		return adb.Result{Stdout: f.getStateOut}, nil
 	case cmd == "shell" && len(args) == 5 && filepath.Base(args[3]) == "cat":
 		// 设备树读取(仅寻址回退用到 serial-number);未配置的 transport 视为文件不存在
 		if v, ok := f.deviceTreeSerialByTransport[args[1]]; ok {

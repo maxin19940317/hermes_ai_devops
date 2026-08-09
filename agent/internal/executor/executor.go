@@ -61,6 +61,11 @@ type Summary struct {
 	Collected          []string          `json:"collected"`
 	Environment        map[string]string `json:"environment"`
 	OutDir             string            `json:"out_dir"`
+	// FailureScope/FailureStage 是主失败归因(spec §5/§6),仅在走 fail()
+	// 返回路径的站点赋值;best-effort 路径(collect 等)一律不碰,详见
+	// classifyFailure 与 Execute 内各 fail 调用点。
+	FailureScope string `json:"failure_scope,omitempty"`
+	FailureStage string `json:"failure_stage,omitempty"`
 }
 
 // Executor 驱动流水线;设备交互全部经 Runner(可注入 fake 测试)。
@@ -141,26 +146,31 @@ func (e *Executor) Execute(ctx context.Context, opts Options) (*Summary, error) 
 		Environment: map[string]string{"serial": opts.Serial},
 		OutDir:      opts.OutDir,
 	}
-	fail := func(err error) (*Summary, error) {
+	// fail 是唯一给 FailureScope/FailureStage 赋值的路径(spec §6 防线 1):
+	// best-effort 站点(collect 等)不经过它,一律不碰这两个字段。
+	// stage 必须落在契约枚举内:resolve|precheck|download|unpack|deploy|run|collect。
+	fail := func(stage string, err error) (*Summary, error) {
+		sum.FailureStage = stage
+		sum.FailureScope = e.classifyFailure(ctx, opts.Serial, stage, err)
 		e.transition(sum, StatusFailed)
 		e.writeSummary(sum)
 		return sum, err
 	}
 
 	if err := os.MkdirAll(opts.OutDir, 0o755); err != nil {
-		return fail(fmt.Errorf("create out dir: %w", err))
+		return fail("download", fmt.Errorf("create out dir: %w", err))
 	}
 
 	// ---- 获取包(DOWNLOADING 仅在需要下载时出现) ----
 	pkgPath := opts.PackagePath
 	if pkgPath == "" {
 		if opts.PackageURL == "" || opts.SHA256 == "" {
-			return fail(errors.New("package-url 模式必须提供 url 与 sha256"))
+			return fail("download", errors.New("package-url 模式必须提供 url 与 sha256"))
 		}
 		e.transition(sum, StatusDownloading)
 		pkgPath = filepath.Join(opts.OutDir, "package.tar.gz")
 		if err := artifact.Download(ctx, e.HTTP, opts.PackageURL, opts.Auth, pkgPath); err != nil {
-			return fail(err)
+			return fail("download", err)
 		}
 	}
 
@@ -168,21 +178,21 @@ func (e *Executor) Execute(ctx context.Context, opts Options) (*Summary, error) 
 	e.transition(sum, StatusPreparing)
 	if opts.SHA256 != "" {
 		if err := artifact.VerifySHA256(pkgPath, opts.SHA256); err != nil {
-			return fail(err)
+			return fail("download", err)
 		}
 	}
 	extractDir := filepath.Join(opts.OutDir, "package")
 	if _, err := artifact.ExtractTarGz(pkgPath, extractDir); err != nil {
-		return fail(fmt.Errorf("extract package: %w", err))
+		return fail("unpack", fmt.Errorf("extract package: %w", err))
 	}
 	m, err := manifest.Load(filepath.Join(extractDir, "manifest.yaml"))
 	if err != nil {
-		return fail(err)
+		return fail("unpack", err)
 	}
 	// 逐文件完整性:manifest 声明的 sha256 必须与解出内容一致
 	for _, df := range m.Deploy.Files {
 		if err := artifact.VerifySHA256(filepath.Join(extractDir, filepath.FromSlash(df.Src)), df.SHA256); err != nil {
-			return fail(fmt.Errorf("deploy file integrity: %w", err))
+			return fail("unpack", fmt.Errorf("deploy file integrity: %w", err))
 		}
 	}
 	// 寻址解析(放在包校验之后:校验不过不得触碰设备):USB gadget serial 丢失时
@@ -190,14 +200,14 @@ func (e *Executor) Execute(ctx context.Context, opts Options) (*Summary, error) 
 	// 此时逐个 transport 探测 ro.serialno,找到后用真实 transport 替换逻辑 serial。
 	transport, err := e.resolveTransport(ctx, opts.Serial)
 	if err != nil {
-		return fail(err)
+		return fail("resolve", err)
 	}
 	if transport != opts.Serial {
 		e.logf("serial resolve: %s -> transport %s", opts.Serial, transport)
 		opts.Serial = transport
 	}
 	if err := e.precheck(ctx, opts.Serial, m, sum); err != nil {
-		return fail(fmt.Errorf("device precheck: %w", err))
+		return fail("precheck", fmt.Errorf("device precheck: %w", err))
 	}
 
 	// ---- DEPLOYING: 清理旧现场 → push → chmod ----
@@ -207,7 +217,7 @@ func (e *Executor) Execute(ctx context.Context, opts Options) (*Summary, error) 
 	}
 	e.transition(sum, StatusDeploying)
 	if err := e.deploy(ctx, opts.Serial, m, extractDir); err != nil {
-		return fail(fmt.Errorf("deploy: %w", err))
+		return fail("deploy", fmt.Errorf("deploy: %w", err))
 	}
 
 	// ---- RUNNING: 超时控制,超时 kill 但仍收集 ----
@@ -220,7 +230,7 @@ func (e *Executor) Execute(ctx context.Context, opts Options) (*Summary, error) 
 	canceled, timedOut, res, duration, err := e.run(ctx, opts.Serial, m, opts.OutDir)
 	sum.DurationSec = duration.Seconds()
 	if err != nil {
-		return fail(fmt.Errorf("run entry: %w", err))
+		return fail("run", fmt.Errorf("run entry: %w", err))
 	}
 	sum.ExitCode = res.ExitCode
 
@@ -266,6 +276,76 @@ func (e *Executor) finishCanceled(sum *Summary) (*Summary, error) {
 // 归因为 client(spec §5.1);包裹后用 errors.Is 判别。
 var errAdbServer = errors.New("adb server failure")
 
+// 归因判定用的 sentinel(spec §5.1/§5.3.1)。各失败站点用 %w 包裹对应
+// sentinel,classifyFailure 才能用 errors.Is 识别失败的语义类别而不必解析
+// 错误文本(红线:不解析 stderr 文本做判断)。
+var (
+	// errNoMatch 标识 resolveTransport 走完全部候选后仍未能把逻辑 serial
+	// 绑定到任何 transport(spec §5.3.1)。逻辑 serial 与 transport 本来就
+	// 允许不同(USB gadget serial 丢失场景),不能因为没匹配上就判 device。
+	errNoMatch = errors.New("no transport matched logical serial")
+	// errSOCMismatch/errABIMismatch 标识属性读取成功但比较不符——这是任务
+	// 派错了板或服务端配置漂移,不是设备故障(spec §3)。
+	errSOCMismatch = errors.New("soc mismatch")
+	errABIMismatch = errors.New("abi mismatch")
+	// errNoSpace 标识 df 成功执行但可用空间不足:设备当下状态是自足证据,
+	// 不需要走存活复核(spec §5.1 表倒数第三行)。
+	errNoSpace = errors.New("insufficient storage")
+	// errRemoteExit 标识针对已定位 transport 的调用以非零退出结束。
+	// `adb shell` 透传远端命令的退出码(spec §5.2),所以它默认不是设备
+	// 证据——只有经两级存活复核(livenessScope)确认设备不可达才升级为
+	// device;分类交给 classifyFailure 的默认分支处理,这里只负责标记
+	// "这是一次已定位 transport 上的远端命令失败"。
+	errRemoteExit = errors.New("remote command exited non-zero")
+)
+
+// classifyFailure 按 spec §5 判定主失败归因。全程只看错误的调用层级来源
+// (sentinel/类型)与阶段名,不解析 stderr 文本——文案一改归因就会失效。
+//
+// 分支顺序是判定正确性的一部分:ctx 取消/超时必须最先判,否则会被后面更
+// 具体的 stage/sentinel 分支错误吞掉(例如下载阶段被取消不该判成 client)。
+func (e *Executor) classifyFailure(ctx context.Context, transport, stage string, err error) string {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "none" // 多义:不归任何一方
+	case errors.As(err, new(*adb.LaunchError)), errors.Is(err, errAdbServer):
+		return "client" // 本地进程/server 层,与具体设备无关
+	case errors.Is(err, errNoSpace):
+		return "device" // df 已成功执行 → 设备明确活着,数值不足是自足证据
+	case errors.Is(err, errSOCMismatch), errors.Is(err, errABIMismatch):
+		return "none" // 属性可读但不匹配 = 任务派错了板
+	case errors.Is(err, errNoMatch):
+		return "none" // resolve 阶段:逻辑 serial 与 transport 允许不同(§5.3.1)
+	case stage == "download", stage == "unpack":
+		return "client" // 纯本地操作(下载/解压/校验),尚未触碰任何设备
+	case stage == "resolve":
+		return "none" // resolve 未确定 transport,两级复核无从执行,保守(§5.3.1)
+	}
+	return e.livenessScope(ctx, transport)
+}
+
+// livenessScope 是 spec §5.3 的两级存活复核,调用失败升级为 device 的唯一
+// 一般性途径。全程只看 exit code 与结构化状态字段,不解析 stderr 文本。
+func (e *Executor) livenessScope(ctx context.Context, transport string) string {
+	// 一级:目标设备自身状态。
+	if res, err := e.Runner.Run(ctx, adb.GetState(transport)); err == nil &&
+		res.ExitCode == 0 && strings.TrimSpace(res.Stdout) == "device" {
+		return "none" // 设备活着,失败另有原因
+	}
+	// 二级:全局列表。它成功本身就证明 adb server 与宿主机是好的,此时
+	// 目标 transport 缺席或状态异常才构成设备证据;不能复用 ParseTransports,
+	// 它只保留 state=="device" 的行,offline/unauthorized 恰恰是这里最需要
+	// 的证据。
+	res, err := e.Runner.Run(ctx, adb.Devices())
+	if err != nil || res.ExitCode != 0 {
+		return "none" // 排除不掉 server/宿主机故障,保守
+	}
+	if st, ok := adb.ParseDeviceStates(res.Stdout)[transport]; !ok || st != "device" {
+		return "device" // server 好的,设备却缺席或异常 → 设备证据
+	}
+	return "none" // 矛盾(列表说好、一级说坏),保守
+}
+
 // resolveTransport 把逻辑 serial(ro.serialno)解析为可寻址的 transport。
 // 快路径:serial 本身就在 devices 列表中,原样返回,零额外调用。
 // 慢路径:USB gadget serial 丢失(列表只有 "?" 或陌生 serial)时,逐个
@@ -304,8 +384,8 @@ func (e *Executor) resolveTransport(ctx context.Context, logical string) (string
 			}
 		}
 	}
-	return "", fmt.Errorf("device %q not found via adb (visible transports: %s)",
-		logical, strings.Join(transports, ", "))
+	return "", fmt.Errorf("device %q not found via adb (visible transports: %s): %w",
+		logical, strings.Join(transports, ", "), errNoMatch)
 }
 
 // precheck 校验设备属性与空间(§12: getprop 属性 / df 空间)。
@@ -326,10 +406,12 @@ func (e *Executor) precheckAndroid(ctx context.Context, serial string, m *manife
 			return "", err
 		}
 		// 非零退出码通常是设备不可寻址(not found/unauthorized/offline),
-		// 必须带出 adb stderr,不能让空 stdout 伪装成属性值
+		// 必须带出 adb stderr,不能让空 stdout 伪装成属性值。这是一次针对
+		// 已定位 transport 的调用非零退出,归因默认 none,只有存活复核确认
+		// 设备不可达才升级为 device(spec §5.2/§5.3)。
 		if res.ExitCode != 0 {
-			return "", fmt.Errorf("adb getprop %s: exit=%d: %s",
-				prop, res.ExitCode, strings.TrimSpace(res.Stderr))
+			return "", fmt.Errorf("adb getprop %s: exit=%d: %s: %w",
+				prop, res.ExitCode, strings.TrimSpace(res.Stderr), errRemoteExit)
 		}
 		return strings.TrimSpace(res.Stdout), nil
 	}
@@ -340,7 +422,7 @@ func (e *Executor) precheckAndroid(ctx context.Context, serial string, m *manife
 	}
 	sum.Environment["abi"] = abi
 	if abi != m.Requirements.ABI {
-		return fmt.Errorf("abi mismatch: device=%s, required=%s", abi, m.Requirements.ABI)
+		return fmt.Errorf("abi mismatch: device=%s, required=%s: %w", abi, m.Requirements.ABI, errABIMismatch)
 	}
 
 	if release, err := getprop("ro.build.version.release"); err == nil {
@@ -384,8 +466,8 @@ func (e *Executor) precheckAndroid(ctx context.Context, serial string, m *manife
 			}
 		}
 		if matched == "" {
-			return fmt.Errorf("soc mismatch: device soc chain=%v, required one of %v",
-				chain, m.Requirements.SOC)
+			return fmt.Errorf("soc mismatch: device soc chain=%v, required one of %v: %w",
+				chain, m.Requirements.SOC, errSOCMismatch)
 		}
 		sum.Environment["soc"] = matched
 	}
@@ -400,8 +482,8 @@ func (e *Executor) precheckAndroid(ctx context.Context, serial string, m *manife
 			return err
 		}
 		if availKB < int64(m.Requirements.MinFreeStorageMB)*1024 {
-			return fmt.Errorf("insufficient storage: %d KB available, need %d MB",
-				availKB, m.Requirements.MinFreeStorageMB)
+			return fmt.Errorf("insufficient storage: %d KB available, need %d MB: %w",
+				availKB, m.Requirements.MinFreeStorageMB, errNoSpace)
 		}
 	}
 	return nil
@@ -422,13 +504,29 @@ func parseDFAvailableKB(out string) (int64, error) {
 
 func (e *Executor) deploy(ctx context.Context, serial string, m *manifest.Manifest, extractDir string) error {
 	wd := m.Deploy.Workdir
+	// remoteRun 统一远端命令的错误语义:非零退出包 errRemoteExit
+	// (spec §5.2——退出码是远端命令的,不是设备的,归因交给
+	// classifyFailure 的存活复核默认分支);Runner.Run 自身返回的 err
+	// (如 adb.LaunchError)原样 %w 透传,保留错误链供 errors.As 识别。
+	remoteRun := func(desc string, args []string) error {
+		res, err := e.Runner.Run(ctx, args)
+		if err != nil {
+			return fmt.Errorf("%s: %w", desc, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("%s: exit=%d stderr=%q: %w",
+				desc, res.ExitCode, strings.TrimSpace(res.Stderr), errRemoteExit)
+		}
+		return nil
+	}
+
 	steps := [][]string{
 		adb.ShellRemoveAll(serial, wd), // 清理旧现场
 		adb.ShellMkdirAll(serial, wd),
 	}
 	for _, args := range steps {
-		if res, err := e.Runner.Run(ctx, args); err != nil || res.ExitCode != 0 {
-			return fmt.Errorf("workdir setup (%v): exit=%d stderr=%q err=%v", args, res.ExitCode, strings.TrimSpace(res.Stderr), err)
+		if err := remoteRun(fmt.Sprintf("workdir setup (%v)", args), args); err != nil {
+			return err
 		}
 	}
 	for _, df := range m.Deploy.Files {
@@ -436,20 +534,20 @@ func (e *Executor) deploy(ctx context.Context, serial string, m *manifest.Manife
 		if dir := path.Dir(remote); dir != wd {
 			// exit code 必须检查:只查 Go error 时 mkdir 静默失败,真实错误
 			// 推迟到 push 才暴露且丢失 stderr(2026-08-04 RK3568 实机)
-			if res, err := e.Runner.Run(ctx, adb.ShellMkdirAll(serial, dir)); err != nil || res.ExitCode != 0 {
-				return fmt.Errorf("mkdir %s: exit=%d stderr=%q err=%v", dir, res.ExitCode, strings.TrimSpace(res.Stderr), err)
+			if err := remoteRun("mkdir "+dir, adb.ShellMkdirAll(serial, dir)); err != nil {
+				return err
 			}
 		}
 		local := filepath.Join(extractDir, filepath.FromSlash(df.Src))
-		if res, err := e.Runner.Run(ctx, adb.Push(serial, local, remote)); err != nil || res.ExitCode != 0 {
-			return fmt.Errorf("push %s: exit=%d stderr=%q err=%v", df.Src, res.ExitCode, strings.TrimSpace(res.Stderr), err)
+		if err := remoteRun("push "+df.Src, adb.Push(serial, local, remote)); err != nil {
+			return err
 		}
 		mode := df.Mode
 		if mode == "" {
 			mode = "0644"
 		}
-		if res, err := e.Runner.Run(ctx, adb.ShellChmod(serial, mode, remote)); err != nil || res.ExitCode != 0 {
-			return fmt.Errorf("chmod %s: exit=%d stderr=%q err=%v", remote, res.ExitCode, strings.TrimSpace(res.Stderr), err)
+		if err := remoteRun("chmod "+remote, adb.ShellChmod(serial, mode, remote)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -603,13 +701,14 @@ func (e *Executor) precheckLinux(ctx context.Context, serial string, m *manifest
 		return fmt.Errorf("linux precheck: uname -m: %w", err)
 	}
 	if res.ExitCode != 0 {
-		return fmt.Errorf("linux precheck: uname -m: exit=%d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+		return fmt.Errorf("linux precheck: uname -m: exit=%d: %s: %w",
+			res.ExitCode, strings.TrimSpace(res.Stderr), errRemoteExit)
 	}
 	arch := strings.TrimSpace(res.Stdout)
 	abi := adb.MapLinuxArchToABI(arch)
 	sum.Environment["abi"] = abi
 	if abi != m.Requirements.ABI {
-		return fmt.Errorf("abi mismatch: device=%s (uname=%s), required=%s", abi, arch, m.Requirements.ABI)
+		return fmt.Errorf("abi mismatch: device=%s (uname=%s), required=%s: %w", abi, arch, m.Requirements.ABI, errABIMismatch)
 	}
 	sum.Environment["os"] = "linux"
 
@@ -623,8 +722,8 @@ func (e *Executor) precheckLinux(ctx context.Context, serial string, m *manifest
 			return err
 		}
 		if availKB < int64(m.Requirements.MinFreeStorageMB)*1024 {
-			return fmt.Errorf("insufficient storage: %d KB available, need %d MB",
-				availKB, m.Requirements.MinFreeStorageMB)
+			return fmt.Errorf("insufficient storage: %d KB available, need %d MB: %w",
+				availKB, m.Requirements.MinFreeStorageMB, errNoSpace)
 		}
 	}
 	return nil
