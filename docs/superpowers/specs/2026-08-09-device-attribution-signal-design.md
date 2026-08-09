@@ -19,6 +19,10 @@
 > `ExitError` 分支,不是 `default`);§9.2 明确 outbox payload 的
 > `failure_stage` 由 Store 在事务内从 `results` 回读,避免新开
 > `workflow.GetVersion` 门。
+>
+> 第四轮评审后修订:新增 §5.3.1 —— 两级复核以"已知 transport"为前提,
+> 而 resolve 阶段恰恰还没有 transport,该阶段单独定规则并明确残余盲区;
+> 修正三处仍指向旧编号的测试交叉引用。
 
 ## 1. 问题
 
@@ -40,6 +44,9 @@
 **早于 112 行的签名判定**。而预检失败、adb 寻址不到、push 失败全部产出
 `Status=FAILED`。经 `failScope()` 的 `CategoryInfra + FAILED` 分支,这些
 **全部归到 client 头上**。
+
+(其中"adb 寻址不到"这一条,本设计的效果是从错记 client 变为不记任何一方,
+而非归 device——原因见 §5.3.1 的残余盲区说明。)
 
 结论:一块坏板今天不仅不会被隔离,还在持续抬高它所在 client 的失败计数。
 
@@ -189,6 +196,37 @@ adb server 与宿主机是好的,此时目标设备缺席或异常才构成设�
   最需要的证据。
 
 空间不足不走复核:`df` 已成功执行(设备明确活着),数值不足是自足的设备状态证据。
+
+### 5.3.1 resolve 阶段:两级复核在此**不适用**
+
+§5.3 的前提是"已知目标 transport",而 `resolveTransport`
+(`executor.go:265`)的职责恰恰是把逻辑 serial 映射成 transport。它失败时
+我们通常只知道:`adb devices -l` 成功了、看见若干陌生或 `?` transport、
+但没有任何候选能自证对应目标逻辑 serial。此时**没有 transport 可供
+`get-state` 探测**,两级复核无从执行。
+
+更要紧的是:**不能因为逻辑 serial 没直接出现在列表里就判 `device`**。
+逻辑 serial 与 transport 本来就允许不同——RK3568 / USB gadget serial 丢失
+场景正是如此(`executor.go:265-296` 的慢路径存在的全部理由),这也是本项目
+反复踩过的坑:QCM6125 板 USB 无 iSerial,现用 serial 是手工写入的,重启后丢失。
+
+resolve 阶段的归因规则:
+
+| 情形 | scope |
+|---|---|
+| `adb devices` 启动失败或非零退出 | `client`(server/宿主机能力问题) |
+| 列表成功,但无任何 transport 能绑定到目标逻辑 serial | **`none`**(保守) |
+| 候选身份探测(`ro.serialno` / 设备树)失败,目标 transport 仍未确定 | **`none`**(保守) |
+| 已成功解析出 transport,之后的失败 | 走 §5.3 两级复核 |
+
+**残余盲区(本轮明确不解决)**:真正"在 resolve 之前就掉线"的坏板会落到
+`none`,不计入隔离。要把它归 `device`,前提是**持久化最近一次可信的
+logical→transport 映射**,用历史证据证明"这台设备本该出现却不见了"。
+本轮没有该证据,因此宁可漏计——这与 §5.1 末行"无法可靠区分即 `none`"一致。
+
+注意这意味着 §1 所述"adb 寻址不到"这条误记账路径,本设计的效果是
+**从错记 client 变成不记任何一方**,而不是变成 device。这是诚实的改进,
+但不要误以为它已被隔离机制覆盖。
 
 ### 5.4 必须先修的三处证据丢失
 
@@ -396,10 +434,10 @@ stage 读不到时(旧 Agent、或该 task 未落 stage)payload 留空字符串,
 - **Agent(表驱动)**:每个失败站点 → 期望 (scope, stage)。必须含:
   - `soc mismatch → none`(§3 核心区分)
   - 已定位 transport 后掉线 → `device`
-  - **adb 可执行文件起不来 → `client`**(§5.2 第 1 处)
-  - **`adb devices` 非零退出 → `client`**,不得落成 device(§5.2 第 2 处)
+  - **adb 可执行文件起不来 → `client`**(§5.4 第 1 处)
+  - **`adb devices` 非零退出 → `client`**,不得落成 device(§5.4 第 2 处)
   - **ABI 检查后掉线导致空探测链 → `device`**,不得落成 `soc mismatch/none`
-    (§5.2 第 3 处)
+    (§5.4 第 3 处)
   - ctx 取消 → `none`
   - **`adb shell mkdir -p` 在只读分区返回非零 → `none`**(§5.2 的真实先例,
     存活复核会确认设备活着)
@@ -410,6 +448,10 @@ stage 读不到时(旧 Agent、或该 task 未落 stage)payload 留空字符串,
     (无法排除 server 故障,保守)
   - 二级解析必须能识别 `offline` / `unauthorized` 状态行——用 `ParseTransports`
     会丢掉它们,该用例即回归护栏
+  - **`resolveTransport`:`adb devices -l` 成功、可见若干 transport 但无一匹配
+    目标逻辑 serial → `none`**,不得落成 `device`(§5.3.1;逻辑 serial 与
+    transport 允许不同,RK3568 场景)
+  - `resolveTransport`:`adb devices` 非零退出 → `client`
 - **契约**:合法枚举通过;非法枚举被拒;**只给 `failure_scope` 或只给
   `failure_stage` 的反例各一,均须被 `dependentRequired` 拒绝**
 - **Runtime(扩表)**:
