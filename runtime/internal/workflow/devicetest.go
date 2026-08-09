@@ -492,7 +492,7 @@ const (
 //
 // 终态分支需要 resultStatus:d.Category 单独不足以区分 FAILED(client 侧流水线
 // 失败)与 TIMEOUT(工作负载属性)——两者都是 CategoryInfra。
-func failScope(site releaseSite, category rules.Category, resultStatus string) FailScope {
+func failScope(site releaseSite, category rules.Category, resultStatus, verdict, reportedScope string) FailScope {
 	switch site {
 	case siteDispatchFailed, siteLeaseExpired:
 		// 已知盲区(设计文档 §4.1):callbacks 进程自身宕机 ≥120s 时,心跳送不达、
@@ -505,6 +505,22 @@ func failScope(site releaseSite, category rules.Category, resultStatus string) F
 		siteCanceled, siteLoadResultFailed:
 		return FailScopeNone
 	case siteTerminal:
+		// 防线 2(优先级最高,先于任何上报值判定):成功的任务永远不扣任何一方的
+		// 分(spec §6)。即便 Agent 因 bug 或版本错配把 reportedScope 填成
+		// "device",PASSED 也必须清零——纵深防御,不信任单一信号源。
+		if verdict == string(rules.VerdictPassed) {
+			return FailScopeOK
+		}
+		// 防线 3:Agent 上报了明确 scope 就直接采用,优先于下面的 category 映射。
+		switch reportedScope {
+		case "device":
+			return FailScopeDevice
+		case "client":
+			return FailScopeClient
+		case "none":
+			return FailScopeNone
+		}
+		// 未上报(或上报值不认识)→ 回落既有 category 映射,零行为变化。
 		switch {
 		case resultStatus == "CANCELED":
 			// 取消不是任何一方的错,也不是"干完了"的证据(设计 §4:取消归 none)。
@@ -639,7 +655,7 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 		IdempotencyKey: taskID, ClientID: lease.ClientID, DeviceID: lease.DeviceID,
 		Status: "DISPATCHING",
 	}).Get(ctx, nil); err != nil {
-		release(false, failScope(siteCreateTaskFailed, "", ""))
+		release(false, failScope(siteCreateTaskFailed, "", "", "", ""))
 		return infra("create task: "+err.Error(), true)
 	}
 	finish := func(status, verdict, category, reason string) {
@@ -668,7 +684,7 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 		LeaseID: lease.LeaseID, LeaseGeneration: lease.Generation,
 	}).Get(ctx, nil); err != nil {
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), "dispatch failed")
-		release(true, failScope(siteDispatchFailed, "", ""))
+		release(true, failScope(siteDispatchFailed, "", "", "", ""))
 		return infra("dispatch: "+err.Error(), true)
 	}
 
@@ -676,7 +692,7 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 	if site, infraReason := awaitResult(ctx, taskID, spec, resultCh); infraReason != "" {
 		cancel(infraReason)
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), infraReason)
-		release(true, failScope(site, "", ""))
+		release(true, failScope(site, "", "", "", ""))
 		return infra(infraReason, true)
 	}
 
@@ -692,7 +708,7 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 		}
 		cancel(reason)
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), reason)
-		release(true, failScope(siteLoadResultFailed, "", ""))
+		release(true, failScope(siteLoadResultFailed, "", "", "", ""))
 		return infra(reason, true)
 	}
 	res := &rec.Result
@@ -750,7 +766,8 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 		maybeEscalate(ctx, in, taskID, spec, res, d, ev, sum.Analysis)
 	}
 	finish(res.Status, sum.Verdict, sum.Category, sum.Reason)
-	release(d.Category == rules.CategoryInfra, failScope(siteTerminal, d.Category, res.Status))
+	release(d.Category == rules.CategoryInfra,
+		failScope(siteTerminal, d.Category, res.Status, string(d.Verdict), res.FailureScope))
 	return sum
 }
 
