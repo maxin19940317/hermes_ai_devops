@@ -18,6 +18,18 @@ type Config struct {
 	BacklogInterval time.Duration
 	StuckAttempts   int
 	BacklogWarnAge  time.Duration
+
+	// 设备隔离通知(spec §9.2/§9.3)。与 cmd/worker 同款飞书双模配置——
+	// app 三件套齐全优先,否则 webhook 兜底,都没配 → Notifier=nil。
+	// DeviceNotifyDisabled 是显式关闭(RELAY_DEVICE_NOTIFY=off);
+	// 未显式关闭且 Notifier 为 nil 时,relay 让 device-quarantined 事件保持
+	// pending(不静默 MarkPublished),见 internal/relay/relay.go deliver()。
+	FeishuWebhookURL     string
+	FeishuAppID          string
+	FeishuAppSecret      string
+	FeishuReceiveID      string
+	FeishuReceiveIDType  string
+	DeviceNotifyDisabled bool
 }
 
 // loadConfig 从 getenv(通常是 os.Getenv)派生 Config;
@@ -90,5 +102,14 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		BacklogInterval: backlogInterval,
 		StuckAttempts:   stuckAttempts,
 		BacklogWarnAge:  backlogWarnAge,
+
+		FeishuWebhookURL:    getenv("FEISHU_WEBHOOK_URL"),
+		FeishuAppID:         getenv("FEISHU_APP_ID"),
+		FeishuAppSecret:     getenv("FEISHU_APP_SECRET"),
+		FeishuReceiveID:     getenv("FEISHU_RECEIVE_ID"),      // open_id 单聊 / chat_id 群
+		FeishuReceiveIDType: getenv("FEISHU_RECEIVE_ID_TYPE"), // 空 → chat_id
+		// 显式关闭(spec §9.3 第三行):值为 "off" 才算关闭,其余(含空)都是
+		// "未显式关闭",走"未配置则保持 pending"分支——默认必须偏向不丢通知。
+		DeviceNotifyDisabled: getenv("RELAY_DEVICE_NOTIFY") == "off",
 	}, nil
 }
