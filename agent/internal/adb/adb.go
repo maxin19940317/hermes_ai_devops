@@ -172,6 +172,27 @@ func ParseTransports(out string) []string {
 	return serials
 }
 
+// GetState 查询单台设备的连接状态(存活复核一级,spec §5.3)。
+// 输出为 "device" / "offline" / "unauthorized" 之一,或非零退出。
+func GetState(serial string) []string { return withSerial(serial, "get-state") }
+
+// ParseDeviceStates 解析 `adb devices -l`,返回 serial → state 全量映射。
+//
+// 与 ParseTransports 的区别:后者只保留 state == "device" 的行。
+// 存活复核二级(spec §5.3)恰恰需要 offline / unauthorized —— 它们是
+// "设备确实不可达"的证据,被丢掉就无法与"adb server 挂了"区分。
+func ParseDeviceStates(out string) map[string]string {
+	states := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] == "List" {
+			continue
+		}
+		states[fields[0]] = fields[1]
+	}
+	return states
+}
+
 // ShellListGlob 在 workdir 内展开 glob。pattern 来自 Manifest collect 字段,
 // 已由 Schema 限定字符集([A-Za-z0-9._*/-],无 ..),不加引号以保留 glob 展开。
 func ShellListGlob(serial, workdir, pattern string) []string {

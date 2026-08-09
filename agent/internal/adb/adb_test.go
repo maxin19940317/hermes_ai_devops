@@ -185,6 +185,32 @@ func TestRunNonZeroExitIsNotLaunchError(t *testing.T) {
 	}
 }
 
+func TestGetStateIsSerialScoped(t *testing.T) {
+	got := GetState("dev1")
+	want := []string{"-s", "dev1", "get-state"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetState = %v, want %v(红线 §14:必须带 -s)", got, want)
+	}
+}
+
+// 二级复核要靠 offline/unauthorized 判定设备不可达,不能像 ParseTransports 那样丢弃
+func TestParseDeviceStatesRetainsNonDeviceStates(t *testing.T) {
+	out := "List of devices attached\n" +
+		"dev1\tdevice\n" +
+		"dev2\toffline\n" +
+		"dev3\tunauthorized\n" +
+		"\n"
+	got := ParseDeviceStates(out)
+	want := map[string]string{"dev1": "device", "dev2": "offline", "dev3": "unauthorized"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseDeviceStates = %v, want %v", got, want)
+	}
+	// 对照:ParseTransports 会把后两台丢掉,故不可复用
+	if len(ParseTransports(out)) != 1 {
+		t.Fatal("前提失效:ParseTransports 不再只保留 device 行,请重新评估 §5.3 设计")
+	}
+}
+
 func TestParseTransports(t *testing.T) {
 	out := "List of devices attached\n" +
 		"513cd3de\tdevice product:trinket\n" +
