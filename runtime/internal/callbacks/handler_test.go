@@ -335,6 +335,57 @@ func TestResultSchemaViolationIs400(t *testing.T) {
 	}
 }
 
+// TestResultCallbackPersistsAttribution:result.json 携带 failure_scope/
+// failure_stage(Task 5 契约,device 归因信号)时,回调须原样落库
+// results.result_json——LoadResult 权威回读(经 GetResult)两字段必须完整,
+// 否则 Task 9 的 failScope() 拿不到设备侧信号,只能回落既有 category 映射。
+func TestResultCallbackPersistsAttribution(t *testing.T) {
+	s, _, srv := newEnv(t)
+	_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w1:t:a1", WorkflowID: "w1", IdempotencyKey: "w1:t:a1"})
+
+	result := validResult("w1:t:a1")
+	result["status"] = "FAILED"
+	result["exit_code"] = -1
+	result["failure_scope"] = "device"
+	result["failure_stage"] = "run"
+
+	body := map[string]any{"task_id": "w1:t:a1", "idempotency_key": "w1:t:a1", "result": result}
+	if resp := post(t, srv.URL+"/callbacks/v1/results", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	rec, err := s.GetResult(ctx, "w1:t:a1")
+	if err != nil || rec == nil {
+		t.Fatalf("GetResult: rec=%+v err=%v", rec, err)
+	}
+	if rec.Result.FailureScope != "device" || rec.Result.FailureStage != "run" {
+		t.Errorf("FailureScope/FailureStage = %q/%q, want device/run",
+			rec.Result.FailureScope, rec.Result.FailureStage)
+	}
+}
+
+// TestResultCallbackOmitsAttributionWhenAbsent:两字段成对可选
+// (contracts dependentRequired),缺省场景(无设备归因信号)不得凭空产生值——
+// omitempty 保证旧 history/未携带归因的正常 PASSED 结果不受影响。
+func TestResultCallbackOmitsAttributionWhenAbsent(t *testing.T) {
+	s, _, srv := newEnv(t)
+	_ = s.CreateTask(ctx, wf.TaskRow{TaskID: "w1:t:a2", WorkflowID: "w1", IdempotencyKey: "w1:t:a2"})
+
+	body := map[string]any{"task_id": "w1:t:a2", "idempotency_key": "w1:t:a2", "result": validResult("w1:t:a2")}
+	if resp := post(t, srv.URL+"/callbacks/v1/results", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	rec, err := s.GetResult(ctx, "w1:t:a2")
+	if err != nil || rec == nil {
+		t.Fatalf("GetResult: rec=%+v err=%v", rec, err)
+	}
+	if rec.Result.FailureScope != "" || rec.Result.FailureStage != "" {
+		t.Errorf("FailureScope/FailureStage = %q/%q, want 均为空(未上报)",
+			rec.Result.FailureScope, rec.Result.FailureStage)
+	}
+}
+
 func TestResultUnknownTaskIs400(t *testing.T) {
 	_, sig, srv := newEnv(t)
 	resp := post(t, srv.URL+"/callbacks/v1/results",

@@ -40,6 +40,12 @@ type TaskResultSignal struct {
 	SignaturesHit []string           `json:"signatures_hit"`
 	Metrics       map[string]float64 `json:"metrics"`
 	Attachments   []Attachment       `json:"attachments"`
+	// FailureScope/FailureStage 是设备侧归因信号(contracts result.schema.json,
+	// Task 5),成对可选。omitempty 必须保留:本结构体进 Temporal workflow
+	// history,旧 history 重放时不带这两个字段,缺省值(空串)必须与"未上报"
+	// 等价,不能让重放因多出字段而分叉。
+	FailureScope string `json:"failure_scope,omitempty"`
+	FailureStage string `json:"failure_stage,omitempty"`
 }
 
 type Attachment struct {
