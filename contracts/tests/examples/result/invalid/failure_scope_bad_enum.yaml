@@ -1,0 +1,9 @@
+result_version: 1
+task_id: "wf-1:v1:a1"
+attempt: 1
+status: FAILED
+exit_code: -1
+duration_sec: 3.5
+cases: { total: 0, passed: 0, failed: 0, skipped: 0 }
+failure_scope: broken
+failure_stage: precheck
