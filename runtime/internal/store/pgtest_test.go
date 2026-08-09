@@ -83,7 +83,7 @@ func openTestPG(t *testing.T) *PGStore {
 	}
 	t.Cleanup(func() { _ = s.DB.Close() })
 	if _, err := s.DB.ExecContext(ctx,
-		`TRUNCATE artifacts, workflow_runs, clients, devices, device_leases, tasks, task_events, results, decisions, outbox, evidence_snapshots, command_translations CASCADE`); err != nil {
+		`TRUNCATE artifacts, workflow_runs, clients, devices, device_leases, tasks, task_events, results, decisions, outbox, evidence_snapshots, command_translations, audit_log, metrics CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	return s

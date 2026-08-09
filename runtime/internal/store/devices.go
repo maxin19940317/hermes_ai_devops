@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -183,8 +184,9 @@ func (s *MemStore) AcquireDevice(_ context.Context, sel wf.DeviceSelector, taskI
 //
 // 非租约持有者释放/租约已易主/重复释放:幂等,无副作用,且不计数。
 //
-// 注:device scope 目前无信号源(rules.CategoryDevice 无人产出,见设计 §7),
-// 因此 devices.fail_streak 恒为 0、隔离不再触发——这是预期状态,不是缺陷。
+// 置 QUARANTINED 时在同一临界区(等价于 PGStore 的同一事务)内经 emitQuarantineEvent
+// 写 outbox + audit_log(spec §9.2):"隔离已提交、进程在发通知前崩溃" 是让 activity
+// 靠返回值另发通知的致命缺陷——本方法幂等早返回时无法再补发,写进临界区内就没有这个窗口。
 func (s *MemStore) ReleaseDevice(_ context.Context, deviceID, taskID string, scope wf.FailScope, quarantineAfter int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -200,6 +202,7 @@ func (s *MemStore) ReleaseDevice(_ context.Context, deviceID, taskID string, sco
 		row.FailStreak++
 		if row.FailStreak >= quarantineAfter {
 			row.Status = DeviceQuarantined
+			s.emitQuarantineEvent(row, taskID)
 			return nil
 		}
 	case wf.FailScopeClient:
@@ -212,6 +215,50 @@ func (s *MemStore) ReleaseDevice(_ context.Context, deviceID, taskID string, sco
 	}
 	row.Status = DeviceIdle
 	return nil
+}
+
+// emitQuarantineEvent 写 outbox(spec §9.2)+ audit_log,调用方(ReleaseDevice)已持锁,
+// 与置 QUARANTINED 视为同一原子操作。event_key 用**触发本次隔离的 task_id**,
+// 不能用 fail_streak:UnquarantineDevice 会把它清零(fleet.go 的
+// UnquarantineDevice 注释「status=IDLE、fail_streak=0」),于是"隔离 → 解除 →
+// 再次隔离"第二次仍在 streak=3 触发,生成与第一次完全相同的键,第二条 outbox 行
+// 会被幂等挡掉——第二次隔离永远不通知。task_id 不会有这个问题:同一次 Release
+// 的重试 task_id 不变(天然幂等),再次隔离必然是另一个 task。
+//
+// failure_stage 按 task_id 从已持久化的 results 读(权威读,差距 #2 同款);
+// 读不到留空,事件照常产生——通知不能因为缺一个展示字段就不发。
+func (s *MemStore) emitQuarantineEvent(row *deviceRow, taskID string) {
+	stage := ""
+	if rec, ok := s.results[taskID]; ok {
+		stage = rec.Result.FailureStage
+	}
+	payload, err := json.Marshal(QuarantineEventPayload{
+		DeviceID: row.DeviceID, ClientID: row.ClientID, Serial: row.Serial,
+		DisplayName: row.DisplayName, FailStreak: row.FailStreak,
+		TaskID: taskID, FailureStage: stage,
+	})
+	if err != nil {
+		// QuarantineEventPayload 全是字符串/int 字段,理论上不会序列化失败;
+		// 即便失败也不能让隔离本身失败,只跳过本次事件与审计。
+		return
+	}
+	eventKey := row.DeviceID + ":quarantined:" + taskID
+	if _, exists := s.outboxByKey[eventKey]; !exists {
+		s.outboxSeq++
+		ev := &outboxRow{
+			ev: OutboxEvent{
+				ID: s.outboxSeq, AggregateType: "device", AggregateID: row.DeviceID,
+				EventType: EventTypeDeviceQuarantined, EventKey: eventKey, Payload: payload,
+			},
+			createdAt: time.Now().UTC(),
+		}
+		s.outbox = append(s.outbox, ev)
+		s.outboxByKey[eventKey] = ev
+		s.outboxByID[ev.ev.ID] = ev
+	}
+	s.auditLog = append(s.auditLog, AuditEntry{
+		Actor: "activity:release_device", Action: "device_quarantined", Target: row.DeviceID,
+	})
 }
 
 // leasable 判定设备当前是否可出租:IDLE 可租;BUSY 仅当租约已过期
@@ -378,7 +425,7 @@ func (s *MemStore) GetClientVersion(_ context.Context, clientID string) (string,
 // AuditEntry is a single audit_log row (§11 Phase 3).
 type AuditEntry struct {
 	Actor         string // activity:dispatch / activity:acquire_device / ...
-	Action        string // dispatched / device_leased / device_released / escalated
+	Action        string // dispatched / device_leased / device_released / escalated / device_quarantined
 	Target        string // task_id / device_id
 	PayloadDigest string // sha256 of the marshal of the operation payload (empty = not applicable)
 }

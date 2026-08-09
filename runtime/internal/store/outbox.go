@@ -12,6 +12,26 @@ import (
 // 事件分级:Result 属关键事件,必须走事务性 Outbox)。
 const EventTypeTaskResult = "task-result"
 
+// EventTypeDeviceQuarantined 是设备被自动隔离事件的 event_type
+// (设计文档 2026-08-09-device-attribution-signal-design.md §9.2)。
+// ReleaseDevice 在把设备置 QUARANTINED 的同一事务内写这类事件,由 Relay
+// 投递给通知端——隔离已提交后进程崩溃也不会丢通知(at-least-once)。
+const EventTypeDeviceQuarantined = "device-quarantined"
+
+// QuarantineEventPayload 是 event_type=device-quarantined 的 outbox payload
+// (spec §9.2)。FailureStage 取自触发本次隔离的 task 的已持久化结果
+// (results.result_json ->> 'failure_stage');该 task 无 stage 时留空——
+// 通知不能因为缺一个展示字段就不发。
+type QuarantineEventPayload struct {
+	DeviceID     string `json:"device_id"`
+	ClientID     string `json:"client_id"`
+	Serial       string `json:"serial"`
+	DisplayName  string `json:"display_name"`
+	FailStreak   int    `json:"fail_streak"`
+	TaskID       string `json:"task_id"`
+	FailureStage string `json:"failure_stage"`
+}
+
 // OutboxEvent 对应 outbox 表一行(docs/device-test-sequence.md 文末表结构)。
 // PublishedAt 不暴露给投递方:ClaimUnpublished 只返回未投递行,
 // MarkPublished/MarkFailed 也只作用于未投递行。

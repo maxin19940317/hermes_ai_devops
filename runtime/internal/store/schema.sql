@@ -183,8 +183,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     id             BIGSERIAL PRIMARY KEY,
     aggregate_type TEXT        NOT NULL,            -- task / device / ...
     aggregate_id   TEXT        NOT NULL,
-    event_type     TEXT        NOT NULL,            -- task-result / cancel / ...
-    event_key      TEXT        NOT NULL UNIQUE,     -- 幂等键,如 {task_id}:result
+    event_type     TEXT        NOT NULL,            -- task-result / cancel / device-quarantined / ...
+    event_key      TEXT        NOT NULL UNIQUE,     -- 幂等键,如 {task_id}:result 或 {device_id}:quarantined:{task_id}
     payload        JSONB       NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     published_at   TIMESTAMPTZ,                     -- NULL = 未投递
@@ -208,7 +208,7 @@ WHERE published_at IS NULL;
 
 -- 统一审计日志(§11, Phase 3):所有产生副作用的操作都留一行。
 -- actor: 哪个组件(activity:dispatch / activity:acquire_device 等)
--- action: dispatched / device_leased / device_released / escalated / task_finished
+-- action: dispatched / device_leased / device_released / device_quarantined / escalated / task_finished
 -- target: 操作对象(task_id / device_id)
 -- payload_digest: 操作载荷的 sha256 摘要(可从对应表 JOIN 回查原始数据)
 -- 写入失败不阻断主流程(活动内 fire-and-forget)
