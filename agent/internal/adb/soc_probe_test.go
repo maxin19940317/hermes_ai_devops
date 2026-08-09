@@ -39,3 +39,40 @@ func TestProbeChainNoErrorWhenPropsMerelyEmpty(t *testing.T) {
 		t.Fatalf("chain = %v, want empty", chain)
 	}
 }
+
+// mixedRunner 按 getprop 的属性名(args 最后一个元素)分派:命中 failProps 的
+// 属性返回传输层失败,其余返回 soc(合法 SoC 值)。用于构造"链上部分调用
+// 失败、部分调用探到有效值"的混合场景——前两条用例(errRunner 恒失败 /
+// okRunner 恒成功但值恒为空)分别只覆盖了 out 恒空的两端,都不会拦住把
+// 返回条件从 `len(out) == 0 && lastErr != nil` 误简化为 `lastErr != nil`
+// 的退化(2026-08-09 评审 Important)。
+type mixedRunner struct {
+	failProps map[string]bool
+	soc       string
+}
+
+func (r mixedRunner) Run(_ context.Context, args []string) (Result, error) {
+	prop := args[len(args)-1]
+	if r.failProps[prop] {
+		return Result{}, &LaunchError{Args: args, Err: errors.New("boom")}
+	}
+	return Result{Stdout: r.soc}, nil
+}
+
+// 链上前两跳(ro.soc.model / ro.chipname)传输层失败,后两跳
+// (ro.board.platform / ro.product.board)调用成功并探到合法值:
+// 设备显然是活的,即便过程中出现过失败也不应报错,且失败不能吞掉后面
+// 探到的有效值。
+func TestProbeChainNoErrorWhenSomePropsFailButOthersSucceed(t *testing.T) {
+	runner := mixedRunner{
+		failProps: map[string]bool{"ro.soc.model": true, "ro.chipname": true},
+		soc:       "trinket",
+	}
+	chain, err := ProbeAndroidSOCChain(context.Background(), runner, "dev1")
+	if err != nil {
+		t.Fatalf("链上探到了有效值,即便部分调用失败也不应报错: %v", err)
+	}
+	if len(chain) != 1 || chain[0] != "trinket" {
+		t.Fatalf("chain = %v, want [trinket](失败的属性不应吞掉后面探到的有效值)", chain)
+	}
+}
