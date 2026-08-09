@@ -316,8 +316,15 @@ func (e *Executor) classifyFailure(ctx context.Context, transport, stage string,
 		return "none" // 属性可读但不匹配 = 任务派错了板
 	case errors.Is(err, errNoMatch):
 		return "none" // resolve 阶段:逻辑 serial 与 transport 允许不同(§5.3.1)
-	case stage == "download", stage == "unpack":
-		return "client" // 纯本地操作(下载/解压/校验),尚未触碰任何设备
+	case stage == "download":
+		return "client" // 本地磁盘/网络故障,尚未触碰任何设备
+	case stage == "unpack":
+		// tar 解压失败 / manifest 不合法 / 逐文件 sha256 不符,全是构建产物
+		// (CI/打包)的问题,不是这台 Windows client 的问题——归 client 会让
+		// 恰好领到坏包的那台 client 失败计数上涨,把健康 client 显示成故障中
+		// (§1 描述的"记错账"同一种病)。无法可靠区分产物问题 vs 本机问题,
+		// 按 §5.1 末行保守默认为 none。
+		return "none"
 	case stage == "resolve":
 		return "none" // resolve 未确定 transport,两级复核无从执行,保守(§5.3.1)
 	}
