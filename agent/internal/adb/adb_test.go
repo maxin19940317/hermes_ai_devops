@@ -1,6 +1,8 @@
 package adb
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -156,6 +158,30 @@ func TestExecRunnerUsesPrivatePort(t *testing.T) {
 		if !found {
 			t.Errorf("commandEnv 缺少 ANDROID_ADB_SERVER_PORT=5137: %v", env)
 		}
+	}
+}
+
+func TestRunWrapsLaunchFailureAsLaunchError(t *testing.T) {
+	r := &ExecRunner{ADBPath: "/nonexistent/adb-binary-xyz"}
+	_, err := r.Run(context.Background(), Devices())
+	if err == nil {
+		t.Fatal("adb 二进制不存在时应返回 error")
+	}
+	var le *LaunchError
+	if !errors.As(err, &le) {
+		t.Fatalf("应为 *LaunchError(供调用方归因 client),got %T: %v", err, err)
+	}
+}
+
+// 非零退出码不是 error,更不能是 LaunchError:它是"设备/远端命令的客观结果"
+func TestRunNonZeroExitIsNotLaunchError(t *testing.T) {
+	r := &ExecRunner{ADBPath: "/bin/false"}
+	res, err := r.Run(context.Background(), Devices())
+	if err != nil {
+		t.Fatalf("非零退出不应作为 error: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatal("期望非零退出码")
 	}
 }
 
