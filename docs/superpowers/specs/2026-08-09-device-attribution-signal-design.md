@@ -12,6 +12,13 @@
 > `event_key` 由 fail_streak 改 task_id(解隔离会清零 streak,第二次隔离的
 > 通知会被 UNIQUE 吞掉);新增 §9.3 Relay 通知能力与未配置语义;
 > §4 两字段用 `dependentRequired` 成对约束。
+>
+> 第三轮评审后修订:§5.3 改为两级复核(单靠 `get-state` 无法区分"设备没了"
+> 与"server 没了",原文自相矛盾),并指出不能复用只保留 `device` 行的
+> `ParseTransports`;修正 `exec` 启动失败的措辞(私有 server 起不来走
+> `ExitError` 分支,不是 `default`);§9.2 明确 outbox payload 的
+> `failure_stage` 由 Store 在事务内从 `results` 回读,避免新开
+> `workflow.GetVersion` 门。
 
 ## 1. 问题
 
@@ -115,7 +122,7 @@ callbacks 侧在独立的 `schema_drift_test.go`)。
 
 | error 来源 | 实际含义 | 正确 scope |
 |---|---|---|
-| `exec` 启动失败(`default` 分支) | adb 可执行文件缺失/损坏、私有 server 起不来 | `client` |
+| `exec` 启动失败(`default` 分支) | adb 可执行文件缺失/不可执行/权限不足 | `client` |
 | `ctx.Err()` | 超时或取消 | `none` |
 | 针对已定位 transport 的调用失败 | **尚不能定论**,需存活复核(§5.3) | `none` 或 `device` |
 
@@ -151,20 +158,35 @@ callbacks 侧在独立的 `schema_drift_test.go`)。
 
 ### 5.3 存活复核(唯一升级为 device 的途径)
 
-失败发生后,做一次**结构化复核**再决定归因,不解析 stderr 文本:
+失败发生后做**两级结构化复核**再决定归因,全程不解析 stderr 文本。
+
+单靠 `get-state` 不够:它失败时既可能是设备没了,也可能是 adb server 没了,
+**这两者用一次探测无法区分**——所以必须有第二级去排除 server/宿主机故障。
 
 ```
 针对该 transport 的调用失败
-  → 执行白名单探测 adb -s <transport> get-state
-      → 返回 "device"        → 设备活着,失败另有原因 → none
-      → 非 "device" / 调用失败 → 设备不可达          → device
+│
+├─ 一级:adb -s <transport> get-state
+│    └─ stdout == "device"           → 设备活着,失败另有原因      → none
+│
+└─ 二级(一级非 device 或失败):adb devices -l
+     ├─ 调用成功(err==nil && exit==0)
+     │    ├─ 目标 transport 缺席,或状态不是 device(offline/unauthorized)
+     │    │                                → 设备确实不可达        → device
+     │    └─ 目标 transport 状态正常        → 矛盾,保守             → none
+     └─ 调用失败 / 启动失败 / 超时         → 无法排除 server 或宿主机故障 → none
 ```
 
-`get-state` 需要**新增一条白名单命令构造器**(`adb.GetState(serial)`),
-与 §14「ADB 操作走模板化白名单」一致——不能为此开任意 shell。
+二级的作用是**用一次全局调用把 server 摘出去**:全局调用成功本身就证明
+adb server 与宿主机是好的,此时目标设备缺席或异常才构成设备证据。
 
-复核本身也可能因 adb server 故障而失败。此时无法区分"设备没了"与
-"server 没了",按 §5.1 末行**保守归 `none`**。宁可漏计一次,也不误隔离。
+两处新增白名单能力(与 §14「模板化白名单」一致,不为此开任意 shell):
+
+- `adb.GetState(serial)` —— 一级探测的命令构造器
+- **保留状态的解析函数**(如 `adb.ParseDeviceStates(out) map[string]string`)。
+  **不能复用 `ParseTransports`**:它只保留 `fields[1] == "device"` 的行
+  (`adb.go` 内),offline / unauthorized 会被直接丢弃——而这正是二级判定
+  最需要的证据。
 
 空间不足不走复核:`df` 已成功执行(设备明确活着),数值不足是自足的设备状态证据。
 
@@ -175,6 +197,10 @@ callbacks 侧在独立的 `schema_drift_test.go`)。
 
 1. **`adb.ExecRunner.Run` 需区分错误种类**(`adb.go:223`)。
    目前 `exec` 启动失败与其它错误都包成同一个 `fmt.Errorf`,调用方无从分辨。
+   注意 `default` 分支**只在 err 不是 `ExitError` 时到达**,即 adb 二进制
+   根本没跑起来。私有 server 起不来是另一回事:adb 会以非零退出码结束,走
+   `ExitError` 分支返回 `(res, nil)` —— 连 error 都不是,只能靠 §5.3 二级复核
+   把它与设备故障区分开。
    改为返回带类型的错误(如 `*adb.LaunchError`)或在 `Result` 上带一个
    `Kind` 字段;`ctx.Err()` 路径保持可用 `errors.Is(err, context.Canceled)` 判别。
 
@@ -301,6 +327,20 @@ callbacks 进程宕机 ≥120s 时,全 fleet 租约同时过期,会把 Runtime �
     **第二次隔离永远不通知**。改用触发本次隔离的 task_id:同一次 Release 的
     重试 task_id 不变(天然幂等),再次隔离必然是另一个 task
   - `payload` = `{device_id, client_id, serial, display_name, fail_streak, task_id, failure_stage}`
+
+**`failure_stage` 从哪来**:`ReleaseDevice` 的签名是
+`(ctx, deviceID, taskID, scope, quarantineAfter)`(`postgres_devices.go:280`),
+**不含 stage**。采用:**Store 在同一事务内按 `task_id` 从权威的
+`results.result_json` 读出 `failure_stage`**。
+
+理由是避开 Temporal 历史兼容:另一条路是给 `ReleaseRequest` 加字段,但那是
+进 workflow history 的载荷变更,需要**新开一个 `workflow.GetVersion` 门**——
+既有的 `release-fail-scope` 门(`devicetest.go:619`)是上一次归因改造用的,
+不能顺带承担新的历史变更。而结果本来就已落库(`results` 表是权威读的来源,
+差距 #2),事务内多读一行的代价远小于加一个版本门。
+
+stage 读不到时(旧 Agent、或该 task 未落 stage)payload 留空字符串,
+通知照发——**通知不能因为缺一个展示字段就不发**。
 - Relay 的 `deliver` 增加该 `event_type` 分支,调用飞书通知;失败按既有重试与
   `outbox_backlog` 监控走
 - 同时写 `audit_log`(`actor="activity:release_device"`,
@@ -363,9 +403,13 @@ callbacks 进程宕机 ≥120s 时,全 fleet 租约同时过期,会把 Runtime �
   - ctx 取消 → `none`
   - **`adb shell mkdir -p` 在只读分区返回非零 → `none`**(§5.2 的真实先例,
     存活复核会确认设备活着)
-  - **调用失败 + `get-state` 返回 "device" → `none`**;
-    **调用失败 + `get-state` 失败或非 device → `device`**(§5.3 两个方向)
-  - 存活复核本身因 adb server 故障而失败 → `none`(保守)
+  - 调用失败 + 一级 `get-state` 返回 `"device"` → `none`
+  - 调用失败 + 一级非 device + **二级 `adb devices -l` 成功且目标缺席/非 device**
+    → `device`(§5.3 唯一的一般性 device 路径)
+  - 调用失败 + 一级非 device + **二级调用本身失败/超时** → `none`
+    (无法排除 server 故障,保守)
+  - 二级解析必须能识别 `offline` / `unauthorized` 状态行——用 `ParseTransports`
+    会丢掉它们,该用例即回归护栏
 - **契约**:合法枚举通过;非法枚举被拒;**只给 `failure_scope` 或只给
   `failure_stage` 的反例各一,均须被 `dependentRequired` 拒绝**
 - **Runtime(扩表)**:
@@ -374,6 +418,8 @@ callbacks 进程宕机 ≥120s 时,全 fleet 租约同时过期,会把 Runtime �
   - `siteLeaseExpired` 等沉默站点即使 result 带 device 也不采信
 - **Store**:连续 3 次 device → QUARANTINED 且同事务写出 outbox 行;
   中间成功一次 → 计数清零不隔离;重复释放不产生第二行 outbox(`event_key` 幂等)
+- **outbox payload**:stage 必须取自**该 task** 已持久化的结果,不得为空串到
+  其他任务;该 task 无 stage 时 payload 留空但事件照常产生
 - **完整周期(event_key 回归)**:隔离 → `unquarantine`(streak 清零)→ 再次
   连续 3 次 device → **必须产生第二条 outbox 事件**。用 fail_streak 做键时
   这条会失败,是该修正的护栏
@@ -390,18 +436,20 @@ callbacks 进程宕机 ≥120s 时,全 fleet 租约同时过期,会把 Runtime �
 
 1. **证据保真**(§5.4 三处):`adb.Run` 错误分类、`resolveTransport` 查退出码、
    `ProbeAndroidSOCChain` 返回 error。**这一步不动归因逻辑,可独立合入并单测**
-2. 契约两字段 + 三处 embed 同步 + 契约正反例
-3. Agent:`Summary.FailureScope/FailureStage` + 各主失败站点赋值 + 表驱动测试
-4. Runtime:`TaskResultSignal` 两字段 + callbacks 持久化 + `LoadResult` 回读
-5. `failScope()`:PASSED 强制 OK → 采信 reported scope → 回落既有映射;扩表测试
-6. `ReleaseDevice` 同事务写 outbox + audit
-7. **Relay 通知能力**:`Notifier` 依赖 + `cmd/relay` 配置解析 + compose /
+2. **复核能力**(§5.3):新增 `adb.GetState` 白名单构造器 + 保留状态的
+   `adb.ParseDeviceStates`(不可复用 `ParseTransports`)
+3. 契约两字段 + 三处 embed 同步 + 契约正反例
+4. Agent:`Summary.FailureScope/FailureStage` + 各主失败站点赋值 + 表驱动测试
+5. Runtime:`TaskResultSignal` 两字段 + callbacks 持久化 + `LoadResult` 回读
+6. `failScope()`:PASSED 强制 OK → 采信 reported scope → 回落既有映射;扩表测试
+7. `ReleaseDevice` 同事务写 outbox + audit(stage 事务内回读)
+8. **Relay 通知能力**:`Notifier` 依赖 + `cmd/relay` 配置解析 + compose /
    `.env.example` / 部署文档同步 + 未配置语义(§9.3)。
    **这一步不能省**,否则 outbox 里会堆积永远发不出去的隔离事件
-8. 端到端故障注入三例
-9. 更新 CLAUDE.md §9/§10 与 `docs/device-test-sequence.md` 差距 #10
+9. 端到端故障注入三例
+10. 更新 CLAUDE.md §9/§10 与 `docs/device-test-sequence.md` 差距 #10
    (删掉"暂不触发"的说明,它们将不再成立)
 
 第 1 步先行的理由:它修的是既有缺陷(错误来源被压平),本身就有价值,
-且后续判定表完全依赖它。第 9 步不能漏——CLAUDE.md 有两处、时序图有一处
+且后续判定表完全依赖它。第 10 步不能漏——CLAUDE.md 有两处、时序图有一处
 写着"当前无信号源,暂不触发",本设计落地后这些描述会变成错的。
