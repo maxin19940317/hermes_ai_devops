@@ -527,8 +527,10 @@ func failScope(site releaseSite, category rules.Category, resultStatus, verdict,
 			// 与 siteCanceled 保持一致:同一类事件不因谁先观察到而改变归因。
 			return FailScopeNone
 		case category == rules.CategoryDevice:
-			// 目前无人产出 rules.CategoryDevice(设计 §7:设备级信号源本轮不做),
-			// 这个分支恒不可达,device_fail_streak 因此恒为 0——不是缺陷,是保留位。
+			// 这个分支本身恒不可达(category 映射兜底,不是本次改动的入口):
+			// device 归因现在经由上方的 reportedScope 分支(Agent 主动上报)落地,
+			// 不再依赖 rules.CategoryDevice。device_fail_streak 已能真实增长
+			// (见 §5/§9,2026-08-09 设计文档);"因此恒为 0" 的旧论断已不成立。
 			return FailScopeDevice
 		case category == rules.CategoryInfra && resultStatus == "FAILED":
 			return FailScopeClient

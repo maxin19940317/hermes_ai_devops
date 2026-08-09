@@ -231,15 +231,25 @@ func TestQuarantineEventBadPayloadMarksFailed(t *testing.T) {
 
 // TestDeviceQuarantineNotificationBacklogVisibleWhenNotifierUnconfigured 是
 // Task 12 补的第四条端到端场景(设计文档 §11 只列了三条,Task 11 评审要求补上
-// 这条:"Notifier 未配置时 outbox_backlog 视图应出现该行且 last_error 命中")。
+// 这条:"Notifier 未配置时 outbox backlog 应出现该行且 last_error 命中")。
 //
 // 与上面几条 TestQuarantineEvent* 的区别:那些用 quarantineEvent(t) 手工构造
 // payload,只验证 deliver() 内部对 ClaimUnpublished 的影响;这条改为真实驱动
 // store.MemStore.ReleaseDevice 连续 3 次 device scope 释放,让隔离事件由 Store
-// 自己在同一临界区产出(Task 10 的落地),再确认运维/Grafana 实际查询的
-// OutboxBacklog 视图(而不是 ClaimUnpublished)能看见这一行、且 last_error
-// 命中"未配置"提示——这才是"隔离事件产生 → 通知端未配置 → backlog 可见"这条
-// 完整链路,不是链路里某一段的单元测试。
+// 自己在同一临界区产出(Task 10 的落地),再断言 Relay 侧的
+// Store.OutboxBacklog() 聚合(而不是 ClaimUnpublished)能看见这一行、且
+// last_error 命中"未配置"提示——这才是"隔离事件产生 → 通知端未配置 →
+// backlog 可见"这条完整链路,不是链路里某一段的单元测试。
+//
+// 注:仓库里跟"backlog"相关的其实有三个独立的东西,本测试只覆盖第二个:
+//  1. SQL 视图 outbox_backlog(schema.sql):人工排查入口,stuck 阈值硬编码 3,
+//     不含 last_error 列;
+//  2. Store.OutboxBacklog() Go 方法(本测试断言的对象):供 Relay 定期打日志/
+//     告警用,阈值可配(StuckAttempts),含 SampleError(即 last_error);
+//  3. Grafana 面板:直接查 outbox 表,不经过上面两者中的任何一个。
+//
+// 三者互相独立,不能把结论从一个套到另一个:改 Store.OutboxBacklog() 的阈值
+// 不影响 SQL 视图或 Grafana;SQL 视图没有 last_error,不能拿它验证通知文案。
 func TestDeviceQuarantineNotificationBacklogVisibleWhenNotifierUnconfigured(t *testing.T) {
 	s := store.NewMemStore()
 	if err := s.UpsertClientDevices(ctx,
@@ -292,8 +302,11 @@ func TestDeviceQuarantineNotificationBacklogVisibleWhenNotifierUnconfigured(t *t
 	r := &Relay{Store: s}
 	r.deliver(ctx, evs[0])
 
-	// 关键断言:运维/Grafana 依赖的是 outbox_backlog 视图本身(OutboxBacklog
-	// 查询),不是 ClaimUnpublished——这条链路"可见"与否要在这一层验证。
+	// 关键断言:验证的是 Relay 侧的 Store.OutboxBacklog() 聚合(供 Relay 定期
+	// 打日志/告警),不是 ClaimUnpublished——这条链路"可见"与否要在这一层验证。
+	// 与 schema.sql 里的 SQL 视图 outbox_backlog 是两个独立的东西(该视图没有
+	// last_error 列,stuck 阈值也是硬编码的 3),不在本测试覆盖范围内;
+	// Grafana 面板则直接查 outbox 表,与两者都无关。
 	backlog, err := s.OutboxBacklog(ctx, 1)
 	if err != nil {
 		t.Fatal(err)
