@@ -17,7 +17,7 @@ Python 侧 65 passed / 10 error(见 A11)。
 
 | ID | 级别 | 一句话 | 主要文件 |
 |---|---|---|---|
-| A1 | 待定级 | 代号别名表在探测链首跳非代号时失效(条件式,需实机定级) | `agent/internal/executor/executor.go`、`agent/internal/reporter/probe.go` |
+| A1 | ✅ 已修复(P1,2026-08-09 实机验证通过) | 代号别名表在探测链首跳非代号时失效 → 已改整链匹配 | `agent/internal/adb/soc_probe.go`、`agent/internal/executor/executor.go`、`agent/internal/reporter/probe.go` |
 | A2 | P0 | Manifest `deploy.env` 键无约束 → 设备端 shell 注入 | `contracts/manifest.schema.json`、`agent/internal/adb/adb.go` |
 | A3 | P1 | `dev` 版本被最低版本门禁拒绝,与 CLAUDE.md 明文冲突 | `runtime/internal/activity/version.go` |
 | A4a | P1 | 取消路径写入枚举外的 verdict `FAILED`(确定 bug) | `runtime/internal/workflow/devicetest.go` |
@@ -46,11 +46,12 @@ Python 侧 65 passed / 10 error(见 A11)。
 
 ---
 
-## A1 — [待定级] SoC 别名查找只作用于探测链的首个命中值
+## A1 — [✅ 已修复,2026-08-09 实机验证通过] SoC 别名查找只作用于探测链的首个命中值
 
-> **定级说明**:这是一个成立的设计缺口,但它是**条件触发**而非普遍故障,
-> 且触发所需的实机属性值与生产环境 `DEVICE_SOC_ALIASES` 实际配置均未确认。
-> 请先按「如何确认是否正在发生」一节做实机验证,再定级排期。
+> **定级结论(2026-08-09)**:修复随 `eab1b06`(fix: address master red-line
+> audit findings A1-A12)落地,即 `ProbeAndroidSOCChain` + 调用点对整条链
+> 依次「直接匹配 → 别名匹配」。以下「现状 / 触发条件 / 后果」为审计时的
+> 原始描述,保留作历史;修复后行为见文末「实机验证结论」。
 
 ### 位置
 
@@ -172,6 +173,34 @@ adb -s <serial> shell getprop ro.product.board
 - 心跳侧对应用例:同样设备注册后,`SelectTestSpecs` 能选中 QCM6125 变体。
 - 实机:板子接上后 `adb -s <serial> shell getprop ro.soc.model` 先确认实际值,
   再跑一次完整派单。
+
+### 实机验证结论(2026-08-09,A1 定级)
+
+**结果:✅ 未再触发,修复按设计工作。** 在生产三台设备上完成了「如何确认
+是否正在发生」一节要求的四属性采集 + 心跳观测 + 预检/调度链路核对:
+
+| serial | 板型 | ro.soc.model | ro.chipname | ro.board.platform | ro.product.board | 链首有效值 → 判定 |
+|---|---|---|---|---|---|---|
+| 825485946 | QCM6490 **Ubuntu Linux** | EMPTY | EMPTY | EMPTY | `qcs6490` | `qcs6490` → 直接匹配变体 soc |
+| 513cd3de | QCM6125 Android | EMPTY | EMPTY | `trinket` | `trinket` | `trinket` → 别名 `trinket:QCM6125` |
+| ac6dcbcbfc640f3a | RK3568 Linux | — | — | — | — | 设备树 compatible → `rk3568` |
+
+- **513cd3de(关键场景)**:链首两个属性(ro.soc.model / ro.chipname)均为空,
+  走到第三跳 `ro.board.platform=trinket` 命中。Agent 日志实锤:
+  `probe: 513cd3de soc trinket -> QCM6125 (alias)`;worker 心跳注册
+  `soc:"QCM6125"` 与设备表一致。§4.1 预检与 §4.2 心跳共用同一链(Review P1),
+  无 soc mismatch。
+- **825485946**:Android getprop 不可用(`/system/bin/getprop` 不存在)→ 走
+  Linux 设备树路径,compatible 后缀 `idp` → 服务端别名 `idp:QCS6490` 规范化。
+  心跳日志 `raw_soc:"idp" → soc:"QCS6490"` 实锤。这恰好覆盖了 **Linux 板 +
+  别名兜底** 分支,比纯 Android 场景更全。
+- **未命中条件**:A1 的失效条件是「链首有效值既非直接匹配、别名表也没有该
+  键」——三台设备中 513cd3de 的链首有效值 `trinket` 在别名表里有键,
+  825485946 走设备树且 `idp` 有键,均不构成失效。**设计缺口在实机上未触发。**
+
+附带确认(清单 §2 备注):825485946 是 Ubuntu 板,**不要**把用户手动
+`adb shell getprop` 的 `qcs6490`(Android 属性路径)与 Agent 心跳的 `idp`
+(设备树路径)混为同一来源——两条路径并行,这正是设计的意图。
 
 ---
 

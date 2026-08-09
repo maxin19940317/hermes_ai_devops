@@ -101,7 +101,12 @@ variants:
     # 派到任意 Android 板(实测选中 MTK mt8189,而包内 GPU delegate 是 Adreno)。
     # 与 SNPE 变体对齐,加高通 SoC 约束;fleet 无匹配设备时由 SelectTestSpecs
     # 秒级跳过,不再错误派发。
-    requirements: { os: android, abi: arm64-v8a, soc: [QCM6125, QCM6490], min_free_storage_mb: 512 }
+    # 2026-08-09:接入 SM6225(bengal 平台)板(2a7359cf/825d51f0,Android,
+    # hexagon+adreno)。TFLite 包是通用高通二进制,GPU delegate 验证需要
+    # adreno——SM6225 满足;服务端别名表已有 bengal:SM6225(设备表实测
+    # soc=SM6225)。SNPE 变体名编码目标 SoC,SM6225 不属于 QCM6125/QCM6490,
+    # 不并入 SNPE 变体;若 SDK 支持 bengal DSP 需另走业务仓库变体扩展。
+    requirements: { os: android, abi: arm64-v8a, soc: [QCM6125, QCM6490, SM6225], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
     test:
