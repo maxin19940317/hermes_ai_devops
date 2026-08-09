@@ -3,9 +3,15 @@
 2026-08-09。目标:让 `device_fail_streak` 第一次拥有真实信号,使
 「设备连续 3 次故障 → QUARANTINED」(CLAUDE.md §9/§10)从死代码变成生效的安全网。
 
-> 2026-08-09 评审后修订:§5 判定规则按调用层级重写(初稿的「ADB 返回 error →
-> device」会误隔离);新增 §6 主失败约束与 Runtime 纵深校验;§9 通知改走既有
-> outbox(初稿的迁移 bool 会丢通知)。
+> 2026-08-09 第一轮评审后修订:§5 判定规则按调用层级重写(初稿的「ADB 返回
+> error → device」会误隔离);新增 §6 主失败约束与 Runtime 纵深校验;§9 通知
+> 改走既有 outbox(初稿的迁移 bool 会丢通知)。
+>
+> 第二轮评审后修订:非零退出默认 `none`,新增 §5.3 存活复核作为升级为 `device`
+> 的唯一途径(`adb shell` 透传远端退出码,只读分区 `mkdir` 失败会误隔离);
+> `event_key` 由 fail_streak 改 task_id(解隔离会清零 streak,第二次隔离的
+> 通知会被 UNIQUE 吞掉);新增 §9.3 Relay 通知能力与未配置语义;
+> §4 两字段用 `dependentRequired` 成对约束。
 
 ## 1. 问题
 
@@ -52,7 +58,7 @@
 
 | 失败 | 真实原因 | scope |
 |---|---|---|
-| 已定位 transport 后,针对它的调用失败 | 设备掉线、USB 线/hub、板子挂了 | `device` |
+| 调用失败**且存活复核确认设备不可达** | 设备掉线、USB 线/hub、板子挂了 | `device` |
 | df 成功但空间不足 | 设备当下状态(清理或换板即恢复) | `device` |
 | `abi mismatch` / `soc mismatch` | **任务派错了板**,或服务端配置漂移 | `none` |
 
@@ -79,6 +85,19 @@ Grafana 看出来。这是刻意选择:自动处置的前提是归因可靠。
 }
 ```
 
+两字段**必须成对出现**,否则 schema 会接受 `{"failure_scope":"device"}` ——
+设备照样被隔离,通知却没有 stage 可展示:
+
+```json
+"dependentRequired": {
+  "failure_scope": ["failure_stage"],
+  "failure_stage": ["failure_scope"]
+}
+```
+
+`dependentRequired` 属 Draft 2020-12,已实测 `santhosh-tekuri/jsonschema/v5`
+在 `Draft2020` 下确实执行(只给一个字段会被拒),不是纸面约束。
+
 不设 `ok`:成功由 verdict 表达,Agent 只在失败时归因。
 
 `failure_stage` 是枚举而非自由文本:通知要展示"为什么隔离",而
@@ -98,7 +117,7 @@ callbacks 侧在独立的 `schema_drift_test.go`)。
 |---|---|---|
 | `exec` 启动失败(`default` 分支) | adb 可执行文件缺失/损坏、私有 server 起不来 | `client` |
 | `ctx.Err()` | 超时或取消 | `none` |
-| 已定位 transport 后该 transport 调用失败 | 设备证据 | `device` |
+| 针对已定位 transport 的调用失败 | **尚不能定论**,需存活复核(§5.3) | `none` 或 `device` |
 
 ### 5.1 判定规则
 
@@ -108,15 +127,48 @@ callbacks 侧在独立的 `schema_drift_test.go`)。
 |---|---|---|
 | 本地进程启动、私有 adb server 故障 | `client` | 与任何具体设备无关 |
 | 全局 `adb devices`(不带 `-s`) | `client` | 是 server/宿主机能力,不是某台设备 |
-| **已成功定位目标 transport 之后**,针对该 transport 的强设备证据 | `device` | 唯一产出 device 的来源 |
+| 针对已定位 transport 的调用**非零退出** | `none` **默认** | 见 §5.2:退出码是远端命令的,不是设备的 |
+| 上述失败经**存活复核**确认设备不可达 | `device` | 唯一的一般性 device 来源 |
+| 无需复核的强状态证据(df 成功但空间不足) | `device` | 设备当下状态,证据自足 |
 | 属性读取成功、比较不符(`abi`/`soc` mismatch) | `none` | 派单/配置问题 |
 | ctx 取消或超时 | `none` | 多义,不归任何一方 |
 | 无法可靠区分 | `none` | **保守默认** |
 
-"强设备证据"限定为:transport 已解析成功后,针对该 transport 的 adb 调用
-出现传输层失败或非零退出(not found / offline / unauthorized 语义)。
+### 5.2 为什么"transport 调用非零退出"不算设备证据
 
-### 5.2 必须先修的三处证据丢失
+修订前把它当作强设备证据,这是错的。`adb shell` **透传远端命令的退出码**,
+所以非零退出的常见原因恰恰不是设备故障:
+
+- `deploy` 阶段跑的是 `adb shell rm -rf` / `mkdir -p`(`executor.go:406-411`)。
+  **本项目已经踩过**:RK3568 固件 rootfs 整体只读(`ci/variants.yaml` 注释),
+  在只读分区上 `mkdir -p` 返回非零——这是 **manifest workdir 配错**,
+  按修订前的规则会隔离掉一块完全健康的板
+- 测试程序自身非零退出**就是测试结局**,不是设备故障
+- 私有 adb server 在 transport 解析之后才故障,后续命令同样表现为非零退出
+
+"已定位 transport"只能证明**任务选中了这台设备**,不能证明后续每个非零退出
+都该记它头上。
+
+### 5.3 存活复核(唯一升级为 device 的途径)
+
+失败发生后,做一次**结构化复核**再决定归因,不解析 stderr 文本:
+
+```
+针对该 transport 的调用失败
+  → 执行白名单探测 adb -s <transport> get-state
+      → 返回 "device"        → 设备活着,失败另有原因 → none
+      → 非 "device" / 调用失败 → 设备不可达          → device
+```
+
+`get-state` 需要**新增一条白名单命令构造器**(`adb.GetState(serial)`),
+与 §14「ADB 操作走模板化白名单」一致——不能为此开任意 shell。
+
+复核本身也可能因 adb server 故障而失败。此时无法区分"设备没了"与
+"server 没了",按 §5.1 末行**保守归 `none`**。宁可漏计一次,也不误隔离。
+
+空间不足不走复核:`df` 已成功执行(设备明确活着),数值不足是自足的设备状态证据。
+
+### 5.4 必须先修的三处证据丢失
 
 初稿断言"现有控制流本来已分开",**这不成立**。要落地上表,得先让错误来源
 不被压平:
@@ -141,7 +193,7 @@ callbacks 侧在独立的 `schema_drift_test.go`)。
 
 这三处都是既有的证据丢失,不修则本设计的判定表落不了地。
 
-### 5.3 落点
+### 5.5 落点
 
 `executor.Summary` 加 `FailureScope` 与 `FailureStage`,由**主失败站点**赋值
 (见 §6);`reporter` 写进 result.json。
@@ -242,8 +294,12 @@ callbacks 进程宕机 ≥120s 时,全 fleet 租约同时过期,会把 Runtime �
 - `ReleaseDevice` 在**置 QUARANTINED 的同一事务内**插入 outbox 行:
   - `aggregate_type = "device"`,`aggregate_id = <device_id>`
   - `event_type = "device-quarantined"`
-  - `event_key = "<device_id>:quarantined:<fail_streak>"` —— 幂等键。
-    带上 streak,使"隔离→解除→再次隔离"能产生新事件,而同一次隔离的重试不会重复发
+  - `event_key = "<device_id>:quarantined:<task_id>"` —— 幂等键。
+    **不能用 fail_streak**:`UnquarantineDevice` 会把它清零(`fleet.go:68` 注释
+    「status=IDLE、fail_streak=0」),于是"隔离→解除→再次隔离"第二次仍在
+    streak=3 触发,生成与第一次完全相同的键,第二条 outbox 行被 UNIQUE 挡掉,
+    **第二次隔离永远不通知**。改用触发本次隔离的 task_id:同一次 Release 的
+    重试 task_id 不变(天然幂等),再次隔离必然是另一个 task
   - `payload` = `{device_id, client_id, serial, display_name, fail_streak, task_id, failure_stage}`
 - Relay 的 `deliver` 增加该 `event_type` 分支,调用飞书通知;失败按既有重试与
   `outbox_backlog` 监控走
@@ -252,6 +308,33 @@ callbacks 进程宕机 ≥120s 时,全 fleet 租约同时过期,会把 Runtime �
 
 **保证等级:at-least-once**。飞书可能收到重复通知(Relay 重试),但绝不丢。
 `event_key` 保证同一次隔离只产生一个事件行。
+
+### 9.3 Relay 目前发不出通知:必须补的部署前提
+
+至少一次的保证依赖 Relay 能真的发出去,而**它现在没有这个能力**:
+
+- `relay.Relay`(`relay.go:33-40`)只有 `Store` 与 `Signaler`(Temporal),无通知端
+- `runtime/cmd/relay/main.go` **零处** `FEISHU_*` 读取
+- compose 的 relay 服务用共享锚点 `<<: *runtime-environment`,**该锚点内不含
+  `FEISHU_*`**,容器里根本拿不到凭据
+
+所以本设计必须一并交付:
+
+1. `Relay` 增加 `Notifier` 依赖(复用 `internal/feishu` 的 Sender 接口)
+2. `cmd/relay` 解析 `FEISHU_*` 配置并构造 Sender
+3. `deploy/docker-compose.yml`(relay 服务)、`deploy/.env.example`、
+   部署文档同步传入这些变量
+
+**未配置通知端时的语义**(必须明确,否则保证是假的):
+
+| 配置 | 行为 |
+|---|---|
+| Sender 已配置 | 正常投递,失败按既有重试 + `outbox_backlog` 告警 |
+| Sender 未配置,且**未**显式关闭 | 视为部署缺陷:事件**保持 pending**,记录明确 last_error,进入 backlog 告警。**不得静默 MarkPublished** |
+| 显式 `RELAY_DEVICE_NOTIFY=off` | 有意关闭:标记已投递并记一条 Info 日志,不占 backlog |
+
+中间一行是关键——若未配置就当作投递成功,"绝不丢"立刻退化成静默丢弃,
+而且丢的正是"设备被隔离"这种最需要人知道的事件。
 
 状态迁移是 **BUSY → QUARANTINED**:释放发生时设备仍持有租约(BUSY),
 `ReleaseDevice` 要么置 QUARANTINED、要么置 IDLE(`devices.go:199-213`)。
@@ -278,14 +361,24 @@ callbacks 进程宕机 ≥120s 时,全 fleet 租约同时过期,会把 Runtime �
   - **ABI 检查后掉线导致空探测链 → `device`**,不得落成 `soc mismatch/none`
     (§5.2 第 3 处)
   - ctx 取消 → `none`
-- **契约**:新增 valid/invalid 例子(合法枚举、非法枚举被拒)
+  - **`adb shell mkdir -p` 在只读分区返回非零 → `none`**(§5.2 的真实先例,
+    存活复核会确认设备活着)
+  - **调用失败 + `get-state` 返回 "device" → `none`**;
+    **调用失败 + `get-state` 失败或非 device → `device`**(§5.3 两个方向)
+  - 存活复核本身因 adb server 故障而失败 → `none`(保守)
+- **契约**:合法枚举通过;非法枚举被拒;**只给 `failure_scope` 或只给
+  `failure_stage` 的反例各一,均须被 `dependentRequired` 拒绝**
 - **Runtime(扩表)**:
   - `failScope()` 加 reported-scope 行
   - **PASSED + reported device → `FailScopeOK`,计数清零不隔离**(§6 防线 2)
   - `siteLeaseExpired` 等沉默站点即使 result 带 device 也不采信
 - **Store**:连续 3 次 device → QUARANTINED 且同事务写出 outbox 行;
   中间成功一次 → 计数清零不隔离;重复释放不产生第二行 outbox(`event_key` 幂等)
-- **Relay**:`device-quarantined` 事件投递成功/失败重试;未知 event_type 不回归
+- **完整周期(event_key 回归)**:隔离 → `unquarantine`(streak 清零)→ 再次
+  连续 3 次 device → **必须产生第二条 outbox 事件**。用 fail_streak 做键时
+  这条会失败,是该修正的护栏
+- **Relay**:`device-quarantined` 投递成功/失败重试;未知 event_type 不回归;
+  **Sender 未配置且未显式关闭时事件保持 pending 且不被 MarkPublished**(§9.3)
 - **故障注入(端到端)**:
   - 设备不可达 3 次 → QUARANTINED + 通知发出 + audit 落库
   - `soc mismatch` 3 次 → **不隔离**
@@ -295,17 +388,20 @@ callbacks 进程宕机 ≥120s 时,全 fleet 租约同时过期,会把 Runtime �
 
 ## 12. 实施顺序
 
-1. **证据保真**(§5.2 三处):`adb.Run` 错误分类、`resolveTransport` 查退出码、
+1. **证据保真**(§5.4 三处):`adb.Run` 错误分类、`resolveTransport` 查退出码、
    `ProbeAndroidSOCChain` 返回 error。**这一步不动归因逻辑,可独立合入并单测**
 2. 契约两字段 + 三处 embed 同步 + 契约正反例
 3. Agent:`Summary.FailureScope/FailureStage` + 各主失败站点赋值 + 表驱动测试
 4. Runtime:`TaskResultSignal` 两字段 + callbacks 持久化 + `LoadResult` 回读
 5. `failScope()`:PASSED 强制 OK → 采信 reported scope → 回落既有映射;扩表测试
-6. `ReleaseDevice` 同事务写 outbox + audit;Relay 增加 `device-quarantined` 分支
-7. 端到端故障注入三例
-8. 更新 CLAUDE.md §9/§10 与 `docs/device-test-sequence.md` 差距 #10
+6. `ReleaseDevice` 同事务写 outbox + audit
+7. **Relay 通知能力**:`Notifier` 依赖 + `cmd/relay` 配置解析 + compose /
+   `.env.example` / 部署文档同步 + 未配置语义(§9.3)。
+   **这一步不能省**,否则 outbox 里会堆积永远发不出去的隔离事件
+8. 端到端故障注入三例
+9. 更新 CLAUDE.md §9/§10 与 `docs/device-test-sequence.md` 差距 #10
    (删掉"暂不触发"的说明,它们将不再成立)
 
 第 1 步先行的理由:它修的是既有缺陷(错误来源被压平),本身就有价值,
-且后续判定表完全依赖它。第 8 步不能漏——CLAUDE.md 有两处、时序图有一处
+且后续判定表完全依赖它。第 9 步不能漏——CLAUDE.md 有两处、时序图有一处
 写着"当前无信号源,暂不触发",本设计落地后这些描述会变成错的。
