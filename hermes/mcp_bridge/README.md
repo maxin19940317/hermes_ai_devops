@@ -26,7 +26,7 @@ Postgres / Temporal → Windows Agent → 设备测试
   封闭枚举指令,复用 feishucmd.Executor。
 - 执行逻辑全部在确定性 Runtime(worker),LLM 不在关键路径(§3 规则 5)。
 
-## 工具(11 个)
+## 工具(12 个)
 
 | 工具 | 指令 | 类型 |
 |---|---|---|
@@ -34,6 +34,7 @@ Postgres / Temporal → Windows Agent → 设备测试
 | `devops_status` | status | 只读 |
 | `devops_runs [n]` | runs | 只读 |
 | `devops_result <workflow_id>` | result | 只读 |
+| `devops_wait_result <workflow_id> [timeout_sec] [interval_sec]` | result(轮询) | 只读 |
 | `devops_metrics <variant>` | metrics | 只读 |
 | `devops_artifacts <variant>` | artifacts | 只读 |
 | `devops_test <variant>` | test | 副作用 |
@@ -65,7 +66,7 @@ Postgres / Temporal → Windows Agent → 设备测试
    `-p 0.0.0.0:8645:8645`)。
 7. **hermes-rocklin 注册**(tobias_pm profile):
    `hermes mcp add hermes_devops --url http://172.17.0.1:8645/mcp`,
-   交互:auth→No,enable all 11 tools→Yes。需 pty 驱动交互
+   交互:auth→No,enable all 12 tools→Yes。需 pty 驱动交互
    (getpass 不吃管道;见下)。
 
 ## 验证
@@ -81,6 +82,9 @@ hermes mcp list   # hermes_devops ✓ enabled
 # 端到端(聊天触发工具)
 hermes -z "查看设备列表"
 hermes -z "用 devops_test 测试变体 aarch64_Android_QCM6125_SNPE_1.68"
+# 发起后等结果并汇报(路径 B,2026-08-10):
+# Hermes 会自动调用 devops_wait_result 轮询到终态,把结论带进对话。
+hermes -z "测试 aarch64_Android_QCM6125_SNPE_1.68 并等它跑完汇报结果"
 
 # Temporal 里确认 workflow 起来了
 docker exec hermes-runtime-temporal-1 temporal workflow list --address temporal:7233 \

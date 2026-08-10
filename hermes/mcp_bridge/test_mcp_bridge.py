@@ -99,6 +99,7 @@ def test_tools_registered(bridge):
         "devops_devices", "devops_status", "devops_runs", "devops_result",
         "devops_metrics", "devops_artifacts", "devops_test", "devops_cancel",
         "devops_rerun", "devops_quarantine", "devops_unquarantine",
+        "devops_wait_result",
     }
     assert expected <= names, f"missing tools: {expected - names}"
     # 不允许出现任何直连 ADB 的任意命令工具
@@ -137,6 +138,93 @@ def test_quarantine_optional_id(bridge, monkeypatch):
     bridge.devops_quarantine("dev-1")
     assert rec.payloads[0] == {"command": "quarantine", "args": []}
     assert rec.payloads[1] == {"command": "quarantine", "args": ["dev-1"]}
+
+
+# ---- devops_wait_result(2026-08-10:路径 B,发起后自动等结果并汇报)----
+
+RUNNING_RESULT = (
+    "wf-dev-1\ngabc1234 p42 v1.2.3 rules-v1\n"
+    "  aarch64_Android_QCM6125_SNPE_1.68 [RUNNING]"
+)
+TERMINAL_RESULT = (
+    "wf-dev-1\ngabc1234 p42 v1.2.3 rules-v1\n"
+    "  aarch64_Android_QCM6125_SNPE_1.68 [COMPLETED] exit=0 dur=12s cases=3/3 | latency_ms_p50=12.4"
+)
+
+
+def test_result_is_terminal_pure(bridge):
+    """终态判定纯函数:运行中/无任务/查无的分界。"""
+    assert bridge._result_is_terminal(RUNNING_RESULT) is False
+    assert bridge._result_is_terminal(TERMINAL_RESULT) is True
+    assert bridge._result_is_terminal("查无 workflow: xxx") is True
+    assert bridge._result_is_terminal("wf\n  v1 无任务") is False
+
+
+def test_wait_result_polls_until_terminal(bridge, monkeypatch):
+    """运行中 → 再查 → 终态:多次调用 result,最后一次返回终态文本。"""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        body = json.loads(request.content)
+        assert body == {"command": "result", "args": ["wf-dev-1"]}
+        return httpx.Response(200, json={"reply": TERMINAL_RESULT if calls["n"] > 1 else RUNNING_RESULT})
+
+    install_transport(monkeypatch, handler)
+
+    # interval 取最小值加速测试;终态直接返回,不 sleep 到 timeout。
+    reply = bridge.devops_wait_result("wf-dev-1", interval_sec=2)
+    assert calls["n"] >= 2, f"应至少轮询 2 次,实际 {calls['n']}"
+    assert "COMPLETED" in reply and "latency_ms_p50=12.4" in reply
+
+
+def test_wait_result_immediate_terminal(bridge, monkeypatch):
+    """首次查询即终态:只调一次,不 sleep。"""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(200, json={"reply": TERMINAL_RESULT})
+
+    install_transport(monkeypatch, handler)
+    bridge.devops_wait_result("wf-dev-1", interval_sec=2)
+    assert calls["n"] == 1
+
+
+def test_wait_result_unknown_workflow_is_terminal(bridge, monkeypatch):
+    """查无 workflow 视为终态:立即返回,不轮询。"""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(200, json={"reply": "查无 workflow: ghost"})
+
+    install_transport(monkeypatch, handler)
+    reply = bridge.devops_wait_result("ghost", interval_sec=2)
+    assert "ghost" in reply
+    assert calls["n"] == 1
+
+
+def test_wait_result_timeout(bridge, monkeypatch):
+    """一直运行中 → 超时:返回超时提示 + 当前状态,不无限轮询。"""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(200, json={"reply": RUNNING_RESULT})
+
+    install_transport(monkeypatch, handler)
+    reply = bridge.devops_wait_result("wf-dev-1", timeout_sec=1, interval_sec=2)
+    assert "等待超时" in reply
+    assert "RUNNING" in reply
+    assert calls["n"] >= 1
+
+
+def test_wait_result_argument_translation(bridge, monkeypatch):
+    """参数应透传为 result 命令调用(workflow_id 唯一参数)。"""
+    rec = install_transport(monkeypatch, ok({"reply": TERMINAL_RESULT}))
+    bridge.devops_wait_result("wf-arg-check", interval_sec=2)
+    assert rec.payload == {"command": "result", "args": ["wf-arg-check"]}
 
 
 # ---- 鉴权头 ----

@@ -24,7 +24,9 @@ feishucmd.Executor(worker 内),本 bridge 只做信封翻译,无 LLM、无状态
 
 import logging
 import os
+import re
 import ssl
+import time
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -55,7 +57,9 @@ mcp = FastMCP(
     "hermes-devops-mcp",
     instructions=(
         "DevOps 设备测试系统(Hermes AI DevOps)的受控接口。"
-        "所有工具都是封闭指令:只读查询或受控副作用,不提供任意命令能力。"
+        "所有工具都是封闭指令:只读查询或受控副作用,不提供任意命令能力。\n"
+        "工作流提示:用户要求触发测试时,先调用 devops_test 启动测试,然后立即调用 "
+        "devops_wait_result 等待该 workflow 完成,并把最终结论汇报给用户。"
     ),
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -119,6 +123,56 @@ def devops_runs(n: int = 5) -> str:
 def devops_result(workflow_id: str) -> str:
     """单次运行的各变体结论。workflow_id 必填(来自 devops_runs)。"""
     return runtime_cmd("result", [workflow_id])
+
+
+# result 命令文本里的终态标记。状态行格式:
+#   <variant> [COMPLETED] exit=0 dur=12s cases=10/10 | ...
+#   <variant> 无任务            ← 待调度/从未 kick,不是终态
+TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "TIMEOUT", "CANCELED"})
+_STATUS_LINE = re.compile(r"^\s+\S+\s+\[([A-Z_]+)\]", re.MULTILINE)
+
+
+def _result_is_terminal(reply: str) -> bool:
+    """判断 result 命令输出是否已全部终态。
+
+    判定规则:
+      - 查无 workflow → 视为终态(workflow 已不存在,没必要再轮询);
+      - 没有任何 `[STATUS]` 行(全部"无任务"或查询失败)→ 非终态;
+      - 任一 variant 的 status 不在终态集合 → 非终态。
+    """
+    if reply.startswith("查无 workflow"):
+        return True
+    statuses = _STATUS_LINE.findall(reply)
+    if not statuses:
+        return False
+    return all(s in TERMINAL_STATUSES for s in statuses)
+
+
+@mcp.tool()
+def devops_wait_result(workflow_id: str, timeout_sec: int = 600,
+                       interval_sec: int = 10) -> str:
+    """等待一次测试运行完成并返回最终结论(阻塞轮询)。
+
+    发起测试(devops_test)后调用本工具,直到该 workflow 全部变体到达终态
+    (COMPLETED/FAILED/TIMEOUT/CANCELED)或超时。workflow_id 必填
+    (来自 devops_test / devops_runs 的返回)。timeout_sec 缺省 600
+    (1-1800 秒),interval_sec 缺省 10(2-60 秒)。超时返回当前状态并提示
+    可再次调用。这是从对话里"等测试跑完"的推荐方式——发完 test 后接着
+    调它,把返回的结论直接汇报给用户。
+    """
+    timeout_sec = max(1, min(1800, int(timeout_sec)))
+    interval_sec = max(2, min(60, int(interval_sec)))
+    deadline = time.time() + timeout_sec
+    last_reply = ""
+    while True:
+        last_reply = runtime_cmd("result", [workflow_id])
+        if _result_is_terminal(last_reply):
+            return last_reply
+        if time.time() >= deadline:
+            return (f"⏳ 等待超时({timeout_sec}s),workflow {workflow_id} 仍在运行。\n"
+                    f"当前状态:\n{last_reply}\n"
+                    f"可再次调用 devops_wait_result 或 devops_result 查看最新进展。")
+        time.sleep(interval_sec)
 
 
 @mcp.tool()
