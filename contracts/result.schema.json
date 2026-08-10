@@ -83,6 +83,18 @@
         }
       },
       "default": []
+    },
+    "failure_scope": {
+      "enum": ["device", "client", "none"],
+      "description": "导致最终非 PASSED 结局的主失败归因。缺省 = 未归因,Runtime 回落既有 category 映射。旁路/可选/清理失败一律不填。"
+    },
+    "failure_stage": {
+      "enum": ["resolve", "precheck", "download", "unpack", "deploy", "run", "collect"],
+      "description": "主失败发生的阶段,供通知与排障展示。不参与任何判定。"
     }
+  },
+  "dependentRequired": {
+    "failure_scope": ["failure_stage"],
+    "failure_stage": ["failure_scope"]
   }
 }

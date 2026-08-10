@@ -302,3 +302,192 @@ func specParallel2() TestSpec {
 	s.Variant = "aarch64_Android_QCM6490_SNPE_2.21"
 	return s
 }
+
+// ---- 9. 差距 #10 端到端:设备归因信号驱动(或不驱动)隔离 ----
+//
+// 下面三条对应设计文档 docs/superpowers/specs/2026-08-09-device-attribution-signal-design.md
+// §11「故障注入(端到端)」的前三条(第四条——隔离通知投递可见于 outbox backlog——
+// 落在 internal/relay 包,因为真正的隔离/outbox 写入发生在 Store,workflow 包
+// 无法引入 internal/store 而不产生 import cycle:store 已经 import workflow)。
+//
+// 三条用例共用的机制:fakeActs.quarantineAfter>0 时,ReleaseDevice/AcquireDevice
+// 复刻 store.MemStore 的记账语义(见 devicetest_test.go)。真正的 Store 端记账
+// 已由 Task 10 的 conformance 测试覆盖;这里要证明的是另一件事——workflow 从
+// result signal 算出的 FailScope,在连续 3 次真实驱动这套记账时,结果与设计
+// 意图完全一致:该隔离的隔离,不该隔离的绝不隔离。
+
+// deviceUnreachableResult 模拟 Agent 两级存活复核确认设备不可达后上报的结果
+// (设计 §5.3):Status=FAILED(precheck/deploy 阶段调用失败),FailureScope=device。
+func deviceUnreachableResult(id string) TaskResultSignal {
+	return TaskResultSignal{TaskID: id, Status: "FAILED", ExitCode: 1,
+		FailureScope: "device", FailureStage: "deploy"}
+}
+
+// TestFaultInjectionDeviceUnreachableQuarantines:设备连续 3 次不可达 → QUARANTINED。
+// Status=FAILED 触发 decideV1 的 CategoryInfra + Retry=true(rules.go:108),
+// 因此 spec1() 的 MaxInfraRetries=2 会在同一 workflow 执行内驱动 3 次 attempt——
+// 与生产环境"同一块坏板连续 3 次机械重试全部失败"完全对应,不是人为拼凑。
+func TestFaultInjectionDeviceUnreachableQuarantines(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}, quarantineAfter: 3}
+	env := newEnv(t, f)
+	for _, a := range []string{"a1", "a2", "a3"} {
+		sig := deviceUnreachableResult(taskID(a))
+		seedResult(f, sig)
+		aCopy := a
+		env.RegisterDelayedCallback(func() {
+			env.SignalWorkflow(SignalTaskResult, deviceUnreachableResult(taskID(aCopy)))
+		}, time.Duration(10*mustAttemptIndex(aCopy))*time.Second)
+	}
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Tasks[0].Verdict != string(rules.VerdictInfraError) || out.Tasks[0].Attempt != 3 {
+		t.Fatalf("summary = %+v, want INFRA_ERROR attempt=3(3 次机械重试耗尽)", out.Tasks[0])
+	}
+	if len(f.released) != 3 {
+		t.Fatalf("released = %d 次, want 3(每次 attempt 都要释放)", len(f.released))
+	}
+	for i, r := range f.released {
+		if r.FailScope != FailScopeDevice {
+			t.Errorf("第 %d 次 release FailScope = %q, want device(Agent 上报 device 且非 PASSED,防线 3)",
+				i+1, r.FailScope)
+		}
+	}
+	// 隔离机制真的走完了 3 次,不是只验证单次调用的返回值。
+	if !f.quarantinedDevices[defaultLease.DeviceID] {
+		t.Fatal("连续 3 次 device scope 释放后设备应被(模拟)隔离,但未触发")
+	}
+	if f.deviceFailStreak[defaultLease.DeviceID] != 3 {
+		t.Errorf("deviceFailStreak = %d, want 3", f.deviceFailStreak[defaultLease.DeviceID])
+	}
+}
+
+// mustAttemptIndex 把 "a1"/"a2"/"a3" 转成 1/2/3,供延迟回调错开时间用。
+func mustAttemptIndex(a string) int {
+	switch a {
+	case "a1":
+		return 1
+	case "a2":
+		return 2
+	case "a3":
+		return 3
+	}
+	panic("unknown attempt suffix: " + a)
+}
+
+// socMismatchResult 模拟 SoC 别名表配置漂移(2026-08-08 A1 审计的真实先例):
+// 属性读取成功但比较不符,Agent 按设计 §5.1 归 none(派单/配置问题,不是设备的错)。
+func socMismatchResult(id string) TaskResultSignal {
+	return TaskResultSignal{TaskID: id, Status: "FAILED", ExitCode: 1,
+		FailureScope: "none", FailureStage: "precheck"}
+}
+
+// TestFaultInjectionSocMismatchDoesNotQuarantine:§3 核心护栏——配置错误(SoC
+// 别名表失效导致连续 soc mismatch)绝不能隔离一块完全健康的板。与上一条同构
+// (Status=FAILED → 3 次机械重试全部在同一 workflow 内发生),唯一差异是
+// Agent 上报的 scope 是 none 而不是 device;这正是本用例要锁住的分界线。
+//
+// 必须真的驱动 3 次记账(而不是只调用一次 failScope()):否则测不出"如果
+// FailScopeNone 被错误地当成会累计的值,第 3 次会不会被隔离"这个问题,
+// 单次调用无法暴露记账逻辑本身的缺陷。
+func TestFaultInjectionSocMismatchDoesNotQuarantine(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}, quarantineAfter: 3}
+	env := newEnv(t, f)
+	for _, a := range []string{"a1", "a2", "a3"} {
+		seedResult(f, socMismatchResult(taskID(a)))
+		aCopy := a
+		env.RegisterDelayedCallback(func() {
+			env.SignalWorkflow(SignalTaskResult, socMismatchResult(taskID(aCopy)))
+		}, time.Duration(10*mustAttemptIndex(aCopy))*time.Second)
+	}
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, input())
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Tasks[0].Verdict != string(rules.VerdictInfraError) || out.Tasks[0].Attempt != 3 {
+		t.Fatalf("summary = %+v, want INFRA_ERROR attempt=3(3 次机械重试耗尽)", out.Tasks[0])
+	}
+	if len(f.released) != 3 {
+		t.Fatalf("released = %d 次, want 3", len(f.released))
+	}
+	for i, r := range f.released {
+		if r.FailScope != FailScopeNone {
+			t.Errorf("第 %d 次 release FailScope = %q, want none(配置类失败不驱动任何处置)",
+				i+1, r.FailScope)
+		}
+	}
+	// 最要紧的断言:走完 3 次真实记账之后,设备依然可用、依然未被隔离。
+	if f.quarantinedDevices[defaultLease.DeviceID] {
+		t.Fatal("soc mismatch 连续 3 次不得隔离设备——配置错误不许误伤好板")
+	}
+	if f.deviceFailStreak[defaultLease.DeviceID] != 0 {
+		t.Errorf("deviceFailStreak = %d, want 0(none 不驱动设备计数)", f.deviceFailStreak[defaultLease.DeviceID])
+	}
+	if f.acquireCalls != 3 {
+		t.Errorf("acquireCalls = %d, want 3(设备全程可正常复用)", f.acquireCalls)
+	}
+}
+
+// passedWithCollectFailureResult 模拟一次整体 PASSED、但可选 collect 附件拉取
+// 失败的结果。设计 §6 防线 1 要求 Agent 侧 best-effort 路径永不填这两个字段;
+// 这里刻意反着构造(把 FailureScope 填成 device)是为了压测防线 2——Runtime
+// 侧的纵深校验必须独立生效,不能依赖防线 1 不出 bug。
+func passedWithCollectFailureResult(id string) TaskResultSignal {
+	return TaskResultSignal{TaskID: id, Status: "COMPLETED", ExitCode: 0,
+		CasesTotal: 10, CasesFailed: 0,
+		FailureScope: "device", FailureStage: "collect"}
+}
+
+// TestFaultInjectionPassedWithCollectFailureDoesNotQuarantine:§6 防线 2 回归
+// 护栏——即便 Agent 因 bug 把旁路 collect 失败误填成 failure_scope=device,
+// 只要最终 verdict 是 PASSED,Runtime 必须强制清零,连续 3 次都不能例外。
+//
+// verdict=PASSED 时 rules.Decision.Retry 恒为 false(decideV1 最终 return 分支
+// 未设 Retry),所以这里不能像前两条那样靠同一 workflow 内的机械重试拿到 3 次
+// attempt——PASSED 是终态,一次就完。改用 3 次独立的 workflow 执行(对应生产环境
+// "同一块板连续 3 次测试都 PASSED,但每次 collect 都失败"),共享同一个 fakeActs
+// 实例以保留跨次的模拟记账状态,这样"3 次都不隔离"才是真实断言而不是巧合。
+func TestFaultInjectionPassedWithCollectFailureDoesNotQuarantine(t *testing.T) {
+	f := &fakeActs{specs: []TestSpec{spec1()}, quarantineAfter: 3}
+	for i := 0; i < 3; i++ {
+		env := newEnv(t, f)
+		tid := taskID("a1")
+		sig := passedWithCollectFailureResult(tid)
+		seedResult(f, sig)
+		env.RegisterDelayedCallback(func() {
+			env.SignalWorkflow(SignalTaskResult, sig)
+		}, 10*time.Second)
+
+		env.ExecuteWorkflow(DeviceTestWorkflow, input())
+		var out DeviceTestOutput
+		if err := env.GetWorkflowResult(&out); err != nil {
+			t.Fatalf("第 %d 次执行: %v", i+1, err)
+		}
+		if out.Tasks[0].Verdict != string(rules.VerdictPassed) {
+			t.Fatalf("第 %d 次执行 verdict = %s, want PASSED", i+1, out.Tasks[0].Verdict)
+		}
+	}
+	if len(f.released) != 3 {
+		t.Fatalf("released = %d 次, want 3(3 次独立执行各释放一次)", len(f.released))
+	}
+	for i, r := range f.released {
+		if r.FailScope != FailScopeOK {
+			t.Errorf("第 %d 次 release FailScope = %q, want ok(PASSED 必须强制清零,忽略上报值)",
+				i+1, r.FailScope)
+		}
+	}
+	if f.quarantinedDevices[defaultLease.DeviceID] {
+		t.Fatal("PASSED 连续 3 次绝不能隔离设备——旁路失败不许误伤好板(§6 防线 2)")
+	}
+	if f.deviceFailStreak[defaultLease.DeviceID] != 0 {
+		t.Errorf("deviceFailStreak = %d, want 0", f.deviceFailStreak[defaultLease.DeviceID])
+	}
+	if f.acquireCalls != 3 {
+		t.Errorf("acquireCalls = %d, want 3(设备全程可正常复用)", f.acquireCalls)
+	}
+}

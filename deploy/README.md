@@ -273,6 +273,27 @@ The `outbox_backlog` view uses a fixed `attempts >= 3` for its `stuck` column; i
 human-facing coarse filter, while `RELAY_STUCK_ATTEMPTS` is the configurable threshold the
 relay's own log uses. Set `RELAY_BACKLOG_INTERVAL=0` to turn the periodic report off.
 
+### Device-quarantine notifications
+
+When a device is auto-quarantined (three consecutive `device`-scoped failures), the
+release path writes an `event_type=device-quarantined` outbox row in the same transaction
+that flips the device to `QUARANTINED`. `relay` delivers it through the same `FEISHU_*`
+credentials as `worker` — the shared `runtime-environment` compose anchor does not include
+`FEISHU_*`, so the `relay` service definition passes them explicitly. Getting this wrong
+does not make the notification silently disappear; it makes the outbox row silently
+undeliverable, which is worse because nobody comes looking for it. Three configurations,
+choose one on purpose:
+
+| Config | Behavior |
+|---|---|
+| `FEISHU_*` set (either mode) | Delivered normally; failures retry and count toward `outbox_backlog` like any other row |
+| `FEISHU_*` unset, `RELAY_DEVICE_NOTIFY` unset (default) | Treated as a deployment gap: the row stays pending with `last_error = "notifier not configured; ..."` and shows up in the backlog — it is never marked delivered |
+| `RELAY_DEVICE_NOTIFY=off` | Intentionally disabled: the row is marked delivered immediately (logged at info) and does not occupy the backlog |
+
+If `outbox_backlog` shows a stuck row with `last_error` mentioning "notifier not
+configured", that is not an infra failure to retry away — it means `FEISHU_*` needs to be
+set on the `relay` service, or `RELAY_DEVICE_NOTIFY=off` needs to be set deliberately.
+
 ## Upgrade
 
 **Deployment order when a release adds a dispatch payload field** (e.g. `lease_id`,

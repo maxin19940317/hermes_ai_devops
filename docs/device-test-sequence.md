@@ -236,7 +236,7 @@ sequenceDiagram
             W->>W: 下一 attempt(回到获取设备)
         else 终态
             W->>R: FinishTask + ReleaseDevice Activity
-            R->>D: PASSED / TEST_FAILED / PERF_REGRESSION<br/>→ fail_streak 清零;<br/>device_fail_streak 连续 3 → QUARANTINED(当前无信号源,暂不触发,见差距 #10)
+            R->>D: PASSED / TEST_FAILED / PERF_REGRESSION<br/>→ fail_streak 清零;<br/>device_fail_streak 连续 3 → QUARANTINED
         end
     end
 
@@ -276,7 +276,7 @@ sequenceDiagram
 | 7 | Rule Engine 版本化(plan.rule_version 路由) | rules.Decide 无版本,升级即破坏重放确定性 | **新建**:plan/契约加 rule_version,版本路由,历史实现保留 |
 | 8 | 预签名 URL 按需签发(收集时请求) | **已实现**(2026-07-29):callbacks 新增 upload-requests,租约凭据鉴权,收集完成后秒级签发;顺带修复 collect glob(logs/*.log、dumps/**)从未上传的缺陷 | 遗留:派单时的 presigned_uploads 保留作滚动升级与端点不可达时的回退,下线条件见 `docs/superpowers/specs/2026-07-29-on-demand-presign-design.md` §7 |
 | 9 | 日志流式全扫(不只尾部 8MB) | **已实现**(2026-07-30):单遍流式扫描完整日志,签名命中使用真实全局行号;仅保留命中 ±50 行上下文与有界兜底摘录,普通大文件不再有尾部盲区 | 遗留:Evidence v3 对单行扫描设 1MiB 上限,超长单行明确降级并记入 `truncated_files`;签名上下文与兜底摘录共享 96KiB 内容预算,并非整个序列化 evidence.json 的硬上限 |
-| 10 | 失败归因 device/client 分离 + 明确重置规则 | **已实现**(2026-07-29):四值归因 ok/device/client/none,Runtime 自身故障不再计入任何一方 | 遗留:`device` 无信号源(rules.CategoryDevice 无人产出),故设备隔离暂不触发,恢复路径见 `docs/superpowers/specs/2026-07-29-fail-streak-attribution-design.md` §7 |
+| 10 | 失败归因 device/client 分离 + 明确重置规则 + 隔离阈值真实生效 | **已实现**(2026-07-29 起四值归因 ok/device/client/none,Runtime 自身故障不再计入任何一方;2026-08-09 起 `device` 拥有真实信号源——Agent 按调用层级 + 两级存活复核归因,连续 3 次真实驱动 QUARANTINED,同事务写 outbox 通知 + audit):设计与判定表见 `docs/superpowers/specs/2026-08-09-device-attribution-signal-design.md` | 遗留:飞书隔离/解除按钮(UI)、client 侧自动处置、隔离后自动恢复三项是该设计明确的非目标(见该文档 §2/§8),未来若要做需先解决 §8 记录的 client 侧沉默盲区 |
 | 11 | Workflow ID 冲突策略精细化(失败仅显式 retry) | AllowDuplicateFailedOnly:失败 workflow 可被 webhook 重放自动重启 | Trigger 侧区分显式 retry 与普通重放 |
 | 12 | Client 只读 Deploy Token(原则 5) | bearer PAT(高权限) | 配置变更:read_package_registry Deploy Token 替换 `ARTIFACT_AUTH_TOKEN` |
 | 13 | kick 精确产物地址(原则 4) | **已实现**(2026-08-07):`/kick` + `ci/kick.py` 已接线进业务仓库 `.gitlab-ci.yml`(仅 master 分支,上传成功后直发);`TRIGGER_KICK_URL`(http://10.88.118.251:18090/kick)与 `TRIGGER_KICK_TOKEN` 已配为 GitLab CI/CD 变量且与 Trigger 共享密钥一致;端点实测鉴权/校验正常 | 遗留:`TRIGGER_PIPELINE_WEBHOOK=false` 已配置(kick 模式关闭 pipeline success webhook 触发语义,防 bundle/变体双跑);webhook 仍保留记录 bundle 完整性断言 |

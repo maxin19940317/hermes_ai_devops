@@ -141,6 +141,38 @@ func artifactAttempts(t *testing.T, s fullStore) map[string]int {
 	return out
 }
 
+// quarantineAuditCount 统计 audit_log 里 action=device_quarantined 且
+// target=deviceID 的行数。WriteAudit/audit_log 只有写接口(§11 Phase 3 fire-and
+// -forget 设计),没有公开的读方法,按 artifactAttempts 同样的做法对两套实现分别读:
+// MemStore 直接读内部切片,PGStore 查表(pgtest_test.go 的 TRUNCATE 已含
+// audit_log,子测试之间不会互相污染计数)。
+func quarantineAuditCount(t *testing.T, s fullStore, deviceID string) int {
+	t.Helper()
+	switch st := s.(type) {
+	case *MemStore:
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		n := 0
+		for _, e := range st.auditLog {
+			if e.Action == "device_quarantined" && e.Target == deviceID {
+				n++
+			}
+		}
+		return n
+	case *PGStore:
+		var n int
+		if err := st.DB.QueryRowContext(ctx,
+			`SELECT count(*) FROM audit_log WHERE action = 'device_quarantined' AND target = $1`,
+			deviceID).Scan(&n); err != nil {
+			t.Fatalf("count audit_log: %v", err)
+		}
+		return n
+	default:
+		t.Fatalf("unsupported store type %T", s)
+		return 0
+	}
+}
+
 // runConformance 对一个空 store 实例跑全部行为断言;
 // newStore 每个子测试调用一次,必须返回干净实例。
 func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
@@ -658,6 +690,202 @@ func runConformance(t *testing.T, newStore func(t *testing.T) fullStore) {
 		}
 		if ov.Devices[0].FailStreak != 0 || ov.Devices[0].Status == "QUARANTINED" {
 			t.Errorf("ok 应清零且不隔离, got %+v", ov.Devices[0])
+		}
+	})
+
+	// Task 10 / spec §9.2:置 QUARANTINED 的同一事务内必须写出恰好一行 outbox
+	// device-quarantined 事件 + 一行 audit_log,payload 携带触发本次隔离的 task_id。
+	// 未持久化任何 result 时 failure_stage 必须留空而不是报错——通知不能因为缺
+	// 一个展示字段就不发。
+	t.Run("QuarantineEmitsOutboxEventInSameTx", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+		var lastTask string
+		for i := 1; i <= 3; i++ { // §10:连续 3 次 device scope 释放 → QUARANTINED
+			taskID := fmt.Sprintf("w:t%d:a1", i)
+			lastTask = taskID
+			lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, taskID, 120)
+			if err != nil || lease == nil {
+				t.Fatalf("acquire %d: %+v %v", i, lease, err)
+			}
+			if err := s.ReleaseDevice(ctx, lease.DeviceID, taskID, wf.FailScopeDevice, 3); err != nil {
+				t.Fatalf("release %d: %v", i, err)
+			}
+		}
+		ov, err := s.FleetOverview(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ov.Devices[0].Status != "QUARANTINED" {
+			t.Fatalf("device status = %s, want QUARANTINED", ov.Devices[0].Status)
+		}
+
+		rows, err := s.ClaimUnpublished(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("outbox rows = %d, want 恰好 1: %+v", len(rows), rows)
+		}
+		got := rows[0]
+		wantKey := "513cd3de:quarantined:" + lastTask
+		if got.AggregateType != "device" || got.AggregateID != "513cd3de" ||
+			got.EventType != EventTypeDeviceQuarantined || got.EventKey != wantKey {
+			t.Errorf("outbox row = %+v, want aggregate_type=device aggregate_id=513cd3de event_type=%s event_key=%s",
+				got, EventTypeDeviceQuarantined, wantKey)
+		}
+		var payload QuarantineEventPayload
+		if err := json.Unmarshal(got.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		if payload.DeviceID != "513cd3de" || payload.ClientID != "c1" || payload.Serial != "513cd3de" ||
+			payload.FailStreak != 3 || payload.TaskID != lastTask || payload.FailureStage != "" {
+			t.Errorf("payload = %+v, want device_id=513cd3de client_id=c1 serial=513cd3de "+
+				"fail_streak=3 task_id=%s failure_stage=\"\"(未落库结果不得报错也不得串号)",
+				payload, lastTask)
+		}
+
+		if n := quarantineAuditCount(t, s, "513cd3de"); n != 1 {
+			t.Errorf("audit_log device_quarantined 行数 = %d, want 1", n)
+		}
+	})
+
+	// Task 10 / spec §9.2 最关键的回归护栏:event_key 必须用触发本次隔离的
+	// task_id,不能用 fail_streak——UnquarantineDevice 会把 fail_streak 清零,
+	// "隔离 → 解除 → 再次隔离" 第二次仍在 streak=3 触发,若键仍是 fail_streak,
+	// 第二条 outbox 行会与第一条撞成同一个 event_key,被 UNIQUE/幂等挡掉,
+	// 第二次隔离就永远不会通知。本测试要求两次隔离各产生一行、键各不相同。
+	t.Run("ReQuarantineAfterUnquarantineEmitsSecondEvent", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+
+		quarantineOnce := func(offset int) string {
+			t.Helper()
+			var last string
+			for i := offset; i < offset+3; i++ {
+				taskID := fmt.Sprintf("w:t%d:a1", i)
+				last = taskID
+				lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, taskID, 120)
+				if err != nil || lease == nil {
+					t.Fatalf("acquire %d: %+v %v", i, lease, err)
+				}
+				if err := s.ReleaseDevice(ctx, lease.DeviceID, taskID, wf.FailScopeDevice, 3); err != nil {
+					t.Fatalf("release %d: %v", i, err)
+				}
+			}
+			return last
+		}
+
+		firstTask := quarantineOnce(1)
+		ov, err := s.FleetOverview(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ov.Devices[0].Status != "QUARANTINED" {
+			t.Fatalf("第一次隔离未生效: %+v", ov.Devices[0])
+		}
+
+		if ok, err := s.UnquarantineDevice(ctx, "513cd3de"); err != nil || !ok {
+			t.Fatalf("unquarantine: ok=%v err=%v", ok, err)
+		}
+
+		secondTask := quarantineOnce(4) // 与第一轮不同的 task_id
+		ov, err = s.FleetOverview(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ov.Devices[0].Status != "QUARANTINED" {
+			t.Fatalf("第二次隔离未生效: %+v", ov.Devices[0])
+		}
+
+		rows, err := s.ClaimUnpublished(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 用 fail_streak 做键时这里会退化成 1(两次都在 streak=3 触发,生成
+		// 相同的 event_key,被幂等挡掉)——这正是本测试要锁住的回归。
+		if len(rows) != 2 {
+			t.Fatalf("outbox rows = %d, want 2(第二次隔离必须产生第二条事件); rows=%+v", len(rows), rows)
+		}
+		keys := map[string]OutboxEvent{}
+		for _, r := range rows {
+			keys[r.EventKey] = r
+			if r.EventType != EventTypeDeviceQuarantined {
+				t.Errorf("event_type = %s, want %s", r.EventType, EventTypeDeviceQuarantined)
+			}
+		}
+		if len(keys) != 2 {
+			t.Fatalf("两次隔离的 event_key 必须各不相同: %+v", keys)
+		}
+		wantFirstKey := "513cd3de:quarantined:" + firstTask
+		wantSecondKey := "513cd3de:quarantined:" + secondTask
+		firstEv, ok1 := keys[wantFirstKey]
+		secondEv, ok2 := keys[wantSecondKey]
+		if !ok1 || !ok2 {
+			t.Fatalf("event_key 未按各自触发 task_id 生成, got keys=%+v, want %s 与 %s",
+				keys, wantFirstKey, wantSecondKey)
+		}
+		var firstPayload, secondPayload QuarantineEventPayload
+		if err := json.Unmarshal(firstEv.Payload, &firstPayload); err != nil {
+			t.Fatalf("unmarshal first payload: %v", err)
+		}
+		if err := json.Unmarshal(secondEv.Payload, &secondPayload); err != nil {
+			t.Fatalf("unmarshal second payload: %v", err)
+		}
+		if firstPayload.TaskID != firstTask || secondPayload.TaskID != secondTask {
+			t.Errorf("payload task_id 串号: first=%+v second=%+v", firstPayload, secondPayload)
+		}
+
+		if n := quarantineAuditCount(t, s, "513cd3de"); n != 2 {
+			t.Errorf("audit_log device_quarantined 行数 = %d, want 2(两次隔离各一行)", n)
+		}
+	})
+
+	// Task 10 / spec §9.2:outbox payload 的 failure_stage 必须取自**触发本次隔离
+	// 的那个 task** 已持久化的结果,不得从其它已落库的 task 串号(即便那个 task
+	// 也参与了同一轮 fail_streak 计数)。
+	t.Run("QuarantinePayloadCarriesStageFromThatTask", func(t *testing.T) {
+		s := newStore(t)
+		seed(t, s)
+
+		saveStage := func(taskID, stage string) {
+			t.Helper()
+			if err := s.CreateTask(ctx, wf.TaskRow{TaskID: taskID, WorkflowID: "w", IdempotencyKey: taskID}); err != nil {
+				t.Fatalf("create task %s: %v", taskID, err)
+			}
+			if _, err := s.SaveResult(ctx, wf.ResultRecord{TaskID: taskID, Result: wf.TaskResultSignal{
+				TaskID: taskID, Status: "FAILED", FailureScope: "device", FailureStage: stage,
+			}}); err != nil {
+				t.Fatalf("save result %s: %v", taskID, err)
+			}
+		}
+		saveStage("w:t1:a1", "deploy")   // 第 1 次:不该被读到
+		saveStage("w:t2:a1", "download") // 第 2 次:不该被读到
+		saveStage("w:t3:a1", "run")      // 触发隔离的第 3 次:唯一应被读到的 stage
+
+		for _, taskID := range []string{"w:t1:a1", "w:t2:a1", "w:t3:a1"} {
+			lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, taskID, 120)
+			if err != nil || lease == nil {
+				t.Fatalf("acquire %s: %+v %v", taskID, lease, err)
+			}
+			if err := s.ReleaseDevice(ctx, lease.DeviceID, taskID, wf.FailScopeDevice, 3); err != nil {
+				t.Fatalf("release %s: %v", taskID, err)
+			}
+		}
+
+		rows, err := s.ClaimUnpublished(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("outbox rows = %d, want 1: %+v", len(rows), rows)
+		}
+		var payload QuarantineEventPayload
+		if err := json.Unmarshal(rows[0].Payload, &payload); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		if payload.TaskID != "w:t3:a1" || payload.FailureStage != "run" {
+			t.Errorf("payload = %+v, want task_id=w:t3:a1 failure_stage=run(不得取自 t1/t2)", payload)
 		}
 	})
 

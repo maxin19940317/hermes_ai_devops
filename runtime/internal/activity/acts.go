@@ -176,6 +176,13 @@ func (a *Acts) FinishTask(ctx context.Context, req wf.FinishRequest) error {
 
 // ReleaseDevice 归还设备并按归因记账。空 FailScope 表示载荷来自改动前的
 // workflow(重放场景,设计文档 §5):按旧语义翻译,保持当初的记账行为。
+//
+// 注:若本次释放把设备置 QUARANTINED,Task 10(spec §9.2)的 outbox 事件
+// (EventTypeDeviceQuarantined)与对应的 audit_log("device_quarantined")行由
+// a.Store.ReleaseDevice 在同一次持久化操作内直接写出,不在这里补——写在这里会
+// 重新引入"隔离已提交、进程在发通知前崩溃 → activity 重试时幂等早返回 → 永远
+// 不再通知"的窗口(§9.1)。这里的 "device_released" 审计是另一条,无论是否触发
+// 隔离都会写,记录"设备被释放"这个事实本身。
 func (a *Acts) ReleaseDevice(ctx context.Context, req wf.ReleaseRequest) error {
 	scope := req.FailScope
 	if scope == "" {

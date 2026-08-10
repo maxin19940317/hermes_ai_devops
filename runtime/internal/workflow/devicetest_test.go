@@ -64,6 +64,17 @@ type fakeActs struct {
 
 	leaseExpiry     *time.Time // CheckLease 的返回(模拟 device_leases.lease_expires_at);nil = 未续期
 	checkLeaseCalls []string
+
+	// quarantineAfter > 0 时启用简化版隔离记账(Task 12 端到端故障注入专用):
+	// 复刻 store.MemStore.ReleaseDevice 的记账语义(仅 device scope 计数、ok
+	// 清零、client/none 不动)。目的不是重新实现 Store——真正的隔离/outbox/
+	// audit 落地已由 Task 10 在 internal/store 的 conformance 测试覆盖——而是
+	// 证明 workflow 层连续算出的 FailScope 真的会驱动(或真的不会驱动)隔离,
+	// 不能只验证单次调用的返回值。quarantineAfter == 0(缺省)时零行为变化,
+	// 不影响任何既有测试。
+	quarantineAfter    int
+	deviceFailStreak   map[string]int  // 按 DeviceID 计数
+	quarantinedDevices map[string]bool // 按 DeviceID 记录已(模拟)隔离
 }
 
 var defaultLease = &Lease{DeviceID: "dev1", Serial: "513cd3de", ClientID: "c1", ClientBaseURL: "https://client:8443"}
@@ -95,6 +106,10 @@ func (f *fakeActs) AcquireDevice(_ context.Context, _ AcquireRequest) (*Lease, e
 		l := f.acquires[0]
 		f.acquires = f.acquires[1:]
 		return l, nil
+	}
+	if f.quarantinedDevices[defaultLease.DeviceID] {
+		// 模拟 store.MemStore:QUARANTINED 设备不可租(devices.go:leasable)。
+		return nil, nil
 	}
 	return defaultLease, nil
 }
@@ -134,6 +149,25 @@ func (f *fakeActs) ReleaseDevice(_ context.Context, r ReleaseRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.released = append(f.released, r)
+	if f.quarantineAfter > 0 {
+		if f.deviceFailStreak == nil {
+			f.deviceFailStreak = map[string]int{}
+		}
+		switch r.FailScope {
+		case FailScopeDevice:
+			f.deviceFailStreak[r.DeviceID]++
+			if f.deviceFailStreak[r.DeviceID] >= f.quarantineAfter {
+				if f.quarantinedDevices == nil {
+					f.quarantinedDevices = map[string]bool{}
+				}
+				f.quarantinedDevices[r.DeviceID] = true
+			}
+		case FailScopeOK:
+			f.deviceFailStreak[r.DeviceID] = 0
+		}
+		// FailScopeClient/FailScopeNone: 计数器不动,与 store.MemStore.ReleaseDevice
+		// 的记账语义一致(none/client 都不驱动设备级隔离)。
+	}
 	return nil
 }
 func (f *fakeActs) Notify(_ context.Context, msg string) error {
@@ -1013,34 +1047,64 @@ func TestDeviceBusyThenAvailable(t *testing.T) {
 // check lease 失败 → none(不是 device),终态 INFRA+FAILED → client(不是 device)。
 func TestFailScope(t *testing.T) {
 	cases := []struct {
-		name     string
-		site     releaseSite
-		category rules.Category
-		status   string
-		want     FailScope
+		name          string
+		site          releaseSite
+		category      rules.Category
+		status        string
+		verdict       string
+		reportedScope string
+		want          FailScope
 	}{
-		{"CreateTask 失败是 Runtime 侧", siteCreateTaskFailed, "", "", FailScopeNone},
-		{"Dispatch 失败连不上 agent", siteDispatchFailed, "", "", FailScopeClient},
-		{"租约过期即 agent 失联", siteLeaseExpired, "", "", FailScopeClient},
-		{"CheckLease 自身失败是 Runtime 侧", siteCheckLeaseFailed, "", "", FailScopeNone},
-		{"hard deadline 成因两可", siteHardDeadline, "", "", FailScopeNone},
-		{"人为取消", siteCanceled, "", "", FailScopeNone},
-		{"LoadResult 失败是 outbox/DB", siteLoadResultFailed, "", "", FailScopeNone},
-		{"终态 CANCELED 与 siteCanceled 一致归 none", siteTerminal, "", "CANCELED", FailScopeNone},
-		{"终态 DEVICE 类", siteTerminal, rules.CategoryDevice, "FAILED", FailScopeDevice},
-		{"终态 INFRA+FAILED 是 client 流水线", siteTerminal, rules.CategoryInfra, "FAILED", FailScopeClient},
-		{"终态 INFRA+TIMEOUT 是工作负载属性", siteTerminal, rules.CategoryInfra, "TIMEOUT", FailScopeNone},
-		{"终态 PASSED", siteTerminal, "", "COMPLETED", FailScopeOK},
-		{"终态 CODE 类测试失败", siteTerminal, rules.CategoryCode, "COMPLETED", FailScopeOK},
-		{"未覆盖组合保守取 none", releaseSite("unknown"), "", "", FailScopeNone},
+		{"CreateTask 失败是 Runtime 侧", siteCreateTaskFailed, "", "", "", "", FailScopeNone},
+		{"Dispatch 失败连不上 agent", siteDispatchFailed, "", "", "", "", FailScopeClient},
+		{"租约过期即 agent 失联", siteLeaseExpired, "", "", "", "", FailScopeClient},
+		{"CheckLease 自身失败是 Runtime 侧", siteCheckLeaseFailed, "", "", "", "", FailScopeNone},
+		{"hard deadline 成因两可", siteHardDeadline, "", "", "", "", FailScopeNone},
+		{"人为取消", siteCanceled, "", "", "", "", FailScopeNone},
+		{"LoadResult 失败是 outbox/DB", siteLoadResultFailed, "", "", "", "", FailScopeNone},
+		{"终态 CANCELED 与 siteCanceled 一致归 none", siteTerminal, "", "CANCELED", "", "", FailScopeNone},
+		{"终态 DEVICE 类", siteTerminal, rules.CategoryDevice, "FAILED", "", "", FailScopeDevice},
+		{"终态 INFRA+FAILED 是 client 流水线", siteTerminal, rules.CategoryInfra, "FAILED", "", "", FailScopeClient},
+		{"终态 INFRA+TIMEOUT 是工作负载属性", siteTerminal, rules.CategoryInfra, "TIMEOUT", "", "", FailScopeNone},
+		{"终态 PASSED", siteTerminal, "", "COMPLETED", "", "", FailScopeOK},
+		{"终态 CODE 类测试失败", siteTerminal, rules.CategoryCode, "COMPLETED", "", "", FailScopeOK},
+		{"未覆盖组合保守取 none", releaseSite("unknown"), "", "", "", "", FailScopeNone},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := failScope(tc.site, tc.category, tc.status); got != tc.want {
-				t.Errorf("failScope(%q, %q, %q) = %q, want %q",
-					tc.site, tc.category, tc.status, got, tc.want)
+			if got := failScope(tc.site, tc.category, tc.status, tc.verdict, tc.reportedScope); got != tc.want {
+				t.Errorf("failScope(%q, %q, %q, %q, %q) = %q, want %q",
+					tc.site, tc.category, tc.status, tc.verdict, tc.reportedScope, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestFailScopeHonorsReportedScope:终态站点采信 Agent 上报的归因(Task 8
+// TaskResultSignal.FailureScope),优先于 category 映射(设计 §6 防线 3)。
+func TestFailScopeHonorsReportedScope(t *testing.T) {
+	got := failScope(siteTerminal, rules.CategoryInfra, "FAILED",
+		string(rules.VerdictInfraError), "device")
+	if got != FailScopeDevice {
+		t.Fatalf("scope = %v, want device(应采信 Agent 上报)", got)
+	}
+}
+
+// TestFailScopePassedForcesOK:纵深防御,PASSED 时忽略任何上报 scope(spec §6 防线 2)。
+func TestFailScopePassedForcesOK(t *testing.T) {
+	got := failScope(siteTerminal, "", "COMPLETED", string(rules.VerdictPassed), "device")
+	if got != FailScopeOK {
+		t.Fatalf("scope = %v, want ok(PASSED 必须清零,不许扣设备的分)", got)
+	}
+}
+
+// TestFailScopeIgnoresReportedScopeOnSilentSites:沉默站点永不采信(归因铁律)——
+// 租约过期时 Runtime 无法区分设备失联/Agent 挂了/网络断了/自身故障,
+// 若据此隔离,一次 Runtime 重启就会隔离掉整个 fleet。
+func TestFailScopeIgnoresReportedScopeOnSilentSites(t *testing.T) {
+	got := failScope(siteLeaseExpired, "", "", "", "device")
+	if got == FailScopeDevice {
+		t.Fatal("租约过期是沉默,不得据此隔离设备")
 	}
 }
 

@@ -24,7 +24,8 @@ var socProbeChain = []string{
 }
 
 // ProbeAndroidSOCChain 按 socProbeChain 探测,返回**所有**通过 ValidSOC 校验的
-// 值(保持链上顺序,去重);全部取不到返回空切片。
+// 值(保持链上顺序,去重);属性读不到但调用成功时静默跳过(设备是活的,只是
+// 没有这个属性)。
 //
 // 为什么要返回整条链而不是首个命中(2026-08-08 A1):别名表(AGENT_SOC_ALIASES /
 // 服务端 DEVICE_SOC_ALIASES)按惯例以**平台代号**为键(trinket→QCM6125),
@@ -32,29 +33,43 @@ var socProbeChain = []string{
 // "别名本可以救、却没机会参与"的情况:直接匹配不上、别名也查不到,
 // 于是预检报 soc mismatch、心跳注册的 soc 匹配不上任何 manifest(变体被静默
 // 判 SKIPPED)。调用方必须对每个候选依次尝试"直接匹配 → 别名匹配"。
-func ProbeAndroidSOCChain(ctx context.Context, runner Runner, serial string) []string {
+//
+// 返回的 error 非 nil 表示探测过程中出现过传输层失败(设备可能已掉线),
+// 与"属性取不到"是两回事,不要混为一谈(2026-08-09):此前实现把每次
+// getprop 失败一律静默 continue,设备在 ABI 检查后掉线时四次全失败 →
+// 空链 → 调用方误读为 soc mismatch,真实的设备故障被伪装成配置问题。
+// 只要探到了任何有效值就说明设备是活的,个别属性读失败不报错;
+// 一个有效值都没探到、且过程中确有传输层失败,才把该失败带给调用方。
+func ProbeAndroidSOCChain(ctx context.Context, runner Runner, serial string) ([]string, error) {
 	var out []string
+	var lastErr error
 	seen := map[string]bool{}
 	for _, prop := range socProbeChain {
 		soc, err := getPropQuiet(ctx, runner, serial, prop)
-		if err != nil || soc == "" {
+		if err != nil {
+			lastErr = err // 保留传输层失败,不再静默丢弃(spec §5.4 第 3 处)
 			continue
 		}
-		if !ValidSOC(soc) || seen[soc] {
+		if soc == "" || !ValidSOC(soc) || seen[soc] {
 			continue
 		}
 		seen[soc] = true
 		out = append(out, soc)
 	}
-	return out
+	// 一个都没探到、且过程中有传输层失败 → 设备很可能掉线了。
+	// 报错让调用方走存活复核,而不是让空链被误读成 soc mismatch。
+	if len(out) == 0 && lastErr != nil {
+		return nil, lastErr
+	}
+	return out, nil
 }
 
 // ProbeAndroidSOC 返回链上第一个有效值(设备身份的展示/上报缺省值);
-// 全部取不到返回 ""。**做匹配判断时不要用它**——用 ProbeAndroidSOCChain
-// 遍历整条链,理由见其 doc comment。
+// 全部取不到或探测出错返回 ""。**做匹配判断时不要用它**——用
+// ProbeAndroidSOCChain 遍历整条链,理由见其 doc comment。
 func ProbeAndroidSOC(ctx context.Context, runner Runner, serial string) string {
-	chain := ProbeAndroidSOCChain(ctx, runner, serial)
-	if len(chain) == 0 {
+	chain, err := ProbeAndroidSOCChain(ctx, runner, serial)
+	if err != nil || len(chain) == 0 {
 		return ""
 	}
 	return chain[0]

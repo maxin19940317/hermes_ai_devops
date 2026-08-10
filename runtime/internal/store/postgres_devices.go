@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -275,10 +276,24 @@ func (s *PGStore) GetLeaseExpiry(ctx context.Context, taskID string) (*time.Time
 }
 
 // ReleaseDevice 归还租约并按归因记账(差距 #10,设计文档 §4)。语义见 MemStore 同名方法。
-// 三段 CTE 一条语句 = 单事务:lease 实际释放了才会有下游行,因此重复释放/
-// 非持有者释放天然不计数(WHERE 匹配不到行,整条语句空转)。
+// lease 实际释放了才会有下游行,因此重复释放/非持有者释放天然不计数(WHERE 匹配不到行,
+// dev/cli CTE 空转,最终 SELECT 零行)。
+//
+// 置 QUARANTINED 时在**同一事务内**追加写 outbox + audit_log(spec §9.2):"隔离已提交、
+// 进程在发通知前崩溃" 是让 activity 靠返回值另发通知的致命缺陷——activity 重试时本函数
+// 因 released_at 已非 NULL 而空转,通知会永远发不出去;写进同一事务就没有这个窗口。
 func (s *PGStore) ReleaseDevice(ctx context.Context, deviceID, taskID string, scope wf.FailScope, quarantineAfter int) error {
-	_, err := s.DB.ExecContext(ctx, `
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("release device %s: begin: %w", deviceID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		clientID, status, serial, displayName string
+		failStreak                            int
+	)
+	err = tx.QueryRowContext(ctx, `
 		WITH lease AS (
 			UPDATE device_leases SET released_at = now()
 			WHERE device_id = $1 AND task_id = $2 AND released_at IS NULL
@@ -295,17 +310,78 @@ func (s *PGStore) ReleaseDevice(ctx context.Context, deviceID, taskID string, sc
 					ELSE fail_streak
 				END
 			WHERE device_id IN (SELECT device_id FROM lease)
-			RETURNING client_id
+			RETURNING client_id, status, fail_streak, serial, display_name
+		), cli AS (
+			UPDATE clients SET fail_streak = CASE
+				WHEN $3 = 'client' THEN fail_streak + 1
+				WHEN $3 = 'ok'     THEN 0
+				ELSE fail_streak
+			END
+			WHERE client_id IN (SELECT client_id FROM dev)
 		)
-		UPDATE clients SET fail_streak = CASE
-			WHEN $3 = 'client' THEN fail_streak + 1
-			WHEN $3 = 'ok'     THEN 0
-			ELSE fail_streak
-		END
-		WHERE client_id IN (SELECT client_id FROM dev)`,
-		deviceID, taskID, string(scope), quarantineAfter)
+		SELECT client_id, status, fail_streak, serial, display_name FROM dev`,
+		deviceID, taskID, string(scope), quarantineAfter).
+		Scan(&clientID, &status, &failStreak, &serial, &displayName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // 重复释放/非持有者释放:lease 未匹配,幂等无副作用
+	}
 	if err != nil {
 		return fmt.Errorf("release device %s scope=%s: %w", deviceID, scope, err)
+	}
+
+	if status == DeviceQuarantined {
+		if err := s.emitQuarantineEventTx(ctx, tx, deviceID, clientID, serial, displayName, taskID, failStreak); err != nil {
+			return fmt.Errorf("release device %s: quarantine event: %w", deviceID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("release device %s: commit: %w", deviceID, err)
+	}
+	return nil
+}
+
+// emitQuarantineEventTx 在 tx 内写 outbox(spec §9.2)+ audit_log,与置 QUARANTINED
+// 视为同一事务。event_key 用**触发本次隔离的 task_id**,不能用 fail_streak:
+// UnquarantineDevice 会把它清零(postgres_fleet.go 的 UnquarantineDevice 注释
+// 「status='IDLE'、fail_streak=0」),于是"隔离 → 解除 → 再次隔离"第二次仍在
+// streak=3 触发,生成与第一次完全相同的键,第二条 outbox 行被 UNIQUE 挡掉——第二次
+// 隔离永远不通知。task_id 不会有这个问题:同一次 Release 的重试 task_id 不变
+// (天然幂等),再次隔离必然是另一个 task。
+//
+// failure_stage 按 task_id 从权威的 results.result_json 读(差距 #2 同款回读)。
+// 不改 ReleaseRequest 加字段——那是进 Temporal workflow history 的载荷变更,需要
+// 新开一个 workflow.GetVersion 门,成本远高于事务内多读一行。读不到留空,事件照常
+// 产生——通知不能因为缺一个展示字段就不发。
+func (s *PGStore) emitQuarantineEventTx(
+	ctx context.Context, tx *sql.Tx,
+	deviceID, clientID, serial, displayName, taskID string, failStreak int,
+) error {
+	var stage sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT result_json ->> 'failure_stage' FROM results WHERE task_id = $1`, taskID,
+	).Scan(&stage); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read failure_stage for %s: %w", taskID, err)
+	}
+	payload, err := json.Marshal(QuarantineEventPayload{
+		DeviceID: deviceID, ClientID: clientID, Serial: serial, DisplayName: displayName,
+		FailStreak: failStreak, TaskID: taskID, FailureStage: stage.String,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal quarantine payload: %w", err)
+	}
+	eventKey := deviceID + ":quarantined:" + taskID
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO outbox (aggregate_type, aggregate_id, event_type, event_key, payload)
+		VALUES ('device', $1, $2, $3, $4)
+		ON CONFLICT (event_key) DO NOTHING`,
+		deviceID, EventTypeDeviceQuarantined, eventKey, payload); err != nil {
+		return fmt.Errorf("insert outbox %s: %w", eventKey, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO audit_log (actor, action, target) VALUES ($1, $2, $3)`,
+		"activity:release_device", "device_quarantined", deviceID); err != nil {
+		return fmt.Errorf("insert audit_log for %s: %w", deviceID, err)
 	}
 	return nil
 }

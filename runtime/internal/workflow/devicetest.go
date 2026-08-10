@@ -40,6 +40,12 @@ type TaskResultSignal struct {
 	SignaturesHit []string           `json:"signatures_hit"`
 	Metrics       map[string]float64 `json:"metrics"`
 	Attachments   []Attachment       `json:"attachments"`
+	// FailureScope/FailureStage 是设备侧归因信号(contracts result.schema.json,
+	// Task 5),成对可选。omitempty 必须保留:本结构体进 Temporal workflow
+	// history,旧 history 重放时不带这两个字段,缺省值(空串)必须与"未上报"
+	// 等价,不能让重放因多出字段而分叉。
+	FailureScope string `json:"failure_scope,omitempty"`
+	FailureStage string `json:"failure_stage,omitempty"`
 }
 
 type Attachment struct {
@@ -486,7 +492,7 @@ const (
 //
 // 终态分支需要 resultStatus:d.Category 单独不足以区分 FAILED(client 侧流水线
 // 失败)与 TIMEOUT(工作负载属性)——两者都是 CategoryInfra。
-func failScope(site releaseSite, category rules.Category, resultStatus string) FailScope {
+func failScope(site releaseSite, category rules.Category, resultStatus, verdict, reportedScope string) FailScope {
 	switch site {
 	case siteDispatchFailed, siteLeaseExpired:
 		// 已知盲区(设计文档 §4.1):callbacks 进程自身宕机 ≥120s 时,心跳送不达、
@@ -499,14 +505,35 @@ func failScope(site releaseSite, category rules.Category, resultStatus string) F
 		siteCanceled, siteLoadResultFailed:
 		return FailScopeNone
 	case siteTerminal:
+		// 防线 2(优先级最高,先于任何上报值判定):成功的任务永远不扣任何一方的
+		// 分(spec §6)。即便 Agent 因 bug 或版本错配把 reportedScope 填成
+		// "device",PASSED 也必须清零——纵深防御,不信任单一信号源。
+		if verdict == string(rules.VerdictPassed) {
+			return FailScopeOK
+		}
+		// 防线 3:Agent 上报了明确 scope 就直接采用,优先于下面的 category 映射。
+		switch reportedScope {
+		case "device":
+			return FailScopeDevice
+		case "client":
+			return FailScopeClient
+		case "none":
+			return FailScopeNone
+		}
+		// 未上报(或上报值不认识)→ 回落既有 category 映射,零行为变化。
 		switch {
 		case resultStatus == "CANCELED":
 			// 取消不是任何一方的错,也不是"干完了"的证据(设计 §4:取消归 none)。
 			// 与 siteCanceled 保持一致:同一类事件不因谁先观察到而改变归因。
 			return FailScopeNone
 		case category == rules.CategoryDevice:
-			// 目前无人产出 rules.CategoryDevice(设计 §7:设备级信号源本轮不做),
-			// 这个分支恒不可达,device_fail_streak 因此恒为 0——不是缺陷,是保留位。
+			// 这个分支是可达的映射兜底,不是本次改动的主要入口:device 归因现在
+			// 主要经由上方的 reportedScope 分支(Agent 主动上报)落地(见 §5/§9,
+			// 2026-08-09 设计文档)。今天 ci/variants.yaml 没有任何签名声明
+			// classify: DEVICE,所以这条路径实践中暂未被触发——但它是代码可达的
+			// 合法映射(DEVICE 是 manifest.schema.json 里 classify 的合法取值,
+			// rules.decideV1 的签名判定分支会产出 rules.CategoryDevice),一旦有人
+			// 声明这类签名就会生效,不要把它当死代码删掉。
 			return FailScopeDevice
 		case category == rules.CategoryInfra && resultStatus == "FAILED":
 			return FailScopeClient
@@ -633,7 +660,7 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 		IdempotencyKey: taskID, ClientID: lease.ClientID, DeviceID: lease.DeviceID,
 		Status: "DISPATCHING",
 	}).Get(ctx, nil); err != nil {
-		release(false, failScope(siteCreateTaskFailed, "", ""))
+		release(false, failScope(siteCreateTaskFailed, "", "", "", ""))
 		return infra("create task: "+err.Error(), true)
 	}
 	finish := func(status, verdict, category, reason string) {
@@ -662,7 +689,7 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 		LeaseID: lease.LeaseID, LeaseGeneration: lease.Generation,
 	}).Get(ctx, nil); err != nil {
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), "dispatch failed")
-		release(true, failScope(siteDispatchFailed, "", ""))
+		release(true, failScope(siteDispatchFailed, "", "", "", ""))
 		return infra("dispatch: "+err.Error(), true)
 	}
 
@@ -670,7 +697,7 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 	if site, infraReason := awaitResult(ctx, taskID, spec, resultCh); infraReason != "" {
 		cancel(infraReason)
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), infraReason)
-		release(true, failScope(site, "", ""))
+		release(true, failScope(site, "", "", "", ""))
 		return infra(infraReason, true)
 	}
 
@@ -686,7 +713,7 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 		}
 		cancel(reason)
 		finish("FAILED", string(rules.VerdictInfraError), string(rules.CategoryInfra), reason)
-		release(true, failScope(siteLoadResultFailed, "", ""))
+		release(true, failScope(siteLoadResultFailed, "", "", "", ""))
 		return infra(reason, true)
 	}
 	res := &rec.Result
@@ -744,7 +771,8 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 		maybeEscalate(ctx, in, taskID, spec, res, d, ev, sum.Analysis)
 	}
 	finish(res.Status, sum.Verdict, sum.Category, sum.Reason)
-	release(d.Category == rules.CategoryInfra, failScope(siteTerminal, d.Category, res.Status))
+	release(d.Category == rules.CategoryInfra,
+		failScope(siteTerminal, d.Category, res.Status, string(d.Verdict), res.FailureScope))
 	return sum
 }
 

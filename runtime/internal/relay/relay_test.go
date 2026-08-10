@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -61,6 +62,264 @@ func resultEvent(t *testing.T, workflowID, taskID string) store.OutboxEvent {
 	}
 	return store.OutboxEvent{AggregateType: "task", AggregateID: taskID,
 		EventType: store.EventTypeTaskResult, EventKey: taskID + ":result", Payload: payload}
+}
+
+// fakeNotifier 记录每次 SendText 的调用内容,便于断言通知文案用到了展示字段。
+type fakeNotifier struct {
+	mu    sync.Mutex
+	texts []string
+	err   error
+}
+
+func (f *fakeNotifier) SendText(_ context.Context, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.texts = append(f.texts, text)
+	return f.err
+}
+
+func (f *fakeNotifier) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.texts)
+}
+
+func quarantineEvent(t *testing.T) store.OutboxEvent {
+	t.Helper()
+	payload, err := json.Marshal(store.QuarantineEventPayload{
+		DeviceID: "dev-1", ClientID: "client-1", Serial: "SN123",
+		DisplayName: "QCM6125-01", FailStreak: 3, TaskID: "wf-1:t:a3", FailureStage: "deploy",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store.OutboxEvent{AggregateType: "device", AggregateID: "dev-1",
+		EventType: store.EventTypeDeviceQuarantined, EventKey: "dev-1:quarantined:wf-1:t:a3", Payload: payload}
+}
+
+// published 判断该 outbox 行是否已被标记投递(不在 ClaimUnpublished 结果中)。
+func published(t *testing.T, s *store.MemStore, id int64) bool {
+	t.Helper()
+	rows, err := s.ClaimUnpublished(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.ID == id {
+			return false
+		}
+	}
+	return true
+}
+
+// 隔离通知投递:成功 → published,文案带上展示字段;Notifier 返回错误 →
+// MarkFailed 且保持 pending,不得吞错误。
+func TestDeliverQuarantineNotification(t *testing.T) {
+	t.Run("投递成功标记published且文案带展示字段", func(t *testing.T) {
+		s := store.NewMemStore()
+		ev := quarantineEvent(t)
+		id := seedOutbox(t, s, ev)
+		notifier := &fakeNotifier{}
+		r := &Relay{Store: s, Notifier: notifier}
+
+		r.deliver(ctx, store.OutboxEvent{ID: id, AggregateType: ev.AggregateType,
+			AggregateID: ev.AggregateID, EventType: ev.EventType, EventKey: ev.EventKey, Payload: ev.Payload})
+
+		if !published(t, s, id) {
+			t.Fatal("通知发送成功后应标记 published")
+		}
+		if notifier.callCount() != 1 {
+			t.Fatalf("SendText 调用次数 = %d, want 1", notifier.callCount())
+		}
+		text := notifier.texts[0]
+		for _, want := range []string{"client-1", "3", "deploy", "dev-1"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("通知文案缺少展示字段 %q: %q", want, text)
+			}
+		}
+	})
+
+	t.Run("Notifier返回错误则MarkFailed并保持pending", func(t *testing.T) {
+		s := store.NewMemStore()
+		ev := quarantineEvent(t)
+		id := seedOutbox(t, s, ev)
+		notifier := &fakeNotifier{err: errors.New("feishu unavailable")}
+		r := &Relay{Store: s, Notifier: notifier}
+
+		r.deliver(ctx, store.OutboxEvent{ID: id, AggregateType: ev.AggregateType,
+			AggregateID: ev.AggregateID, EventType: ev.EventType, EventKey: ev.EventKey, Payload: ev.Payload})
+
+		if published(t, s, id) {
+			t.Fatal("Notifier 失败却标记 published")
+		}
+		rows, err := s.ClaimUnpublished(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0].Attempts != 1 {
+			t.Fatalf("rows = %+v, want 1 row with attempts=1", rows)
+		}
+		if !strings.Contains(rows[0].LastError, "feishu unavailable") {
+			t.Errorf("last_error = %q, want 包含底层错误", rows[0].LastError)
+		}
+	})
+}
+
+// 保证等级的关键:未配置且未显式关闭时不得静默成功(spec §9.3)。
+// 若这里改成直接 MarkPublished,"绝不丢"就退化成静默丢弃隔离通知。
+func TestQuarantineEventStaysPendingWhenNotifierUnconfigured(t *testing.T) {
+	s := store.NewMemStore()
+	ev := quarantineEvent(t)
+	id := seedOutbox(t, s, ev)
+	r := &Relay{Store: s} // Notifier 为 nil,DeviceNotifyDisabled 缺省 false
+
+	r.deliver(ctx, store.OutboxEvent{ID: id, AggregateType: ev.AggregateType,
+		AggregateID: ev.AggregateID, EventType: ev.EventType, EventKey: ev.EventKey, Payload: ev.Payload})
+
+	if published(t, s, id) {
+		t.Fatal("未配置通知端却标记已投递 = 静默丢弃隔离通知")
+	}
+	rows, err := s.ClaimUnpublished(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Attempts != 1 {
+		t.Fatalf("rows = %+v, want 1 row with attempts=1", rows)
+	}
+	if !strings.Contains(rows[0].LastError, "notifier not configured") {
+		t.Errorf("last_error = %q, want 明确指出未配置", rows[0].LastError)
+	}
+}
+
+// 显式 RELAY_DEVICE_NOTIFY=off:有意关闭,标记已投递,不占 backlog。
+func TestQuarantineEventPublishedWhenNotifyExplicitlyOff(t *testing.T) {
+	s := store.NewMemStore()
+	ev := quarantineEvent(t)
+	id := seedOutbox(t, s, ev)
+	r := &Relay{Store: s, DeviceNotifyDisabled: true} // Notifier 仍为 nil,验证关闭优先于"未配置"分支
+
+	r.deliver(ctx, store.OutboxEvent{ID: id, AggregateType: ev.AggregateType,
+		AggregateID: ev.AggregateID, EventType: ev.EventType, EventKey: ev.EventKey, Payload: ev.Payload})
+
+	if !published(t, s, id) {
+		t.Fatal("显式关闭时应标记已投递,避免永久占用 backlog")
+	}
+	rows, err := s.ClaimUnpublished(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("rows = %+v, want 0(已发布)", rows)
+	}
+}
+
+// payload 解码失败(部署/版本错配)按坏行处理:记 failed 供监控介入,不得 panic。
+func TestQuarantineEventBadPayloadMarksFailed(t *testing.T) {
+	s := store.NewMemStore()
+	ev := store.OutboxEvent{AggregateType: "device", AggregateID: "dev-1",
+		EventType: store.EventTypeDeviceQuarantined, EventKey: "dev-1:quarantined:bad", Payload: json.RawMessage(`{bad`)}
+	id := seedOutbox(t, s, ev)
+	r := &Relay{Store: s, Notifier: &fakeNotifier{}}
+
+	r.deliver(ctx, store.OutboxEvent{ID: id, AggregateType: ev.AggregateType,
+		AggregateID: ev.AggregateID, EventType: ev.EventType, EventKey: ev.EventKey, Payload: ev.Payload})
+
+	if published(t, s, id) {
+		t.Fatal("payload 解码失败却标记已投递")
+	}
+}
+
+// TestDeviceQuarantineNotificationBacklogVisibleWhenNotifierUnconfigured 是
+// Task 12 补的第四条端到端场景(设计文档 §11 只列了三条,Task 11 评审要求补上
+// 这条:"Notifier 未配置时 outbox backlog 应出现该行且 last_error 命中")。
+//
+// 与上面几条 TestQuarantineEvent* 的区别:那些用 quarantineEvent(t) 手工构造
+// payload,只验证 deliver() 内部对 ClaimUnpublished 的影响;这条改为真实驱动
+// store.MemStore.ReleaseDevice 连续 3 次 device scope 释放,让隔离事件由 Store
+// 自己在同一临界区产出(Task 10 的落地),再断言 Relay 侧的
+// Store.OutboxBacklog() 聚合(而不是 ClaimUnpublished)能看见这一行、且
+// last_error 命中"未配置"提示——这才是"隔离事件产生 → 通知端未配置 →
+// backlog 可见"这条完整链路,不是链路里某一段的单元测试。
+//
+// 注:仓库里跟"backlog"相关的其实有三个独立的东西,本测试只覆盖第二个:
+//  1. SQL 视图 outbox_backlog(schema.sql):人工排查入口,stuck 阈值硬编码 3,
+//     不含 last_error 列;
+//  2. Store.OutboxBacklog() Go 方法(本测试断言的对象):供 Relay 定期打日志/
+//     告警用,阈值可配(StuckAttempts),含 SampleError(即 last_error);
+//  3. Grafana 面板:直接查 outbox 表,不经过上面两者中的任何一个。
+//
+// 三者互相独立,不能把结论从一个套到另一个:改 Store.OutboxBacklog() 的阈值
+// 不影响 SQL 视图或 Grafana;SQL 视图没有 last_error,不能拿它验证通知文案。
+func TestDeviceQuarantineNotificationBacklogVisibleWhenNotifierUnconfigured(t *testing.T) {
+	s := store.NewMemStore()
+	if err := s.UpsertClientDevices(ctx,
+		store.Client{ClientID: "c1", BaseURL: "https://client:8443"},
+		[]store.Device{{DeviceID: "dev-1", Serial: "513cd3de", ClientID: "c1",
+			SOC: "QCM6125", ABI: "arm64-v8a"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	const quarantineAfter = 3
+	var deviceID string
+	for i := 0; i < quarantineAfter; i++ {
+		taskID := fmt.Sprintf("wf-1:t:a%d", i+1)
+		lease, err := s.AcquireDevice(ctx, wf.DeviceSelector{}, taskID, 120)
+		if err != nil || lease == nil {
+			t.Fatalf("第 %d 次 acquire 失败: lease=%+v err=%v", i+1, lease, err)
+		}
+		deviceID = lease.DeviceID
+		if err := s.ReleaseDevice(ctx, lease.DeviceID, taskID, wf.FailScopeDevice, quarantineAfter); err != nil {
+			t.Fatalf("第 %d 次 release 失败: %v", i+1, err)
+		}
+	}
+
+	// 隔离本身不是本用例重点(Task 10 已覆盖),但没隔离的话后面全部空转——
+	// 先确认链路的第一环真的发生了。
+	ov, err := s.FleetOverview(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantined := false
+	for _, d := range ov.Devices {
+		if d.DeviceID == deviceID {
+			quarantined = d.Status == "QUARANTINED"
+		}
+	}
+	if !quarantined {
+		t.Fatalf("连续 %d 次 device scope 释放后设备未隔离: %+v", quarantineAfter, ov.Devices)
+	}
+
+	evs, err := s.ClaimUnpublished(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 || evs[0].EventType != store.EventTypeDeviceQuarantined {
+		t.Fatalf("outbox events = %+v, want 恰好 1 条 device-quarantined 事件", evs)
+	}
+
+	// Relay 未配置 Notifier(且未显式 RELAY_DEVICE_NOTIFY=off):必须投递失败,
+	// 不得静默 MarkPublished(spec §9.3)。
+	r := &Relay{Store: s}
+	r.deliver(ctx, evs[0])
+
+	// 关键断言:验证的是 Relay 侧的 Store.OutboxBacklog() 聚合(供 Relay 定期
+	// 打日志/告警),不是 ClaimUnpublished——这条链路"可见"与否要在这一层验证。
+	// 与 schema.sql 里的 SQL 视图 outbox_backlog 是两个独立的东西(该视图没有
+	// last_error 列,stuck 阈值也是硬编码的 3),不在本测试覆盖范围内;
+	// Grafana 面板则直接查 outbox 表,与两者都无关。
+	backlog, err := s.OutboxBacklog(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backlog.Pending != 1 {
+		t.Fatalf("backlog.Pending = %d, want 1(未配置通知端的隔离事件应可见于 backlog)", backlog.Pending)
+	}
+	if backlog.Stuck != 1 {
+		t.Errorf("backlog.Stuck = %d, want 1(attempts=1 已达 stuckAttempts=1 阈值)", backlog.Stuck)
+	}
+	if !strings.Contains(backlog.SampleError, "notifier not configured") {
+		t.Errorf("backlog.SampleError = %q, want 命中未配置提示", backlog.SampleError)
+	}
 }
 
 // 投递归宿状态机(表驱动):成功/NotFound → published;瞬时错误/未知事件 →

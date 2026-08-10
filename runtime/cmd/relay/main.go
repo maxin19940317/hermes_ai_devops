@@ -15,6 +15,18 @@
 //	RELAY_BACKLOG_INTERVAL   积压报告间隔,缺省 1m;设 0 关闭
 //	RELAY_STUCK_ATTEMPTS     attempts >= 此值算"卡住",缺省 3
 //	RELAY_BACKLOG_WARN_AGE   最老未投递行超过此年龄升级为 warn,缺省 5m
+//
+// 设备隔离通知(spec §9.2/§9.3;与 cmd/worker 同款飞书双模,见 internal/feishu):
+//
+//	FEISHU_WEBHOOK_URL      可选;群自定义机器人 webhook(双模兜底)
+//	FEISHU_APP_ID           可选;企业自建应用(三件套齐全时优先于 webhook)
+//	FEISHU_APP_SECRET       可选;同上
+//	FEISHU_RECEIVE_ID       可选;接收方 open_id(个人单聊)或 chat_id(群)
+//	FEISHU_RECEIVE_ID_TYPE  可选;chat_id|open_id,缺省 chat_id
+//	RELAY_DEVICE_NOTIFY     可选;设为 "off" 显式关闭设备隔离通知(标记已投递,
+//	                        不占 backlog)。留空且飞书未配置时,device-quarantined
+//	                        事件保持 pending 并计入 backlog——未配置绝不等价于
+//	                        静默丢弃(spec §9.3 三种语义表中间一行)。
 package main
 
 import (
@@ -27,6 +39,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.temporal.io/sdk/client"
 
+	"hermes-devops/runtime/internal/feishu"
 	"hermes-devops/runtime/internal/relay"
 	"hermes-devops/runtime/internal/store"
 )
@@ -65,12 +78,31 @@ func main() {
 	}
 	defer tc.Close()
 
+	// ---- 设备隔离通知(spec §9.2/§9.3):与 cmd/worker 同款飞书双模装配。
+	// 三者皆空 → Notifier=nil;deliver() 据此 + DeviceNotifyDisabled 决定
+	// device-quarantined 事件是保持 pending 还是标记已投递(见 relay.go 注释)。
+	feishuSender, feishuMode := feishu.NewSender(feishu.Config{
+		AppID:         cfg.FeishuAppID,
+		AppSecret:     cfg.FeishuAppSecret,
+		ReceiveID:     cfg.FeishuReceiveID,
+		ReceiveIDType: cfg.FeishuReceiveIDType,
+		WebhookURL:    cfg.FeishuWebhookURL,
+	})
+	log.Info().Str("mode", feishuMode).Bool("device_notify_disabled", cfg.DeviceNotifyDisabled).
+		Msg("device quarantine notify config")
+	if feishuSender == nil && !cfg.DeviceNotifyDisabled {
+		log.Warn().Msg("飞书未配置且 RELAY_DEVICE_NOTIFY 未设为 off:" +
+			"device-quarantined 事件将保持 pending 并计入 outbox backlog,直到补配置或显式关闭")
+	}
+
 	r := &relay.Relay{
 		Store: st, Signaler: tc, Log: &log,
 		BatchSize: cfg.BatchSize, PollInterval: cfg.PollInterval, MaxBackoff: cfg.MaxBackoff,
-		BacklogInterval: cfg.BacklogInterval,
-		StuckAttempts:   cfg.StuckAttempts,
-		BacklogWarnAge:  cfg.BacklogWarnAge,
+		BacklogInterval:      cfg.BacklogInterval,
+		StuckAttempts:        cfg.StuckAttempts,
+		BacklogWarnAge:       cfg.BacklogWarnAge,
+		Notifier:             feishuSender,
+		DeviceNotifyDisabled: cfg.DeviceNotifyDisabled,
 	}
 	log.Info().Dur("poll_interval", cfg.PollInterval).Msg("outbox relay starting")
 	if err := r.Run(ctx); err != nil {

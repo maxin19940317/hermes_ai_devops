@@ -201,6 +201,16 @@ services:
       RELAY_BACKLOG_INTERVAL: ${RELAY_BACKLOG_INTERVAL:-1m}
       RELAY_STUCK_ATTEMPTS: ${RELAY_STUCK_ATTEMPTS:-3}
       RELAY_BACKLOG_WARN_AGE: ${RELAY_BACKLOG_WARN_AGE:-5m}
+      # 设备隔离通知(spec §9.2/§9.3)。共享锚点 runtime-environment 不含
+      # FEISHU_*,relay 需要独立通知端才能真正发出 device-quarantined 事件,
+      # 这里显式补传——不传等价于让隔离通知永久卡在 outbox backlog 里。
+      FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_RECEIVE_ID: ${FEISHU_RECEIVE_ID:-}
+      FEISHU_RECEIVE_ID_TYPE: ${FEISHU_RECEIVE_ID_TYPE:-}
+      # 三种语义(留空/off/已配置)见 deploy/.env.example 对应注释与 spec §9.3。
+      RELAY_DEVICE_NOTIFY: ${RELAY_DEVICE_NOTIFY:-}
 
   minio:
     image: ${MINIO_IMAGE:?MINIO_IMAGE must come from images.lock.env}

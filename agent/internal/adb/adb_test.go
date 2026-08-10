@@ -1,6 +1,8 @@
 package adb
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -156,6 +158,56 @@ func TestExecRunnerUsesPrivatePort(t *testing.T) {
 		if !found {
 			t.Errorf("commandEnv 缺少 ANDROID_ADB_SERVER_PORT=5137: %v", env)
 		}
+	}
+}
+
+func TestRunWrapsLaunchFailureAsLaunchError(t *testing.T) {
+	r := &ExecRunner{ADBPath: "/nonexistent/adb-binary-xyz"}
+	_, err := r.Run(context.Background(), Devices())
+	if err == nil {
+		t.Fatal("adb 二进制不存在时应返回 error")
+	}
+	var le *LaunchError
+	if !errors.As(err, &le) {
+		t.Fatalf("应为 *LaunchError(供调用方归因 client),got %T: %v", err, err)
+	}
+}
+
+// 非零退出码不是 error,更不能是 LaunchError:它是"设备/远端命令的客观结果"
+func TestRunNonZeroExitIsNotLaunchError(t *testing.T) {
+	r := &ExecRunner{ADBPath: "/bin/false"}
+	res, err := r.Run(context.Background(), Devices())
+	if err != nil {
+		t.Fatalf("非零退出不应作为 error: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatal("期望非零退出码")
+	}
+}
+
+func TestGetStateIsSerialScoped(t *testing.T) {
+	got := GetState("dev1")
+	want := []string{"-s", "dev1", "get-state"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetState = %v, want %v(红线 §14:必须带 -s)", got, want)
+	}
+}
+
+// 二级复核要靠 offline/unauthorized 判定设备不可达,不能像 ParseTransports 那样丢弃
+func TestParseDeviceStatesRetainsNonDeviceStates(t *testing.T) {
+	out := "List of devices attached\n" +
+		"dev1\tdevice\n" +
+		"dev2\toffline\n" +
+		"dev3\tunauthorized\n" +
+		"\n"
+	got := ParseDeviceStates(out)
+	want := map[string]string{"dev1": "device", "dev2": "offline", "dev3": "unauthorized"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseDeviceStates = %v, want %v", got, want)
+	}
+	// 对照:ParseTransports 会把后两台丢掉,故不可复用
+	if len(ParseTransports(out)) != 1 {
+		t.Fatal("前提失效:ParseTransports 不再只保留 device 行,请重新评估 §5.3 设计")
 	}
 }
 

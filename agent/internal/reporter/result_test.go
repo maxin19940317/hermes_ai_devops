@@ -207,6 +207,67 @@ func TestReportAssemblesValidResult(t *testing.T) {
 	}
 }
 
+// TestResultCarriesFailureAttribution 验证 executor.Summary 的
+// FailureScope/FailureStage(Task 6)经 build() 透传进上送的 result.json
+// (Task 7,spec §5/§6)。
+func TestResultCarriesFailureAttribution(t *testing.T) {
+	f, srv := newFakeRuntime(t)
+	s := openTempStore(t)
+	task := seedTask(t, s, "t1", "wf1:t1:a1", "SERIAL1")
+	driveTerminal(t, s, "t1", store.StateFailed)
+	writeSummary(t, executor.Summary{
+		Status:       executor.StatusFailed,
+		ExitCode:     -1,
+		DurationSec:  1.5,
+		Environment:  map[string]string{"serial": "SERIAL1"},
+		OutDir:       task.OutDir,
+		FailureScope: "device",
+		FailureStage: "precheck",
+	})
+
+	rr := newResultReporter(s, srv.URL)
+	if err := rr.Report(context.Background(), "t1", nil); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+
+	_, _, results := f.snapshot()
+	result, _ := results[0]["result"].(map[string]any)
+	// 关键:上送的 result 必须过 contracts/result.schema.json(含
+	// dependentRequired 双向绑定校验)
+	if err := compileRealResultSchema(t).Validate(result); err != nil {
+		t.Fatalf("上送 result 未过契约校验: %v", err)
+	}
+	if result["failure_scope"] != "device" || result["failure_stage"] != "precheck" {
+		t.Errorf("归因未写入 result: failure_scope=%v failure_stage=%v", result["failure_scope"], result["failure_stage"])
+	}
+}
+
+// TestSuccessfulResultOmitsAttribution 验证成功任务不带归因字段
+// (spec §6 防线 1):归因只描述"导致最终非 PASSED 结局的主失败",
+// 成功却带 failure_scope 会让 Runtime 误判连续失败并隔离健康设备。
+func TestSuccessfulResultOmitsAttribution(t *testing.T) {
+	f, srv := newFakeRuntime(t)
+	s := openTempStore(t)
+	seedTerminalTask(t, s, "t1", "wf1:t1:a1", true)
+
+	rr := newResultReporter(s, srv.URL)
+	if err := rr.Report(context.Background(), "t1", nil); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+
+	_, _, results := f.snapshot()
+	result, _ := results[0]["result"].(map[string]any)
+	if err := compileRealResultSchema(t).Validate(result); err != nil {
+		t.Fatalf("上送 result 未过契约校验: %v", err)
+	}
+	if _, ok := result["failure_scope"]; ok {
+		t.Errorf("成功任务不应带 failure_scope: %v", result["failure_scope"])
+	}
+	if _, ok := result["failure_stage"]; ok {
+		t.Errorf("成功任务不应带 failure_stage: %v", result["failure_stage"])
+	}
+}
+
 func TestReportSynthesizesCases(t *testing.T) {
 	cases := []struct {
 		name        string

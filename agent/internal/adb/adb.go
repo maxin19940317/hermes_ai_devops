@@ -172,6 +172,27 @@ func ParseTransports(out string) []string {
 	return serials
 }
 
+// GetState 查询单台设备的连接状态(存活复核一级,spec §5.3)。
+// 输出为 "device" / "offline" / "unauthorized" 之一,或非零退出。
+func GetState(serial string) []string { return withSerial(serial, "get-state") }
+
+// ParseDeviceStates 解析 `adb devices -l`,返回 serial → state 全量映射。
+//
+// 与 ParseTransports 的区别:后者只保留 state == "device" 的行。
+// 存活复核二级(spec §5.3)恰恰需要 offline / unauthorized —— 它们是
+// "设备确实不可达"的证据,被丢掉就无法与"adb server 挂了"区分。
+func ParseDeviceStates(out string) map[string]string {
+	states := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] == "List" {
+			continue
+		}
+		states[fields[0]] = fields[1]
+	}
+	return states
+}
+
 // ShellListGlob 在 workdir 内展开 glob。pattern 来自 Manifest collect 字段,
 // 已由 Schema 限定字符集([A-Za-z0-9._*/-],无 ..),不加引号以保留 glob 展开。
 func ShellListGlob(serial, workdir, pattern string) []string {
@@ -220,6 +241,23 @@ func (r *ExecRunner) commandEnv() []string {
 	return append(env, fmt.Sprintf("ANDROID_ADB_SERVER_PORT=%d", port))
 }
 
+// LaunchError 表示 adb 二进制本身没能执行(缺失、不可执行、权限不足)。
+// 归因意义:这是 Client 侧故障,与任何具体设备无关(spec §5.1)。
+//
+// 注意它**不**覆盖"私有 adb server 起不来":那种情况 adb 进程正常启动、
+// 以非零退出码结束,走 ExitError 分支返回 (res, nil),连 error 都不是,
+// 只能由 spec §5.3 的两级复核区分。
+type LaunchError struct {
+	Args []string
+	Err  error
+}
+
+func (e *LaunchError) Error() string {
+	return fmt.Sprintf("adb %s: %v", strings.Join(e.Args, " "), e.Err)
+}
+
+func (e *LaunchError) Unwrap() error { return e.Err }
+
 func (r *ExecRunner) Run(ctx context.Context, args []string) (Result, error) {
 	cmd := exec.CommandContext(ctx, r.ADBPath, args...)
 	cmd.Env = r.commandEnv()
@@ -239,6 +277,6 @@ func (r *ExecRunner) Run(ctx context.Context, args []string) (Result, error) {
 		}
 		return res, nil // 非零退出码是客观结果,不作为 error
 	default:
-		return res, fmt.Errorf("adb %s: %w", strings.Join(args, " "), err)
+		return res, &LaunchError{Args: args, Err: err}
 	}
 }

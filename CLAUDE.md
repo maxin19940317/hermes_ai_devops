@@ -49,7 +49,7 @@
 | 数据库 | PostgreSQL 15+(与 Temporal 共实例分库) | Client 本地用 SQLite(WAL) |
 | 附件/日志存储 | MinIO(S3 兼容),预签名 URL 直传 | 大文件不过 Runtime |
 | 产物仓库 | GitLab Generic Package Registry(现状沿用) | |
-| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 展示卡片已实现;重试/忽略按钮已实现(2026-08-03);隔离按钮因无设备级信号源暂不做,见差距 #10 |
+| 通知 | 飞书机器人 + 交互卡片(**按钮回调经 WS listener 执行,不是 workflow signal**——终态通知发出时 workflow 已结束) | 展示卡片已实现;重试/忽略按钮已实现(2026-08-03);隔离按钮属 UI,留给单独一轮实现 |
 | 部署 | Docker Compose(服务器全套);Client 手动安装 MSI/exe | |
 | 日志 | 结构化日志(zerolog),UTC + 毫秒,全组件 NTP | |
 
@@ -230,7 +230,7 @@ verdict (终态后判定):
 
 | category | 判定来源 | 缺省对策(Plan 可覆盖) |
 |---|---|---|
-| INFRA | Runtime 判定(下载失败/ADB 断连/离线/租约过期) | 机械重试 ≤2;设备连续 3 次 → QUARANTINED(2026-07-29 起 device 归因无信号源,该阈值暂不触发,见 docs/device-test-sequence.md 差距 #10) |
+| INFRA | Runtime 判定(下载失败/ADB 断连/离线/租约过期) | 机械重试 ≤2;设备连续 3 次 → QUARANTINED |
 | BUILD | GitLab pipeline 状态 | 不进设备测试;通知附编译错误摘要 |
 | CODE | 签名 native_crash / junit 失败 | 不重试;分析 + 通知;MR 场景阻断 |
 | MODEL/DELEGATE | 签名 cpu_fallback 等 | 不重试;分析 Delegate 分区;通知 |
@@ -240,7 +240,7 @@ verdict (终态后判定):
 
 ## 10. 关键参数缺省值(可配置,写入 config)
 
-心跳 10s;离线判定 3 次丢失;任务租约 120s(心跳续期);ADB 命令级重试 2 次间隔 3s(仅幂等命令);任务级机械重试 max 2(仅 INFRA);设备隔离阈值连续 3 次 INFRA(2026-07-29 起 device 归因无信号源,该阈值暂不触发,见 docs/device-test-sequence.md 差距 #10);产物下载超时 10min;私有 adb server 端口 **5137**(`ANDROID_ADB_SERVER_PORT`,Agent 内置固定版本 adb,自管生命周期,永不使用系统 5037)。
+心跳 10s;离线判定 3 次丢失;任务租约 120s(心跳续期);ADB 命令级重试 2 次间隔 3s(仅幂等命令);任务级机械重试 max 2(仅 INFRA);设备隔离阈值连续 3 次 INFRA;产物下载超时 10min;私有 adb server 端口 **5137**(`ANDROID_ADB_SERVER_PORT`,Agent 内置固定版本 adb,自管生命周期,永不使用系统 5037)。
 
 ## 11. 数据模型(PostgreSQL,Temporal 自身表之外)
 
@@ -309,7 +309,7 @@ Evidence Extractor 完整化✅(签名匹配 ±50 行上下文 + junit 失败 + 
 Analyzer 完善✅(LLM 分析 evidence → 结构化结论 → decisions 落库 + model 审计 + disagrees_with_rule 自洽校验;
 Hermes 超时/不可用 → 规则引擎保底);
 飞书交互卡片✅(展示卡片 2026-07-30 上线;重试/忽略按钮 2026-08-03 上线;
-按钮回调经 WS listener 执行而非 workflow signal;隔离按钮因无设备级信号源暂不做,见差距 #10);
+按钮回调经 WS listener 执行而非 workflow signal;隔离按钮属 UI,留给单独一轮实现);
 Planner v1✅(自然语言 → Plan DSL,经 analyze_bridge /plan 路由,Schema 校验不过打回重试 ≤3 次);
 CLAUDE.md §4 卡片状态已同步。
 

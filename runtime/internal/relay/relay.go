@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -30,11 +31,25 @@ type Signaler interface {
 	SignalWorkflow(ctx context.Context, workflowID, runID, signalName string, arg interface{}) error
 }
 
+// Notifier 是设备隔离通知的发送端(与 internal/feishu.Sender 同形,
+// 使 cmd/relay 可直接传入既有的飞书发送器实现,无需另写一套)。
+type Notifier interface {
+	SendText(ctx context.Context, text string) error
+}
+
 // Relay 是 outbox 投递循环。BatchSize/PollInterval/MaxBackoff 由 cmd/relay 配置注入。
 type Relay struct {
 	Store    Store
 	Signaler Signaler
 	Log      *zerolog.Logger // 可选;nil 用 Nop
+
+	// 设备隔离通知(spec §9.2/§9.3)。Notifier 为 nil 且 DeviceNotifyDisabled
+	// 为 false 时,event_type=device-quarantined 的行保持 pending 不被
+	// MarkPublished——未配置绝不能等价于静默丢弃。DeviceNotifyDisabled=true
+	// 是运维显式选择关闭通知("RELAY_DEVICE_NOTIFY=off"),此时标记已投递,
+	// 避免永久占用 backlog。
+	Notifier             Notifier
+	DeviceNotifyDisabled bool
 
 	BatchSize    int           // 每轮 claim 上限
 	PollInterval time.Duration // 空转(无待投递行)时的间隔
@@ -134,6 +149,33 @@ func (r *Relay) deliver(ctx context.Context, ev store.OutboxEvent) {
 		}
 		log.Error().Err(err).Msg("signal failed, will retry")
 		r.fail(ctx, ev, err.Error())
+	case store.EventTypeDeviceQuarantined:
+		var p store.QuarantineEventPayload
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			// payload 坏行重投无意义,但语义上属"未知事件"类:记 failed 供监控介入
+			r.fail(ctx, ev, "decode payload: "+err.Error())
+			return
+		}
+		if r.DeviceNotifyDisabled {
+			// 有意关闭(RELAY_DEVICE_NOTIFY=off):标记已投递,避免永久占用 backlog
+			log.Info().Str("device_id", p.DeviceID).Msg("device notify disabled, event consumed")
+			r.publish(ctx, ev)
+			return
+		}
+		if r.Notifier == nil {
+			// 不得静默 MarkPublished:那会把"绝不丢"退化成静默丢弃,
+			// 丢的还正是最需要人知道的事件(spec §9.3)
+			r.fail(ctx, ev, "notifier not configured; set FEISHU_* or RELAY_DEVICE_NOTIFY=off")
+			return
+		}
+		text := fmt.Sprintf("[hermes-devops] 设备已自动隔离\n设备: %s (%s)\nclient: %s\n连续失败: %d 次\n触发任务: %s\n失败阶段: %s\n解除: 发送 unquarantine %s",
+			p.DisplayName, p.DeviceID, p.ClientID, p.FailStreak, p.TaskID, p.FailureStage, p.DeviceID)
+		if err := r.Notifier.SendText(ctx, text); err != nil {
+			log.Error().Err(err).Msg("notify failed, will retry")
+			r.fail(ctx, ev, err.Error())
+			return
+		}
+		r.publish(ctx, ev)
 	default:
 		// 未知事件类型是部署/版本错配:重试无法自愈,记 failed 供 backlog 监控
 		// 发现(第四批:Outbox backlog 和失败监控),不阻塞其他行投递。

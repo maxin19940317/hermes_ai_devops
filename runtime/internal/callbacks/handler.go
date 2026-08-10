@@ -337,6 +337,10 @@ type resultDoc struct {
 	SignaturesHit []string           `json:"signatures_hit"`
 	Metrics       map[string]float64 `json:"metrics"`
 	Attachments   []wf.Attachment    `json:"attachments"`
+	// FailureScope/FailureStage 是设备侧归因信号(contracts result.schema.json,
+	// Task 5),成对可选,Schema 已用 dependentRequired 保证不会只填一个。
+	FailureScope string `json:"failure_scope,omitempty"`
+	FailureStage string `json:"failure_stage,omitempty"`
 }
 
 func (h *Handler) result(w http.ResponseWriter, r *http.Request) {
@@ -374,6 +378,7 @@ func (h *Handler) result(w http.ResponseWriter, r *http.Request) {
 		DurationSec: parsed.DurationSec, CasesTotal: parsed.Cases.Total,
 		CasesFailed: parsed.Cases.Failed, SignaturesHit: parsed.SignaturesHit,
 		Metrics: parsed.Metrics, Attachments: parsed.Attachments,
+		FailureScope: parsed.FailureScope, FailureStage: parsed.FailureStage,
 	}
 	// 事务性 Outbox(docs/device-test-sequence.md 原则 3,差距清单 #1):
 	// results + outbox 单事务写入(幂等键 {task_id}:result),消灭"写库成功但
