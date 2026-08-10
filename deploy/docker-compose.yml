@@ -176,7 +176,9 @@ services:
     ports:
       - "${WORKER_CALLBACKS_BIND_IP:-0.0.0.0}:${WORKER_CALLBACKS_HOST_PORT:-18091}:8091"
     healthcheck:
-      test: [CMD, wget, -qO-, http://127.0.0.1:8091/healthz]
+      # mTLS(2026-08-04)后 8091 只讲 https;先试带客户端证书的 mTLS,
+      # 失败再退明文 http(兼容 MTLS_* 未配置的可选部署)。
+      test: ["CMD-SHELL", "wget -qO- --ca-certificate=/etc/hermes/certs/ca-cert.pem --certificate=/etc/hermes/certs/client-windows-client-01.pem https://127.0.0.1:8091/healthz || wget -qO- http://127.0.0.1:8091/healthz"]
       interval: 5s
       timeout: 3s
       retries: 20

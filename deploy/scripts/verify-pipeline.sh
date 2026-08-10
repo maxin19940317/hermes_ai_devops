@@ -30,7 +30,13 @@ printf 'header = "X-Gitlab-Token: %s"\n' "$TRIGGER_WEBHOOK_SECRET" >"$webhook_cu
 trap 'rm -f "$gitlab_curl_cfg" "$webhook_curl_cfg" "$response_file"' EXIT
 
 curl -fsS "$trigger_url/healthz" | grep -qx ok
-curl -fsS "http://127.0.0.1:${WORKER_CALLBACKS_HOST_PORT:-18091}/healthz" | grep -qx ok
+# worker/callbacks 已启用 mTLS(2026-08-04):优先带客户端证书走 https,
+# 失败退回明文(兼容未启用 mTLS 的可选部署)。
+worker_port=${WORKER_CALLBACKS_HOST_PORT:-18091}
+curl -fsS --cacert deploy/certs/ca-cert.pem \
+  --cert deploy/certs/client-windows-client-01.pem \
+  "https://127.0.0.1:$worker_port/healthz" 2>/dev/null | grep -qx ok \
+  || curl -fsS "http://127.0.0.1:$worker_port/healthz" | grep -qx ok
 
 project=$(curl -fsS -K "$gitlab_curl_cfg" \
   "$GITLAB_BASE_URL/api/v4/projects/$project_id")
