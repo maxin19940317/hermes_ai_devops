@@ -248,6 +248,12 @@ func (f *fakeActs) SaveMetrics(_ context.Context, r SaveMetricsRequest) error {
 	return nil
 }
 
+// SyncWorkflowRuns 是 workflow 结束的排行榜回填(fire-and-forget 旁路);
+// fake 直接成功,不校验内容(测试关注主链路,不关注回填)。
+func (f *fakeActs) SyncWorkflowRuns(_ context.Context, _ SyncWorkflowRunsRequest) error {
+	return nil
+}
+
 // seedResult 把 sig 登记为 results 表的权威行:事务性 Outbox 链路下
 // workflow 只消费 signal 里的 task_id,结果本体由 LoadResult 回读(差距 #2)。
 func seedResult(f *fakeActs, sig TaskResultSignal) {
@@ -266,6 +272,22 @@ func spec1() TestSpec {
 		Package:           PackageRef{URL: "https://reg/pkg.tar.gz", SHA256: "aa", ManifestDigest: "bb"},
 		Selector:          DeviceSelector{SOC: []string{"QCM6125"}},
 		SignatureCategory: map[string]rules.Category{"cpu_fallback": "MODEL", "dsp_unavailable": "DELEGATE"},
+		MaxInfraRetries:   2,
+		LeaseSeconds:      120,
+		HardTimeoutSec:    2700,
+		DeviceWaitRounds:  3,
+		DeviceWaitSeconds: 30,
+	}
+}
+
+// spec2 是第二个变体(多 spec 并发调度用):不同 TestID、不同 SoC 约束。
+func spec2() TestSpec {
+	return TestSpec{
+		TestID:            "t2",
+		Variant:           "aarch64_Android_RK3576_RKNN_2.3.2",
+		Package:           PackageRef{URL: "https://reg/pkg2.tar.gz", SHA256: "cc", ManifestDigest: "dd"},
+		Selector:          DeviceSelector{SOC: []string{"RK3576"}},
+		SignatureCategory: map[string]rules.Category{"rknpu_fallback": "MODEL"},
 		MaxInfraRetries:   2,
 		LeaseSeconds:      120,
 		HardTimeoutSec:    2700,
@@ -1862,5 +1884,171 @@ func TestFormatMetricsCardKeepsBulletPrefix(t *testing.T) {
 	// 排序确定性 + 指标名与数值仍在
 	if !strings.Contains(lines[0], "ocr_test") || !strings.Contains(lines[0], "1451.4ms") {
 		t.Errorf("首行内容异常: %q", lines[0])
+	}
+}
+
+// ---- Phase 4:多 spec 并发调度(parallel-specs)----
+
+// taskIDForSpec 按 workflow+spec.TestID 派生 task_id(与 runAttempt 的
+// fmt.Sprintf("%s:%s:a%d", wfID, spec.TestID, attempt) 同构)。
+// wf 是实际 workflow ID(变体级输入带 scope 后缀,与 runAttempt 一致)。
+func taskIDForSpec(wf string, spec TestSpec, attempt string) string {
+	return wf + ":" + spec.TestID + ":" + attempt
+}
+
+// lease2 是第二台设备(与 defaultLease 的 dev1 区分)。
+var lease2 = &Lease{DeviceID: "dev2", Serial: "b84aa09110cfc84a", ClientID: "c1", ClientBaseURL: "https://client:8443"}
+
+// TestParallelSpecsTwoDevices:两个 spec 各拿一台设备并发完成。
+// 验证:信号按 test_id 前缀正确 fan-out(不串台)、两 spec 均 PASSED、
+// 两台设备都被释放、输出按声明顺序(t1 在前)。
+func TestParallelSpecsTwoDevices(t *testing.T) {
+	f := &fakeActs{
+		specs:    []TestSpec{spec1(), spec2()},
+		acquires: []*Lease{defaultLease, lease2}, // t1→dev1,t2→dev2
+	}
+	in := inputVariant()
+	env := newEnvID(t, f, in.WorkflowID())
+	// 两个 spec 各自的结果(t1 先完成,t2 稍后)
+	sig1 := passResult(taskIDForSpec(in.WorkflowID(), spec1(), "a1"))
+	sig2 := passResult(taskIDForSpec(in.WorkflowID(), spec2(), "a1"))
+	seedResult(f, sig1)
+	seedResult(f, sig2)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, sig1)
+	}, 20*time.Second)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, sig2)
+	}, 40*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow err: %v", env.GetWorkflowError())
+	}
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	// 输出顺序 = spec 声明顺序(确定性,通知卡片零改动)
+	if len(out.Tasks) != 2 {
+		t.Fatalf("tasks = %d, want 2", len(out.Tasks))
+	}
+	if out.Tasks[0].TestID != "t1" || out.Tasks[0].Verdict != "PASSED" {
+		t.Errorf("tasks[0] = %+v, want t1 PASSED(声明顺序)", out.Tasks[0])
+	}
+	if out.Tasks[1].TestID != "t2" || out.Tasks[1].Verdict != "PASSED" {
+		t.Errorf("tasks[1] = %+v, want t2 PASSED", out.Tasks[1])
+	}
+	// 两台设备都被派单且被释放(无 INFRA)
+	if len(f.dispatched) != 2 {
+		t.Fatalf("dispatched = %d, want 2", len(f.dispatched))
+	}
+	devices := map[string]bool{}
+	for _, d := range f.dispatched {
+		devices[d.DeviceSerial] = true
+	}
+	if !devices["513cd3de"] || !devices["b84aa09110cfc84a"] {
+		t.Errorf("两台设备都应被派单, got %v", devices)
+	}
+	if len(f.released) != 2 {
+		t.Fatalf("released = %d, want 2", len(f.released))
+	}
+	for _, r := range f.released {
+		if r.InfraFail || r.FailScope != FailScopeOK {
+			t.Errorf("PASSED 释放应 FailScopeOK 且不计 fail_streak: %+v", r)
+		}
+	}
+}
+
+// TestParallelSpecsOneInfraFailureOnePassed:并发下 t1 设备掉线(INFRA 重试耗尽),
+// t2 独立完成 PASSED——隔离性验证:一台设备的故障不拖累另一台。
+// t1 3 次 attempt(机械重试 ≤2)均失败(dispatch 持续报错),t2 首次即成功。
+func TestParallelSpecsOneInfraFailureOnePassed(t *testing.T) {
+	f := &fakeActs{
+		specs: []TestSpec{spec1(), spec2()},
+		// t1 的 dispatch 3 次 attempt 全部失败(队列 3 个错误),t2 走默认 nil
+		dispatchErrs: []error{errBoom, errBoom, errBoom},
+		acquires:     []*Lease{defaultLease, lease2},
+	}
+	in := inputVariant()
+	env := newEnvID(t, f, in.WorkflowID())
+	// 只有 t2 会发信号(t1 在 dispatch 阶段即失败,不会进入 await_result)
+	sig2 := passResult(taskIDForSpec(in.WorkflowID(), spec2(), "a1"))
+	seedResult(f, sig2)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, sig2)
+	}, 20*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow err: %v", env.GetWorkflowError())
+	}
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Tasks) != 2 {
+		t.Fatalf("tasks = %d, want 2", len(out.Tasks))
+	}
+	// t1 3 次 attempt 全 INFRA 失败;t2 正常 PASSED
+	if out.Tasks[0].TestID != "t1" || out.Tasks[0].Verdict != "INFRA_ERROR" ||
+		out.Tasks[0].Attempt != 3 {
+		t.Errorf("tasks[0] = %+v, want t1 INFRA_ERROR attempt=3", out.Tasks[0])
+	}
+	if out.Tasks[1].TestID != "t2" || out.Tasks[1].Verdict != "PASSED" {
+		t.Errorf("tasks[1] = %+v, want t2 PASSED(不受 t1 影响)", out.Tasks[1])
+	}
+	// t1 每 attempt 一次 CreateTask(3 次),t2 一次;两台设备都释放
+	if len(f.created) != 4 {
+		t.Errorf("created = %d, want 4(t1×3 + t2×1)", len(f.created))
+	}
+	if len(f.released) != 4 {
+		t.Errorf("released = %d, want 4(每个 attempt 释放一次)", len(f.released))
+	}
+}
+
+// TestParallelSpecsStaleSignalIgnored:并发下,一个 spec 结束后其私有 channel 收到
+// 迟到重复信号,不得阻塞分发器导致其余 spec 饿死(demuxSignalLoop 尾端风险)。
+// t1 在 10s 完成;t2 在 60s 完成(租约 120s 内)。t1 完成后 30-50s(t1 私有
+// channel 已无人消费)连发 5 条迟到信号填满其 channel,验证 t2 60s 的信号
+// 仍能通过分发器送达正常完成。
+func TestParallelSpecsStaleSignalDoesNotBlockDemux(t *testing.T) {
+	f := &fakeActs{
+		specs:    []TestSpec{spec1(), spec2()},
+		acquires: []*Lease{defaultLease, lease2},
+	}
+	in := inputVariant()
+	env := newEnvID(t, f, in.WorkflowID())
+	sig1 := passResult(taskIDForSpec(in.WorkflowID(), spec1(), "a1"))
+	sig2 := passResult(taskIDForSpec(in.WorkflowID(), spec2(), "a1"))
+	seedResult(f, sig1)
+	seedResult(f, sig2)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, sig1)
+	}, 10*time.Second)
+	// t1 完成后(t1 channel 无消费者),连发 5 条迟到信号填充其私有 channel
+	for i := 0; i < 5; i++ {
+		env.RegisterDelayedCallback(func() {
+			env.SignalWorkflow(SignalTaskResult, sig1)
+		}, time.Duration(30+i*5)*time.Second)
+	}
+	// t2 在租约(120s)内完成——若分发器被迟到信号阻塞,t2 会饿死直到 lease expired
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalTaskResult, sig2)
+	}, 60*time.Second)
+
+	env.ExecuteWorkflow(DeviceTestWorkflow, in)
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow err: %v", env.GetWorkflowError())
+	}
+	var out DeviceTestOutput
+	if err := env.GetWorkflowResult(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Tasks) != 2 {
+		t.Fatalf("tasks = %d, want 2", len(out.Tasks))
+	}
+	if out.Tasks[0].Verdict != "PASSED" || out.Tasks[1].Verdict != "PASSED" {
+		t.Errorf("两 spec 都应 PASSED(迟到信号不得饿死 t2): %+v", out.Tasks)
 	}
 }

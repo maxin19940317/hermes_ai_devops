@@ -328,7 +328,10 @@ Agent 版本上报 + 最低版本门禁✅(ldflags 注入版本,`MIN_AGENT_VERSI
 `AGENT_DEVICE_CAPABILITIES_MAP` 降级为兜底)。
 
 ### Phase 4 — 扩展
-Grafana 看板✅(Phase 4 第 1 轮,2026-08-04 上线:纯只读 postgres datasource,dashboard JSON 进 Git 自动 provisioning,13 个面板覆盖 task 状态/verdict/错误分类/吞吐量堆叠/设备状态/fail_streak 趋势/P50/P99 延迟/基线 delta/outbox 积压/decisions/audit;端口绑 localhost 走 SSH 转发);多设备并发调度;性能基线 MR 门禁;Linux 变体 SSH Adapter。
+Grafana 看板✅(Phase 4 第 1 轮,2026-08-04 上线:纯只读 postgres datasource,dashboard JSON 进 Git 自动 provisioning,13 个面板覆盖 task 状态/verdict/错误分类/吞吐量堆叠/设备状态/fail_streak 趋势/P50/P99 延迟/基线 delta/outbox 积压/decisions/audit;端口绑 localhost 走 SSH 转发);
+多设备并发调度✅(2026-08-10 验收:runParallelSpecs 并行执行 + demux 信号 fan-out + 3 项表驱动并发测试
+TwoDevices/OneInfraFailureOnePassed/StaleSignalDoesNotBlockDemux + q-uat 实测 RK3576 与 QCM6125 两 workflow 并行占用两台设备均 PASSED);
+性能基线 MR 门禁;Linux 变体 SSH Adapter。
 
 ## 13. 工程约定
 
