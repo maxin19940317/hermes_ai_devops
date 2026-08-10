@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,9 +20,21 @@ import (
 	"hermes-devops/agent/internal/uploader"
 )
 
+// outDirNameMaxLen 是 out_dir 目录名上限(2026-08-10)。task_id 里变体名
+// 出现两次(形如 device-test-<proj>-<sha>-p<n>-<variant>-r<n>:<variant>:a<n>),
+// 净化后可超 120 字符;其下还要再拼 \package\hermes-test-<variant>\lib\
+// <name>.so.x.y.z 约 96 字符(最坏:37 字符变体名 + 33 字符文件名)。
+// Windows 的 adb.exe 无长路径支持(MAX_PATH 260),本地文件路径一旦超限,
+// push 以 exit=1 + 空 stderr 失败(cannot stat 打在 stdout),极难诊断
+// ——实机踩坑:libopencv_imgcodecs.so.4.2.0 比同内容前两份副本长 2 字符,
+// 恰好越线。封顶 80 字符:给 RunsRoot 留 ~80 字符余量,同时保住常见
+// task_id(约 78 字符)的可读目录名不被哈希。
+const outDirNameMaxLen = 80
+
 // safeOutDirName 把 task_id 净化为单级安全目录名:仅保留
 // [A-Za-z0-9._-],其余字符(含 '/' ':' '\')一律替换为 '_';
 // 结果为空、"." 或 ".." 时返回 "_",保证 join 后不越出 RunsRoot。
+// 超长时截断为 <前缀>-<sha256前4字节hex>,见 outDirNameMaxLen 注释。
 func safeOutDirName(taskID string) string {
 	name := strings.Map(func(r rune) rune {
 		switch {
@@ -33,6 +47,13 @@ func safeOutDirName(taskID string) string {
 	}, taskID)
 	if name == "" || name == "." || name == ".." {
 		return "_"
+	}
+	if len(name) > outDirNameMaxLen {
+		sum := sha256.Sum256([]byte(taskID))
+		// TrimRight:截断点不能落在 '.'/'-'/'_' 上——Windows 传统 API 对
+		// 结尾是 '.' 的路径组件会静默吞掉尾点,导致预期外的目录名。
+		name = strings.TrimRight(name[:outDirNameMaxLen-9], ".-_") +
+			"-" + hex.EncodeToString(sum[:4])
 	}
 	return name
 }

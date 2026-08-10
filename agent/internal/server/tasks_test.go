@@ -31,6 +31,34 @@ func TestSafeOutDirName(t *testing.T) {
 	}
 }
 
+// 超长 task_id 必须截断+哈希(2026-08-10 Windows MAX_PATH 实机事故,
+// 见 tasks.go outDirNameMaxLen 注释):目录名封顶、确定性、保唯一、
+// 截断点不留尾 '.'/'-'/'_'(Windows 传统 API 会吞尾点)。
+func TestSafeOutDirNameTruncatesLongIDs(t *testing.T) {
+	// 2026-08-10 实机失败任务:变体名出现两次,净化后 126 字符
+	long1 := "device-test-aios/algo_super_sdk-ge543adfd-p106-aarch64_Linux_Qualcomm_TFLite_2.21.0-r2:aarch64_Linux_Qualcomm_TFLite_2.21.0:a3"
+	// 与 long1 共享 71 字符前缀、仅末尾不同——验证哈希保唯一
+	long2 := "device-test-aios/algo_super_sdk-ge543adfd-p106-aarch64_Linux_Qualcomm_TFLite_2.21.0-r2:aarch64_Linux_Qualcomm_TFLite_2.21.0:a4"
+
+	got1 := safeOutDirName(long1)
+	if len(got1) > outDirNameMaxLen {
+		t.Errorf("len(safeOutDirName(long)) = %d, want <= %d", len(got1), outDirNameMaxLen)
+	}
+	if got1 != safeOutDirName(long1) {
+		t.Error("同一 task_id 必须得到同一目录名(确定性)")
+	}
+	if got2 := safeOutDirName(long2); got2 == got1 {
+		t.Error("仅 attempt 不同的两个长 task_id 不得撞目录名")
+	}
+	if strings.HasSuffix(got1, ".") || strings.HasSuffix(got1, "-") || strings.HasSuffix(got1, "_") {
+		t.Errorf("截断结果不得以 '.'/'-'/'_' 结尾: %q", got1)
+	}
+	// 可读性:前缀原样保留 task_id 开头
+	if !strings.HasPrefix(got1, "device-test-aios_algo_super_sdk") {
+		t.Errorf("截断结果应保留可读前缀, got %q", got1)
+	}
+}
+
 // filesMapUploader 与 server_test.go 的 fakeUploader 不同:它同时记录
 // presigned 键和 files map,用于断言 uploadFixedSet 的 filepath.Base 后缀
 // 匹配不仅放行了正确的键,还把本地路径映射到了 wellKnownFiles 声明的位置。
