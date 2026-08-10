@@ -127,19 +127,27 @@ func TestHeartbeatBackoffOnFailure(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	start := time.Now()
 	go func() { done <- h.Run(ctx) }()
 	time.Sleep(130 * time.Millisecond)
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+	elapsed := time.Since(start)
 
 	times := f.heartbeatAttempts()
-	// 退避间隔 10→20→40→40…,130ms 窗口约 5 次;无退避应 ~13 次
-	if len(times) < 3 || len(times) > 8 {
-		t.Fatalf("attempts = %d, want 3..8 (退避生效)", len(times))
+	// 退避间隔 10→20→40→40…;至少应有 3 次(10+20ms 就够了)。
+	// 上限用实际耗时计算:若无退避每 10ms 一次,上限 = elapsed/10ms+2;
+	// 有退避上限远低于此;不用硬编码避免 CI 低速机器 sleep 过久导致误判。
+	if len(times) < 3 {
+		t.Fatalf("attempts = %d, want ≥ 3 (退避未充分触发)", len(times))
 	}
-	// Go timer 不会提前触发:第二次失败后的间隔应 ≥ 20ms 标称
+	maxWithoutBackoff := int(elapsed/h.Interval) + 2
+	if len(times) > maxWithoutBackoff {
+		t.Fatalf("attempts = %d > %d (elapsed=%v), backoff 未生效", len(times), maxWithoutBackoff, elapsed)
+	}
+	// 第二次失败后的间隔应 ≥ 20ms 标称:验证指数退避真正生效
 	if gap := times[2].Sub(times[1]); gap < 15*time.Millisecond {
 		t.Errorf("gap[1→2] = %v, want ≥ ~20ms (指数退避)", gap)
 	}

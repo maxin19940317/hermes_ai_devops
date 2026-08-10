@@ -25,8 +25,8 @@ echo "== go vet =="
 echo "go vet OK"
 
 echo "== go test =="
-(cd runtime && go test ./... 2>&1 | tail -3)
-(cd agent && go test ./... 2>&1 | tail -3)
+(cd runtime && go test ./...)
+(cd agent && go test ./...)
 echo "go test OK"
 
 echo "ALL LINT CHECKS PASSED"
