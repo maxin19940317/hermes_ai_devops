@@ -1,12 +1,11 @@
 # runtime — Temporal Worker + Trigger + REST API(Go)
 
-当前内容：Phase 1.4 Temporal spike、Phase 1.5 Trigger、Phase 1.6
-DeviceTestWorkflow/Worker 主干,可靠事件链路第一批(docs/device-test-sequence.md
-差距清单 #1/#2:outbox 表 + Callback API 单事务写入 + 独立 Outbox Relay
-进程(`cmd/relay`)+ workflow LoadResult 权威读),以及 Temporal History 与
-重放安全第二批(#3/#7/#11/#15:心跳只续 DB 租约(所有权凭据条件续租,
-失配 LEASE_NOT_OWNED)、workflow 改租约到期 Durable Timer + CheckLease、
-plan.rule_version 版本路由、workflow ID RejectDuplicate + 显式 retry -r{N})。
+当前内容:Phase 1 可靠事件链路第一批(#1/#2:outbox 表 + Callback API 单事务写入 +
+独立 Outbox Relay 进程(`cmd/relay`)+ workflow LoadResult 权威读)、Temporal History
+与重放安全第二批(#3/#7/#11/#15:心跳只续 DB 租约、Durable Timer + CheckLease、
+plan.rule_version 版本路由、workflow ID RejectDuplicate + 显式 retry -r{N}),
+以及 Phase 2–4 的完整能力:证据提取/分析/规则判定、飞书通知卡片 + 重试/忽略按钮、
+cmdapi 受控命令接口(MCP 桥)、设备归因、mTLS 硬化、Grafana 只读看板、多设备并发调度。
 q-uat 容器部署见 [`../deploy/README.md`](../deploy/README.md)。
 
 ## Trigger 服务(Phase 1.5)
@@ -31,11 +30,25 @@ bundle webhook 启动前还会跳过已测变体:kick 变体级 workflow 已出�
 Postgres 集成测试由 `TEST_DATABASE_URL` 门控(本机跳过,服务器部署后必须跑通);
 其余测试含真实 dev server 上的启动/去重 e2e(`internal/testtemporal` 拉起)。
 
-## Worker 服务(Phase 1.6 / Phase 2)
+## Worker 服务(Phase 1.6 → Phase 4)
 
 `cmd/worker`:Temporal worker + Client 回调 HTTP 服务,配置见
 `cmd/worker/main.go` 头注释(环境变量全表)。飞书指令自然语言翻译新增两项
-(设计文档 2026-07-28,详见 `../deploy/README.md` "飞书指令自然语言翻译"小节):
+(设计文档 2026-07-28,详见 `../deploy/README.md` "飞书指令自然语言翻译"小节)。
+
+Phase 2 起新增的能力(均在 `cmd/worker` 装配):
+
+- **飞书指令层**(`internal/feishucmd`):自然语言翻译 + 封闭枚举指令
+  (status/devices/test/rerun/quarantine/cancel/runs/result/metrics/artifacts/plan),
+  白名单鉴权,终态通知卡片 + 重试/忽略按钮(按钮回调经 WS listener 执行)。
+- **受控命令接口**(`internal/cmdapi`):`POST /api/v1/cmd` 封闭枚举指令
+  (Hermes/MCP 桥通道),`CMD_API_TOKEN` 鉴权,挂在 callbacks 同一 listener 上。
+- **证据提取**(`internal/evidence`):Evidence v3 提取器(见下方描述)。
+- **规则引擎**(`internal/rules`):verdict 判定优先由确定性规则完成,LLM 只补解释。
+- **设备归因**(`internal/workflow` gap #10):device attribution signal,
+  设备隔离通知经 relay 投递。
+- **回调链路**(`internal/callbacks`):心跳/事件/结果 + 预签名直传
+  (`internal/presign`),mTLS 双向认证(`internal/mtls`,Phase 3)。
 
 当前 Evidence v3 提取器会单遍流式扫描完整日志,保留真实全局行号、签名命中
 ±50 行上下文和有界兜底摘录,已无只读尾部 8MiB 的盲区;签名上下文与
@@ -46,6 +59,9 @@ Postgres 集成测试由 `TEST_DATABASE_URL` 门控(本机跳过,服务器部署
 | `FEISHU_CMD_NL` | `false` | 翻译旁路总开关(灰度)。真正启用还需 `HERMES_ENDPOINT` 非空且 `FEISHU_CMD_WHITELIST` 非空(指令 listener 已启用),三者合取 |
 | `FEISHU_CMD_NL_TIMEOUT_SEC` | `60` | `/translate` 调用超时,不复用 `HERMES_TIMEOUT_SEC`(bridge 实测 `-t ""` 冷/热约 76s/13s,这是交互路径,需单独调) |
 | `UPLOAD_REQUEST_MAX_FILES` | `64` | `POST /callbacks/v1/upload-requests` 单次请求文件数上限(差距 #8 按需签发,2026-07-29),超限整请求拒绝而非截断 |
+| `CMD_API_TOKEN` | (空) | cmdapi 受控命令接口密钥;空 = 接口未启用(401) |
+| `WORKFLOW_BRIDGE_URL` | (空) | 测试结果回填 hermes 排行榜的桥 URL;空 = 跳过 |
+| `WORKFLOW_BRIDGE_TOKEN` | (空) | 桥鉴权 Bearer 密钥 |
 
 ## Spike 结论(2026-07-17)
 
@@ -83,14 +99,25 @@ cd runtime && go test ./spike/ -v
 ```text
 spike/                  # go/no-go 三场景(workflow/activity + e2e 测试)
 cmd/spike-worker/       # 独立 worker 进程,供 SIGKILL 场景使用
-cmd/trigger/            # Trigger 服务(webhook → bundle → artifacts → workflow)
-cmd/worker/             # Temporal worker + Client 回调 HTTP 服务
+cmd/spike-cardaction/   # 卡片按钮回调 spike(WS listener)
+cmd/trigger/            # Trigger 服务(webhook/kick → artifacts → workflow)
+cmd/worker/             # Temporal worker + Client 回调 HTTP 服务 + cmdapi
 cmd/relay/              # 独立 Outbox Relay(claim 未投递行 → Signal → 标记已投)
 internal/trigger/       # handler / bundle 校验 / GitLab 客户端 / Temporal starter
-internal/store/         # Postgres 访问层(schema.sql + 内存实现,含 outbox)
-internal/workflow/      # DeviceTestWorkflow(signal 唤醒 + LoadResult 权威读)
+internal/store/         # Postgres 访问层(schema.sql + 内存实现,含 outbox/workflow_runs)
+internal/workflow/      # DeviceTestWorkflow(signal 唤醒 + LoadResult 权威读 + 并发调度)
+internal/activity/      # dispatch/collect/extract_evidence/NotifyCard/SyncWorkflowRuns 等
+internal/evidence/      # 确定性证据提取器(签名 ±50 行 + junit + 指标差值)
+internal/rules/         # 规则引擎(LLM 的保底裁决)
+internal/feishucmd/     # 飞书指令执行(自然语言翻译 + 封闭枚举 + 卡片按钮)
+internal/cmdapi/        # 受控命令 HTTP 接口(Hermes/MCP 通道)
+internal/callbacks/     # Client → Runtime 回调(心跳/事件/结果)
+internal/presign/       # MinIO 预签名直传签发
+internal/mtls/          # mTLS 客户端证书加载
 internal/relay/         # Relay 投递循环(task-result;NotFound 视为已消费)
 internal/testtemporal/  # 测试用 dev server 拉起助手
 ```
 
-后续：Client Agent RPC/心跳接入、MinIO 预签名直传，以及生产 HTTPS/mTLS 硬化。
+Phase 3 硬化(mTLS 双向 + 幂等键全链路 + 审计 + MinIO 生命周期 + 版本门禁 +
+设备能力表服务端管理)与 Phase 4(Grafana 只读看板、多设备并发调度)均已在
+`cmd/worker` / `internal/*` 落地,详见 CLAUDE.md §12 Phase 3/4。

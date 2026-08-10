@@ -6,6 +6,8 @@ Phase 2):把 Runtime 的请求翻译成平台内 `hermes -z` 一次性调用,输
 
 - `POST /analyze` — Analyzer:evidence → analysis.schema.json
 - `POST /translate` — 飞书指令层意图翻译:自然语言 + 上下文快照 → command.schema.json
+- `POST /plan` — Planner v1:自然语言需求 → Plan DSL(plan.schema.json),Schema 校验不过打回重试 ≤3
+- `POST /express` — 表述层(Smart Reply):devices 等只读命令的规则结果 → 人性化表述
 
 > 部署提醒:本服务**不在 `deploy/docker-compose.yml` 里**,由实例内
 > `start-analyze-bridge` 启停。Runtime 侧启用 `FEISHU_CMD_NL` 之前,必须先拉新代码
@@ -23,11 +25,13 @@ Phase 2):把 Runtime 的请求翻译成平台内 `hermes -z` 一次性调用,输
 
 ## 文件
 
-- `analyze_bridge.py` — FastAPI 应用(`GET /health`、`POST /analyze`、`POST /translate`)
+- `analyze_bridge.py` — FastAPI 应用(`GET /health`、`POST /analyze`、`POST /translate`、`POST /plan`、`POST /express`)
 - `analysis.schema.json` — `contracts/analysis.schema.json` 的部署副本
   (防漂移由 `test_analyze_bridge.py::test_schema_copy_matches_contracts` 保证)
 - `command.schema.json` — `contracts/command.schema.json` 的部署副本
   (防漂移由 `test_analyze_bridge.py::test_command_schema_copy_matches_contracts` 保证)
+- `plan.schema.json` — `contracts/plan.schema.json` 的部署副本(Planner v1)
+- `express.schema.json` — `contracts/express.schema.json` 的部署副本(表述层)
 - `start-analyze-bridge` — 实例内启动脚本(env 文件 + pidfile + nohup uvicorn,
   幂等;形态同实例既有 `start-queinfer-gitlab-bridge`)
 - `test_analyze_bridge.py` — pytest(假 hermes CLI 驱动,20 例)
