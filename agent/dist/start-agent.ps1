@@ -58,9 +58,87 @@ if ($usableLines.Count -lt 1) {
 }
 
 Write-Host "`n==> 2/4 Device property self-check" -ForegroundColor Cyan
-$serial = ($usableLines | Select-Object -First 1) -split "`t" | Select-Object -First 1
-& $ADB -s $serial shell /system/bin/getprop ro.product.cpu.abi
-& $ADB -s $serial shell /system/bin/getprop ro.board.platform
+$serial = (($usableLines | Select-Object -First 1) -split "`t")[0].Trim()
+# 平台代号优先取 adb devices -l 的 product 字段——零设备侧调用,不会卡;
+# 再做一次带超时的 getprop/uname 探测,adbd 异常时最多等 8s 跳过,不阻塞脚本。
+$product = ""
+foreach ($line in $usableLines) {
+  $lineStr = $line.ToString()
+  $parts = $lineStr -split "`t"
+  if ($parts[0].Trim() -eq $serial) {
+    if ($lineStr -match 'product:([^\s]+)') { $product = $Matches[1] }
+    break
+  }
+}
+
+# 带超时的 adb shell 执行(.NET Process;PS 5.1 的 & + ForEach-Object 管道在
+# 设备返回无换行的二进制输出时会挂起,且没有超时手段)。超时/非零退出返回 $null。
+# 注意:PS 5.1/.NET Framework 没有 ProcessStartInfo.ArgumentList,只能用
+# Arguments 字符串(含空格的参数用双引号包裹)。
+function Invoke-AdbShell {
+  param([string[]]$Cmd, [int]$TimeoutSec = 8)
+  $parts = @("-s", $serial, "shell") + $Cmd
+  $argStr = (($parts | ForEach-Object {
+    if ($_ -match '[\s"]') { "`"$_`"" } else { $_ }
+  }) -join " ")
+  $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+  $pinfo.FileName = $ADB
+  $pinfo.Arguments = $argStr
+  $pinfo.RedirectStandardOutput = $true
+  $pinfo.RedirectStandardError = $true
+  $pinfo.UseShellExecute = $false
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo = $pinfo
+  [void]$p.Start()
+  if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+    try { $p.Kill(); $p.WaitForExit() } catch { }
+    return $null
+  }
+  try {
+    $err = $p.StandardError.ReadToEnd()
+    $out = $p.StandardOutput.ReadToEnd()
+  } catch { return $null }
+  if ($p.ExitCode -ne 0) { return $null }
+  return $out + $err
+}
+
+# Android 用 getprop;Linux 板(QCS Ubuntu / rk3568 等)没有 /system/bin/getprop,
+# 输出是 shell 的 "No such file or directory" —— 此时走 Linux 分支,
+# 与 Agent probe/precheckLinux 的判定同源,不要把这当错误。
+$abiOut = Invoke-AdbShell @("/system/bin/getprop", "ro.product.cpu.abi")
+$gotAndroid = ($null -ne $abiOut) -and (-not ($abiOut -match "No such file"))
+if ($gotAndroid) {
+  Write-Host "android abi = $($abiOut.Trim())  platform = $product"
+} else {
+  Write-Host "(non-Android / Linux board detected)" -ForegroundColor Yellow
+  $uname = Invoke-AdbShell @("uname", "-m")
+  $arch = if ($uname) { $uname.Trim() } else { "" }
+  $abi = switch ($arch) {
+    "aarch64" { "arm64-v8a" }
+    "armv7l"  { "armeabi-v7a" }
+    "x86_64"  { "x86_64" }
+    "i686"    { "x86" }
+    default   { $arch }
+  }
+  # soc:优先 device-tree compatible(与 Agent linuxSOC 同源),取第一个
+  # "vendor,platform" 的 platform;探测失败/超时回退 adb devices -l 的 product。
+  $soc = ""
+  $compat = Invoke-AdbShell @("/bin/cat", "/proc/device-tree/compatible")
+  if ($compat) {
+    $candidates = ($compat -replace "`0", "`n") -split "`n" | Where-Object { $_ -match "," }
+    if ($candidates) { $soc = ($candidates[0] -split ",")[-1] }
+  }
+  if (-not $soc) { $soc = $product }
+  # AGENT_SOC_ALIASES(逗号分隔 key:value)命中则提示规范化名。
+  $aliasHint = ""
+  if ($env:AGENT_SOC_ALIASES -and $soc) {
+    foreach ($pair in $env:AGENT_SOC_ALIASES.Split(',')) {
+      $k, $v = $pair.Split(':')
+      if ($k -and $k.Trim() -ieq $soc.Trim()) { $aliasHint = " -> $v"; break }
+    }
+  }
+  Write-Host "linux   abi = $abi  soc = $soc$aliasHint"
+}
 
 Write-Host "`n==> 3/4 Server connectivity" -ForegroundColor Cyan
 # mTLS 启用后 18091 只接受带客户端证书的 TLS 握手;PS 5.1 加载 pem 做

@@ -98,6 +98,17 @@ $env:ANDROID_ADB_SERVER_PORT = "5137"
 
 预期输出分别为 `device` 和 `arm64-v8a`。如果这里失败，不要继续运行 Agent。
 
+> **Linux 板(QCS Ubuntu / rk3568 等)**没有 `/system/bin/getprop`,上述 getprop 会报
+> `No such file or directory`,这是正常现象,不是故障。Linux 板请改用 device-tree + uname
+> 确认(与 Agent `precheckLinux` / `linuxSOC` 同源):
+>
+> ```powershell
+> & $adb -s $serial shell uname -m                          # 预期 aarch64
+> & $adb -s $serial shell /bin/cat /proc/device-tree/compatible   # 预期 ...vendor,platform
+> ```
+>
+> `start-agent.ps1` 的第 2/4 步自检已自动识别 Linux 板并走上述回退。
+
 ## 2. 运行 Smoke Test
 
 在本目录打开 PowerShell。每条 Agent 命令结束后立即读取 `$LASTEXITCODE`。
