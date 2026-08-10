@@ -133,6 +133,11 @@ type fakeADB struct {
 	// (模拟只读 rootfs 建子目录失败,2026-08-04 RK3568 实机)
 	mkdirFailSubstr string
 
+	// pushStdoutErr 非空时 push 返回 exit=1 且错误只在 stdout
+	// (模拟 adb.exe 本地侧错误,如 cannot stat 超长路径文件——
+	// 2026-08-10 实机:这类错误不走 stderr)
+	pushStdoutErr string
+
 	// 两级存活复核(Task 6,spec §5.3)支持:
 	// getStateOut 是一级 `adb -s <transport> get-state` 的 stdout,
 	// 空串模拟该调用未返回 "device"(不区分是失败还是返回其它状态,
@@ -201,6 +206,9 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 	case cmd == "push" || cmd == "logcat":
 		if cmd == "logcat" && args[3] == "-d" {
 			return adb.Result{Stdout: "fake logcat content\n"}, nil
+		}
+		if cmd == "push" && f.pushStdoutErr != "" {
+			return adb.Result{ExitCode: 1, Stdout: f.pushStdoutErr}, nil
 		}
 		return adb.Result{}, nil
 	case cmd == "pull":
@@ -714,6 +722,32 @@ func TestDeployFailsOnSubdirMkdir(t *testing.T) {
 	}
 	if idx := f.find("push"); idx >= 0 {
 		t.Error("mkdir 失败后不得发生 push")
+	}
+}
+
+// TestDeployPushErrorIncludesStdout:push 非零退出且错误只在 stdout 时,
+// 错误串必须带出 stdout——adb 的本地侧错误(cannot stat 超长路径等)
+// 不走 stderr,只拼 stderr 就是诊断黑洞(2026-08-10 实机)。
+func TestDeployPushErrorIncludesStdout(t *testing.T) {
+	f := &fakeADB{pushStdoutErr: "adb: error: cannot stat 'C:\\...\\libopencv_imgcodecs.so.4.2.0': No such file or directory\n"}
+	e := &Executor{Runner: f}
+	extractDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(extractDir, "big.so"), []byte("elf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := &manifest.Manifest{}
+	m.Deploy.Workdir = workdir
+	m.Deploy.Files = []manifest.File{{Src: "big.so", Dst: "big.so"}}
+
+	err := e.deploy(context.Background(), serial, m, extractDir)
+	if err == nil {
+		t.Fatal("deploy: want push failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot stat") {
+		t.Errorf("err = %v, 必须带出 stdout 里的真实原因", err)
+	}
+	if !errors.Is(err, errRemoteExit) {
+		t.Errorf("err = %v, 必须包 errRemoteExit(归因语义不变)", err)
 	}
 }
 

@@ -521,8 +521,11 @@ func (e *Executor) deploy(ctx context.Context, serial string, m *manifest.Manife
 			return fmt.Errorf("%s: %w", desc, err)
 		}
 		if res.ExitCode != 0 {
-			return fmt.Errorf("%s: exit=%d stderr=%q: %w",
-				desc, res.ExitCode, strings.TrimSpace(res.Stderr), errRemoteExit)
+			// stdout 必须带上:adb 的本地侧错误(cannot stat 超长路径文件等)
+			// 打在 stdout 而非 stderr,只拼 stderr 会得到 exit=1 + 空 stderr
+			// 的诊断黑洞(2026-08-10 实机,TFLite 变体长文件名 push 失败)。
+			return fmt.Errorf("%s: exit=%d stderr=%q stdout=%q: %w",
+				desc, res.ExitCode, strings.TrimSpace(res.Stderr), truncForErr(res.Stdout), errRemoteExit)
 		}
 		return nil
 	}
@@ -558,6 +561,16 @@ func (e *Executor) deploy(ctx context.Context, serial string, m *manifest.Manife
 		}
 	}
 	return nil
+}
+
+// truncForErr 截断进入错误串的命令输出,防爆(adb stdout 偶尔带大段传输统计)。
+func truncForErr(s string) string {
+	const max = 512
+	s = strings.TrimSpace(s)
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
 }
 
 // run 执行 entry。返回 canceled/timedOut 标志与实际时长;
