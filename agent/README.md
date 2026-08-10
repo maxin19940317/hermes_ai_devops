@@ -35,7 +35,8 @@ CLI 细节见 [`dist/README.md`](dist/README.md)。
 
 必填:`AGENT_CLIENT_ID` / `AGENT_RUNTIME_CALLBACK_URL` / `AGENT_BASE_URL` / `AGENT_ADB_PATH`。
 可选:`AGENT_LISTEN_ADDR`(:8480)/`AGENT_VERSION`/`AGENT_RUNS_ROOT`/`AGENT_DB_PATH`/
-`AGENT_HEARTBEAT_INTERVAL`(10s)/`AGENT_SOC_ALIASES`/`AGENT_DEVICE_CAPABILITIES_MAP`。
+`AGENT_HEARTBEAT_INTERVAL`(10s)/`AGENT_SOC_ALIASES`/`AGENT_DEVICE_CAPABILITIES_MAP`/
+`AGENT_RUNS_RETAIN_DAYS`(7,0 = 不清理)。
 mTLS(2026-08-04 起 Runtime 回调端强制):`AGENT_RUNTIME_CALLBACK_URL` 用 `https://`,
 `AGENT_MTLS_CA_FILE` 指向 ca-cert.pem(验服务端),`AGENT_MTLS_CERT_FILE` 指向
 client-{id}.pem(证书+私钥合体);两变量留空则回退纯 HTTP(仅兼容旧部署,
@@ -182,7 +183,13 @@ agent install|uninstall|start|stop   # Windows Service / systemd(kardianos/servi
 环境变量优先)。必填 `AGENT_CLIENT_ID`、`AGENT_RUNTIME_CALLBACK_URL`、
 `AGENT_BASE_URL`、`AGENT_ADB_PATH`;可选 `AGENT_LISTEN_ADDR`(默认 `:8480`)、
 `AGENT_VERSION`(默认 `dev`)、`AGENT_RUNS_ROOT`(默认 `./agent-runs`)、
-`AGENT_DB_PATH`(默认 `./agent.db`)、`AGENT_HEARTBEAT_INTERVAL`(默认 `10s`)。
+`AGENT_DB_PATH`(默认 `./agent.db`)、`AGENT_HEARTBEAT_INTERVAL`(默认 `10s`)、
+`AGENT_RUNS_RETAIN_DAYS`(默认 `7`,0 = 不清理)。
+
+运行目录清理(2026-08-10):任务终态即删 out_dir 里的 SDK 负载
+(`package.tar.gz` 与 `package/`,可从 Registry 重下);已上报任务的剩余
+目录超过保留期后整目录删除(启动时 + 每小时扫描)。DB 无记录的孤儿目录
+(如 agent.db 被重置)不自动删,需人工清理。
 
 启动恢复(§4):上次进程的非终态任务统一置 FAILED(事件+合成摘要结果回流),
 随后补报未上报的终态结果与事件。

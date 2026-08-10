@@ -521,3 +521,52 @@ VALUES ('t-old', 'wf0:t-old:a1', 'RUNNING', 1, '{}', '/tmp/out/t-old', '2026-07-
 		t.Fatalf("CreateTask after migrate: %v", err)
 	}
 }
+
+// 保留期清理的取数层(2026-08-10):只选"已终态 + 结果已上报 + ended_at
+// 早于 cutoff"的任务,三类反例(未上报/未终态/未超期)一律不选。
+func TestListRecordedTerminalBefore(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	old := formatTime(time.Now().UTC().Add(-8 * 24 * time.Hour))
+
+	seedTerminal := func(id string, recorded bool) {
+		t.Helper()
+		if err := s.CreateTask(ctx, mkTask(id, "k:"+id)); err != nil {
+			t.Fatalf("CreateTask %s: %v", id, err)
+		}
+		if _, err := s.Transition(ctx, id, StateQueued, StateCompleted, ""); err != nil {
+			t.Fatalf("Transition %s: %v", id, err)
+		}
+		if recorded {
+			if err := s.MarkResultRecorded(ctx, id); err != nil {
+				t.Fatalf("MarkResultRecorded %s: %v", id, err)
+			}
+		}
+	}
+
+	seedTerminal("old-recorded", true)
+	seedTerminal("old-unrecorded", false)
+	seedTerminal("recent-recorded", true)
+	if err := s.CreateTask(ctx, mkTask("inflight", "k:inflight")); err != nil {
+		t.Fatalf("CreateTask inflight: %v", err)
+	}
+	// 把前两个的 ended_at 回拨到 8 天前(Transition 只能写当前时间)
+	for _, id := range []string{"old-recorded", "old-unrecorded"} {
+		if _, err := s.db.Exec(`UPDATE tasks SET ended_at = ? WHERE task_id = ?`, old, id); err != nil {
+			t.Fatalf("backdate %s: %v", id, err)
+		}
+	}
+
+	got, err := s.ListRecordedTerminalBefore(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("ListRecordedTerminalBefore: %v", err)
+	}
+	if len(got) != 1 || got[0].TaskID != "old-recorded" {
+		ids := []string{}
+		for _, task := range got {
+			ids = append(ids, task.TaskID)
+		}
+		t.Errorf("selected = %v, want [old-recorded]", ids)
+	}
+}

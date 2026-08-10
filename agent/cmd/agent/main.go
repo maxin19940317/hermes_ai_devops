@@ -18,6 +18,8 @@
 //	AGENT_LISTEN_ADDR            可选,HTTP 监听地址(默认 :8480)
 //	AGENT_VERSION                可选,Agent 版本(默认 dev)
 //	AGENT_RUNS_ROOT              可选,本地结果根目录(默认 ./agent-runs)
+//	AGENT_RUNS_RETAIN_DAYS       可选,运行目录保留天数(默认 7;0 = 不清理。
+//	                             任务终态即删 SDK 负载,保留期只管剩余小文件)
 //	AGENT_DB_PATH                可选,SQLite 路径(默认 ./agent.db)
 //	AGENT_HEARTBEAT_INTERVAL     可选,心跳周期,Go duration(默认 10s)
 //	AGENT_SOC_ALIASES            可选,平台代号→SoC 型号别名(如 trinket:QCM6125,多个用逗号分隔)
@@ -36,6 +38,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -63,6 +66,7 @@ type Config struct {
 	RunsRoot           string
 	DBPath             string
 	HeartbeatInterval  time.Duration
+	RunsRetainDays     int // agent-runs 保留天数;0 = 不清理
 	SOCAliases         map[string]string
 	Capabilities       []string
 	DeviceCapabilities map[string][]string
@@ -240,6 +244,16 @@ func loadConfig(path string, getenv func(string) string) (Config, error) {
 		}
 		cfg.HeartbeatInterval = d
 	}
+	// agent-runs 保留期(2026-08-10):缺省 7 天,0 = 不清理。
+	// 任务终态即删 SDK 负载,此保留期只作用于剩余小文件与目录本体。
+	cfg.RunsRetainDays = 7
+	if v := get("AGENT_RUNS_RETAIN_DAYS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return Config{}, fmt.Errorf("AGENT_RUNS_RETAIN_DAYS %q 不是非负整数(0 = 不清理)", v)
+		}
+		cfg.RunsRetainDays = n
+	}
 	aliases, err := parseSOCAliases(get("AGENT_SOC_ALIASES"))
 	if err != nil {
 		return Config{}, err
@@ -380,6 +394,25 @@ func runAgent(ctx context.Context, cfg Config) error {
 	go func() { defer wg.Done(); _ = hb.Run(ctx) }()
 	// EventReporter.Run 首轮即抽干未上报事件,之后按周期补报
 	go func() { defer wg.Done(); _ = events.Run(ctx) }()
+
+	// agent-runs 保留期清理(2026-08-10):启动即扫一轮,之后每小时一轮。
+	// 只删"已终态且结果已上报"的超期目录;RunsRetainDays=0 关闭。
+	if cfg.RunsRetainDays > 0 {
+		retain := time.Duration(cfg.RunsRetainDays) * 24 * time.Hour
+		go func() {
+			srv.SweepRuns(ctx, time.Now().Add(-retain))
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					srv.SweepRuns(ctx, time.Now().Add(-retain))
+				}
+			}
+		}()
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

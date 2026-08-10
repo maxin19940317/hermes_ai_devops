@@ -25,7 +25,7 @@ $env:AGENT_CLIENT_ID            = "windows-client-01"
 $env:AGENT_RUNTIME_CALLBACK_URL = "http://10.88.118.251:18091"   # q-uat Worker 回调
 $env:AGENT_BASE_URL             = "http://<本机LAN-IP>:8480"      # Runtime 派单回连地址
 $env:AGENT_ADB_PATH             = $adb                            # 见上文变量
-# 可选: AGENT_LISTEN_ADDR(:8480) AGENT_VERSION AGENT_RUNS_ROOT AGENT_DB_PATH AGENT_HEARTBEAT_INTERVAL(10s)
+# 可选: AGENT_LISTEN_ADDR(:8480) AGENT_VERSION AGENT_RUNS_ROOT AGENT_DB_PATH AGENT_HEARTBEAT_INTERVAL(10s) AGENT_RUNS_RETAIN_DAYS(7)
 ```
 
 ### 前台运行与自检

@@ -426,6 +426,28 @@ ORDER BY started_at`)
 	return out, nil
 }
 
+// ListRecordedTerminalBefore 返回已终态、结果已上报且 ended_at 早于 cutoff
+// 的任务——供 agent-runs 保留期清理(2026-08-10)定位可删的运行目录。
+// 时间列是 UTC 定宽布局,字符串比较即时间比较。
+func (s *Store) ListRecordedTerminalBefore(ctx context.Context, cutoff time.Time) ([]Task, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT task_id, idempotency_key, state, attempt, dispatch_json, out_dir,
+       started_at, ended_at, result_recorded,
+       COALESCE(lease_id, ''), COALESCE(lease_generation, 0)
+FROM tasks WHERE state IN ('COMPLETED', 'FAILED', 'TIMEOUT', 'CANCELED')
+  AND result_recorded = 1
+  AND ended_at IS NOT NULL AND ended_at < ?
+ORDER BY started_at`, formatTime(cutoff))
+	if err != nil {
+		return nil, fmt.Errorf("list recorded terminal tasks: %w", err)
+	}
+	tasks, err := scanTasks(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan recorded terminal tasks: %w", err)
+	}
+	return tasks, nil
+}
+
 // scanTask 扫描单个任务行;sql.ErrNoRows 归一为 ErrTaskNotFound。
 func (s *Store) scanTask(row *sql.Row) (Task, error) {
 	var (

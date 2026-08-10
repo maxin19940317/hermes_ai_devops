@@ -30,8 +30,27 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.ListenAddr != ":8480" || cfg.Version != "dev" ||
 		cfg.RunsRoot != "./agent-runs" || cfg.DBPath != "./agent.db" ||
-		cfg.HeartbeatInterval != 10*time.Second {
+		cfg.HeartbeatInterval != 10*time.Second || cfg.RunsRetainDays != 7 {
 		t.Errorf("defaults = %+v", cfg)
+	}
+}
+
+func TestLoadConfigRunsRetainDays(t *testing.T) {
+	base := []string{
+		"AGENT_CLIENT_ID", "c1",
+		"AGENT_RUNTIME_CALLBACK_URL", "http://runtime:18091",
+		"AGENT_BASE_URL", "http://agent:8480",
+		"AGENT_ADB_PATH", "/usr/bin/adb",
+	}
+	cfg, err := loadConfig("", envOf(append(base, "AGENT_RUNS_RETAIN_DAYS", "0")...))
+	if err != nil || cfg.RunsRetainDays != 0 {
+		t.Errorf("0 = 不清理, got %d, err %v", cfg.RunsRetainDays, err)
+	}
+	if _, err := loadConfig("", envOf(append(base, "AGENT_RUNS_RETAIN_DAYS", "-1")...)); err == nil {
+		t.Error("负数应报错")
+	}
+	if _, err := loadConfig("", envOf(append(base, "AGENT_RUNS_RETAIN_DAYS", "abc")...)); err == nil {
+		t.Error("非整数应报错")
 	}
 }
 

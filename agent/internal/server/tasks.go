@@ -288,6 +288,9 @@ func (s *Server) runTask(d Dispatch, outDir string, exec *executor.Executor) {
 		collected = sum.Collected
 	}
 
+	// 终态即清 SDK 负载(数百 MB;上报/恢复不依赖它,可从 Registry 重下)。
+	s.purgeRunPayload(outDir)
+
 	attachments := s.uploadAttachments(ctx, d, outDir, collected)
 	if err := s.cfg.Results.Report(ctx, d.TaskID, attachments); err != nil {
 		s.logf("task %s: report result: %v", d.TaskID, err)
