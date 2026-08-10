@@ -12,6 +12,7 @@
 | analyze_bridge | `hermes-devops-analyzer` 容器内 uvicorn(:8643) | §3.1 |
 | kanban_bridge | 宿主 tobias 账号 uvicorn(:8644) | §3.2 |
 | Windows agent | `windows-client-01` 前台进程(8480/5137) | §3.3 |
+| workflow_bridge | `hermes-rocklin` 容器内 uvicorn(:8646,排行榜回填) | §3.5 |
 
 ## 1. Runtime 标准更新流程
 
@@ -109,6 +110,37 @@ powershell -ExecutionPolicy Bypass -File .\dist\start-agent.ps1
 - **回滚纯 HTTP**:`deploy/.env` 的 MTLS_CA_FILE/CERT_FILE/KEY_FILE 三项清空 +
   `up -d --no-deps worker`,Windows 侧摘掉 `AGENT_MTLS_*` 两个变量重启 Agent。
 
+### 3.5 workflow_bridge(排行榜回填,hermes-rocklin 容器内)
+
+测试结果回填 hermes workflow-assets 排行榜的桥。**两个手动前置条件,任一缺失
+都会静默丢回填**(worker 只记日志,不阻断主链路):
+
+1. **网络:hermes-rocklin 必须挂在 hermes-runtime 网络上**(compose 里没声明,
+   rocklin 重建会脱网)。检查 + 修复:
+
+   ```bash
+   deploy/scripts/check-backfill.sh          # 检查(链路健康 = PASS)
+   deploy/scripts/check-backfill.sh --fix    # 自动重挂网络 + 重启 bridge
+   # 症状:worker 日志 "sync workflow run ... server misbehaving"
+   ```
+
+2. **进程:bridge 必须在 rocklin 里跑**(幂等启动):
+
+   ```bash
+   docker exec hermes-rocklin bash /opt/data/bin/start-workflow-bridge
+   docker exec hermes-runtime-worker-1 wget -q -O- http://hermes-rocklin:8646/health
+   # 预期 {"status":"ok"};失败说明进程没起来或端口不对
+   ```
+
+   上面两步可用 `deploy/scripts/check-backfill.sh --fix` 一键完成。
+
+更新 bridge 代码:拷贝新 `hermes/workflow_bridge/workflow_bridge.py` 到
+`/opt/data/bin/`,然后重复上面第 2 步(pidfile 已存在时先 kill 旧 pid)。
+
+补填历史漏掉的回填(网络断了期间的记录):从 Runtime Postgres 导出终态 task,
+POST 到 bridge,run_id 用 `wr-devops-{sanitized_workflow_id}-{sanitized_variant}`
+(bridge 按 run_id 幂等,可重复执行)。一次性脚本形态见 2026-08-10 修复记录。
+
 ## 4. 健康速查
 
 ```bash
@@ -124,6 +156,8 @@ docker exec hermes-runtime-temporal-1 temporal workflow describe \
   --address temporal:7233 -w '<workflow_id>'
 # MinIO 证据(附件 runs/,快照 evidence/)
 docker logs hermes-runtime-worker-1 --since 1h 2>&1 | grep -v DEBUG | tail -20
+# 排行榜回填链路(worker DNS + bridge 进程 + 库记录数;--fix 自动修复)
+deploy/scripts/check-backfill.sh
 ```
 
 ## 5. 已知坑(实机踩过)
@@ -132,6 +166,7 @@ docker logs hermes-runtime-worker-1 --since 1h 2>&1 | grep -v DEBUG | tail -20
 |---|---|---|
 | 设备永久 BUSY,后续全部 "no device available" | workflow 被 terminate,旧代码无租约回收 | 已修(懒回收);残留时手动清 `device_leases` 行 + 置 IDLE |
 | 任务 DOWNLOADING 秒挂,basic auth 报错 | compose 未透传 env | 见 §1 注意 2,补透传后 `up -d --no-deps worker` |
+| 排行榜得分不涨,worker 日志 "server misbehaving" | `hermes-rocklin` 脱出 hermes-runtime 网络(重建后),或 bridge 进程退出 | §3.5:重新 `docker network connect` + `start-workflow-bridge`;断档期间的结果需手动补填 |
 | adb 只显示 `?`,任务 precheck "device not found" | USB gadget serial 丢失 | 新 agent 自动解析寻址;旧 agent 需 ConfigFS 写 serial(见 agent/dist/README.md) |
 | 非 Android 设备注册进表,soc 是 shell 错误文本 | probe 用 Android 命令探 Linux 设备 | 人工置 QUARANTINED;agent probe 防护待做 |
 | 飞书 NL 指令收到两条回复 | WS 事件 ack 超时重投 | 已修(异步处理 + message_id 去重) |

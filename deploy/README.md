@@ -223,6 +223,8 @@ Do not combine this window with deployment of the prerequisite batch.
 curl -fsS http://127.0.0.1:18090/healthz
 curl -fsS --cacert deploy/certs/ca-cert.pem --cert deploy/certs/client-windows-client-01.pem https://127.0.0.1:18091/healthz
 deploy/scripts/verify-pipeline.sh deploy/.env deploy/images.lock.env
+# 排行榜回填链路(worker → hermes-rocklin:8646;--fix 可自动重挂网络+重启 bridge)
+deploy/scripts/check-backfill.sh
 ```
 
 Temporal UI is localhost-only at `http://127.0.0.1:18080`. Access it remotely with:
@@ -395,3 +397,65 @@ The datasource connects as `${RUNTIME_DB_USER}` (same role the Runtime uses)
 with `sslmode: disable` inside the Compose network. Grafana's `editable: false`
 flag prevents UI-side datasource tampering; the only way to change it is
 through Git-tracked provisioning files.
+
+## Hermes workflow-assets leaderboard backfill (workflow_bridge)
+
+Since 2026-08-07 (方案 B) the worker syncs real test results into the Hermes
+workflow-assets leaderboard via a `workflow_bridge` FastAPI service that runs
+**inside the `hermes-rocklin` container** (not in this compose file). The worker
+POSTs to `WORKFLOW_BRIDGE_URL` (default
+`http://hermes-rocklin:8646/api/workflow-runs`) at workflow end; failures are
+logged and never block the main flow.
+
+**Two manual prerequisites** (container rebuilds silently break this — see
+RUNBOOK §3.4):
+
+1. **`hermes-rocklin` must be attached to the `hermes-runtime` bridge network**
+   so the worker's container-name DNS resolution works:
+
+   ```bash
+   docker network connect hermes-runtime hermes-rocklin
+   # verify from inside the worker:
+   docker exec hermes-runtime-worker-1 getent hosts hermes-rocklin
+   ```
+
+   The network attachment is NOT part of any compose file; if `hermes-rocklin`
+   is recreated it detaches and the worker logs
+   `lookup hermes-rocklin ... server misbehaving`. Re-run the connect.
+
+2. **`workflow_bridge` must be running inside `hermes-rocklin`**:
+
+   ```bash
+   docker exec hermes-rocklin bash /opt/data/bin/start-workflow-bridge   # idempotent
+   docker exec hermes-runtime-worker-1 wget -q -O- http://hermes-rocklin:8646/health
+   # → {"status":"ok"}
+   ```
+
+Env files: `WORKFLOW_BRIDGE_URL` / `WORKFLOW_BRIDGE_TOKEN` live in `deploy/.env`
+(worker side); the bridge side reads `/opt/data/bin/workflow_bridge.env` inside
+the container.
+
+**Diagnosing "leaderboard score didn't increase":**
+
+```bash
+# 1. worker can reach the bridge?
+docker logs hermes-runtime-worker-1 --since 1h 2>&1 | grep -i "sync workflow"
+#    "server misbehaving" → network attachment lost → fix prerequisite 1
+
+# 2. bridge process alive?
+docker exec hermes-rocklin ps aux | grep workflow_bridge
+
+# 3. records actually written?
+docker exec hermes-rocklin bash -c '
+  PATH=/opt/hermes/.venv/bin:$PATH python3 - <<"EOF"
+  import sqlite3
+  db = sqlite3.connect("/opt/data/profiles/workflow_runtime/workflow-runtime.db")
+  n = db.execute("SELECT COUNT(*) FROM workflow_runs WHERE run_id LIKE \"wr-devops-%\"").fetchone()[0]
+  print("devops runs:", n)
+  EOF'
+
+# Backfill missed runs (network was broken): dump completed tasks from the
+# runtime Postgres and POST them to the bridge with run_id = 
+# wr-devops-{sanitized workflow_id}-{sanitized variant} (idempotent; safe to re-run).
+# See git history 2026-08-10 "fix backfill" for the one-off script shape.
+```
