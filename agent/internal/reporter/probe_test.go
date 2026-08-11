@@ -320,9 +320,9 @@ func TestProbeDevicesMultipleQuestionMarkDevices(t *testing.T) {
 		"-t 3 shell /system/bin/getprop ro.product.cpu.abi":   {Stdout: "/bin/sh: line 1: getprop: not found\n"}, // Linux 板
 		"-t 3 shell /bin/cat /proc/device-tree/compatible":    {Stdout: "qualcomm,qcm6490\x00\n", ExitCode: 0},
 		"-t 3 shell uname -m":                                 {Stdout: "aarch64\n"},
-		"-t 3 shell /system/bin/df -k /data/local/tmp":        {ExitCode: 1}, // Linux 板无 /system/bin/df
-		"-t 3 shell df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
-			"/dev/root 20000000 100 5000000 1% /\n"}, // Linux df(PATH 内)
+		"-t 3 shell /system/bin/df -k /data/local/tmp":        {ExitCode: 1}, // Linux 板无 /system/bin/df,且路径也不是 /data/local/tmp
+		"-t 3 shell df -k /tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+			"/dev/root 20000000 100 5000000 1% /\n"}, // Linux df(PATH 内),探测 /tmp 分区
 		"-t 1 shell /system/bin/getprop ro.serialno":              {Stdout: "513cd3de\n"},
 		"-t 1 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
 		"-t 1 shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},

@@ -15,6 +15,15 @@ import (
 // GET /api/v1/devices 共用(设计 §3.3/§3.5):adb devices 发现 →
 // 逐台 getprop 属性 + df 空间;busy 集合命中的记 BUSY,
 // getprop 不可达的记 OFFLINE 并跳过后续探测。
+
+// 磁盘探测路径(按 OS,2026-08-11):探测"实际使用的 workdir 所在分区"。
+// Android → /data/local/tmp(workdir_android,挂 /data);Linux → /tmp
+// (workdir_linux,QCS6490 /data noexec,见 ci/variants.yaml)。
+const (
+	androidWorkdir = "/data/local/tmp"
+	linuxWorkdir   = "/tmp"
+)
+
 type Prober struct {
 	Runner adb.Runner                       // 可注入 fake
 	Logf   func(format string, args ...any) // nil → 静默
@@ -172,14 +181,21 @@ func (p *Prober) probeMemTotal(ctx context.Context, t adb.Target, props *DeviceP
 }
 
 // probeDisk 探测 workdir 所在文件系统的总/可用空间(df -k),写入 props。
-// Linux 板无 /system/bin/df(2026-08-04 RK3568 实机),走 PATH 里的 df。
+// 按设备 OS 选择路径与命令(2026-08-11:用户实际使用的 workdir 分区):
+//
+//	Android: /data/local/tmp(workdir_android,挂在 /data 分区)
+//	Linux:   /tmp(workdir_linux,QCS6490 的 /data noexec,见 ci/variants.yaml)
+//
+// df 命令同步按 OS:Android /system/bin/df,Linux 走 PATH 里的 df。
 // 失败静默(磁盘是展示信息,非调度必要条件)。
 func (p *Prober) probeDisk(ctx context.Context, t adb.Target, props *DeviceProps) {
+	path := androidWorkdir
 	cmd := adb.DiskFreeKB
 	if props.OS == "linux" {
+		path = linuxWorkdir
 		cmd = adb.DiskFreeKBLinux
 	}
-	res, err := p.Runner.Run(ctx, cmd(t, p.deviceWorkdir()))
+	res, err := p.Runner.Run(ctx, cmd(t, path))
 	if err != nil || res.ExitCode != 0 {
 		return
 	}
