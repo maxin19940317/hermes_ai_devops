@@ -664,7 +664,7 @@ func TestResolveTransportFallsBackToDeviceTreeSerial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveTransport: %v", err)
 	}
-	if got != "?" {
+	if got.Serial != "?" {
 		t.Errorf("transport = %q, want '?'", got)
 	}
 }
@@ -713,7 +713,7 @@ func TestDeployFailsOnSubdirMkdir(t *testing.T) {
 	m.Deploy.Workdir = workdir
 	m.Deploy.Files = []manifest.File{{Src: "bin/ocr_test", Dst: "bin/ocr_test", Mode: "0755"}}
 
-	err := e.deploy(context.Background(), serial, m, extractDir)
+	err := e.deploy(context.Background(), adb.TargetFor(serial, 0), m, extractDir)
 	if err == nil {
 		t.Fatal("deploy: want mkdir failure, got nil")
 	}
@@ -739,7 +739,7 @@ func TestDeployPushErrorIncludesStdout(t *testing.T) {
 	m.Deploy.Workdir = workdir
 	m.Deploy.Files = []manifest.File{{Src: "big.so", Dst: "big.so"}}
 
-	err := e.deploy(context.Background(), serial, m, extractDir)
+	err := e.deploy(context.Background(), adb.TargetFor(serial, 0), m, extractDir)
 	if err == nil {
 		t.Fatal("deploy: want push failure, got nil")
 	}
@@ -845,5 +845,34 @@ func TestPrecheckStillFailsWhenNoChainEntryMatches(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "SM8250") || !strings.Contains(err.Error(), "kona") {
 		t.Errorf("错误信息应带出整条探测链便于排障, got: %v", err)
+	}
+}
+
+// TestResolveTransportMultipleQuestionMarks:多台 USB serial 丢失(? 设备)时,
+// resolveTransport 用 transport_id 寻址(-t <id>)逐台探测 ro.serialno,
+// 正确解析出目标逻辑 serial 对应的设备(2026-08-11:此前 unknownCount != 1
+// 直接跳过多台 ?;adb 官方 -t <id> 可精确寻址,见 commandline.cpp)。
+func TestResolveTransportMultipleQuestionMarks(t *testing.T) {
+	f := &fakeADB{
+		props:               defaultProps(),
+		devicesList:         "List of devices attached\n? device product:qcm6490-Ubuntu transport_id:3\n? device product:trinket transport_id:1\n",
+		serialnoByTransport: map[string]string{"3": "825485946", "1": "513cd3de"},
+	}
+	e := &Executor{Runner: f}
+	// 目标逻辑 serial = 825485946(QCS6490,transport_id 3)
+	got, err := e.resolveTransport(context.Background(), "825485946")
+	if err != nil {
+		t.Fatalf("resolveTransport: %v", err)
+	}
+	if got.TransportID != 3 || got.Serial != "" {
+		t.Errorf("target = %+v, want transport#3(825485946)", got)
+	}
+	// 另一台(trinket,transport_id 1)
+	got2, err := e.resolveTransport(context.Background(), "513cd3de")
+	if err != nil {
+		t.Fatalf("resolveTransport 513cd3de: %v", err)
+	}
+	if got2.TransportID != 1 {
+		t.Errorf("target2 = %+v, want transport#1(513cd3de)", got2)
 	}
 }

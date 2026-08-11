@@ -40,12 +40,12 @@ var socProbeChain = []string{
 // 空链 → 调用方误读为 soc mismatch,真实的设备故障被伪装成配置问题。
 // 只要探到了任何有效值就说明设备是活的,个别属性读失败不报错;
 // 一个有效值都没探到、且过程中确有传输层失败,才把该失败带给调用方。
-func ProbeAndroidSOCChain(ctx context.Context, runner Runner, serial string) ([]string, error) {
+func ProbeAndroidSOCChain(ctx context.Context, runner Runner, t Target) ([]string, error) {
 	var out []string
 	var lastErr error
 	seen := map[string]bool{}
 	for _, prop := range socProbeChain {
-		soc, err := getPropQuiet(ctx, runner, serial, prop)
+		soc, err := getPropQuiet(ctx, runner, t, prop)
 		if err != nil {
 			lastErr = err // 保留传输层失败,不再静默丢弃(spec §5.4 第 3 处)
 			continue
@@ -67,8 +67,8 @@ func ProbeAndroidSOCChain(ctx context.Context, runner Runner, serial string) ([]
 // ProbeAndroidSOC 返回链上第一个有效值(设备身份的展示/上报缺省值);
 // 全部取不到或探测出错返回 ""。**做匹配判断时不要用它**——用
 // ProbeAndroidSOCChain 遍历整条链,理由见其 doc comment。
-func ProbeAndroidSOC(ctx context.Context, runner Runner, serial string) string {
-	chain, err := ProbeAndroidSOCChain(ctx, runner, serial)
+func ProbeAndroidSOC(ctx context.Context, runner Runner, t Target) string {
+	chain, err := ProbeAndroidSOCChain(ctx, runner, t)
 	if err != nil || len(chain) == 0 {
 		return ""
 	}
@@ -118,8 +118,8 @@ func ValidSOC(s string) bool {
 }
 
 // getPropQuiet 读单个 getprop,失败/非零退出静默(探测是尽力而为)。
-func getPropQuiet(ctx context.Context, runner Runner, serial, prop string) (string, error) {
-	res, err := runner.Run(ctx, GetProp(serial, prop))
+func getPropQuiet(ctx context.Context, runner Runner, t Target, prop string) (string, error) {
+	res, err := runner.Run(ctx, GetProp(t, prop))
 	if err != nil {
 		return "", err
 	}

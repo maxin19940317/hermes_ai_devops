@@ -113,7 +113,7 @@ func (s *Server) buildProbeArgs(req DiagnosticsRequest) ([]string, error) {
 		if lines == 0 {
 			lines = defaultLogcatLines
 		}
-		return adb.LogcatTail(serial, lines), nil
+		return adb.LogcatTail(adb.TargetFor(serial, 0), lines), nil
 
 	case "df":
 		if serial == "" {
@@ -126,7 +126,7 @@ func (s *Server) buildProbeArgs(req DiagnosticsRequest) ([]string, error) {
 		if workdir == "" {
 			workdir = reporter.DefaultDeviceWorkdir
 		}
-		return adb.DiskFreeKB(serial, workdir), nil
+		return adb.DiskFreeKB(adb.TargetFor(serial, 0), workdir), nil
 
 	case "getprop":
 		if serial == "" {
@@ -138,7 +138,7 @@ func (s *Server) buildProbeArgs(req DiagnosticsRequest) ([]string, error) {
 		if !propNamePattern.MatchString(propName) {
 			return nil, fmt.Errorf("args.prop_name must match %s", propNamePattern)
 		}
-		return adb.GetProp(serial, propName), nil
+		return adb.GetProp(adb.TargetFor(serial, 0), propName), nil
 	}
 	return nil, fmt.Errorf("unknown probe %q (whitelist: adb_devices, logcat_tail, df, getprop)", req.Probe)
 }

@@ -16,7 +16,7 @@ func (r errRunner) Run(context.Context, []string) (Result, error) { return Resul
 // "设备没有这个 SoC"(soc mismatch),真实的设备故障被伪装成配置问题。
 func TestProbeChainReportsTransportFailure(t *testing.T) {
 	_, err := ProbeAndroidSOCChain(context.Background(),
-		errRunner{err: &LaunchError{Args: []string{"getprop"}, Err: errors.New("boom")}}, "dev1")
+		errRunner{err: &LaunchError{Args: []string{"getprop"}, Err: errors.New("boom")}}, TargetFor("dev1", 0))
 	if err == nil {
 		t.Fatal("全部 getprop 失败时必须报错,否则空链会被上层误读为 soc mismatch")
 	}
@@ -31,7 +31,7 @@ func (r okRunner) Run(context.Context, []string) (Result, error) {
 
 // 属性为空但调用本身成功:设备是活的,不应报错,只是链为空。
 func TestProbeChainNoErrorWhenPropsMerelyEmpty(t *testing.T) {
-	chain, err := ProbeAndroidSOCChain(context.Background(), okRunner{out: ""}, "dev1")
+	chain, err := ProbeAndroidSOCChain(context.Background(), okRunner{out: ""}, TargetFor("dev1", 0))
 	if err != nil {
 		t.Fatalf("属性为空不是故障,不应报错: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestProbeChainNoErrorWhenSomePropsFailButOthersSucceed(t *testing.T) {
 		failProps: map[string]bool{"ro.soc.model": true, "ro.chipname": true},
 		soc:       "trinket",
 	}
-	chain, err := ProbeAndroidSOCChain(context.Background(), runner, "dev1")
+	chain, err := ProbeAndroidSOCChain(context.Background(), runner, TargetFor("dev1", 0))
 	if err != nil {
 		t.Fatalf("链上探到了有效值,即便部分调用失败也不应报错: %v", err)
 	}

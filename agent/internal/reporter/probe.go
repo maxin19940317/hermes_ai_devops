@@ -53,28 +53,29 @@ func (p *Prober) ProbeDevices(ctx context.Context, busy map[string]bool) []Devic
 		p.logf("probe: adb devices: %v", err)
 		return devices
 	}
-	transports := adb.ParseTransports(res.Stdout)
-	unknownCount := 0
-	for _, transport := range transports {
-		if transport == "?" {
-			unknownCount++
+	// 2026-08-11:USB serial 丢失的设备(adb devices -l 显示 "?")不再因"多台
+	// 无法区分"被跳过——用 transport_id 独立寻址(-t <id>),每台都能探测。
+	// transport_id 是 adb server 会话内的稳定寻址,多台 ? 互不干扰。
+	list := adb.ParseDeviceList(res.Stdout)
+	n := len(list)
+	for _, d := range list {
+		if d.State != "device" {
+			continue
 		}
-	}
-	for _, transport := range transports {
-		serial := transport
-		if transport == "?" {
-			if unknownCount != 1 {
-				p.logf("probe: %d devices have unusable serial '?'; cannot resolve unambiguously", unknownCount)
+		target := adb.TargetFor(d.Serial, d.TransportID)
+		serial := d.Serial
+		if d.Serial == "?" {
+			// 解析真实 serial(ro.serialno / 设备树)。2026-08-11 起用
+			// transport_id 逐台寻址,多台 ? 也能独立解析;解析失败则跳过
+			// (设备身份无法确定,避免用易变的 transport#N 污染设备表)。
+			serial, err = p.resolveUnknownSerial(ctx, target)
+			if err != nil || serial == "" {
+				p.logf("probe: cannot resolve serial for transport %s: %v; skipping", target, err)
 				continue
 			}
-			serial, err = p.resolveUnknownSerial(ctx, transport)
-			if err != nil {
-				p.logf("probe: cannot resolve device serial '?': %v", err)
-				continue
-			}
-			p.logf("probe: transport '?' resolved to serial %s", serial)
+			p.logf("probe: transport %s resolved to serial %s", target, serial)
 		}
-		devices = append(devices, p.probeDevice(ctx, transport, serial, busy[serial], len(transports) == 1))
+		devices = append(devices, p.probeDevice(ctx, target, serial, busy[serial], n == 1))
 	}
 	return devices
 }
@@ -82,14 +83,14 @@ func (p *Prober) ProbeDevices(ctx context.Context, busy map[string]bool) []Devic
 // probeDevice 探测单台设备。getprop 属性集与 executor 预检一致
 // (ro.product.cpu.abi / ro.build.version.release / ro.board.platform,
 // platform 取不到时回退 ro.product.board)。
-func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBusy, allowLegacyCaps bool) DeviceInfo {
+func (p *Prober) probeDevice(ctx context.Context, t adb.Target, serial string, isBusy, allowLegacyCaps bool) DeviceInfo {
 	state := DeviceIdle
 	if isBusy {
 		state = DeviceBusy
 	}
 	dev := DeviceInfo{Serial: serial, DisplayName: "UNKNOWN-" + serial, State: state}
 
-	abi, err := p.getprop(ctx, transport, "ro.product.cpu.abi")
+	abi, err := p.getprop(ctx, t, "ro.product.cpu.abi")
 	if err == nil && !androidABI(abi) {
 		// 老 adbd 不回传远程退出码且 adb 合并 stderr:getprop 不存在时
 		// adb 仍回 exit 0,stdout 是 shell 报错文本(实测 Nexus 4)。
@@ -100,15 +101,22 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		// 非 Android 但 ADB 可达的设备(如 rk3568 Linux 板):getprop 失败
 		// 但设备树可读,不应标 OFFLINE——设备在线且 adb shell 连通,只是没有
 		// Android getprop。标 IDLE 使其可被调度。
-		if soc := p.linuxSOC(ctx, transport); soc != "" {
-			abi := p.linuxABI(ctx, transport)
+		if soc := p.linuxSOC(ctx, t); soc != "" {
+			abi := p.linuxABI(ctx, t)
 			dev.State = DeviceIdle
+			// Linux 板 soc 同样走别名表(2026-08-11:此前 Linux 分支直用设备树
+			// 代号如 qcm6490,不进 SOCAliases——与 Android 分支不一致,调度约束
+			// 用型号(QCS6490)时永远匹配不到)。与 probe.go Android 路径同源。
+			if alias, ok := adb.ResolveSOCAlias([]string{soc}, p.SOCAliases); ok {
+				p.logf("probe: %s linux soc %s -> %s (alias)", serial, soc, alias)
+				soc = alias
+			}
 			// Capabilities 与 Android 路径同源(probe.go:138):能力是配置声明
 			// 而非探测,Linux 板同样需要(rknpu 调度约束,2026-08-05 实机遗漏)
 			dev.Props = &DeviceProps{OS: "linux", SOC: soc, ABI: abi, Capabilities: p.capabilitiesFor(serial, soc, allowLegacyCaps)}
 			dev.DisplayName = strings.ToUpper(soc) + "-" + serial
 			p.logf("probe: %s is non-Android Linux (%s/%s); reporting IDLE", serial, soc, abi)
-			p.probeMemTotal(ctx, transport, dev.Props)
+			p.probeMemTotal(ctx, t, dev.Props)
 			return dev
 		}
 		dev.State = DeviceOffline
@@ -116,21 +124,21 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 		return dev
 	}
 	props := &DeviceProps{OS: "android", ABI: abi}
-	if release, err := p.getprop(ctx, transport, "ro.build.version.release"); err == nil {
+	if release, err := p.getprop(ctx, t, "ro.build.version.release"); err == nil {
 		props.Android = release
 	}
 	// 别名解析必须遍历**整条**探测链(2026-08-08 A1):别名表按平台代号为键
 	// (trinket→QCM6125),而链的第一跳 ro.soc.model 给的是型号串。只拿首个值
 	// 查别名时别名永不命中,设备会以型号串注册 → SelectTestSpecs 找不到匹配
 	// 设备 → 变体被静默判 SKIPPED(无错误、无告警,最难排查的那种)。
-	chain, err := adb.ProbeAndroidSOCChain(ctx, p.Runner, transport)
+	chain, err := adb.ProbeAndroidSOCChain(ctx, p.Runner, t)
 	if err != nil {
 		// 心跳探测是尽力而为(设计 §3.3):传输层失败按空链降级,不让
 		// 单次探测失败拖垮整轮心跳,只留一条日志供排障。
 		p.logf("probe: %s soc chain probe failed: %v", serial, err)
 		chain = nil
 	}
-	soc := p.probeAndroidSOC(ctx, transport)
+	soc := p.probeAndroidSOC(ctx, t)
 	if alias, ok := adb.ResolveSOCAlias(chain, p.SOCAliases); ok {
 		p.logf("probe: %s soc chain %v -> %s (alias)", serial, chain, alias)
 		soc = alias
@@ -141,9 +149,9 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 	}
 	props.Capabilities = p.capabilitiesFor(serial, soc, allowLegacyCaps)
 	dev.Props = props
-	p.probeMemTotal(ctx, transport, props)
+	p.probeMemTotal(ctx, t, props)
 
-	if res, err := p.Runner.Run(ctx, adb.DiskFreeKB(transport, p.deviceWorkdir())); err == nil && res.ExitCode == 0 {
+	if res, err := p.Runner.Run(ctx, adb.DiskFreeKB(t, p.deviceWorkdir())); err == nil && res.ExitCode == 0 {
 		if kb, err := ParseDFAvailableKB(res.Stdout); err == nil && kb >= 0 {
 			mb := kb / 1024
 			dev.WorkdirFreeMB = &mb
@@ -154,8 +162,8 @@ func (p *Prober) probeDevice(ctx context.Context, transport, serial string, isBu
 
 // probeMemTotal 探测设备物理内存总量(/proc/meminfo MemTotal),写入 props。
 // 失败静默(内存是展示信息,不是调度必要条件)。
-func (p *Prober) probeMemTotal(ctx context.Context, transport string, props *DeviceProps) {
-	res, err := p.Runner.Run(ctx, adb.MemTotalKB(transport))
+func (p *Prober) probeMemTotal(ctx context.Context, t adb.Target, props *DeviceProps) {
+	res, err := p.Runner.Run(ctx, adb.MemTotalKB(t))
 	if err != nil || res.ExitCode != 0 {
 		return
 	}
@@ -179,13 +187,13 @@ func (p *Prober) probeMemTotal(ctx context.Context, transport string, props *Dev
 // SOCAliases 仍保留为探测链之后的最后兜底(兼容旧设备代号映射)。
 // 实现委托给 adb.ProbeAndroidSOC——心跳与任务预检必须共用同一探测链
 // (2026-08-08 Review P1:两套身份判断不得漂移)。
-func (p *Prober) probeAndroidSOC(ctx context.Context, transport string) string {
-	soc := adb.ProbeAndroidSOC(ctx, p.Runner, transport)
-	if soc != "" && soc != transport {
+func (p *Prober) probeAndroidSOC(ctx context.Context, t adb.Target) string {
+	soc := adb.ProbeAndroidSOC(ctx, p.Runner, t)
+	if soc != "" && soc != t.String() {
 		// 记录探测来源(仅日志;ro.board.platform 等代号级不额外标注)
 		for _, prop := range []string{"ro.soc.model", "ro.chipname"} {
-			if v, err := p.getprop(ctx, transport, prop); err == nil && v == soc {
-				p.logf("probe: %s %s=%q (auto-detected model)", transport, prop, soc)
+			if v, err := p.getprop(ctx, t, prop); err == nil && v == soc {
+				p.logf("probe: %s %s=%q (auto-detected model)", t, prop, soc)
 				break
 			}
 		}
@@ -257,8 +265,8 @@ func (p *Prober) capabilitiesFor(serial, soc string, allowLegacy bool) []string 
 	return nil
 }
 
-func (p *Prober) linuxSOC(ctx context.Context, transport string) string {
-	res, err := p.Runner.Run(ctx, adb.DeviceTreeCompatible(transport))
+func (p *Prober) linuxSOC(ctx context.Context, t adb.Target) string {
+	res, err := p.Runner.Run(ctx, adb.DeviceTreeCompatible(t))
 	if err != nil || res.ExitCode != 0 {
 		return ""
 	}
@@ -274,8 +282,8 @@ func (p *Prober) linuxSOC(ctx context.Context, transport string) string {
 }
 
 // getprop 取单个属性;非零退出码(设备掉线/unauthorized)视为不可达。
-func (p *Prober) getprop(ctx context.Context, serial, prop string) (string, error) {
-	res, err := p.Runner.Run(ctx, adb.GetProp(serial, prop))
+func (p *Prober) getprop(ctx context.Context, t adb.Target, prop string) (string, error) {
+	res, err := p.Runner.Run(ctx, adb.GetProp(t, prop))
 	if err != nil {
 		return "", err
 	}
@@ -350,14 +358,14 @@ func ParseMemTotalKB(out string) (int64, error) {
 
 // resolveUnknownSerial 尝试解析 transport 为 "?" 的设备的真实序列号。
 // 优先 ro.serialno(Android),失败则回退 /proc/device-tree/serial-number(Linux)。
-func (p *Prober) resolveUnknownSerial(ctx context.Context, transport string) (string, error) {
+func (p *Prober) resolveUnknownSerial(ctx context.Context, t adb.Target) (string, error) {
 	// 尝试 Android getprop ro.serialno
-	serial, err := p.getprop(ctx, transport, "ro.serialno")
+	serial, err := p.getprop(ctx, t, "ro.serialno")
 	if err == nil && validSerial(serial) {
 		return serial, nil
 	}
 	// 回退 Linux 设备树序列号
-	if res, dterr := p.Runner.Run(ctx, adb.DeviceTreeSerialNumber(transport)); dterr == nil && res.ExitCode == 0 {
+	if res, dterr := p.Runner.Run(ctx, adb.DeviceTreeSerialNumber(t)); dterr == nil && res.ExitCode == 0 {
 		// 设备树字符串按规范 NUL 结尾(RK3568 实测 ac6dcbcbfc640f3a\0):
 		// 先按首个 NUL 截断再去空白,否则 validSerial 拒绝 NUL 字符。
 		serial, _, _ := strings.Cut(res.Stdout, "\x00")
@@ -369,8 +377,8 @@ func (p *Prober) resolveUnknownSerial(ctx context.Context, transport string) (st
 	return "", fmt.Errorf("cannot resolve serial for transport '?'")
 }
 
-func (p *Prober) linuxABI(ctx context.Context, transport string) string {
-	res, err := p.Runner.Run(ctx, adb.UnameM(transport))
+func (p *Prober) linuxABI(ctx context.Context, t adb.Target) string {
+	res, err := p.Runner.Run(ctx, adb.UnameM(t))
 	if err != nil || res.ExitCode != 0 {
 		return ""
 	}

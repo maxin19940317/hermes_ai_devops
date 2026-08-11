@@ -44,7 +44,7 @@ func TestClassifyFailure(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeADB{getStateOut: tc.liveness, devicesList: tc.devicesOut, devicesErr: tc.devicesErr}
 			e, _ := newExecutor(f)
-			got := e.classifyFailure(context.Background(), "dev1", tc.stage, tc.err)
+			got := e.classifyFailure(context.Background(), adb.TargetFor("dev1", 0), tc.stage, tc.err)
 			if got != tc.wantScope {
 				t.Fatalf("scope = %q, want %q", got, tc.wantScope)
 			}

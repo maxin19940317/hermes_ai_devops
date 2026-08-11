@@ -92,11 +92,12 @@ func TestProbeDevicesIgnoresLegacyCapabilitiesWithMultipleDevices(t *testing.T) 
 func TestProbeDevicesResolvesQuestionMarkTransport(t *testing.T) {
 	runner := &fakeRunner{responses: map[string]adb.Result{
 		"devices -l": {Stdout: "List of devices attached\n? device product:trinket transport_id:28\n"},
-		"-s ? shell /system/bin/getprop ro.serialno":              {Stdout: "513cd3de\n"},
-		"-s ? shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
-		"-s ? shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
-		"-s ? shell /system/bin/getprop ro.board.platform":        {Stdout: "trinket\n"},
-		"-s ? shell /system/bin/df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+		// 2026-08-11:? 设备用 -t <transport_id> 寻址(可区分多台 ?),不再 -s ?
+		"-t 28 shell /system/bin/getprop ro.serialno":              {Stdout: "513cd3de\n"},
+		"-t 28 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-t 28 shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
+		"-t 28 shell /system/bin/getprop ro.board.platform":        {Stdout: "trinket\n"},
+		"-t 28 shell /system/bin/df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
 			"/dev/block/dm-0 10000000 100 1000000 1% /data\n"},
 	}}
 	p := &Prober{Runner: runner, SOCAliases: map[string]string{"trinket": "QCM6125"}}
@@ -250,14 +251,15 @@ func TestProbeDevicesRejectsShellErrorSOCWithValidABI(t *testing.T) {
 }
 
 // '?' transport 设备:ro.serialno 失败但设备树序列号存在时,应被成功解析为独立设备。
+// 设备带 transport_id(真实 adb devices -l 对 ? 设备必有),用 -t 寻址。
 func TestProbeDevicesResolvesLinuxSerialViaDeviceTree(t *testing.T) {
 	runner := &fakeRunner{responses: map[string]adb.Result{
-		"devices -l": {Stdout: "List of devices attached\n? device product:rk3568-linux model:Nexus_4\n"},
-		"-s ? shell /system/bin/getprop ro.serialno":          {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
-		"-s ? shell /bin/cat /proc/device-tree/serial-number": {Stdout: "rk3568-evb-1\x00\n", ExitCode: 0}, // 设备树字符串 NUL 结尾(真机实测)
-		"-s ? shell /system/bin/getprop ro.product.cpu.abi":   {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
-		"-s ? shell /bin/cat /proc/device-tree/compatible":    {Stdout: "rockchip,rk3568\n", ExitCode: 0},
-		"-s ? shell uname -m":                                 {Stdout: "aarch64\n"},
+		"devices -l": {Stdout: "List of devices attached\n? device product:rk3568-linux model:Nexus_4 transport_id:7\n"},
+		"-t 7 shell /system/bin/getprop ro.serialno":          {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-t 7 shell /bin/cat /proc/device-tree/serial-number": {Stdout: "rk3568-evb-1\x00\n", ExitCode: 0}, // 设备树字符串 NUL 结尾(真机实测)
+		"-t 7 shell /system/bin/getprop ro.product.cpu.abi":   {Stdout: "/bin/sh: line 1: /system/bin/getprop: No such file or directory\n"},
+		"-t 7 shell /bin/cat /proc/device-tree/compatible":    {Stdout: "rockchip,rk3568\n", ExitCode: 0},
+		"-t 7 shell uname -m":                                 {Stdout: "aarch64\n"},
 	}}
 	p := &Prober{Runner: runner}
 
@@ -303,6 +305,51 @@ func TestProbeDevicesRejectsShellErrorSerialResolution(t *testing.T) {
 }
 
 // ---- 内存上报(2026-08-07)----
+
+// TestProbeDevicesMultipleQuestionMarkDevices:多台 USB serial 丢失(? 设备)
+// 必须各自独立解析并注册(2026-08-11:此前 unknownCount != 1 直接跳过全部)。
+// 核心:每台 ? 设备用 transport_id 寻址(-t <id>),互不干扰。
+func TestProbeDevicesMultipleQuestionMarkDevices(t *testing.T) {
+	runner := &fakeRunner{responses: map[string]adb.Result{
+		"devices -l": {Stdout: "List of devices attached\n" +
+			"? device product:qcm6490-Ubuntu transport_id:3\n" +
+			"? device product:trinket transport_id:1\n"},
+		"-t 3 shell /system/bin/getprop ro.serialno":              {Stdout: "825485946\n"},
+		"-t 3 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "/bin/sh: line 1: getprop: not found\n"}, // Linux 板
+		"-t 3 shell /bin/cat /proc/device-tree/compatible":        {Stdout: "qualcomm,qcm6490\x00\n", ExitCode: 0},
+		"-t 3 shell uname -m":                                     {Stdout: "aarch64\n"},
+		"-t 3 shell /bin/cat /proc/device-tree/serial-number":     {Stdout: "825485946\x00\n", ExitCode: 0},
+		"-t 1 shell /system/bin/getprop ro.serialno":              {Stdout: "513cd3de\n"},
+		"-t 1 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
+		"-t 1 shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
+		"-t 1 shell /system/bin/getprop ro.board.platform":        {Stdout: "trinket\n"},
+		"-t 1 shell /system/bin/df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+			"/dev/block/dm-0 10000000 100 1000000 1% /data\n"},
+		"-t 3 shell /system/bin/df -k /data/local/tmp": {ExitCode: 1}, // Linux 板 df 走 DiskFreeKBLinux
+		"-t 3 shell df -k /tmp/algo-super-sdk": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+			"/dev/root 10000000 100 1000000 1% /\n"},
+	}}
+	p := &Prober{Runner: runner, SOCAliases: map[string]string{"trinket": "QCM6125", "qcm6490": "QCS6490"}}
+
+	devices := p.ProbeDevices(context.Background(), map[string]bool{})
+	if len(devices) != 2 {
+		t.Fatalf("devices = %+v, want 2 台 ? 设备都解析注册", devices)
+	}
+	bySerial := map[string]DeviceInfo{}
+	for _, d := range devices {
+		bySerial[d.Serial] = d
+	}
+	if qcm, ok := bySerial["513cd3de"]; !ok {
+		t.Errorf("缺 QCM6125(513cd3de): %v", bySerial)
+	} else if qcm.Props == nil || qcm.Props.SOC != "QCM6125" {
+		t.Errorf("QCM6125 props = %+v, want aliased QCM6125", qcm.Props)
+	}
+	if qcs, ok := bySerial["825485946"]; !ok {
+		t.Errorf("缺 QCS6490(825485946): %v", bySerial)
+	} else if qcs.Props == nil || qcs.Props.SOC != "QCS6490" || qcs.Props.OS != "linux" {
+		t.Errorf("QCS6490 props = %+v, want linux QCS6490", qcs.Props)
+	}
+}
 
 func TestParseMemTotalKB(t *testing.T) {
 	cases := []struct {

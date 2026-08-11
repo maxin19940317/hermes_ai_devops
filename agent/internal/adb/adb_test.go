@@ -12,20 +12,20 @@ const serial = "R5CT10XXXXX"
 
 func TestBuildersAlwaysPinSerial(t *testing.T) {
 	cases := [][]string{
-		GetProp(serial, "ro.product.cpu.abi"),
-		DeviceTreeCompatible(serial),
-		DiskFreeKB(serial, "/data/local/tmp"),
-		Push(serial, "/tmp/a", "/data/local/tmp/a"),
-		Pull(serial, "/data/local/tmp/r", "/tmp/r"),
-		ShellMkdirAll(serial, "/data/local/tmp/x"),
-		ShellRemoveAll(serial, "/data/local/tmp/x"),
-		ShellChmod(serial, "0755", "/data/local/tmp/x/run.sh"),
-		ShellPkill(serial, "run.sh"),
-		LogcatClear(serial),
-		LogcatDump(serial),
-		LogcatTail(serial, 100),
-		ShellListGlob(serial, "/data/local/tmp/x", "results/*.json"),
-		ShellRunEntry(serial, "/d", nil, "./run.sh", nil),
+		GetProp(TargetFor(serial, 0), "ro.product.cpu.abi"),
+		DeviceTreeCompatible(TargetFor(serial, 0)),
+		DiskFreeKB(TargetFor(serial, 0), "/data/local/tmp"),
+		Push(TargetFor(serial, 0), "/tmp/a", "/data/local/tmp/a"),
+		Pull(TargetFor(serial, 0), "/data/local/tmp/r", "/tmp/r"),
+		ShellMkdirAll(TargetFor(serial, 0), "/data/local/tmp/x"),
+		ShellRemoveAll(TargetFor(serial, 0), "/data/local/tmp/x"),
+		ShellChmod(TargetFor(serial, 0), "0755", "/data/local/tmp/x/run.sh"),
+		ShellPkill(TargetFor(serial, 0), "run.sh"),
+		LogcatClear(TargetFor(serial, 0)),
+		LogcatDump(TargetFor(serial, 0)),
+		LogcatTail(TargetFor(serial, 0), 100),
+		ShellListGlob(TargetFor(serial, 0), "/data/local/tmp/x", "results/*.json"),
+		ShellRunEntry(TargetFor(serial, 0), "/d", nil, "./run.sh", nil),
 	}
 	for i, argv := range cases {
 		if len(argv) < 3 || argv[0] != "-s" || argv[1] != serial {
@@ -40,29 +40,29 @@ func TestBuilderArgv(t *testing.T) {
 		got  []string
 		want []string
 	}{
-		{"getprop", GetProp(serial, "ro.product.cpu.abi"),
+		{"getprop", GetProp(TargetFor(serial, 0), "ro.product.cpu.abi"),
 			[]string{"-s", serial, "shell", "/system/bin/getprop", "ro.product.cpu.abi"}},
-		{"device tree compatible", DeviceTreeCompatible(serial),
+		{"device tree compatible", DeviceTreeCompatible(TargetFor(serial, 0)),
 			[]string{"-s", serial, "shell", "/bin/cat", "/proc/device-tree/compatible"}},
-		{"df", DiskFreeKB(serial, "/data/local/tmp"),
+		{"df", DiskFreeKB(TargetFor(serial, 0), "/data/local/tmp"),
 			[]string{"-s", serial, "shell", "/system/bin/df", "-k", "/data/local/tmp"}},
-		{"push", Push(serial, "/tmp/a", "/data/local/tmp/a"),
+		{"push", Push(TargetFor(serial, 0), "/tmp/a", "/data/local/tmp/a"),
 			[]string{"-s", serial, "push", "/tmp/a", "/data/local/tmp/a"}},
-		{"pull", Pull(serial, "/data/local/tmp/r", "/tmp/r"),
+		{"pull", Pull(TargetFor(serial, 0), "/data/local/tmp/r", "/tmp/r"),
 			[]string{"-s", serial, "pull", "/data/local/tmp/r", "/tmp/r"}},
-		{"mkdir", ShellMkdirAll(serial, "/data/local/tmp/x"),
+		{"mkdir", ShellMkdirAll(TargetFor(serial, 0), "/data/local/tmp/x"),
 			[]string{"-s", serial, "shell", "mkdir -p '/data/local/tmp/x'"}},
-		{"rm", ShellRemoveAll(serial, "/data/local/tmp/x"),
+		{"rm", ShellRemoveAll(TargetFor(serial, 0), "/data/local/tmp/x"),
 			[]string{"-s", serial, "shell", "rm -rf '/data/local/tmp/x'"}},
-		{"chmod", ShellChmod(serial, "0755", "/data/local/tmp/x/run.sh"),
+		{"chmod", ShellChmod(TargetFor(serial, 0), "0755", "/data/local/tmp/x/run.sh"),
 			[]string{"-s", serial, "shell", "chmod 0755 '/data/local/tmp/x/run.sh'"}},
-		{"pkill", ShellPkill(serial, "run.sh"),
+		{"pkill", ShellPkill(TargetFor(serial, 0), "run.sh"),
 			[]string{"-s", serial, "shell", "pkill -f 'run.sh'"}},
-		{"logcat-c", LogcatClear(serial), []string{"-s", serial, "logcat", "-c"}},
-		{"logcat-d", LogcatDump(serial), []string{"-s", serial, "logcat", "-d"}},
-		{"logcat-tail", LogcatTail(serial, 200), []string{"-s", serial, "logcat", "-d", "-t", "200"}},
+		{"logcat-c", LogcatClear(TargetFor(serial, 0)), []string{"-s", serial, "logcat", "-c"}},
+		{"logcat-d", LogcatDump(TargetFor(serial, 0)), []string{"-s", serial, "logcat", "-d"}},
+		{"logcat-tail", LogcatTail(TargetFor(serial, 0), 200), []string{"-s", serial, "logcat", "-d", "-t", "200"}},
 		{"devices", Devices(), []string{"devices", "-l"}},
-		{"ls-glob", ShellListGlob(serial, "/data/local/tmp/x", "results/*.json"),
+		{"ls-glob", ShellListGlob(TargetFor(serial, 0), "/data/local/tmp/x", "results/*.json"),
 			[]string{"-s", serial, "shell", "cd '/data/local/tmp/x' && ls -1d results/*.json"}},
 	}
 	for _, tt := range tests {
@@ -77,7 +77,7 @@ func TestShellRunEntryDeterministicEnvAndQuoting(t *testing.T) {
 		"LD_LIBRARY_PATH":   "/d/lib",
 		"ADSP_LIBRARY_PATH": "/d/lib/dsp;/system/lib/rfsa/adsp",
 	}
-	got := ShellRunEntry(serial, "/d", env, "./run.sh", []string{"--suite", "snpe-smoke"})
+	got := ShellRunEntry(TargetFor(serial, 0), "/d", env, "./run.sh", []string{"--suite", "snpe-smoke"})
 	want := []string{"-s", serial, "shell",
 		"cd '/d' && ADSP_LIBRARY_PATH='/d/lib/dsp;/system/lib/rfsa/adsp' LD_LIBRARY_PATH='/d/lib' './run.sh' '--suite' 'snpe-smoke'"}
 	if !reflect.DeepEqual(got, want) {
@@ -107,7 +107,7 @@ func TestLogcatTailClampsLines(t *testing.T) {
 		{5000, "1000"},
 	}
 	for _, tt := range tests {
-		got := LogcatTail(serial, tt.lines)
+		got := LogcatTail(TargetFor(serial, 0), tt.lines)
 		want := []string{"-s", serial, "logcat", "-d", "-t", tt.want}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("LogcatTail(%d):\n got %q\nwant %q", tt.lines, got, want)
@@ -186,7 +186,7 @@ func TestRunNonZeroExitIsNotLaunchError(t *testing.T) {
 }
 
 func TestGetStateIsSerialScoped(t *testing.T) {
-	got := GetState("dev1")
+	got := GetState(TargetFor("dev1", 0))
 	want := []string{"-s", "dev1", "get-state"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("GetState = %v, want %v(红线 §14:必须带 -s)", got, want)
@@ -218,7 +218,7 @@ func TestParseTransports(t *testing.T) {
 		"deadbeef\tunauthorized\n" +
 		"offline01\toffline\n"
 	got := ParseTransports(out)
-	if len(got) != 2 || got[0] != "513cd3de" || got[1] != "?" {
+	if len(got) != 2 || got[0].Serial != "513cd3de" || got[1].Serial != "?" {
 		t.Errorf("ParseTransports = %v, want [513cd3de ?](device 状态全保留,含 '?')", got)
 	}
 	if d := ParseDevices(out); len(d) != 1 || d[0] != "513cd3de" {
