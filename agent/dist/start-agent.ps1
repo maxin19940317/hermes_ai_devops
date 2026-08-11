@@ -37,8 +37,27 @@ if (-not $env:AGENT_MTLS_CERT_FILE) { $env:AGENT_MTLS_CERT_FILE = "$PSScriptRoot
 # optional: AGENT_LISTEN_ADDR / AGENT_VERSION / AGENT_RUNS_ROOT / AGENT_DB_PATH / AGENT_HEARTBEAT_INTERVAL
 
 Write-Host "==> 1/4 Prepare private adb server (5137)" -ForegroundColor Cyan
-Remove-Item Env:ANDROID_ADB_SERVER_PORT -ErrorAction SilentlyContinue
-& $ADB kill-server 2>$null | Out-Null   # stop the system 5037 server
+# 2026-08-11 修复:旧逻辑先 Remove-Item env 再 kill-server,此时端口回落默认 5037,
+# 只杀掉了系统 server;残留的 5137 daemon(agent 上次异常退出遗留)没被清掉,
+# start-server 检测到端口已有 daemon 就复用旧进程 → 看不到设备。
+# 正确顺序:先设目标端口再 kill(杀掉同端口残留),netstat 兜底强杀僵尸 daemon。
+function Stop-AdbDaemon([int]$Port) {
+  $env:ANDROID_ADB_SERVER_PORT = "$Port"
+  & $ADB kill-server 2>$null | Out-Null
+  # 兜底:kill-server 只对正常 daemon 生效;僵尸进程(不响应 kill)用 netstat 找 PID 强杀。
+  foreach ($line in (netstat -ano | Select-String ":$Port\s+.*LISTENING")) {
+    $pidPart = (($line.ToString() -split "\s+")[-1])
+    if ($pidPart -match '^\d+$') {
+      $proc = tasklist /FI "PID eq $pidPart" /FO CSV /NH 2>$null
+      if ($proc -match 'adb') {
+        Write-Host "!! stale adb daemon on :$Port (pid $pidPart); force-killing" -ForegroundColor Yellow
+        taskkill /F /PID $pidPart 2>$null | Out-Null
+      }
+    }
+  }
+}
+Stop-AdbDaemon 5137    # 清私有端口残留(本脚本的 daemon)
+Stop-AdbDaemon 5037    # 停系统默认 server
 $env:ANDROID_ADB_SERVER_PORT = "5137"
 & $ADB start-server 2>$null | Out-Null
 & $ADB devices -l

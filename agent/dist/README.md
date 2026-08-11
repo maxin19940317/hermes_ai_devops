@@ -78,11 +78,15 @@ $serial = "513cd3de"
 
 ## 1. 准备私有 ADB Server（5137）
 
-Agent 固定使用 5137，不使用系统默认的 5037。先停止 5037，再启动 5137：
+Agent 固定使用 5137，不使用系统默认的 5037。**先设 5137 再 kill-server**——
+顺序颠倒会清不掉 5137 残留 daemon（见下方排障）：
 
 ```powershell
+$env:ANDROID_ADB_SERVER_PORT = "5137"
+& $adb kill-server    # 清私有端口残留(先设端口再 kill,否则只杀 5037)
+
 Remove-Item Env:ANDROID_ADB_SERVER_PORT -ErrorAction SilentlyContinue
-& $adb kill-server
+& $adb kill-server    # 停系统 5037 server
 
 $env:ANDROID_ADB_SERVER_PORT = "5137"
 & $adb start-server
@@ -215,12 +219,25 @@ Remove-Item Env:AGENT_AUTH_TOKEN
 
 ### 5037 能看到设备，5137 看不到
 
-Windows USB 接口可能已被 5037 Server 占用。重新执行“ADB 5137 准备”的完整步骤，
-确认停止 5037 后再启动 5137。手工排障命令也必须保留：
+两个常见原因：
 
-```powershell
-$env:ANDROID_ADB_SERVER_PORT = "5137"
-```
+1. **残留 5137 daemon**(最常见):上次 agent 异常退出遗留的 adb daemon 还占着
+   5137,`start-server` 检测到端口已监听就复用旧进程(看不到当前设备)。
+   `start-agent.ps1` 已自动处置;手动处置:
+
+   ```powershell
+   # 找占用 5137 的进程并强杀(确认进程名含 adb 再杀)
+   netstat -ano | findstr ":5137"
+   taskkill /F /PID <LISTENING 的 PID>
+   # 然后按本节开头"先设 5137 再 kill-server"重启私有 server
+   ```
+
+2. **5037 与 5137 抢占**:Windows USB 接口被 5037 Server 占用时,先停 5037。
+   手工排障命令也必须保留:
+
+   ```powershell
+   $env:ANDROID_ADB_SERVER_PORT = "5137"
+   ```
 
 ### WSL 成功，原生 Windows 失败
 
