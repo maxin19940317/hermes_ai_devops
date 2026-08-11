@@ -114,6 +114,9 @@ type fakeADB struct {
 	runExit       int
 	runBlocks     bool
 	deviceMissing bool // 模拟 -s 寻址不到设备:所有命令 exit=1 + stderr
+	// collectLsErrText 模拟老 adbd:ls 目标不存在时 exit 0 但 stdout 是
+	// "ls: cannot access ..." 报错文本(2026-08-11 Windows 实机踩坑)。
+	collectLsErrText bool
 
 	// 寻址解析(2026-07-30 USB gadget serial 丢失场景)支持:
 	// devicesList 缺省返回仅含 serial 的列表(快路径);serialnoByTransport
@@ -232,6 +235,13 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 		case strings.Contains(s, "ls -1d"):
 			if strings.Contains(s, "logs/*.log") {
 				return adb.Result{ExitCode: 1, Stderr: "no such file or directory"}, nil
+			}
+			if f.collectLsErrText {
+				// 老 adbd:exit 0 + 报错文本混进 stdout(不是 stderr)。
+				// 模拟 results/junit.xml 和 dumps/** 都不存在。
+				if strings.Contains(s, "junit") || strings.Contains(s, "dumps") {
+					return adb.Result{Stdout: "ls: cannot access 'xxx': No such file or directory\n"}, nil
+				}
 			}
 			return adb.Result{Stdout: "results/result.json\n"}, nil
 		case strings.Contains(s, "'./run.sh'"):
@@ -424,6 +434,33 @@ func TestTimeoutKillsButStillCollects(t *testing.T) {
 	}
 	if pull == -1 || pull < runIdx {
 		t.Error("超时后仍须收集(pull)")
+	}
+}
+
+// TestCollectSkipsLsErrorTextInStdout:老 adbd 把 ls 报错文本以 exit 0 混进
+// stdout(2026-08-11 Windows 实机:"mkdir agent-runs\...\device\ls: cannot
+// access 'results: The directory name is invalid")。collect 必须跳过这类
+// 非路径行,不能把报错文本当成本地路径去 mkdir/pull。
+func TestCollectSkipsLsErrorTextInStdout(t *testing.T) {
+	f := &fakeADB{props: defaultProps(), dfAvailKB: 1 << 20, collectLsErrText: true}
+	sum, err, _ := run(t, f, Options{PackagePath: buildPackage(t, 1), Serial: serial, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("collect 报错文本不应导致失败: %v", err)
+	}
+	if sum.Status != StatusCompleted {
+		t.Errorf("status = %v, want COMPLETED(报错文本被跳过)", sum.Status)
+	}
+	// 只收集到合法的 results/result.json;junit/dumps 的报错文本被跳过
+	if len(sum.Collected) != 1 || sum.Collected[0] != "results/result.json" {
+		t.Errorf("collected = %v, want 仅 results/result.json(报错文本跳过)", sum.Collected)
+	}
+	// 不得对报错文本发起 mkdir/pull(本地设备目录里不应出现 ls: 前缀的路径)
+	deviceDir := filepath.Join(sum.OutDir, "device")
+	entries, _ := os.ReadDir(deviceDir)
+	for _, en := range entries {
+		if strings.HasPrefix(en.Name(), "ls:") {
+			t.Errorf("设备目录出现了 ls: 报错文本路径: %s", en.Name())
+		}
 	}
 }
 
@@ -780,6 +817,29 @@ func TestCollectSkipsDisallowedPattern(t *testing.T) {
 		got := collectPatternOK.MatchString(tc.pattern)
 		if got != tc.wantOK {
 			t.Errorf("collectPatternOK(%q) = %v, want %v", tc.pattern, got, tc.wantOK)
+		}
+	}
+}
+
+// TestCollectedPathOK:ls 输出行的字符白名单。老 adbd 把 ls 报错文本
+// ("ls: cannot access 'xxx': No such file or directory")以 exit 0 混进
+// stdout,不能当路径——否则 Windows mkdir 会崩(2026-08-11 实机)。
+func TestCollectedPathOK(t *testing.T) {
+	for _, tc := range []struct {
+		line   string
+		wantOK bool
+	}{
+		{"results/result.json", true}, // 正常相对路径
+		{"logs/app.log", true},        // 正常
+		{"dumps/tombstone_01", true},  // 正常
+		{"ls: cannot access 'results/junit.xml': No such file or directory", false}, // ls 报错
+		{"ls: cannot access 'dumps/**': No such file or directory", false},          // ls 报错
+		{"/bin/sh: ls: not found", false},                                           // shell 报错
+		{"", false},                                                                 // 空行
+	} {
+		got := collectedPathOK.MatchString(tc.line)
+		if got != tc.wantOK {
+			t.Errorf("collectedPathOK(%q) = %v, want %v", tc.line, got, tc.wantOK)
 		}
 	}
 }

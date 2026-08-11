@@ -661,6 +661,16 @@ func (e *Executor) run(ctx context.Context, t adb.Target, m *manifest.Manifest, 
 // shell(审查 #3)。
 var collectPatternOK = regexp.MustCompile(`^[A-Za-z0-9._*/-]+$`)
 
+// collectedPathOK 校验 `ls -1d <pattern>` 输出的单个相对路径行。
+// 正常输出是纯路径(字符集与契约 collect 一致,无空格/冒号/引号);
+// 老 adbd 不回传远程退出码且合并 stderr 时,ls 的报错文本
+// ("ls: cannot access 'results/junit.xml': No such file or directory")
+// 会以 exit 0 出现在 stdout——它含冒号/引号/空格,明显不是路径。
+// 不合法则跳过,防止把报错文本当成本地文件路径去 mkdir/pull
+// (2026-08-11 Windows 实机:mkdir "agent-runs\...\device\ls: cannot access 'results" 报
+// "The directory name is invalid")。
+var collectedPathOK = regexp.MustCompile(`^[A-Za-z0-9._*/-]+$`)
+
 // collect 按 Manifest collect 列表拉取产物,单项失败只记日志不中断;
 // 多个 pattern 命中同一文件只拉取一次。
 func (e *Executor) collect(ctx context.Context, t adb.Target, m *manifest.Manifest, deviceDir string) []string {
@@ -680,6 +690,12 @@ func (e *Executor) collect(ctx context.Context, t adb.Target, m *manifest.Manife
 		for _, line := range strings.Split(res.Stdout, "\n") {
 			rel := strings.TrimSpace(line)
 			if rel == "" || seen[rel] {
+				continue
+			}
+			// 报错文本防护(见 collectedPathOK doc):老 adbd 把 ls 报错混进
+			// stdout 且 exit 0,不能当路径处理,否则 Windows mkdir 直接崩。
+			if !collectedPathOK.MatchString(rel) {
+				e.logf("collect %q: skipping non-path output line %q", pattern, rel)
 				continue
 			}
 			seen[rel] = true
