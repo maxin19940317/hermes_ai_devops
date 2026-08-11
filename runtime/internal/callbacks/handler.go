@@ -142,6 +142,10 @@ type heartbeatReq struct {
 			// MemTotalMB 是设备物理内存总量(MB,Agent 从 /proc/meminfo 探测)。
 			// 指针:旧 Agent 不上报 → 空;展示信息,不是调度必要条件。
 			MemTotalMB *int64 `json:"mem_total_mb"`
+			// DiskTotalMB / DiskFreeMB 是 workdir 文件系统总/可用空间(MB,
+			// Agent 从 adb shell df -k 探测;2026-08-11 起)。
+			DiskTotalMB *int64 `json:"disk_total_mb"`
+			DiskFreeMB  *int64 `json:"disk_free_mb"`
 		} `json:"props"`
 	} `json:"devices"`
 	// ActiveTaskIDs 过渡期双格式(差距 #15):元素为对象 = 携带租约所有权凭据
@@ -229,7 +233,7 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		devs = append(devs, store.Device{
 			DeviceID: d.Serial, Serial: d.Serial, DisplayName: displayName, ClientID: req.ClientID,
 			ReportedState: d.State, OS: os, SOC: soc, ABI: d.Props.ABI, Capabilities: caps,
-			MemTotalMB: d.Props.MemTotalMB,
+			MemTotalMB: d.Props.MemTotalMB, DiskTotalMB: d.Props.DiskTotalMB, DiskFreeMB: d.Props.DiskFreeMB,
 		})
 	}
 	if err := h.store.UpsertClientDevices(r.Context(), store.Client{

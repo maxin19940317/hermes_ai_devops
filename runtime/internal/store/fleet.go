@@ -26,6 +26,10 @@ type DeviceStatus struct {
 	// MemTotalMB 是设备物理内存总量(MB,Agent 从 /proc/meminfo 探测上报;
 	// 探测失败为 nil)。文本渲染(formatDeviceLine)与飞书卡片同源展示。
 	MemTotalMB *int64
+	// DiskTotalMB / DiskFreeMB 是 workdir 文件系统总/可用空间(MB,
+	// Agent 从 adb shell df -k 探测上报;2026-08-11 起)。
+	DiskTotalMB *int64
+	DiskFreeMB  *int64
 }
 
 // FleetOverview 是 status 指令的汇总视图。
@@ -64,7 +68,7 @@ func (s *MemStore) FleetOverview(_ context.Context) (*FleetOverview, error) {
 			DeviceID: row.DeviceID, Serial: row.Serial, DisplayName: row.DisplayName, SOC: row.SOC,
 			Status: row.Status, FailStreak: row.FailStreak, LeaseTaskID: leaseTask,
 			ClientID: row.ClientID, ClientFailStreak: s.clientFailStreak[row.ClientID],
-			MemTotalMB: row.MemTotalMB,
+			MemTotalMB: row.MemTotalMB, DiskTotalMB: row.DiskTotalMB, DiskFreeMB: row.DiskFreeMB,
 		})
 	}
 	return out, nil

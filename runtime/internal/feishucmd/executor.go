@@ -1441,9 +1441,10 @@ func scopeTitle(scope string) string {
 }
 
 // formatDeviceLine 渲染一台设备的单行美观摘要:
-// "🟢 QCS6490-6cfa...  [在线] SoC=QCS6490 · 内存=7.1GB · 失败=0 · client=c1(client_fail=0) [· 租约=task]"
+// "🟢 QCS6490-6cfa...  [在线] SoC=QCS6490 · 内存=7.1GB · 磁盘=64GB/32GB · 失败=0 · client=c1(client_fail=0) [· 租约=task]"
 func formatDeviceLine(d store.DeviceStatus) string {
-	core := fmt.Sprintf("SoC=%s · 内存=%s · 失败=%d", d.SOC, memText(d.MemTotalMB), d.FailStreak)
+	core := fmt.Sprintf("SoC=%s · 内存=%s · 磁盘=%s · 失败=%d",
+		d.SOC, memText(d.MemTotalMB), diskText(d.DiskTotalMB, d.DiskFreeMB), d.FailStreak)
 	client := ""
 	if d.ClientID != "" {
 		client = fmt.Sprintf(" · client=%s(client_fail=%d)", d.ClientID, d.ClientFailStreak)

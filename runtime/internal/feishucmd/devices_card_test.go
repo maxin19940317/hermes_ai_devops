@@ -69,8 +69,8 @@ func TestRenderDeviceTableCard(t *testing.T) {
 	if strings.Count(js, `"column_set"`) != 3 {
 		t.Errorf("column_set 行数 = %d, want 3", strings.Count(js, `"column_set"`))
 	}
-	// 表头:设备/系统/架构/内存
-	for _, col := range []string{"设备", "系统", "架构", "内存"} {
+	// 表头:设备/系统/架构/内存/磁盘
+	for _, col := range []string{"设备", "系统", "架构", "内存", "磁盘"} {
 		if !strings.Contains(js, col) {
 			t.Errorf("卡片缺表头 %q: %s", col, js[:300])
 		}
@@ -90,18 +90,21 @@ func TestRenderDeviceTableCard(t *testing.T) {
 	}
 }
 
-// TestDeviceRowFromStatus:完整 FleetDevice → 表格行(显示名/系统/架构/内存)。
+// TestDeviceRowFromStatus:完整 FleetDevice → 表格行(显示名/系统/架构/内存/磁盘)。
 func TestDeviceRowFromStatus(t *testing.T) {
 	mb := int64(7304)
+	diskT := int64(65536)
+	diskF := int64(32768)
 	d := store.FleetDevice{
 		Device: store.Device{
 			DeviceID: "825485946", Serial: "825485946", DisplayName: "QCS6490-825485946",
 			OS: "linux", SOC: "QCS6490", ABI: "arm64-v8a", MemTotalMB: &mb,
+			DiskTotalMB: &diskT, DiskFreeMB: &diskF,
 		},
 		Status: store.DeviceIdle,
 	}
 	row := deviceRowFromStatus(d)
-	want := []string{"QCS6490-825485946", "Linux", "arm64-v8a", "7.1GB"}
+	want := []string{"QCS6490-825485946", "Linux", "arm64-v8a", "7.1GB", "64.0GB/32.0GB"}
 	if len(row) != len(want) {
 		t.Fatalf("row = %v, want %d 列", row, len(want))
 	}
@@ -126,6 +129,28 @@ func TestMemText(t *testing.T) {
 	for _, c := range cases {
 		if got := memText(c.mb); got != c.want {
 			t.Errorf("memText(%v) = %q, want %q", c.mb, got, c.want)
+		}
+	}
+}
+
+// TestDiskText:磁盘 "总/可用" 渲染;任一缺失 → 该侧 "-";全缺 → "-"。
+func TestDiskText(t *testing.T) {
+	big := ptr(65536)
+	small := ptr(32768)
+	cases := []struct {
+		name  string
+		total *int64
+		free  *int64
+		want  string
+	}{
+		{"both", big, small, "64.0GB/32.0GB"},
+		{"only total", big, nil, "64.0GB/-"},
+		{"only free", nil, small, "-/32.0GB"},
+		{"neither", nil, nil, "-"},
+	}
+	for _, c := range cases {
+		if got := diskText(c.total, c.free); got != c.want {
+			t.Errorf("%s: diskText = %q, want %q", c.name, got, c.want)
 		}
 	}
 }

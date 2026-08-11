@@ -41,15 +41,16 @@ func (s *PGStore) UpsertClientDevices(ctx context.Context, c Client, devs []Devi
 			caps = []string{}
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO devices (device_id, serial, display_name, client_id, os, soc, abi, capabilities, mem_total_mb, status, fail_streak)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0)
+			INSERT INTO devices (device_id, serial, display_name, client_id, os, soc, abi, capabilities, mem_total_mb, disk_total_mb, disk_free_mb, status, fail_streak)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 0)
 			ON CONFLICT (device_id) DO UPDATE SET
 				serial = EXCLUDED.serial, display_name = EXCLUDED.display_name, client_id = EXCLUDED.client_id,
 				os = EXCLUDED.os, soc = EXCLUDED.soc, abi = EXCLUDED.abi, capabilities = EXCLUDED.capabilities,
 				mem_total_mb = EXCLUDED.mem_total_mb,
+				disk_total_mb = EXCLUDED.disk_total_mb, disk_free_mb = EXCLUDED.disk_free_mb,
 				status = CASE WHEN devices.status IN ('IDLE', 'OFFLINE') THEN EXCLUDED.status ELSE devices.status END`,
 			d.DeviceID, d.Serial, d.DisplayName, d.ClientID, d.OS, d.SOC, d.ABI, pq.Array(caps),
-			d.MemTotalMB, availableState(d.ReportedState)); err != nil {
+			d.MemTotalMB, d.DiskTotalMB, d.DiskFreeMB, availableState(d.ReportedState)); err != nil {
 			return fmt.Errorf("upsert device %s: %w", d.DeviceID, err)
 		}
 	}
@@ -175,7 +176,7 @@ func (s *PGStore) lockOneCandidate(ctx context.Context, tx *sql.Tx, sel wf.Devic
 
 // ListFleet 返回全部已注册设备(按 device_id 排序),供 fleet-skip 原因展示。
 func (s *PGStore) ListFleet(ctx context.Context) ([]FleetDevice, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT device_id, serial, display_name, os, soc, abi, mem_total_mb, capabilities, status FROM devices ORDER BY device_id`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT device_id, serial, display_name, os, soc, abi, mem_total_mb, disk_total_mb, disk_free_mb, capabilities, status FROM devices ORDER BY device_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list fleet: %w", err)
 	}
@@ -183,7 +184,7 @@ func (s *PGStore) ListFleet(ctx context.Context) ([]FleetDevice, error) {
 	out := []FleetDevice{}
 	for rows.Next() {
 		var d FleetDevice
-		if err := rows.Scan(&d.DeviceID, &d.Serial, &d.DisplayName, &d.OS, &d.SOC, &d.ABI, &d.MemTotalMB, pq.Array(&d.Capabilities), &d.Status); err != nil {
+		if err := rows.Scan(&d.DeviceID, &d.Serial, &d.DisplayName, &d.OS, &d.SOC, &d.ABI, &d.MemTotalMB, &d.DiskTotalMB, &d.DiskFreeMB, pq.Array(&d.Capabilities), &d.Status); err != nil {
 			return nil, fmt.Errorf("list fleet: scan: %w", err)
 		}
 		out = append(out, d)

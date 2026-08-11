@@ -58,6 +58,10 @@ type Device struct {
 	// MemTotalMB 是设备物理内存总量(MB,Agent 从 /proc/meminfo 探测上报;
 	// 2026-08-07 起)。指针:旧 Agent/探测失败 → nil;展示信息,非调度必要条件。
 	MemTotalMB *int64
+	// DiskTotalMB / DiskFreeMB 是 workdir 所在文件系统的总/可用空间(MB,
+	// Agent 从 adb shell df -k 探测上报;2026-08-11 起)。指针同上。
+	DiskTotalMB *int64
+	DiskFreeMB  *int64
 }
 
 // 设备状态(§11):IDLE|BUSY|OFFLINE|QUARANTINED。

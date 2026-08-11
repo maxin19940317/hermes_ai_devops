@@ -62,12 +62,13 @@ type deviceTableColumn struct {
 // deviceTableRow 是表格一行(按列顺序)。
 type deviceTableRow []string
 
-// deviceColumns 是设备表格的列定义(设备/系统/架构/内存)。
+// deviceColumns 是设备表格的列定义(设备/系统/架构/内存/磁盘)。
 var deviceColumns = []deviceTableColumn{
 	{"设备", 3},
 	{"系统", 2},
 	{"架构", 2},
 	{"内存", 1},
+	{"磁盘(总/可用)", 2},
 }
 
 // renderDeviceTableCard 渲染设备列表为飞书卡片(column_set 表格)。
@@ -119,13 +120,14 @@ func buildColumnSetRow(row deviceTableRow) deviceCardElement {
 	return deviceCardElement{Tag: "column_set", FlexMode: "none", Columns: cols}
 }
 
-// deviceRowFromStatus 把一台设备转成表格行(设备名/系统/架构/内存)。
+// deviceRowFromStatus 把一台设备转成表格行(设备名/系统/架构/内存/磁盘)。
 func deviceRowFromStatus(d store.FleetDevice) deviceTableRow {
 	return deviceTableRow{
 		deviceDisplayNameFromFleet(d),
 		osCN2(d.OS),
 		d.ABI,
 		memText(d.MemTotalMB),
+		diskText(d.DiskTotalMB, d.DiskFreeMB),
 	}
 }
 
@@ -162,6 +164,17 @@ func memText(mb *int64) string {
 		return fmt.Sprintf("%.1fGB", m/1024)
 	}
 	return fmt.Sprintf("%dMB", *mb)
+}
+
+// diskText 渲染磁盘 "总/可用" 文本(如 "64GB/32GB");任一缺失 → "-"。
+// 与 memText 同源风格(2026-08-11 加)。
+func diskText(totalMB, freeMB *int64) string {
+	t := memText(totalMB)
+	f := memText(freeMB)
+	if t == "-" && f == "-" {
+		return "-"
+	}
+	return t + "/" + f
 }
 
 // cardJSON 把卡片结构序列化(供测试断言)。
