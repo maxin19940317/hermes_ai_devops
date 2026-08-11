@@ -64,17 +64,18 @@ $env:ANDROID_ADB_SERVER_PORT = "5137"
 $deviceLines = @(& $ADB devices | Select-String "`tdevice$")
 $addressableLines = @($deviceLines | Where-Object { ($_ -split "`t")[0] -ne "?" })
 $unknownLines = @($deviceLines | Where-Object { ($_ -split "`t")[0] -eq "?" })
-$usableLines = @($addressableLines)
-if ($unknownLines.Count -eq 1) {
-  $usableLines += $unknownLines
-  Write-Host "!! one device has transport serial '?'; agent will resolve its logical serial via ro.serialno" -ForegroundColor Yellow
-} elseif ($unknownLines.Count -gt 1) {
-  Write-Host "!! multiple devices have transport serial '?'; they are ambiguous and will be ignored" -ForegroundColor Yellow
+# 2026-08-11:agent 已支持多台 USB serial 丢失设备(? 设备)——
+# 用 adb -t <transport_id> 逐台解析身份,不再需要单台限制。
+# 这里把全部 ? 设备计入 usable(agent 启动后自行 resolveUnknownSerial)。
+$usableLines = @($addressableLines) + $unknownLines
+if ($unknownLines.Count -gt 0) {
+  Write-Host "!! $($unknownLines.Count) device(s) have transport serial '?'; agent will resolve each via ro.serialno / device-tree / machine-id" -ForegroundColor Yellow
 }
 if ($usableLines.Count -lt 1) {
   Write-Host "!! no usable device on 5137; plug in the board / accept authorization, then rerun" -ForegroundColor Red
   exit 1
 }
+
 
 Write-Host "`n==> 2/4 Device property self-check" -ForegroundColor Cyan
 $serial = (($usableLines | Select-Object -First 1) -split "`t")[0].Trim()
