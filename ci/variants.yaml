@@ -115,10 +115,11 @@ variants:
       - { id: delegate_fallback, where: stdout, pattern: "falling back to CPU|Delegate creation failed", classify: DELEGATE }
 
   aarch64_Linux_QCS6125_SNPE_1.68:
-    # SNPE=高通 SDK:目标是任意带 hexagon 的高通 Linux 板,不限定具体 SoC 型号
-    # (soc 留空=不约束;hexagon 能力即高通 DSP 的判据。2026-08-05 review;
-    #  2026-08-06 变体名编码 QCS6125,但需求约束不变)
-    requirements: { os: linux, abi: arm64-v8a, capabilities: [hexagon], min_free_storage_mb: 512 }
+    # SNPE=高通 SDK:严格约束到 QCS6125。2026-08-11:soc 从留空改为明确
+    # 约束——此前只要求 hexagon 能力,导致声明了 hexagon 的 QCS6490 被
+    # 当作 QCS6125 替代测试,但 QCS6490 DSP 实际不可用(RUNTIME_NOT_AVAILABLE),
+    # 一直失败。明确 SOC 后,无 QCS6125 设备时变体被 SKIPPED,不误测。
+    requirements: { os: linux, abi: arm64-v8a, soc: [QCS6125], capabilities: [hexagon], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
       ADSP_LIBRARY_PATH: "{workdir}/lib/dsp"
@@ -129,7 +130,9 @@ variants:
       - { id: dsp_unavailable, where: logs, pattern: "RUNTIME_NOT_AVAILABLE|DspTransport.*not supported|DSP does not support", classify: DELEGATE }
 
   aarch64_Linux_QCS6490_SNPE_2.21:
-    requirements: { os: linux, abi: arm64-v8a, capabilities: [hexagon], min_free_storage_mb: 512 }
+    # SNPE=高通 SDK:严格约束到 QCS6490。2026-08-11:与 QCS6125 同理,
+    # soc 从留空改为明确约束,防止其他 hexagon 板替代测试。
+    requirements: { os: linux, abi: arm64-v8a, soc: [QCS6490], capabilities: [hexagon], min_free_storage_mb: 512 }
     env:
       LD_LIBRARY_PATH: "{workdir}/lib"
       ADSP_LIBRARY_PATH: "{workdir}/lib/dsp"
