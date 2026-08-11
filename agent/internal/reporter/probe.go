@@ -357,19 +357,28 @@ func ParseMemTotalKB(out string) (int64, error) {
 }
 
 // resolveUnknownSerial 尝试解析 transport 为 "?" 的设备的真实序列号。
-// 优先 ro.serialno(Android),失败则回退 /proc/device-tree/serial-number(Linux)。
+// 依次尝试:ro.serialno(Android)→ /proc/device-tree/serial-number(RK3568
+// Linux)→ /etc/machine-id(QCS6490 等无 device-tree serial 的 Linux)。
 func (p *Prober) resolveUnknownSerial(ctx context.Context, t adb.Target) (string, error) {
 	// 尝试 Android getprop ro.serialno
 	serial, err := p.getprop(ctx, t, "ro.serialno")
 	if err == nil && validSerial(serial) {
 		return serial, nil
 	}
-	// 回退 Linux 设备树序列号
+	// 回退 1:Linux 设备树序列号
 	if res, dterr := p.Runner.Run(ctx, adb.DeviceTreeSerialNumber(t)); dterr == nil && res.ExitCode == 0 {
 		// 设备树字符串按规范 NUL 结尾(RK3568 实测 ac6dcbcbfc640f3a\0):
 		// 先按首个 NUL 截断再去空白,否则 validSerial 拒绝 NUL 字符。
 		serial, _, _ := strings.Cut(res.Stdout, "\x00")
 		serial = strings.TrimSpace(serial)
+		if validSerial(serial) {
+			return serial, nil
+		}
+	}
+	// 回退 2:/etc/machine-id(2026-08-11 QCS6490 实机:无 device-tree serial,
+	// 但 machine-id 6cfa3377e493e7b5f8010b6266134d8c 是持久的机器唯一 ID)。
+	if res, mterr := p.Runner.Run(ctx, adb.MachineID(t)); mterr == nil && res.ExitCode == 0 {
+		serial = strings.TrimSpace(strings.TrimRight(res.Stdout, "\n"))
 		if validSerial(serial) {
 			return serial, nil
 		}

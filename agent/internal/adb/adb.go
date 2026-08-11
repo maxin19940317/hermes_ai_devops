@@ -128,6 +128,14 @@ func DeviceTreeSerialNumber(t Target) []string {
 	return append(t.Argv(), "shell", "/bin/cat", "/proc/device-tree/serial-number")
 }
 
+// MachineID 读取 Linux 系统的持久唯一机器 ID(/etc/machine-id,由 systemd
+// 在首次启动生成,32 位 hex)。用于无 ro.serialno 且无 device-tree serial 的
+// Linux 板(2026-08-11 QCS6490 实机:uname qcs6490-odk,machine-id 6cfa3377...)
+// 的 serial 解析回退。仅用于 ? transport 的身份解析,不构成任意 shell 接口。
+func MachineID(t Target) []string {
+	return append(t.Argv(), "shell", "/bin/cat", "/etc/machine-id")
+}
+
 func DiskFreeKB(t Target, path string) []string {
 	return append(t.Argv(), "shell", "/system/bin/df", "-k", path)
 }

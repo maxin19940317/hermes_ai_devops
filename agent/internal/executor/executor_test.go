@@ -123,6 +123,9 @@ type fakeADB struct {
 	devicesList                 string
 	serialnoByTransport         map[string]string
 	deviceTreeSerialByTransport map[string]string
+	// machineIDByTransport:transport 寻址 key → /etc/machine-id 值
+	// (2026-08-11 QCS6490 等无 device-tree serial 的 Linux 板身份解析)。
+	machineIDByTransport map[string]string
 
 	// devicesExit/devicesStderr 模拟 adb server 级故障(adb devices 非零退出);
 	// 缺省 0/空,既有用例(快路径 devicesList)不受影响。
@@ -188,7 +191,14 @@ func (f *fakeADB) Run(ctx context.Context, args []string) (adb.Result, error) {
 		// 两者一视同仁,故这里统一以 ExitCode=0 + 空/异常 stdout 表达)。
 		return adb.Result{Stdout: f.getStateOut}, nil
 	case cmd == "shell" && len(args) == 5 && filepath.Base(args[3]) == "cat":
-		// 设备树读取(仅寻址回退用到 serial-number);未配置的 transport 视为文件不存在
+		// 设备树/机器 ID 读取(寻址回退:serial-number 与 machine-id);
+		// 未配置的 transport 视为文件不存在
+		if args[4] == "/etc/machine-id" {
+			if v, ok := f.machineIDByTransport[args[1]]; ok {
+				return adb.Result{Stdout: v}, nil
+			}
+			return adb.Result{ExitCode: 1, Stderr: "cat: /etc/machine-id: No such file or directory"}, nil
+		}
 		if v, ok := f.deviceTreeSerialByTransport[args[1]]; ok {
 			return adb.Result{Stdout: v}, nil
 		}
@@ -856,16 +866,19 @@ func TestResolveTransportMultipleQuestionMarks(t *testing.T) {
 	f := &fakeADB{
 		props:               defaultProps(),
 		devicesList:         "List of devices attached\n? device product:qcm6490-Ubuntu transport_id:3\n? device product:trinket transport_id:1\n",
-		serialnoByTransport: map[string]string{"3": "825485946", "1": "513cd3de"},
+		serialnoByTransport: map[string]string{"1": "513cd3de"},
+		machineIDByTransport: map[string]string{
+			"3": "6cfa3377e493e7b5f8010b6266134d8c\n",
+		},
 	}
 	e := &Executor{Runner: f}
-	// 目标逻辑 serial = 825485946(QCS6490,transport_id 3)
-	got, err := e.resolveTransport(context.Background(), "825485946")
+	// 目标逻辑 serial = 6cfa...(QCS6490,machine-id,transport_id 3)
+	got, err := e.resolveTransport(context.Background(), "6cfa3377e493e7b5f8010b6266134d8c")
 	if err != nil {
 		t.Fatalf("resolveTransport: %v", err)
 	}
 	if got.TransportID != 3 || got.Serial != "" {
-		t.Errorf("target = %+v, want transport#3(825485946)", got)
+		t.Errorf("target = %+v, want transport#3(QCS6490)", got)
 	}
 	// 另一台(trinket,transport_id 1)
 	got2, err := e.resolveTransport(context.Background(), "513cd3de")

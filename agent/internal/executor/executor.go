@@ -412,6 +412,13 @@ func (e *Executor) resolveTransport(ctx context.Context, logical string) (adb.Ta
 				return t, nil
 			}
 		}
+		// 回退 /etc/machine-id(2026-08-11 QCS6490 实机:无 device-tree serial,
+		// 用持久机器唯一 ID 作身份;与 probe resolveUnknownSerial 同源)。
+		if res, mterr := e.Runner.Run(ctx, adb.MachineID(t)); mterr == nil && res.ExitCode == 0 {
+			if strings.TrimSpace(res.Stdout) == logical {
+				return t, nil
+			}
+		}
 	}
 	visible := make([]string, 0, len(devices))
 	for _, d := range devices {

@@ -314,20 +314,19 @@ func TestProbeDevicesMultipleQuestionMarkDevices(t *testing.T) {
 		"devices -l": {Stdout: "List of devices attached\n" +
 			"? device product:qcm6490-Ubuntu transport_id:3\n" +
 			"? device product:trinket transport_id:1\n"},
-		"-t 3 shell /system/bin/getprop ro.serialno":              {Stdout: "825485946\n"},
+		"-t 3 shell /system/bin/getprop ro.serialno":              {Stdout: "\n"},                                    // Linux 板无 ro.serialno
+		"-t 3 shell /bin/cat /proc/device-tree/serial-number":     {ExitCode: 1},                                     // 无 device-tree serial
+		"-t 3 shell /bin/cat /etc/machine-id":                     {Stdout: "6cfa3377e493e7b5f8010b6266134d8c\n"},    // QCS6490 machine-id
 		"-t 3 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "/bin/sh: line 1: getprop: not found\n"}, // Linux 板
 		"-t 3 shell /bin/cat /proc/device-tree/compatible":        {Stdout: "qualcomm,qcm6490\x00\n", ExitCode: 0},
 		"-t 3 shell uname -m":                                     {Stdout: "aarch64\n"},
-		"-t 3 shell /bin/cat /proc/device-tree/serial-number":     {Stdout: "825485946\x00\n", ExitCode: 0},
+		"-t 3 shell /system/bin/df -k /data/local/tmp":            {ExitCode: 1}, // Linux 板无 /system/bin/df
 		"-t 1 shell /system/bin/getprop ro.serialno":              {Stdout: "513cd3de\n"},
 		"-t 1 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
 		"-t 1 shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
 		"-t 1 shell /system/bin/getprop ro.board.platform":        {Stdout: "trinket\n"},
 		"-t 1 shell /system/bin/df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
 			"/dev/block/dm-0 10000000 100 1000000 1% /data\n"},
-		"-t 3 shell /system/bin/df -k /data/local/tmp": {ExitCode: 1}, // Linux 板 df 走 DiskFreeKBLinux
-		"-t 3 shell df -k /tmp/algo-super-sdk": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
-			"/dev/root 10000000 100 1000000 1% /\n"},
 	}}
 	p := &Prober{Runner: runner, SOCAliases: map[string]string{"trinket": "QCM6125", "qcm6490": "QCS6490"}}
 
@@ -344,8 +343,8 @@ func TestProbeDevicesMultipleQuestionMarkDevices(t *testing.T) {
 	} else if qcm.Props == nil || qcm.Props.SOC != "QCM6125" {
 		t.Errorf("QCM6125 props = %+v, want aliased QCM6125", qcm.Props)
 	}
-	if qcs, ok := bySerial["825485946"]; !ok {
-		t.Errorf("缺 QCS6490(825485946): %v", bySerial)
+	if qcs, ok := bySerial["6cfa3377e493e7b5f8010b6266134d8c"]; !ok {
+		t.Errorf("缺 QCS6490(machine-id 6cfa...): %v", bySerial)
 	} else if qcs.Props == nil || qcs.Props.SOC != "QCS6490" || qcs.Props.OS != "linux" {
 		t.Errorf("QCS6490 props = %+v, want linux QCS6490", qcs.Props)
 	}
