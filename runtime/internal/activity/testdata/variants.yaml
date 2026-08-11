@@ -35,6 +35,6 @@ variants:
     signatures:
       - { id: rknn_init_fail, where: stdout, pattern: "rknn_init.*fail|RKNN_ERR", classify: DELEGATE }
   aarch64_Linux_QCS6490_SNPE_2.21:
-    requirements: { os: linux, abi: arm64-v8a, capabilities: [hexagon], min_free_storage_mb: 512 }
+    requirements: { os: linux, abi: arm64-v8a, soc: [QCS6490], capabilities: [hexagon], min_free_storage_mb: 512 }
     test:
       args: []

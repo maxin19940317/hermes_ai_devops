@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -48,6 +49,7 @@ type variantsFile struct {
 type variantDecl struct {
 	Requirements struct {
 		OS           string   `yaml:"os"`
+		ABI          string   `yaml:"abi"`
 		SOC          []string `yaml:"soc"`
 		Capabilities []string `yaml:"capabilities"`
 	} `yaml:"requirements"`
@@ -72,7 +74,48 @@ func LoadSpecConfig(path string, d SpecDefaults) (*SpecConfig, error) {
 	if err := yaml.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("parse variants config: %w", err)
 	}
+	if err := validateVariants(f); err != nil {
+		return nil, err
+	}
 	return &SpecConfig{file: f, defaults: d}, nil
+}
+
+// socNamePattern 匹配变体名中编码的目标 SoC 名(2026-08-06 起变体名编码目标
+// SoC,如 aarch64_Linux_QCS6125_SNPE_1.68)。QCS/QCM 为高通,SM 为骁龙,
+// RK 为瑞芯微。用于"变体名含 SoC 必须声明对应 soc 约束"的防漂移校验。
+var socNamePattern = regexp.MustCompile(`(QCS[0-9]+|QCM[0-9]+|SM[0-9]+|RK[0-9]+)`)
+
+// validateVariants 校验变体配置的调度约束完整性(2026-08-11,方案 B):
+// 业务仓库 variants.yaml 是唯一权威,本配置只是运行时副本——配置错误必须在
+// 启动时 fail fast,不能等派单才暴露。
+// 规则(最严):
+//  1. 每个变体必须声明 os + abi + soc(缺任何一项 = 无法确定性调度);
+//  2. 变体名含 SoC 编码(如 QCS6125)时,soc 约束必须包含该 SoC——
+//     防止"名字写 QCS6125、约束却留空/写别的"的漂移(2026-08-11 实机:
+//     QCS6125 变体无 soc 约束被派到 QCS6490,DSP 不可用连败)。
+func validateVariants(f variantsFile) error {
+	for name, v := range f.Variants {
+		req := v.Requirements
+		if req.OS == "" || req.ABI == "" || len(req.SOC) == 0 {
+			return fmt.Errorf("variants %q: requirements 必须声明 os+abi+soc (got os=%q abi=%q soc=%v)",
+				name, req.OS, req.ABI, req.SOC)
+		}
+		// 变体名含 SoC 编码 → soc 约束必须包含该 SoC(防漂移)。
+		if m := socNamePattern.FindString(name); m != "" {
+			hit := false
+			for _, soc := range req.SOC {
+				if strings.EqualFold(soc, m) {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				return fmt.Errorf("variants %q: 名字含 SoC %q 但 soc 约束 %v 不含它(防漂移,业务仓库 variants.yaml 是唯一权威)",
+					name, m, req.SOC)
+			}
+		}
+	}
+	return nil
 }
 
 // VariantNames 返回全部已声明变体名(排序后顺序稳定),供翻译层的上下文快照与

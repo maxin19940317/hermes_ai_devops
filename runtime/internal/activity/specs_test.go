@@ -197,6 +197,87 @@ func TestLoadSpecConfigMissingFile(t *testing.T) {
 	}
 }
 
+// TestValidateVariantsRejectsMissingRequirements:方案 B(2026-08-11)——
+// 业务仓库 variants.yaml 是唯一权威,Runtime 启动时校验配置完整性:
+// 任何变体缺 os/abi/soc 必须 fail fast,不能等派单才暴露。
+func TestValidateVariantsRejectsMissingRequirements(t *testing.T) {
+	ok := variantsFile{Variants: map[string]variantDecl{
+		"v1": {Requirements: struct {
+			OS           string   `yaml:"os"`
+			ABI          string   `yaml:"abi"`
+			SOC          []string `yaml:"soc"`
+			Capabilities []string `yaml:"capabilities"`
+		}{OS: "linux", ABI: "arm64-v8a", SOC: []string{"QCS6490"}}},
+	}}
+	if err := validateVariants(ok); err != nil {
+		t.Fatalf("合法配置不应报错: %v", err)
+	}
+	cases := []struct {
+		name string
+		req  struct {
+			OS           string   `yaml:"os"`
+			ABI          string   `yaml:"abi"`
+			SOC          []string `yaml:"soc"`
+			Capabilities []string `yaml:"capabilities"`
+		}
+	}{
+		{"缺 os", struct {
+			OS           string   `yaml:"os"`
+			ABI          string   `yaml:"abi"`
+			SOC          []string `yaml:"soc"`
+			Capabilities []string `yaml:"capabilities"`
+		}{ABI: "arm64-v8a", SOC: []string{"QCS6490"}}},
+		{"缺 abi", struct {
+			OS           string   `yaml:"os"`
+			ABI          string   `yaml:"abi"`
+			SOC          []string `yaml:"soc"`
+			Capabilities []string `yaml:"capabilities"`
+		}{OS: "linux", SOC: []string{"QCS6490"}}},
+		{"缺 soc", struct {
+			OS           string   `yaml:"os"`
+			ABI          string   `yaml:"abi"`
+			SOC          []string `yaml:"soc"`
+			Capabilities []string `yaml:"capabilities"`
+		}{OS: "linux", ABI: "arm64-v8a"}},
+	}
+	for _, tc := range cases {
+		f := variantsFile{Variants: map[string]variantDecl{
+			"bad-variant": {Requirements: tc.req},
+		}}
+		if err := validateVariants(f); err == nil {
+			t.Errorf("%s: 应拒绝(必须 os+abi+soc)", tc.name)
+		}
+	}
+}
+
+// TestValidateVariantsRejectsSoCNameDrift:变体名含 SoC 编码但 soc 约束不含它
+// (或留空)必须拒绝——正是 2026-08-11 实机 bug(QCS6125 变体无 soc 约束被派到
+// QCS6490)的防漂移门。
+func TestValidateVariantsRejectsSoCNameDrift(t *testing.T) {
+	req := struct {
+		OS           string   `yaml:"os"`
+		ABI          string   `yaml:"abi"`
+		SOC          []string `yaml:"soc"`
+		Capabilities []string `yaml:"capabilities"`
+	}{OS: "linux", ABI: "arm64-v8a", SOC: []string{"QCS6490"}}
+	// 名字含 QCS6125,约束却是 QCS6490 → 漂移,必须拒绝
+	f := variantsFile{Variants: map[string]variantDecl{
+		"aarch64_Linux_QCS6125_SNPE_1.68": {Requirements: req},
+	}}
+	if err := validateVariants(f); err == nil {
+		t.Error("名字含 QCS6125 但约束 QCS6490 必须拒绝")
+	}
+	// 名字含 QCS6125,约束也含 QCS6125 → 合法
+	req2 := req
+	req2.SOC = []string{"QCS6125"}
+	f2 := variantsFile{Variants: map[string]variantDecl{
+		"aarch64_Linux_QCS6125_SNPE_1.68": {Requirements: req2},
+	}}
+	if err := validateVariants(f2); err != nil {
+		t.Errorf("匹配的约束不应拒绝: %v", err)
+	}
+}
+
 // TestQualcommTFLiteSkippedOnNonQualcommFleet:2026-08-06 实机回归——
 // aarch64_Android_Qualcomm_TFLite_2.21.0 曾因无 soc 约束被派到 MTK mt8189 板
 // (AcquireDevice 按 device_id 升序选中 10.83.100.13:5555),而包内 GPU delegate

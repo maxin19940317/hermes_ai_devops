@@ -6,6 +6,12 @@
 #   - workdir_linux 不能用 /opt:RK3568 固件 rootfs 整体只读(2026-08-04 实机:
 #     /opt、/root 均 Read-only)。2026-08-07 起用 /tmp(/data 在 QCS6490 是 noexec,
 #     run.sh 无法执行;QCS ext4 与 RK3568 tmpfs 的 /tmp 均可写可执行)。
+# 权威说明(2026-08-11,方案 B):本文件是业务仓库(algo-super-sdk)variants.yaml
+#   的运行时副本。SOC/OS/ABI 调度约束由业务仓库决定(打包期渲染进包内
+#   manifest.yaml);本仓库副本必须与业务仓库保持一致。Runtime worker 启动时
+#   校验:每个变体必须声明 os+abi+soc,且变体名含 SoC 编码(QCS*/QCM*/SM*/RK*)
+#   时 soc 约束必须包含该 SoC——配置漂移会在启动时 fail fast,不等到派单才暴露。
+#   修改约束请先改业务仓库,再同步本文件。
 #   - 2026-08-06 包名变更(pipeline 1109):SNPE/TFLite 变体名编码目标 SoC,
 #     与业务仓库 ci/hermes/variants.yaml 保持一致;Android SNPE 2.21 目标
 #     SoC 从 QCM6125 改为 QCM6490(仅变体名与 soc 变化,签名/环境不变)。
