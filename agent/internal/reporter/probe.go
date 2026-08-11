@@ -117,6 +117,7 @@ func (p *Prober) probeDevice(ctx context.Context, t adb.Target, serial string, i
 			dev.DisplayName = strings.ToUpper(soc) + "-" + serial
 			p.logf("probe: %s is non-Android Linux (%s/%s); reporting IDLE", serial, soc, abi)
 			p.probeMemTotal(ctx, t, dev.Props)
+			p.probeDisk(ctx, t, dev.Props)
 			return dev
 		}
 		dev.State = DeviceOffline
@@ -150,13 +151,8 @@ func (p *Prober) probeDevice(ctx context.Context, t adb.Target, serial string, i
 	props.Capabilities = p.capabilitiesFor(serial, soc, allowLegacyCaps)
 	dev.Props = props
 	p.probeMemTotal(ctx, t, props)
-
-	if res, err := p.Runner.Run(ctx, adb.DiskFreeKB(t, p.deviceWorkdir())); err == nil && res.ExitCode == 0 {
-		if kb, err := ParseDFAvailableKB(res.Stdout); err == nil && kb >= 0 {
-			mb := kb / 1024
-			dev.WorkdirFreeMB = &mb
-		}
-	}
+	p.probeDisk(ctx, t, props)
+	dev.WorkdirFreeMB = props.DiskFreeMB // 同源:WorkdirFreeMB 与 props.DiskFreeMB 一致
 	return dev
 }
 
@@ -173,6 +169,28 @@ func (p *Prober) probeMemTotal(ctx context.Context, t adb.Target, props *DeviceP
 	}
 	mb := kb / 1024
 	props.MemTotalMB = &mb
+}
+
+// probeDisk 探测 workdir 所在文件系统的总/可用空间(df -k),写入 props。
+// Linux 板无 /system/bin/df(2026-08-04 RK3568 实机),走 PATH 里的 df。
+// 失败静默(磁盘是展示信息,非调度必要条件)。
+func (p *Prober) probeDisk(ctx context.Context, t adb.Target, props *DeviceProps) {
+	cmd := adb.DiskFreeKB
+	if props.OS == "linux" {
+		cmd = adb.DiskFreeKBLinux
+	}
+	res, err := p.Runner.Run(ctx, cmd(t, p.deviceWorkdir()))
+	if err != nil || res.ExitCode != 0 {
+		return
+	}
+	if free, err := ParseDFAvailableKB(res.Stdout); err == nil && free >= 0 {
+		mb := free / 1024
+		props.DiskFreeMB = &mb
+	}
+	if total, err := ParseDFTotalKB(res.Stdout); err == nil && total > 0 {
+		mb := total / 1024
+		props.DiskTotalMB = &mb
+	}
 }
 
 // probeAndroidSOC 自动探测 Android 设备的 SoC(2026-08-07):
@@ -330,6 +348,24 @@ func ParseDFAvailableKB(out string) (int64, error) {
 	kb, err := strconv.ParseInt(fields[3], 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("parse df available: %w", err)
+	}
+	return kb, nil
+}
+
+// ParseDFTotalKB 解析 `df -k` 输出的 Total(1K-blocks)列(fields[1],
+// 最后一行数据;与 ParseDFAvailableKB 同源规则)。总空间是设备展示信息。
+func ParseDFTotalKB(out string) (int64, error) {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 2 {
+		return 0, fmt.Errorf("unexpected df output: %q", out)
+	}
+	fields := strings.Fields(lines[len(lines)-1])
+	if len(fields) < 4 {
+		return 0, fmt.Errorf("unexpected df line: %q", lines[len(lines)-1])
+	}
+	kb, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse df total: %w", err)
 	}
 	return kb, nil
 }

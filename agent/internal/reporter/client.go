@@ -66,6 +66,10 @@ type DeviceProps struct {
 	// MemTotalMB 是设备物理内存总量(MB,来自 /proc/meminfo MemTotal)。
 	// 指针:探测失败省略,不谎报 0。
 	MemTotalMB *int64 `json:"mem_total_mb,omitempty"`
+	// DiskTotalMB / DiskFreeMB 是 workdir 所在文件系统的总/可用空间(MB,
+	// 来自 adb shell df -k;2026-08-11 加)。指针:探测失败省略。
+	DiskTotalMB *int64 `json:"disk_total_mb,omitempty"`
+	DiskFreeMB  *int64 `json:"disk_free_mb,omitempty"`
 }
 
 // DeviceInfo 是心跳载荷中的单台设备。WorkdirFreeMB 为指针:

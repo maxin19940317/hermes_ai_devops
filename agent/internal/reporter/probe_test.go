@@ -314,13 +314,15 @@ func TestProbeDevicesMultipleQuestionMarkDevices(t *testing.T) {
 		"devices -l": {Stdout: "List of devices attached\n" +
 			"? device product:qcm6490-Ubuntu transport_id:3\n" +
 			"? device product:trinket transport_id:1\n"},
-		"-t 3 shell /system/bin/getprop ro.serialno":              {Stdout: "\n"},                                    // Linux 板无 ro.serialno
-		"-t 3 shell /bin/cat /proc/device-tree/serial-number":     {ExitCode: 1},                                     // 无 device-tree serial
-		"-t 3 shell /bin/cat /etc/machine-id":                     {Stdout: "6cfa3377e493e7b5f8010b6266134d8c\n"},    // QCS6490 machine-id
-		"-t 3 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "/bin/sh: line 1: getprop: not found\n"}, // Linux 板
-		"-t 3 shell /bin/cat /proc/device-tree/compatible":        {Stdout: "qualcomm,qcm6490\x00\n", ExitCode: 0},
-		"-t 3 shell uname -m":                                     {Stdout: "aarch64\n"},
-		"-t 3 shell /system/bin/df -k /data/local/tmp":            {ExitCode: 1}, // Linux 板无 /system/bin/df
+		"-t 3 shell /system/bin/getprop ro.serialno":          {Stdout: "\n"},                                    // Linux 板无 ro.serialno
+		"-t 3 shell /bin/cat /proc/device-tree/serial-number": {ExitCode: 1},                                     // 无 device-tree serial
+		"-t 3 shell /bin/cat /etc/machine-id":                 {Stdout: "6cfa3377e493e7b5f8010b6266134d8c\n"},    // QCS6490 machine-id
+		"-t 3 shell /system/bin/getprop ro.product.cpu.abi":   {Stdout: "/bin/sh: line 1: getprop: not found\n"}, // Linux 板
+		"-t 3 shell /bin/cat /proc/device-tree/compatible":    {Stdout: "qualcomm,qcm6490\x00\n", ExitCode: 0},
+		"-t 3 shell uname -m":                                 {Stdout: "aarch64\n"},
+		"-t 3 shell /system/bin/df -k /data/local/tmp":        {ExitCode: 1}, // Linux 板无 /system/bin/df
+		"-t 3 shell df -k /data/local/tmp": {Stdout: "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+			"/dev/root 20000000 100 5000000 1% /\n"}, // Linux df(PATH 内)
 		"-t 1 shell /system/bin/getprop ro.serialno":              {Stdout: "513cd3de\n"},
 		"-t 1 shell /system/bin/getprop ro.product.cpu.abi":       {Stdout: "arm64-v8a\n"},
 		"-t 1 shell /system/bin/getprop ro.build.version.release": {Stdout: "12\n"},
@@ -342,12 +344,27 @@ func TestProbeDevicesMultipleQuestionMarkDevices(t *testing.T) {
 		t.Errorf("缺 QCM6125(513cd3de): %v", bySerial)
 	} else if qcm.Props == nil || qcm.Props.SOC != "QCM6125" {
 		t.Errorf("QCM6125 props = %+v, want aliased QCM6125", qcm.Props)
+	} else if qcm.Props.DiskTotalMB == nil || *qcm.Props.DiskTotalMB != 9765 ||
+		qcm.Props.DiskFreeMB == nil || *qcm.Props.DiskFreeMB != 976 {
+		t.Errorf("QCM6125 磁盘 = %v/%v, want 9765/976 MB(df 10000000/1000000 kB)",
+			ptrVal(qcm.Props.DiskTotalMB), ptrVal(qcm.Props.DiskFreeMB))
 	}
 	if qcs, ok := bySerial["6cfa3377e493e7b5f8010b6266134d8c"]; !ok {
 		t.Errorf("缺 QCS6490(machine-id 6cfa...): %v", bySerial)
 	} else if qcs.Props == nil || qcs.Props.SOC != "QCS6490" || qcs.Props.OS != "linux" {
 		t.Errorf("QCS6490 props = %+v, want linux QCS6490", qcs.Props)
+	} else if qcs.Props.DiskTotalMB == nil || *qcs.Props.DiskTotalMB != 19531 ||
+		qcs.Props.DiskFreeMB == nil || *qcs.Props.DiskFreeMB != 4882 {
+		t.Errorf("QCS6490 磁盘 = %v/%v, want 19531/4882 MB(df 20000000/5000000 kB)",
+			ptrVal(qcs.Props.DiskTotalMB), ptrVal(qcs.Props.DiskFreeMB))
 	}
+}
+
+func ptrVal(p *int64) int64 {
+	if p == nil {
+		return -1
+	}
+	return *p
 }
 
 func TestParseMemTotalKB(t *testing.T) {
@@ -498,5 +515,25 @@ func TestValidSOCAcceptsModelNumbers(t *testing.T) {
 		if validSOC(s) {
 			t.Errorf("validSOC(%q) = true, want false", s)
 		}
+	}
+}
+
+// ParseDFTotalKB / ParseDFAvailableKB 解析 df -k 输出的 Total 与 Available 列
+// (2026-08-11 加 Total;Available 既有)。规则:取最后一行数据,字段序
+// Filesystem 1K-blocks Used Available Use% Mounted on。
+func TestParseDFTotalAndAvailable(t *testing.T) {
+	dfOut := "Filesystem 1K-blocks Used Available Use% Mounted on\n" +
+		"/dev/block/dm-0 67108864 33554432 33554432 50% /data\n"
+	total, err := ParseDFTotalKB(dfOut)
+	if err != nil || total != 67108864 {
+		t.Errorf("ParseDFTotalKB = %d, %v; want 67108864", total, err)
+	}
+	free, err := ParseDFAvailableKB(dfOut)
+	if err != nil || free != 33554432 {
+		t.Errorf("ParseDFAvailableKB = %d, %v; want 33554432", free, err)
+	}
+	// 非法输出
+	if _, err := ParseDFTotalKB("single line"); err == nil {
+		t.Error("ParseDFTotalKB 应拒绝单行输出")
 	}
 }
