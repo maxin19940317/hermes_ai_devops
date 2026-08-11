@@ -204,8 +204,28 @@ func TestStatusAndDevicesReply(t *testing.T) {
 	sender.texts = nil
 	exec.HandleMessage(ctx, wlOpenID, "devices")
 	if !strings.Contains(sender.texts[0], "dev1") || !strings.Contains(sender.texts[0], "SoC=QCM6125") ||
-		!strings.Contains(sender.texts[0], "失败=0") {
+		!strings.Contains(sender.texts[0], "失败=0") || !strings.Contains(sender.texts[0], "内存=-") {
 		t.Errorf("devices 回复 = %q", sender.texts[0])
+	}
+}
+
+// TestDevicesTextIncludesMemory:文本渲染(formatDeviceLine)必须含内存字段,
+// 与飞书卡片同源(2026-08-11:Hermes 走 cmdapi 文本时曾缺内存)。
+func TestDevicesTextIncludesMemory(t *testing.T) {
+	st := store.NewMemStore()
+	mem := int64(7304)
+	if err := st.UpsertClientDevices(ctx, store.Client{ClientID: "c1"},
+		[]store.Device{{DeviceID: "dev-qcs", Serial: "6cfa", ClientID: "c1", SOC: "QCS6490", MemTotalMB: &mem}}); err != nil {
+		t.Fatal(err)
+	}
+	sender := &fakeSender{}
+	exec := newExec(st, &fakeStarter{}, sender)
+	exec.HandleMessage(ctx, wlOpenID, "devices")
+	if len(sender.texts) != 1 {
+		t.Fatalf("texts = %v", sender.texts)
+	}
+	if !strings.Contains(sender.texts[0], "内存=7.1GB") {
+		t.Errorf("devices 文本缺内存: %q", sender.texts[0])
 	}
 }
 

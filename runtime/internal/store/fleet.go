@@ -22,6 +22,10 @@ type DeviceStatus struct {
 
 	ClientID         string // 归属 client
 	ClientFailStreak int    // 该 client 的连续失败计数(差距 #10)
+
+	// MemTotalMB 是设备物理内存总量(MB,Agent 从 /proc/meminfo 探测上报;
+	// 探测失败为 nil)。文本渲染(formatDeviceLine)与飞书卡片同源展示。
+	MemTotalMB *int64
 }
 
 // FleetOverview 是 status 指令的汇总视图。
@@ -60,6 +64,7 @@ func (s *MemStore) FleetOverview(_ context.Context) (*FleetOverview, error) {
 			DeviceID: row.DeviceID, Serial: row.Serial, DisplayName: row.DisplayName, SOC: row.SOC,
 			Status: row.Status, FailStreak: row.FailStreak, LeaseTaskID: leaseTask,
 			ClientID: row.ClientID, ClientFailStreak: s.clientFailStreak[row.ClientID],
+			MemTotalMB: row.MemTotalMB,
 		})
 	}
 	return out, nil
