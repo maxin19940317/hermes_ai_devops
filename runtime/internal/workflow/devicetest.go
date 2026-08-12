@@ -229,6 +229,10 @@ type ExtractEvidenceRequest struct {
 	Variant string           `json:"variant"`
 	Project string           `json:"project"` // 基线查询键(§9 metrics 表)
 	Result  TaskResultSignal `json:"result"`
+	// Signatures 是变体失败签名(业务仓库 variants.yaml 声明,2026-08-12 解耦)。
+	// workflow 从 spec.Package.FailureSignatures 传入;空 → 活动侧按既有
+	// 行为从 SpecCfg 降级(滚动升级兼容)。
+	Signatures []VariantSignature `json:"signatures,omitempty"`
 }
 
 // ExtractEvidenceResponse 携带 evidence.json 序列化形态及其 sha256 摘要;
@@ -783,6 +787,7 @@ func extractEvidenceOnce(ctx workflow.Context, taskID string, spec TestSpec, res
 	var ev ExtractEvidenceResponse
 	if err := workflow.ExecuteActivity(ctx, "ExtractEvidence", ExtractEvidenceRequest{
 		TaskID: taskID, Variant: spec.Variant, Project: project, Result: *res,
+		Signatures: spec.Package.FailureSignatures,
 	}).Get(ctx, &ev); err != nil {
 		workflow.GetLogger(ctx).Error("extract evidence failed, rule decision stands", "task", taskID, "error", err)
 		return nil

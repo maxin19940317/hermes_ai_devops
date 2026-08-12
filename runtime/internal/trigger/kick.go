@@ -34,6 +34,10 @@ type kickPayload struct {
 	// (N 取自 artifacts.workflow_attempt 原子递增);缺省 false = 普通触发,
 	// 同 ID 已存在一律幂等不再启动(无论上次成败)。
 	Retry bool `json:"retry"`
+	// Requirements / FailureSignatures 是业务仓库 variants.yaml 声明的设备
+	// 调度约束与失败签名(2026-08-12 解耦:单变体触发自包含,不依赖 artifact)。
+	Requirements      *wf.VariantRequirements `json:"requirements,omitempty"`
+	FailureSignatures []wf.VariantSignature   `json:"failure_signatures,omitempty"`
 }
 
 var (
@@ -142,6 +146,9 @@ func (h *Handler) HandleKick(w http.ResponseWriter, r *http.Request) {
 		Variant: p.Variant, BuildType: "Release", // 见 store.Artifact 的 CONTRACT-ISSUE
 		Version: p.Version, URL: p.URL, SHA256: p.SHA256, Size: p.Size,
 		ManifestDigest: p.ManifestDigest,
+		// 2026-08-12 解耦:单变体触发自包含调度约束与签名。
+		VariantRequirements: p.Requirements,
+		VariantSignatures:   p.FailureSignatures,
 	}
 	if err := h.store.RegisterArtifacts(r.Context(), []store.Artifact{art}); err != nil {
 		log.Error().Err(err).Msg("register artifacts")
@@ -156,6 +163,7 @@ func (h *Handler) HandleKick(w http.ResponseWriter, r *http.Request) {
 		Packages: []wf.PackageRef{{
 			Variant: p.Variant, PackageFile: p.PackageFile, URL: p.URL,
 			SHA256: p.SHA256, Size: p.Size, ManifestDigest: p.ManifestDigest,
+			Requirements: p.Requirements, FailureSignatures: p.FailureSignatures,
 		}},
 	}
 	if p.Retry {

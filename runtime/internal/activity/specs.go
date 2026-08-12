@@ -195,46 +195,75 @@ func (c *SpecConfig) SignaturesForVariant(variant string) []evidence.Signature {
 func (a *Acts) SelectTestSpecs(ctx context.Context, in wf.DeviceTestInput) (*wf.SpecSelection, error) {
 	sel := &wf.SpecSelection{}
 	for _, p := range in.Packages {
-		v, ok := a.SpecCfg.file.Variants[p.Variant]
-		if !ok {
+		// 2026-08-12 解耦:优先用包携带的 requirements(业务仓库 variants.yaml
+		// 是唯一权威)。旧触发载荷(改动前)无此字段 → 降级到运行时副本 SpecCfg,
+		// 保证滚动升级期间行为不变。SpecCfg 最终会移除。
+		req := p.Requirements
+		if req == nil && a.SpecCfg != nil {
+			if v, ok := a.SpecCfg.file.Variants[p.Variant]; ok {
+				req = &wf.VariantRequirements{
+					OS: v.Requirements.OS, ABI: v.Requirements.ABI,
+					SOC: v.Requirements.SOC, Capabilities: v.Requirements.Capabilities,
+				}
+			}
+		}
+		if req == nil {
+			a.warnf("variant %s: no requirements (neither package nor spec config); skipping", p.Variant)
 			continue
 		}
-		os := v.Requirements.OS
+		os := req.OS
 		if os == "" {
 			os = "android" // 兼容:旧 variants.yaml 可能未显式声明 os
 		}
-		timeout := v.Test.TimeoutSec
-		if timeout == 0 {
-			timeout = a.SpecCfg.file.Defaults.Test.TimeoutSec
-		}
+
+		// 签名:优先包携带的 failure_signatures;旧载荷降级 SpecCfg。
 		sigs := map[string]rules.Category{}
-		switch os {
-		case "linux":
-			for _, s := range a.SpecCfg.file.Defaults.SignaturesCommonLinux {
+		if len(p.FailureSignatures) > 0 {
+			for _, s := range p.FailureSignatures {
 				sigs[s.ID] = rules.Category(s.Classify)
 			}
-		default:
-			for _, s := range a.SpecCfg.file.Defaults.SignaturesCommonAndroid {
-				sigs[s.ID] = rules.Category(s.Classify)
+		} else if a.SpecCfg != nil {
+			if v, ok := a.SpecCfg.file.Variants[p.Variant]; ok {
+				switch os {
+				case "linux":
+					for _, s := range a.SpecCfg.file.Defaults.SignaturesCommonLinux {
+						sigs[s.ID] = rules.Category(s.Classify)
+					}
+				default:
+					for _, s := range a.SpecCfg.file.Defaults.SignaturesCommonAndroid {
+						sigs[s.ID] = rules.Category(s.Classify)
+					}
+				}
+				for _, s := range v.Signatures {
+					sigs[s.ID] = rules.Category(s.Classify)
+				}
 			}
 		}
-		for _, s := range v.Signatures {
-			sigs[s.ID] = rules.Category(s.Classify)
-		}
+
 		d := a.SpecCfg.defaults
+		timeout := d.HardTimeoutMargin
+		if a.SpecCfg != nil {
+			if v, ok := a.SpecCfg.file.Variants[p.Variant]; ok {
+				if v.Test.TimeoutSec != 0 {
+					timeout += v.Test.TimeoutSec
+				} else {
+					timeout += a.SpecCfg.file.Defaults.Test.TimeoutSec
+				}
+			}
+		}
 		spec := wf.TestSpec{
 			TestID:  p.Variant,
 			Variant: p.Variant,
 			Package: p,
 			Selector: wf.DeviceSelector{
 				OS:           os,
-				SOC:          v.Requirements.SOC,
-				Capabilities: v.Requirements.Capabilities,
+				SOC:          req.SOC,
+				Capabilities: req.Capabilities,
 			},
 			SignatureCategory: sigs,
 			MaxInfraRetries:   d.MaxInfraRetries,
 			LeaseSeconds:      d.LeaseSeconds,
-			HardTimeoutSec:    timeout + d.HardTimeoutMargin,
+			HardTimeoutSec:    timeout,
 			DeviceWaitRounds:  d.DeviceWaitRounds,
 			DeviceWaitSeconds: d.DeviceWaitSeconds,
 		}

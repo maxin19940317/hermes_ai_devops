@@ -42,6 +42,10 @@ type Store interface {
 	// ListArtifactsForVariant 返回指定变体最近 limit 条构建(created_at 倒序,
 	// 不限 project)。供 artifacts 指令查构建历史。
 	ListArtifactsForVariant(ctx context.Context, variant string, limit int) ([]store.Artifact, error)
+	// AllVariants 返回每个变体最近登记的 artifact(含调度约束/签名),按
+	// variant 排序。供 DeviceFacts 计算设备可测变体与调度缺口
+	// (2026-08-12 解耦:变体清单来自已登记产物,替代 SpecCfg.VariantNames)。
+	AllVariants(ctx context.Context) ([]store.Artifact, error)
 	NextWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	CurrentWorkflowAttempt(ctx context.Context, project, commitSHA string, pipelineID int, variant string) (int, error)
 	NextWorkflowAttemptAll(ctx context.Context, project, commitSHA string, pipelineID int) (int, error)
@@ -459,7 +463,7 @@ func (e *Executor) devices(ctx context.Context, args []string) (string, error) {
 	}
 	// 缺省 online:表述层可用时走 Smart Reply(规则 Facts + LLM 表述),
 	// LLM 挂/未启用 → 规则文本(在 expressDevices 内部降级)。
-	if scope == "online" && e.Express != nil && e.SpecCfg != nil {
+	if scope == "online" && e.Express != nil {
 		return e.expressDevices(ctx, matched)
 	}
 	var b strings.Builder
@@ -747,6 +751,9 @@ func pkgRef(a store.Artifact) wf.PackageRef {
 	return wf.PackageRef{
 		Variant: a.Variant, URL: a.URL, SHA256: a.SHA256,
 		Size: a.Size, ManifestDigest: a.ManifestDigest,
+		// 2026-08-12 解耦:从 artifact 透传调度约束与签名
+		// (test/rerun 从 artifact 重新派单时,workflow 仍能拿到约束)。
+		Requirements: a.VariantRequirements, FailureSignatures: a.VariantSignatures,
 	}
 }
 

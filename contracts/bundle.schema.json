@@ -49,9 +49,58 @@
             "type": "string",
             "pattern": "^[0-9a-f]{64}$",
             "description": "包内 manifest.yaml 的 sha256,派单时透传给 Client 核对"
+          },
+          "requirements": {
+            "$ref": "#/$defs/requirements",
+            "description": "设备调度约束(业务仓库 variants.yaml 声明,2026-08-12 解耦:Runtime 不再维护变体配置)"
+          },
+          "failure_signatures": {
+            "$ref": "#/$defs/failureSignatures",
+            "description": "失败签名(业务仓库声明;证据提取与规则归类用,2026-08-12 解耦)"
           }
         }
       }
+    }
+  },
+  "$defs": {
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "abi"],
+      "properties": {
+        "os": { "enum": ["android", "linux"] },
+        "abi": { "enum": ["arm64-v8a", "armeabi-v7a", "x86_64"] },
+        "soc": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "允许运行的 SoC 白名单;缺省不限"
+        },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "min_free_storage_mb": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "failureSignatures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "where", "pattern", "classify"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+          "where": { "enum": ["logcat", "stdout", "stderr", "logs", "file"] },
+          "pattern": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "classify": {
+            "type": "string",
+            "enum": ["INFRA", "CODE", "MODEL", "DELEGATE", "DEVICE", "PERF", "UNKNOWN"]
+          }
+        }
+      },
+      "default": []
     }
   }
 }

@@ -78,13 +78,25 @@ func (s *PGStore) CurrentWorkflowAttempt(
 // RegisterArtifacts 幂等登记:同 (project,commit,pipeline,variant) 冲突时忽略。
 func (s *PGStore) RegisterArtifacts(ctx context.Context, arts []Artifact) error {
 	const q = `INSERT INTO artifacts
-		(project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		ON CONFLICT ON CONSTRAINT artifacts_project_key DO NOTHING`
+		(project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest,
+		 variant_requirements, variant_signatures)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT ON CONSTRAINT artifacts_project_key DO UPDATE SET
+			url = EXCLUDED.url, sha256 = EXCLUDED.sha256, size = EXCLUDED.size,
+			manifest_digest = EXCLUDED.manifest_digest,
+			variant_requirements = EXCLUDED.variant_requirements,
+			variant_signatures = EXCLUDED.variant_signatures`
 	for _, a := range arts {
+		var req, sigs any
+		if a.VariantRequirements != nil {
+			req = a.VariantRequirements
+		}
+		if a.VariantSignatures != nil {
+			sigs = a.VariantSignatures
+		}
 		if _, err := s.DB.ExecContext(ctx, q,
 			a.Project, a.CommitSHA, a.PipelineID, a.Variant, a.BuildType,
-			a.Version, a.URL, a.SHA256, a.Size, a.ManifestDigest); err != nil {
+			a.Version, a.URL, a.SHA256, a.Size, a.ManifestDigest, req, sigs); err != nil {
 			return fmt.Errorf("register artifact %s: %w", a.Variant, err)
 		}
 	}

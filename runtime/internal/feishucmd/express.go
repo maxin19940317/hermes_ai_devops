@@ -10,6 +10,7 @@ import (
 
 	"hermes-devops/runtime/internal/activity"
 	"hermes-devops/runtime/internal/hermesclient"
+	wf "hermes-devops/runtime/internal/workflow"
 	"hermes-devops/runtime/internal/store"
 )
 
@@ -21,8 +22,28 @@ func (e *Executor) expressDevices(ctx context.Context, matched []store.DeviceSta
 	if err != nil {
 		return "", err
 	}
-	variants := e.SpecCfg.VariantNames()
-	facts := activity.ComputeDeviceFacts(e.nowFn(), fleet, variants, e.SpecCfg.VariantSelector)
+	// 2026-08-12 解耦:变体清单来自已登记产物(业务仓库权威),不再用
+	// SpecCfg.VariantNames。selectorFor 从 artifact 的 requirements 派生。
+	arts, err := e.Store.AllVariants(ctx)
+	if err != nil {
+		return "", err
+	}
+	variants := make([]string, 0, len(arts))
+	selectorFor := func(variant string) wf.DeviceSelector {
+		for _, a := range arts {
+			if a.Variant == variant && a.VariantRequirements != nil {
+				r := a.VariantRequirements
+				return wf.DeviceSelector{
+					OS: r.OS, SOC: r.SOC, Capabilities: r.Capabilities,
+				}
+			}
+		}
+		return wf.DeviceSelector{}
+	}
+	for _, a := range arts {
+		variants = append(variants, a.Variant)
+	}
+	facts := activity.ComputeDeviceFacts(e.nowFn(), fleet, variants, selectorFor)
 	factsJSON, err := json.Marshal(facts)
 	if err != nil {
 		return "", err

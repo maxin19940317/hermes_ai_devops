@@ -17,6 +17,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
     -- 显式 retry 计数(差距 #11):workflow ID 加 -r{N} 后缀,N 由此列原子递增;
     -- 普通 webhook/kick 重放绝不递增(RejectDuplicate,失败不自动重启)。
     workflow_attempt INTEGER    NOT NULL DEFAULT 0,
+    -- 变体调度约束与失败签名(业务仓库 variants.yaml 声明,2026-08-12 解耦)。
+    -- 登记时写入(webhook 从 bundle / kick 从载荷);旧行为 NULL,触发端降级。
+    variant_requirements JSONB,
+    variant_signatures   JSONB,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT artifacts_project_key
         UNIQUE (project, commit_sha, pipeline_id, variant)

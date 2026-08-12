@@ -181,6 +181,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Variant: p.Variant, BuildType: "Release", // 见 store.Artifact 的 CONTRACT-ISSUE
 			Version: b.Version, URL: p.URL, SHA256: p.SHA256, Size: p.Size,
 			ManifestDigest: p.ManifestDigest,
+			// 2026-08-12 解耦:requirements/signatures 随 artifact 登记,
+			// 供 rerun/test 等从 artifact 重新派单时仍能拿到调度约束。
+			VariantRequirements: p.Requirements,
+			VariantSignatures:   p.FailureSignatures,
 		})
 	}
 	if err := h.store.RegisterArtifacts(r.Context(), arts); err != nil {

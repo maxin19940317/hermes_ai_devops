@@ -154,6 +154,31 @@ func (s *MemStore) ListArtifactsForVariant(
 	return out, nil
 }
 
+// AllVariants 返回每个变体最近登记的一条 artifact(含调度约束/签名),按
+// variant 排序。供 DeviceFacts 计算"设备可测哪些变体"与调度缺口
+// (2026-08-12 解耦:变体清单来自已登记产物,业务仓库是权威)。
+func (s *MemStore) AllVariants(_ context.Context) ([]Artifact, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	type keyed struct {
+		art Artifact
+		seq int64
+	}
+	latest := map[string]keyed{}
+	for _, a := range s.rows {
+		seq := s.rowSeq[artifactKey(a.Project, a.CommitSHA, a.PipelineID, a.Variant)]
+		if cur, ok := latest[a.Variant]; !ok || seq > cur.seq {
+			latest[a.Variant] = keyed{art: a, seq: seq}
+		}
+	}
+	out := make([]Artifact, 0, len(latest))
+	for _, k := range latest {
+		out = append(out, k.art)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Variant < out[j].Variant })
+	return out, nil
+}
+
 // LatestArtifactForVariant 返回指定变体最近登记的产物(按登记序,模拟 created_at
 // 最新,不限 project);无记录返回 nil,nil。供 test 命令缺省 commit 时定位
 // "最近构建"——project 从 artifact 自身带出。

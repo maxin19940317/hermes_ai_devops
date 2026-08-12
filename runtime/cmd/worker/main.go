@@ -51,6 +51,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -172,8 +173,7 @@ func main() {
 	exec := &feishucmd.Executor{
 		Store: st, Log: &log,
 		Starter:  &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
-		Variants: specCfg.VariantNames(),
-		SpecCfg:  specCfg,
+		Variants: variantNamesFromStore(ctx, st),
 	}
 
 	// ---- 飞书指令 listener:白名单(FEISHU_CMD_WHITELIST)非空才启动;
@@ -223,7 +223,7 @@ func main() {
 				exec.Translator = &feishucmd.Translator{
 					Client:   nlClient,
 					Store:    st,
-					Variants: specCfg.VariantNames(),
+					Variants: variantNamesFromStore(ctx, st),
 					Model:    cfg.Activity.HermesModel,
 					Log:      &log,
 				}
@@ -312,12 +312,11 @@ func main() {
 	// 卡片优先指令返回文本),与飞书 listener 的共享 exec 零竞态。
 	// **不能用 `*exec` 复制**(Executor 含 sync.Mutex,pending map 共享引用,
 	// go vet 报 copying locks);新建独立实例,只共享只读依赖
-	// (Store/Starter/SpecCfg/Variants,2026-08-08 Review P4 修复)。
+	// (Store/Starter/Variants,2026-08-08 Review P4 修复)。
 	cmdExec := &feishucmd.Executor{
 		Store: st, Log: &log,
 		Starter:  &trigger.TemporalStarter{Client: tc, TaskQueue: cfg.TemporalTaskQueue},
-		Variants: specCfg.VariantNames(),
-		SpecCfg:  specCfg,
+		Variants: variantNamesFromStore(ctx, st),
 		TextOnly: true,
 	}
 	cmdMux := cb.Mux()
@@ -376,4 +375,21 @@ func main() {
 		log.Fatal().Err(runErr).Msg("worker run")
 	}
 	log.Info().Msg("worker stopped")
+}
+
+// variantNamesFromStore 从已登记产物拉取变体清单(2026-08-12 解耦:
+// 业务仓库 variants.yaml 是唯一权威,变体列表来自 artifacts 表,
+// 不再读运行时 variants.yaml 副本)。查询失败降级为空清单
+// (翻译层显示"无已知变体",不影响执行关键路径)。
+func variantNamesFromStore(ctx context.Context, st feishucmd.Store) []string {
+	arts, err := st.AllVariants(ctx)
+	if err != nil {
+		return []string{}
+	}
+	out := make([]string, 0, len(arts))
+	for _, a := range arts {
+		out = append(out, a.Variant)
+	}
+	sort.Strings(out)
+	return out
 }

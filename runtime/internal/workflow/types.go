@@ -17,6 +17,32 @@ type PackageRef struct {
 	SHA256         string `json:"sha256"`
 	Size           int64  `json:"size"`
 	ManifestDigest string `json:"manifest_digest"`
+	// Requirements / FailureSignatures 是业务仓库 variants.yaml 声明的设备
+	// 调度约束与失败签名(2026-08-12 解耦:触发端从 bundle/kick 带入,workflow
+	// 据此做设备匹配与证据提取,不再查 Runtime 自己的变体配置)。
+	// 旧触发载荷(改动前)为空 → SelectTestSpecs 按既有行为降级。
+	Requirements      *VariantRequirements `json:"requirements,omitempty"`
+	FailureSignatures []VariantSignature   `json:"failure_signatures,omitempty"`
+}
+
+// VariantRequirements 是业务仓库 variants.yaml 声明的设备调度约束
+// (与 Manifest requirements 同构;bundle/kick 携带,2026-08-12 解耦)。
+// 定义在 workflow 包:store 依赖 workflow(store → workflow),反向会循环。
+type VariantRequirements struct {
+	OS               string   `json:"os"`
+	ABI              string   `json:"abi"`
+	SOC              []string `json:"soc,omitempty"`
+	Capabilities     []string `json:"capabilities,omitempty"`
+	MinFreeStorageMB int      `json:"min_free_storage_mb,omitempty"`
+}
+
+// VariantSignature 是失败签名(业务仓库 variants.yaml 声明;证据提取与
+// 规则归类用,与 Manifest failure_signatures 同构)。
+type VariantSignature struct {
+	ID       string `json:"id"`
+	Where    string `json:"where"`
+	Pattern  string `json:"pattern"`
+	Classify string `json:"classify"`
 }
 
 // DeviceTestInput 是 DeviceTestWorkflow 的启动输入,由 Trigger 从 bundle 派生。

@@ -58,6 +58,16 @@ def test_full_set_produces_schema_valid_bundle(tmp_path):
     assert [p["variant"] for p in bundle["packages"]] == all_variants()
     # 顶层已有 project/commit 等,packages 内不重复携带
     assert "commit" not in bundle["packages"][0]
+    # 2026-08-12 解耦:每个 package 必须携带 requirements 与 failure_signatures
+    # (业务仓库 variants.yaml 声明;Runtime 据此调度/取证,不再维护副本)。
+    for p in bundle["packages"]:
+        assert p["requirements"].get("os") in ("android", "linux"), p
+        assert p["requirements"].get("abi"), p
+        assert p["requirements"].get("soc"), p
+        assert isinstance(p["failure_signatures"], list), p
+    # QCS6125 变体:soc 约束必须含 QCS6125(防漂移,2026-08-11 bug 回归)
+    q6125 = next(p for p in bundle["packages"] if "QCS6125" in p["variant"])
+    assert "QCS6125" in q6125["requirements"]["soc"], q6125
 
 
 def test_missing_one_meta_blocks_bundle(tmp_path):

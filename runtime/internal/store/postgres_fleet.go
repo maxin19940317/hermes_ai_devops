@@ -83,7 +83,8 @@ func (s *PGStore) ListArtifacts(
 	ctx context.Context, project, commitSHA string, pipelineID int,
 ) ([]Artifact, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest
+		SELECT project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest,
+		       variant_requirements, variant_signatures
 		FROM artifacts WHERE project = $1 AND commit_sha = $2 AND pipeline_id = $3 ORDER BY variant`,
 		project, commitSHA, pipelineID)
 	if err != nil {
@@ -93,11 +94,18 @@ func (s *PGStore) ListArtifacts(
 	out := []Artifact{}
 	for rows.Next() {
 		var a Artifact
+		var req *VariantRequirements
+		var sigs *[]VariantSignature
 		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
-			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest); err != nil {
+			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest,
+			&req, &sigs); err != nil {
 			return nil, fmt.Errorf("list artifacts %s/%s/%d: scan: %w",
 				project, commitSHA, pipelineID, err)
 		}
+		if sigs != nil {
+			a.VariantSignatures = *sigs
+		}
+		a.VariantRequirements = req
 		out = append(out, a)
 	}
 	if err := rows.Err(); err != nil {
@@ -115,7 +123,8 @@ func (s *PGStore) ListArtifactsForVariant(
 		limit = 20 // 防滥用:飞书指令最多看 20 条
 	}
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest
+		SELECT project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest,
+		       variant_requirements, variant_signatures
 		FROM artifacts WHERE variant = $1
 		ORDER BY created_at DESC, artifact_id DESC LIMIT $2`,
 		variant, limit)
@@ -126,10 +135,17 @@ func (s *PGStore) ListArtifactsForVariant(
 	out := []Artifact{}
 	for rows.Next() {
 		var a Artifact
+		var req *VariantRequirements
+		var sigs *[]VariantSignature
 		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
-			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest); err != nil {
+			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest,
+			&req, &sigs); err != nil {
 			return nil, fmt.Errorf("list artifacts for variant %s: scan: %w", variant, err)
 		}
+		if sigs != nil {
+			a.VariantSignatures = *sigs
+		}
+		a.VariantRequirements = req
 		out = append(out, a)
 	}
 	if err := rows.Err(); err != nil {
@@ -144,13 +160,21 @@ func (s *PGStore) LatestArtifactForVariant(
 	ctx context.Context, variant string,
 ) (*Artifact, error) {
 	row := s.DB.QueryRowContext(ctx, `
-		SELECT project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest
+		SELECT project, commit_sha, pipeline_id, variant, build_type, version, url, sha256, size, manifest_digest,
+		       variant_requirements, variant_signatures
 		FROM artifacts WHERE variant = $1
 		ORDER BY created_at DESC, artifact_id DESC LIMIT 1`,
 		variant)
 	var a Artifact
+	var req *VariantRequirements
+	var sigs *[]VariantSignature
 	err := row.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
-		&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest)
+		&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest,
+		&req, &sigs)
+	if sigs != nil {
+		a.VariantSignatures = *sigs
+	}
+	a.VariantRequirements = req
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -353,4 +377,37 @@ func (s *PGStore) recentRuns(
 		return nil, fmt.Errorf("recent runs: commit: %w", err)
 	}
 	return out, nil
+}
+
+// AllVariants 返回每个变体最近登记的一条 artifact(含调度约束/签名),按
+// variant 排序。供 DeviceFacts 计算"设备可测哪些变体"与调度缺口
+// (2026-08-12 解耦:变体清单来自已登记产物,业务仓库是权威)。
+func (s *PGStore) AllVariants(ctx context.Context) ([]Artifact, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT DISTINCT ON (variant) project, commit_sha, pipeline_id, variant,
+		       build_type, version, url, sha256, size, manifest_digest,
+		       variant_requirements, variant_signatures
+		FROM artifacts
+		ORDER BY variant, created_at DESC, artifact_id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("all variants: %w", err)
+	}
+	defer rows.Close()
+	out := []Artifact{}
+	for rows.Next() {
+		var a Artifact
+		var req *VariantRequirements
+		var sigs *[]VariantSignature
+		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
+			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest,
+			&req, &sigs); err != nil {
+			return nil, fmt.Errorf("all variants: scan: %w", err)
+		}
+		if sigs != nil {
+			a.VariantSignatures = *sigs
+		}
+		a.VariantRequirements = req
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }

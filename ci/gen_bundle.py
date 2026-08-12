@@ -45,7 +45,8 @@ def _normalize_created_at(value):
 
 def gen_bundle(*, meta_dir, variants_file, schema_file, outdir, created_at) -> Path:
     meta_dir = Path(meta_dir)
-    variants = sorted(yaml.safe_load(Path(variants_file).read_text(encoding="utf-8"))["variants"])
+    variants_data = yaml.safe_load(Path(variants_file).read_text(encoding="utf-8"))
+    variants = sorted(variants_data["variants"])
 
     missing = [v for v in variants if not (meta_dir / f"{v}.json").exists()]
     if missing:
@@ -63,14 +64,23 @@ def gen_bundle(*, meta_dir, variants_file, schema_file, outdir, created_at) -> P
             raise SystemExit(f"inconsistent {key!r} across metas: {sorted(values)}")
 
     shared = {key: metas[variants[0]][key] for key in SHARED_FIELDS}
+
+    def package_entry(v):
+        entry = {k: metas[v][k] for k in PACKAGE_FIELDS}
+        # 2026-08-12 解耦:业务仓库 variants.yaml 是唯一权威。每个 package
+        # 携带调度约束(requirements)与失败签名(failure_signatures),
+        # Runtime 据此做设备匹配与证据提取,不再维护自己的变体配置。
+        decl = variants_data["variants"][v]
+        entry["requirements"] = decl.get("requirements") or {}
+        entry["failure_signatures"] = _merge_signatures(variants_data, decl)
+        return entry
+
     bundle = {
         "bundle_version": 1,
         **shared,
         "rule_version": DEFAULT_RULE_VERSION,
         "created_at": _normalize_created_at(created_at),
-        "packages": [
-            {k: metas[v][k] for k in PACKAGE_FIELDS} for v in variants
-        ],
+        "packages": [package_entry(v) for v in variants],
     }
 
     with Path(schema_file).open(encoding="utf-8") as f:
@@ -88,6 +98,39 @@ def gen_bundle(*, meta_dir, variants_file, schema_file, outdir, created_at) -> P
     )
     out.write_text(json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8")
     return out
+
+
+def _merge_signatures(variants_data, decl):
+    """合并 defaults.signatures_common_* 与变体自身 signatures(变体覆盖)。
+
+    与 Runtime SignaturesForVariant 的合并语义一致:先公共后变体,
+    同 id 变体覆盖公共。返回 [{id,where,pattern,classify}] 列表。
+    """
+    os_ = (decl.get("requirements") or {}).get("os", "android")
+    common_key = (
+        "signatures_common_linux" if os_ == "linux" else "signatures_common_android"
+    )
+    merged = {}
+    order = []
+    for d in (variants_data.get("defaults") or {}).get(common_key) or []:
+        if d["id"] not in merged:
+            order.append(d["id"])
+        merged[d["id"]] = {
+            "id": d["id"],
+            "where": d.get("where", "logs"),
+            "pattern": d["pattern"],
+            "classify": d["classify"],
+        }
+    for d in decl.get("signatures") or []:
+        if d["id"] not in merged:
+            order.append(d["id"])
+        merged[d["id"]] = {
+            "id": d["id"],
+            "where": d.get("where", "logs"),
+            "pattern": d["pattern"],
+            "classify": d["classify"],
+        }
+    return [merged[k] for k in order]
 
 
 def main(argv):

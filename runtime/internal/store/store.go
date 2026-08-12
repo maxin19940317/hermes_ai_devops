@@ -33,7 +33,21 @@ type Artifact struct {
 	ManifestDigest string // 派单时透传给 Client 核对(§8.1)
 	// WorkflowAttempt 显式 retry 计数(差距 #11):>0 时 workflow ID 加 -r{N}。
 	WorkflowAttempt int
+
+	// VariantRequirements / VariantSignatures 是业务仓库 variants.yaml 声明的
+	// 设备调度约束与失败签名(2026-08-12 解耦:Runtime 不再维护变体配置副本)。
+	// 触发端(webhook 从 bundle / kick 从载荷)登记时写入;旧行为 nil,派单时
+	// 按既有行为降级(不约束设备 / 无签名)。展示信息与调度依据,非产物本体。
+	VariantRequirements *wf.VariantRequirements
+	VariantSignatures   []wf.VariantSignature
 }
+
+// VariantRequirements / VariantSignature 别名到 workflow 包的定义
+// (store 依赖 workflow;类型单一事实源,2026-08-12 解耦)。
+type (
+	VariantRequirements = wf.VariantRequirements
+	VariantSignature    = wf.VariantSignature
+)
 
 // ArtifactStore 登记产物;实现必须幂等(同一 (project,commit,pipeline,variant)
 // 重复登记无效果)。NextWorkflowAttempt 供显式 retry 派生 -r{N} 序号(差距 #11);

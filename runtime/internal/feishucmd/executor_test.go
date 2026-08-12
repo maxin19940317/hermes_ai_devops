@@ -1484,17 +1484,24 @@ func newExpressExec(t *testing.T, express *fakeExpress) (*store.MemStore, *Execu
 	}); err != nil {
 		t.Fatal(err)
 	}
-	sel := map[string]wf.DeviceSelector{
-		"aarch64_Linux_QCS6490_SNPE_2.21":   {OS: "linux", SOC: []string{"QCS6490"}, Capabilities: []string{"hexagon"}},
-		"aarch64_Android_RK3568_RKNN_2.3.2": {OS: "android", SOC: []string{"rk3568"}, Capabilities: []string{"rknpu"}},
-		"aarch64_Android_QCM6125_SNPE_1.68": {OS: "android", SOC: []string{"QCM6125"}, Capabilities: []string{"hexagon"}},
+	// 2026-08-12 解耦:express 从已登记 artifact 的 requirements 取变体清单,
+	// 不再用 SpecCfg。seed 三个变体的 artifact(含 requirements)。
+	arts := []store.Artifact{
+		{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42, Variant: "aarch64_Android_QCM6125_SNPE_1.68",
+			URL: "https://r/q.tar.gz", VariantRequirements: &wf.VariantRequirements{
+				OS: "android", ABI: "arm64-v8a", SOC: []string{"QCM6125"}, Capabilities: []string{"hexagon"}}},
+		{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42, Variant: "aarch64_Android_RK3568_RKNN_2.3.2",
+			URL: "https://r/r.tar.gz", VariantRequirements: &wf.VariantRequirements{
+				OS: "android", ABI: "arm64-v8a", SOC: []string{"rk3568"}, Capabilities: []string{"rknpu"}}},
+		{Project: "grp/p", CommitSHA: "abcd1234", PipelineID: 42, Variant: "aarch64_Linux_QCS6490_SNPE_2.21",
+			URL: "https://r/q9.tar.gz", VariantRequirements: &wf.VariantRequirements{
+				OS: "linux", ABI: "arm64-v8a", SOC: []string{"QCS6490"}, Capabilities: []string{"hexagon"}}},
+	}
+	if err := st.RegisterArtifacts(ctx, arts); err != nil {
+		t.Fatal(err)
 	}
 	e := newExec(st, &fakeStarter{}, &fakeSender{})
 	e.Express = express
-	e.SpecCfg = &fakeSpecCfg{
-		variants: []string{"aarch64_Android_QCM6125_SNPE_1.68", "aarch64_Android_RK3568_RKNN_2.3.2", "aarch64_Linux_QCS6490_SNPE_2.21"},
-		sel:      sel,
-	}
 	return st, e
 }
 

@@ -46,7 +46,16 @@ func (a *Acts) ExtractEvidence(ctx context.Context, req wf.ExtractEvidenceReques
 		SignaturesHitReported: req.Result.SignaturesHit,
 		Metrics:               req.Result.Metrics,
 	}
-	if a.SpecCfg != nil {
+	if len(req.Signatures) > 0 {
+		// 2026-08-12 解耦:签名来自包(业务仓库声明)。
+		in.Signatures = make([]evidence.Signature, 0, len(req.Signatures))
+		for _, s := range req.Signatures {
+			in.Signatures = append(in.Signatures, evidence.Signature{
+				ID: s.ID, Where: s.Where, Pattern: s.Pattern, Classify: s.Classify,
+			})
+		}
+	} else if a.SpecCfg != nil {
+		// 旧载荷(改动前):降级到运行时副本。
 		in.Signatures = a.SpecCfg.SignaturesForVariant(req.Variant)
 	}
 	in.Files, in.Missing = a.fetchEvidenceFiles(ctx, req.Result.Attachments)
