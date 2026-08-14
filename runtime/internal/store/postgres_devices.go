@@ -121,7 +121,8 @@ func (s *PGStore) AcquireDevice(ctx context.Context, sel wf.DeviceSelector, task
 	}
 	return &wf.Lease{
 		DeviceID: chosen.DeviceID, Serial: chosen.Serial,
-		ClientID: chosen.ClientID, ClientBaseURL: baseURL,
+		DeviceName: chosen.DisplayName,
+		ClientID:   chosen.ClientID, ClientBaseURL: baseURL,
 		LeaseID: leaseID, Generation: generation,
 	}, nil
 }
@@ -152,7 +153,7 @@ func (s *PGStore) lockOneCandidate(ctx context.Context, tx *sql.Tx, sel wf.Devic
 
 	var d Device
 	err := tx.QueryRowContext(ctx, `
-		SELECT d.device_id, d.serial, d.client_id, d.soc, d.abi, d.capabilities, d.os
+		SELECT d.device_id, d.serial, d.display_name, d.client_id, d.soc, d.abi, d.capabilities, d.os
 		FROM devices d
 		LEFT JOIN device_leases l ON l.device_id = d.device_id
 		WHERE (d.status = 'IDLE' OR (d.status = 'BUSY' AND l.lease_expires_at < now()))
@@ -164,7 +165,7 @@ func (s *PGStore) lockOneCandidate(ctx context.Context, tx *sql.Tx, sel wf.Devic
 		LIMIT 1
 		FOR UPDATE OF d SKIP LOCKED`,
 		os, pq.Array(socs), pq.Array(caps)).Scan(
-		&d.DeviceID, &d.Serial, &d.ClientID, &d.SOC, &d.ABI, pq.Array(&d.Capabilities), &d.OS)
+		&d.DeviceID, &d.Serial, &d.DisplayName, &d.ClientID, &d.SOC, &d.ABI, pq.Array(&d.Capabilities), &d.OS)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

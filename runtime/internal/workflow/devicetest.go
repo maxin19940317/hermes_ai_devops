@@ -95,6 +95,9 @@ type ExplainNoDeviceRequest struct {
 type Lease struct {
 	DeviceID      string `json:"device_id"`
 	Serial        string `json:"serial"`
+	// DeviceName 是设备的可读显示名(devices.display_name,如 QCS6490-6cfa...)。
+	// 随通知透出,让用户知道测试跑在哪台设备(2026-08-14)。
+	DeviceName    string `json:"device_name"`
 	ClientID      string `json:"client_id"`
 	ClientBaseURL string `json:"client_base_url"`
 	LeaseID       string `json:"lease_id"`
@@ -291,6 +294,8 @@ type TaskSummary struct {
 	Variant     string       `json:"variant"`
 	TaskID      string       `json:"task_id"`
 	Attempt     int          `json:"attempt"` // 最终 attempt 序号
+	// DeviceName 是执行本任务的设备显示名(如 QCS6490-6cfa...);SKIPPED 为空。
+	DeviceName  string       `json:"device_name,omitempty"`
 	Verdict     string       `json:"verdict"`
 	Category    string       `json:"category"`
 	Reason      string       `json:"reason"`
@@ -617,6 +622,8 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 			return infra("acquire device: "+err.Error(), true)
 		}
 		if lease != nil {
+			// 设备已锁定:记录显示名,随通知透出(2026-08-14)。
+			sum.DeviceName = lease.DeviceName
 			break
 		}
 		if round >= spec.DeviceWaitRounds {
@@ -991,6 +998,9 @@ func buildNotification(in DeviceTestInput, out *DeviceTestOutput) string {
 		if tk.Category != "" && tk.Verdict != string(rules.VerdictPassed) {
 			fmt.Fprintf(&b, "(%s)", tk.Category)
 		}
+		if tk.DeviceName != "" {
+			fmt.Fprintf(&b, " · %s", tk.DeviceName)
+		}
 		// 精练格式(§12.6):耗时与用例通过数是性能一瞥;附件 key 不进通知,
 		// 需要时按 task_id 到 MinIO 取。
 		if tk.CasesTotal > 0 {
@@ -1249,6 +1259,7 @@ func cardHeaderTemplate(tasks []TaskSummary) string {
 // actions 是变体失败时的交互按钮组("重试该变体"/"忽略"),不占裁剪预算。
 type cardVariantBlock struct {
 	main    CardElement
+	device  *CardElement // 设备显示名(2026-08-14)
 	metric  *CardElement
 	metrics *CardElement
 	reason  []CardElement // 0..n 行;每行独立 div(列表项/段落)
@@ -1265,6 +1276,9 @@ func (b *cardVariantBlock) clearDetail() {
 
 func (b cardVariantBlock) flatten() []CardElement {
 	es := []CardElement{b.main}
+	if b.device != nil {
+		es = append(es, *b.device)
+	}
 	if b.metric != nil {
 		es = append(es, *b.metric)
 	}
@@ -1298,6 +1312,12 @@ func buildCardVariantBlock(tk TaskSummary, workflowID string) cardVariantBlock {
 		main += " <font color='red'>❌</font>"
 	}
 	blk := cardVariantBlock{main: mdCardDiv(main)}
+
+	// 设备名独立成行(2026-08-14):让用户知道结论出自哪台板。
+	if tk.DeviceName != "" {
+		d := mdCardDiv("📱 " + escapeCardText(tk.DeviceName))
+		blk.device = &d
+	}
 
 	var parts []string
 	if tk.CasesTotal > 0 {

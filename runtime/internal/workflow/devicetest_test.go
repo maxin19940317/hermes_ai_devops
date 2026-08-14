@@ -1463,8 +1463,10 @@ func sampleInput() DeviceTestInput {
 func sampleOutput() *DeviceTestOutput {
 	return &DeviceTestOutput{Tasks: []TaskSummary{
 		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "PASSED",
+			DeviceName: "QCM6125-513cd3de",
 			DurationSec: 412.3, CasesTotal: 38, CasesFailed: 0, Attempt: 1},
 		{Variant: "aarch64_Android_SNPE_1.68", Verdict: "TEST_FAILED", Category: "CODE",
+			DeviceName: "QCM6490-abc",
 			DurationSec: 380.14, CasesTotal: 38, CasesFailed: 3, Attempt: 2,
 			Reason:   "three cases crashed",
 			Analysis: &hermesclient.Analysis{Summary: "DSP 初始化崩溃"}},
@@ -2050,5 +2052,23 @@ func TestParallelSpecsStaleSignalDoesNotBlockDemux(t *testing.T) {
 	}
 	if out.Tasks[0].Verdict != "PASSED" || out.Tasks[1].Verdict != "PASSED" {
 		t.Errorf("两 spec 都应 PASSED(迟到信号不得饿死 t2): %+v", out.Tasks)
+	}
+}
+
+// TestNotificationIncludesDeviceName:终态通知的文本与卡片都带设备名
+// (2026-08-14:用户需要知道结论出自哪台板)。
+func TestNotificationIncludesDeviceName(t *testing.T) {
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "PASSED",
+			DeviceName: "QCM6125-513cd3de", DurationSec: 1.2, CasesTotal: 1, Attempt: 1},
+	}}
+	text := buildNotification(sampleInput(), out)
+	if !strings.Contains(text, "QCM6125-513cd3de") {
+		t.Errorf("纯文本缺设备名: %q", text)
+	}
+	card := buildNotificationCard(sampleInput(), out, "")
+	raw, _ := json.Marshal(card)
+	if !strings.Contains(string(raw), "QCM6125-513cd3de") {
+		t.Errorf("卡片缺设备名: %s", raw)
 	}
 }

@@ -169,6 +169,7 @@ func (s *MemStore) AcquireDevice(_ context.Context, sel wf.DeviceSelector, taskI
 		return &wf.Lease{
 			DeviceID:      row.DeviceID,
 			Serial:        row.Serial,
+			DeviceName:    row.DisplayName,
 			ClientID:      row.ClientID,
 			ClientBaseURL: s.clients[row.ClientID].BaseURL,
 			LeaseID:       row.LeaseID,
