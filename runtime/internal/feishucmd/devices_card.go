@@ -69,30 +69,12 @@ type deviceTableCol struct {
 	Width       string `json:"width,omitempty"`
 }
 
-// deviceTableRowObj 是一行:以 column name 为键,值为 cell。
-type deviceTableRowObj map[string]deviceTableCell
-
-type deviceTableCell struct {
-	Text deviceCellText `json:"text"`
-}
-
-type deviceCellText struct {
-	Tag       string          `json:"tag"` // markdown
-	Content   string          `json:"content"`
-	TextStyle *deviceCellStyle `json:"text_style,omitempty"`
-}
-
-type deviceCellStyle struct {
-	Background string `json:"background,omitempty"` // blue | grey 等
-}
-
-// zebra 交替行底纹:偶数行 blue,奇数行 grey(2026-08-14,飞书实测支持)。
-func zebraBG(rowIdx int) string {
-	if rowIdx%2 == 0 {
-		return "blue"
-	}
-	return "grey"
-}
+// deviceTableRowObj 是一行:以 column name 为键,值为 cell 文本。
+// ⚠️ 实测(2026-08-14):飞书 table 的 cell 必须是**纯字符串**(markdown)。
+// 对象 cell({text:{...}})虽然 API 接受,但 UI 渲染成原始 map 结构(用户实测)。
+// 同理 cell 不支持 text_style.background,行底纹/斑马纹在飞书 table 组件
+// 里无法原生实现——替代:设备名列加粗 + 表头自动高亮。
+type deviceTableRowObj map[string]string
 
 // renderDeviceTableCard 渲染设备列表为飞书 schema 2.0 table 卡片。
 // 返回卡片(直接作 SendCard 的 card 参数);空列表 → 返回空(调用方回纯文本)。
@@ -109,28 +91,20 @@ func renderDeviceTableCard(rows []deviceTableRow) (any, error) {
 			Width:       tableColWidth(i),
 		})
 	}
-	// 数据行 + 斑马纹;设备名列加粗(表头高亮的补充)。
+	// 数据行;设备名列加粗(markdown),其余列原样文本。
+	// 飞书 table cell 只接受字符串,故无对象 cell / 行底纹(实测见上)。
 	tableRows := make([]deviceTableRowObj, 0, len(rows))
-	for i, r := range rows {
-		bg := zebraBG(i)
+	for _, r := range rows {
 		obj := deviceTableRowObj{}
 		for j := range deviceColumns {
 			content := ""
 			if j < len(r) {
 				content = r[j]
 			}
-			// 设备列(第 0 列)加粗,体现设备名是主信息。
-			md := escapeCellText(content)
 			if j == 0 {
-				md = "**" + md + "**"
+				content = "**" + escapeCellText(content) + "**"
 			}
-			obj[fmt.Sprintf("c%d", j)] = deviceTableCell{
-				Text: deviceCellText{
-					Tag:       "markdown",
-					Content:   md,
-					TextStyle: &deviceCellStyle{Background: bg},
-				},
-			}
+			obj[fmt.Sprintf("c%d", j)] = content
 		}
 		tableRows = append(tableRows, obj)
 	}
