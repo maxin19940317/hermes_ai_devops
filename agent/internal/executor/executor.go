@@ -694,8 +694,9 @@ func (e *Executor) collect(ctx context.Context, t adb.Target, m *manifest.Manife
 			}
 			// 报错文本防护(见 collectedPathOK doc):老 adbd 把 ls 报错混进
 			// stdout 且 exit 0,不能当路径处理,否则 Windows mkdir 直接崩。
+			// 静默跳过:"文件不存在"是 collect 的正常情况(manifest 声明了
+			// results/junit.xml 但测试未产出),不构成需要提示的事件。
 			if !collectedPathOK.MatchString(rel) {
-				e.logf("collect %q: skipping non-path output line %q", pattern, rel)
 				continue
 			}
 			seen[rel] = true
