@@ -305,6 +305,19 @@ func (h *Handler) taskEvent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_event", "invalid task event")
 		return
 	}
+	// 与 results 路径一致:任务不存在 → 400 unknown_task(永久拒绝)。
+	// 否则事件插入会违反 task_events 外键 → 500 store_error,agent 视为
+	// 可重试无限补报(2026-08-14 孤儿事件:任务在 Runtime 侧被清理后,agent
+	// 本地遗留的未上报事件每轮心跳都报错)。400 = 不重发,agent 按已上报处理。
+	row, err := h.store.GetTask(r.Context(), ev.TaskID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+		return
+	}
+	if row == nil {
+		writeErr(w, http.StatusBadRequest, "unknown_task", "no such task: "+ev.TaskID)
+		return
+	}
 	ins, err := h.store.AppendTaskEvent(r.Context(), store.TaskEvent{
 		TaskID: ev.TaskID, Seq: ev.Seq, From: ev.From, To: ev.To,
 	})

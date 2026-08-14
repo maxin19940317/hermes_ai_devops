@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -251,6 +252,22 @@ func TestTaskEventDedupAndStatus(t *testing.T) {
 	row, _ := s.GetTask(ctx, "w1:t:a1")
 	if row.Status != "RUNNING" {
 		t.Errorf("status = %s", row.Status)
+	}
+}
+
+// TestTaskEventUnknownTask:任务不存在(Runtime 侧已清理)时返回 400
+// unknown_task,agent 视为永久拒绝不再补发(2026-08-14 孤儿事件修复)。
+func TestTaskEventUnknownTask(t *testing.T) {
+	_, _, srv := newEnv(t)
+	ev := map[string]any{"task_id": "ghost-task", "idempotency_key": "ghost:a1", "seq": 1,
+		"from": "ACCEPTED", "to": "RUNNING", "ts": "2026-07-17T08:00:01.000Z"}
+	resp := post(t, srv.URL+"/callbacks/v1/task-events", ev)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400(unknown_task)", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "unknown_task") {
+		t.Errorf("body = %s, want unknown_task", body)
 	}
 }
 
