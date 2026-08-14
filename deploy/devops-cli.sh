@@ -15,7 +15,12 @@
 # 证书/token 自动从仓库默认位置读取,无需每次带参数。
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 跟随符号链接解析真实脚本位置(软链到 ~/.local/bin/devops 后仍能定位仓库)。
+SCRIPT_SRC="${BASH_SOURCE[0]}"
+if [[ -L "$SCRIPT_SRC" ]]; then
+  SCRIPT_SRC="$(readlink -f "$SCRIPT_SRC")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SRC")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # 从 deploy/.env 读 CMD_API_TOKEN(不 export,避免泄漏到子进程)。
