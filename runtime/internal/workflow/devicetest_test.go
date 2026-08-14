@@ -1463,10 +1463,10 @@ func sampleInput() DeviceTestInput {
 func sampleOutput() *DeviceTestOutput {
 	return &DeviceTestOutput{Tasks: []TaskSummary{
 		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "PASSED",
-			DeviceName: "QCM6125-513cd3de",
+			DeviceName: "QCM6125-arm64-v8a-android · QCM6125-513cd3de",
 			DurationSec: 412.3, CasesTotal: 38, CasesFailed: 0, Attempt: 1},
 		{Variant: "aarch64_Android_SNPE_1.68", Verdict: "TEST_FAILED", Category: "CODE",
-			DeviceName: "QCM6490-abc",
+			DeviceName: "QCM6490-arm64-v8a-android · QCM6490-abc",
 			DurationSec: 380.14, CasesTotal: 38, CasesFailed: 3, Attempt: 2,
 			Reason:   "three cases crashed",
 			Analysis: &hermesclient.Analysis{Summary: "DSP 初始化崩溃"}},
@@ -2060,15 +2060,39 @@ func TestParallelSpecsStaleSignalDoesNotBlockDemux(t *testing.T) {
 func TestNotificationIncludesDeviceName(t *testing.T) {
 	out := &DeviceTestOutput{Tasks: []TaskSummary{
 		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "PASSED",
-			DeviceName: "QCM6125-513cd3de", DurationSec: 1.2, CasesTotal: 1, Attempt: 1},
+			DeviceName: "QCM6125-arm64-v8a-android · QCM6125-513cd3de",
+			DurationSec: 1.2, CasesTotal: 1, Attempt: 1},
 	}}
 	text := buildNotification(sampleInput(), out)
+	if !strings.Contains(text, "QCM6125-arm64-v8a-android") {
+		t.Errorf("纯文本缺设备规格: %q", text)
+	}
 	if !strings.Contains(text, "QCM6125-513cd3de") {
 		t.Errorf("纯文本缺设备名: %q", text)
 	}
 	card := buildNotificationCard(sampleInput(), out, "")
 	raw, _ := json.Marshal(card)
-	if !strings.Contains(string(raw), "QCM6125-513cd3de") {
-		t.Errorf("卡片缺设备名: %s", raw)
+	if !strings.Contains(string(raw), "QCM6125-arm64-v8a-android") {
+		t.Errorf("卡片缺设备规格: %s", raw)
+	}
+}
+
+// TestLeaseDeviceInfo:设备规格摘要格式 "SOC-ABI-OS";缺字段按现有部分拼;
+// 全空用 DeviceName 兜底。
+func TestLeaseDeviceInfo(t *testing.T) {
+	cases := []struct {
+		name  string
+		lease Lease
+		want  string
+	}{
+		{"完整", Lease{SOC: "QCS6490", ABI: "arm64-v8a", OS: "linux"}, "QCS6490-arm64-v8a-linux"},
+		{"缺 OS", Lease{SOC: "QCM6125", ABI: "arm64-v8a"}, "QCM6125-arm64-v8a"},
+		{"仅 SOC", Lease{SOC: "RK3576"}, "RK3576"},
+		{"全空兜底", Lease{DeviceName: "QCS6490-6cfa..."}, "QCS6490-6cfa..."},
+	}
+	for _, tc := range cases {
+		if got := tc.lease.DeviceInfo(); got != tc.want {
+			t.Errorf("%s: DeviceInfo() = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

@@ -96,12 +96,31 @@ type Lease struct {
 	DeviceID      string `json:"device_id"`
 	Serial        string `json:"serial"`
 	// DeviceName 是设备的可读显示名(devices.display_name,如 QCS6490-6cfa...)。
-	// 随通知透出,让用户知道测试跑在哪台设备(2026-08-14)。
-	DeviceName    string `json:"device_name"`
+	DeviceName string `json:"device_name"`
+	// SOC/ABI/OS 是设备基本属性(2026-08-14),用于通知里展示
+	// "SOC-ABI-OS"(如 QCS6490-arm64-v8a-linux),让用户快速识别设备规格。
+	SOC           string `json:"soc"`
+	ABI           string `json:"abi"`
+	OS            string `json:"os"`
 	ClientID      string `json:"client_id"`
 	ClientBaseURL string `json:"client_base_url"`
 	LeaseID       string `json:"lease_id"`
 	Generation    int    `json:"lease_generation"`
+}
+
+// DeviceInfo 返回设备规格摘要,格式 "SOC-ABI-OS"。
+// 任一字段缺失时按现有部分拼;全空则用 DeviceName 兜底(历史/离线设备)。
+func (l *Lease) DeviceInfo() string {
+	parts := make([]string, 0, 3)
+	for _, v := range []string{l.SOC, l.ABI, l.OS} {
+		if v != "" {
+			parts = append(parts, v)
+		}
+	}
+	if len(parts) == 0 {
+		return l.DeviceName
+	}
+	return strings.Join(parts, "-")
 }
 
 type TaskRow struct {
@@ -622,8 +641,14 @@ func runAttempt(ctx workflow.Context, in DeviceTestInput, spec TestSpec, ruleVer
 			return infra("acquire device: "+err.Error(), true)
 		}
 		if lease != nil {
-			// 设备已锁定:记录显示名,随通知透出(2026-08-14)。
-			sum.DeviceName = lease.DeviceName
+			// 设备已锁定:记录规格摘要(SOC-ABI-OS)+ 显示名,随通知透出。
+			// 如 "QCS6490-arm64-v8a-linux · QCS6490-6cfa...";两者相同去重。
+			info := lease.DeviceInfo()
+			if info != lease.DeviceName {
+				sum.DeviceName = info + " · " + lease.DeviceName
+			} else {
+				sum.DeviceName = info
+			}
 			break
 		}
 		if round >= spec.DeviceWaitRounds {

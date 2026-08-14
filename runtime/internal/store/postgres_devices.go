@@ -122,6 +122,7 @@ func (s *PGStore) AcquireDevice(ctx context.Context, sel wf.DeviceSelector, task
 	return &wf.Lease{
 		DeviceID: chosen.DeviceID, Serial: chosen.Serial,
 		DeviceName: chosen.DisplayName,
+		SOC:        chosen.SOC, ABI: chosen.ABI, OS: chosen.OS,
 		ClientID:   chosen.ClientID, ClientBaseURL: baseURL,
 		LeaseID: leaseID, Generation: generation,
 	}, nil
