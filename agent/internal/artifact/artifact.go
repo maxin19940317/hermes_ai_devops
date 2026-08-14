@@ -38,6 +38,8 @@ func (a *Auth) apply(req *http.Request) error {
 			return fmt.Errorf("basic auth requires username (deploy token 用户名,经 --auth-username / auth.username 下发)")
 		}
 		req.SetBasicAuth(a.Username, a.Token)
+	case "none", "":
+		// 匿名下载(MinIO 公开桶等),不附加任何请求头。
 	default:
 		return fmt.Errorf("unknown auth type %q", a.Type)
 	}

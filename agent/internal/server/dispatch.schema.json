@@ -32,15 +32,29 @@
         "auth": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["type", "token"],
+          "required": ["type"],
           "properties": {
-            "type": { "enum": ["bearer", "job_token", "basic"] },
-            "token": { "type": "string", "minLength": 1 },
+            "type": { "enum": ["bearer", "job_token", "basic", "none"] },
+            "token": {
+              "type": "string",
+              "minLength": 1,
+              "description": "凭据;type=none(2026-08-14,匿名下载 MinIO 公开桶等)时可省略或为空,其余类型必填。"
+            },
             "username": {
               "type": "string",
               "description": "basic(GitLab Deploy Token,原则 5 只读凭据)的 HTTP Basic 用户名;type=basic 时必填(运行时校验),其余类型忽略。"
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "not": {
+                  "properties": { "type": { "const": "none" } }
+                }
+              },
+              "then": { "required": ["token"] }
+            }
+          ]
         }
       }
     },

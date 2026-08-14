@@ -109,6 +109,9 @@ func TestValidateDispatchAcceptsValid(t *testing.T) {
 		"job_token 认证": func(d map[string]any) {
 			d["artifact"].(map[string]any)["auth"] = map[string]any{"type": "job_token", "token": "t"}
 		},
+		"none 认证(匿名下载,无 token)": func(d map[string]any) {
+			d["artifact"].(map[string]any)["auth"] = map[string]any{"type": "none"}
+		},
 		"含 presigned_uploads": func(d map[string]any) {
 			d["presigned_uploads"] = []any{
 				map[string]any{"object_key": "runs/t-1/stdout.log", "url": "http://minio:9000/b/runs/t-1/stdout.log?sig=x"},

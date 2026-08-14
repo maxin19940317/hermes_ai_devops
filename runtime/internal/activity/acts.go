@@ -46,7 +46,11 @@ type Config struct {
 	ArtifactAuthToken string
 	// ArtifactAuthUsername 仅 basic 使用(Deploy Token 用户名);空 = 非 basic。
 	ArtifactAuthUsername string
-	FeishuWebhookURL     string // empty → 无 webhook 兜底(dev mode 可全空)
+	// ArtifactAuthGitLabBase 是 ArtifactAuth* 凭据适用的 GitLab 基址(如
+	// https://gitlab.example)。仅在此基址下的产物 URL 下载时附加 auth;
+	// 其余来源(如 MinIO 公开桶)匿名下载。空 = 所有 URL 都带 auth(旧行为)。
+	ArtifactAuthGitLabBase string
+	FeishuWebhookURL       string // empty → 无 webhook 兜底(dev mode 可全空)
 	// 飞书企业自建应用(三件套齐全时优先于 webhook;缺任一项回退 webhook)。
 	FeishuAppID         string
 	FeishuAppSecret     string

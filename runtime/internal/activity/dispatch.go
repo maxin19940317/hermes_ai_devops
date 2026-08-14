@@ -16,7 +16,19 @@ import (
 
 // Dispatch 按 §8.1 POST /api/v1/tasks 派单;非 2xx 返回 error,
 // 由 workflow 的 on_infra_error 策略处理。凭据与回调地址由 Config 补充。
+//
+// 产物 auth 按来源区分:URL 属于 ArtifactAuthGitLabBase 时附加配置的
+// 凭据(GitLab Registry 需要);其余来源(MinIO 公开桶等)匿名下载。
 func (a *Acts) Dispatch(ctx context.Context, req wf.DispatchRequest) error {
+	auth := map[string]any{"type": "none", "token": "", "username": ""}
+	if a.Cfg.ArtifactAuthGitLabBase == "" ||
+		hasURLPrefix(req.PackageURL, strings.TrimRight(a.Cfg.ArtifactAuthGitLabBase, "/")) {
+		auth = map[string]any{
+			"type":     a.Cfg.ArtifactAuthType,
+			"token":    a.Cfg.ArtifactAuthToken,
+			"username": a.Cfg.ArtifactAuthUsername,
+		}
+	}
 	payload := map[string]any{
 		"task_id":         req.TaskID,
 		"idempotency_key": req.IdempotencyKey,
@@ -24,7 +36,7 @@ func (a *Acts) Dispatch(ctx context.Context, req wf.DispatchRequest) error {
 		"artifact": map[string]any{
 			"url":    req.PackageURL,
 			"sha256": req.PackageSHA256,
-			"auth":   map[string]any{"type": a.Cfg.ArtifactAuthType, "token": a.Cfg.ArtifactAuthToken, "username": a.Cfg.ArtifactAuthUsername},
+			"auth":   auth,
 		},
 		"manifest_digest":    req.ManifestDigest,
 		"device_serial":      req.DeviceSerial,
@@ -44,6 +56,12 @@ func (a *Acts) Dispatch(ctx context.Context, req wf.DispatchRequest) error {
 		Target: req.TaskID,
 	})
 	return nil
+}
+
+// hasURLPrefix 判断 u 以 base 为前缀,且须在路径边界分割(base + "/" 或
+// 完全相等),防止 https://gitlab.example 被 https://gitlab.example.evil.com 绕过。
+func hasURLPrefix(u, base string) bool {
+	return u == base || strings.HasPrefix(u, base+"/")
 }
 
 // uploadRequestURL 由回调基址派生按需签发端点地址(差距 #8)。

@@ -203,6 +203,9 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			ArtifactAuthType:     env("ARTIFACT_AUTH_TYPE", "job_token"),
 			ArtifactAuthToken:    getenv("ARTIFACT_AUTH_TOKEN"),
 			ArtifactAuthUsername: getenv("ARTIFACT_AUTH_USERNAME"), // 仅 basic(Deploy Token)使用
+			// 产物 auth 仅适用于该 GitLab 基址下的 URL;其余来源(MinIO 公开桶)
+			// 匿名下载。空 = 所有 URL 都带 auth(旧行为)。
+			ArtifactAuthGitLabBase: strings.TrimRight(env("ARTIFACT_AUTH_GITLAB_BASE", "https://gitlab2.quectel.com"), "/"),
 			FeishuWebhookURL:     getenv("FEISHU_WEBHOOK_URL"),
 			// 飞书双模:三件套齐全走企业自建应用,否则回退 webhook(见 feishu.NewSender)
 			FeishuAppID:         getenv("FEISHU_APP_ID"),
