@@ -208,3 +208,19 @@ func TestDevicesCardSuccessSendsNoTrailingEmptyText(t *testing.T) {
 		t.Errorf("卡片成功后仍发了 %d 条文本: %q; want 0", len(sender.texts), sender.texts)
 	}
 }
+
+// TestCompactDeviceName:设备名超长时截断(表格列宽有限);短名原样。
+func TestCompactDeviceName(t *testing.T) {
+	short := "QCS6490-825485946"
+	if got := compactDeviceName(short); got != short {
+		t.Errorf("compactDeviceName(%q) = %q, want 原样", short, got)
+	}
+	long := "QCS6490-6cfa3377e493e7b5f8010b6266134d8c"
+	got := compactDeviceName(long)
+	if len([]rune(got)) > 20 {
+		t.Errorf("compactDeviceName(%q) = %q, 长度 %d > 20", long, got, len([]rune(got)))
+	}
+	if !strings.HasPrefix(got, "QCS6490-6cfa33") {
+		t.Errorf("compactDeviceName 应保留前缀: %q", got)
+	}
+}
