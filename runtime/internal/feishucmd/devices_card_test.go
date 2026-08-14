@@ -49,9 +49,9 @@ func TestDevicesFallsBackToTextWhenCardSendFails(t *testing.T) {
 	}
 }
 
-// TestRenderDeviceTableCard:卡片 = column_set 表格(用户实测确认并排效果正确)。
-// 列 = 设备/系统/架构/内存;设备名必须完整含 serial(ListFleet 漏选 serial 曾导致
-// 截断成 "SOC-",2026-08-07 修复)。
+// TestRenderDeviceTableCard:卡片 = schema 2.0 table(2026-08-14 升级,
+// 支持表头高亮 + 相邻行底纹)。列 = 设备/系统/架构/内存;设备名必须完整含
+// serial(ListFleet 漏选 serial 曾导致截断成 "SOC-",2026-08-07 修复)。
 func TestRenderDeviceTableCard(t *testing.T) {
 	rows := []deviceTableRow{
 		{"QCS6490-825485946", "Linux", "arm64-v8a", "7.1GB"},
@@ -65,23 +65,30 @@ func TestRenderDeviceTableCard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// column_set 布局(表头 + 2 数据行)
-	if strings.Count(js, `"column_set"`) != 3 {
-		t.Errorf("column_set 行数 = %d, want 3", strings.Count(js, `"column_set"`))
+	// schema 2.0 + table 元素
+	if !strings.Contains(js, `"schema":"2.0"`) {
+		t.Errorf("缺 schema 2.0: %s", js[:200])
 	}
-	// 表头:设备/系统/架构/内存/磁盘
+	if !strings.Contains(js, `"tag":"table"`) {
+		t.Errorf("缺 table 元素: %s", js[:300])
+	}
+	// 列名(display_name):设备/系统/架构/内存/磁盘
 	for _, col := range []string{"设备", "系统", "架构", "内存", "磁盘"} {
 		if !strings.Contains(js, col) {
-			t.Errorf("卡片缺表头 %q: %s", col, js[:300])
+			t.Errorf("卡片缺列 %q: %s", col, js[:300])
 		}
 	}
 	// 设备名完整(含 serial)
 	if !strings.Contains(js, "QCS6490-825485946") || !strings.Contains(js, "QCM6125-513cd3de") {
 		t.Errorf("卡片缺完整设备名(含 serial): %s", js[:400])
 	}
-	// plain_text 单元格(不解析 markdown,防连字符被吞)
-	if !strings.Contains(js, `"tag":"plain_text"`) {
-		t.Errorf("卡片缺 plain_text 单元格: %s", js[:300])
+	// 斑马纹:2 行交替 blue/grey 背景色
+	if !strings.Contains(js, `"background":"blue"`) || !strings.Contains(js, `"background":"grey"`) {
+		t.Errorf("卡片缺斑马纹(blue/grey 交替): %s", js[:400])
+	}
+	// 设备名列加粗(表头高亮的补充)
+	if !strings.Contains(js, "**QCS6490-825485946**") {
+		t.Errorf("卡片缺设备名列加粗: %s", js[:400])
 	}
 	// 空列表 → 空卡片(调用方回纯文本)
 	empty, err := renderDeviceTableCard(nil)

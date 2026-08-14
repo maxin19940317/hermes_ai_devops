@@ -8,52 +8,20 @@ import (
 	"hermes-devops/runtime/internal/store"
 )
 
-// ---- 设备列表卡片(column_set 表格布局,2026-08-07) ----
-// 用户实测确认 column_set 并排布局效果正确(此前竖排/截断的根因是
-// ListFleet 漏选 serial/display_name,导致设备名 fallback 成 "SOC-")。
+// ---- 设备列表卡片(schema 2.0 table,2026-08-14) ----
 
-// deviceCard 是飞书 interactive 卡片的顶层结构。
-type deviceCard struct {
-	Config   deviceCardConfig    `json:"config"`
-	Header   deviceCardHeader    `json:"header"`
-	Elements []deviceCardElement `json:"elements"`
-}
-
-type deviceCardConfig struct {
-	WideScreenMode bool `json:"wide_screen_mode"`
-}
-
+// deviceCardHeader 是卡片头部(标题 + 颜色模板)。
 type deviceCardHeader struct {
 	Title    deviceCardText `json:"title"`
 	Template string         `json:"template"`
 }
 
-// deviceCardElement 是卡片元素:column_set(一行多列)。
-type deviceCardElement struct {
-	Tag      string         `json:"tag"`       // 恒为 column_set
-	FlexMode string         `json:"flex_mode"` // none
-	Columns  []deviceColumn `json:"columns"`
-}
-
-type deviceColumn struct {
-	Tag           string          `json:"tag"`   // 恒为 column
-	Width         string          `json:"width"` // weighted
-	Weight        int             `json:"weight"`
-	VerticalAlign string          `json:"vertical_align"` // top
-	Elements      []deviceColElem `json:"elements"`
-}
-
-type deviceColElem struct {
-	Tag  string         `json:"tag"` // div
-	Text deviceCardText `json:"text"`
-}
-
 type deviceCardText struct {
-	Tag     string `json:"tag"` // plain_text(不解析 markdown,防连字符被吞)
+	Tag     string `json:"tag"` // plain_text
 	Content string `json:"content"`
 }
 
-// deviceTableColumn 定义一列:标题 + 权重(控制宽度)。
+// deviceTableColumn 定义一列:标题 + 权重(列宽分配)。
 type deviceTableColumn struct {
 	Title  string
 	Weight int
@@ -71,53 +39,135 @@ var deviceColumns = []deviceTableColumn{
 	{"磁盘(总/可用)", 2},
 }
 
-// renderDeviceTableCard 渲染设备列表为飞书卡片(column_set 表格)。
-// 返回卡片 JSON(直接作 SendCard 的 card 参数);空列表 → 返回空(调用方回纯文本)。
+// ---- 设备列表卡片(schema 2.0 table,2026-08-14) ----
+// 从 schema 1.0 column_set 升级为 schema 2.0 的 table 组件,以获得表格语义:
+// 列名(display_name)+ 列宽 + 表头高亮 + 相邻行底纹(斑马纹,交替 cell 背景色)。
+// 实测(2026-08-14 飞书 API):table 的 columns 支持 name/display_name/width;
+// rows 是"以 column name 为键"的对象数组;cell 的 text 支持 markdown +
+// text_style.background(背景色)。用户实测确认视觉正确。
+
+// deviceTableCard 是 schema 2.0 卡片顶层结构。
+type deviceTableCard struct {
+	Schema string             `json:"schema"`
+	Header deviceCardHeader   `json:"header"`
+	Body   deviceCardBody     `json:"body"`
+}
+
+type deviceCardBody struct {
+	Elements []deviceTableEl `json:"elements"`
+}
+
+type deviceTableEl struct {
+	Tag     string             `json:"tag"` // 恒为 table
+	Columns []deviceTableCol   `json:"columns"`
+	Rows    []deviceTableRowObj `json:"rows"`
+}
+
+type deviceTableCol struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Width       string `json:"width,omitempty"`
+}
+
+// deviceTableRowObj 是一行:以 column name 为键,值为 cell。
+type deviceTableRowObj map[string]deviceTableCell
+
+type deviceTableCell struct {
+	Text deviceCellText `json:"text"`
+}
+
+type deviceCellText struct {
+	Tag       string          `json:"tag"` // markdown
+	Content   string          `json:"content"`
+	TextStyle *deviceCellStyle `json:"text_style,omitempty"`
+}
+
+type deviceCellStyle struct {
+	Background string `json:"background,omitempty"` // blue | grey 等
+}
+
+// zebra 交替行底纹:偶数行 blue,奇数行 grey(2026-08-14,飞书实测支持)。
+func zebraBG(rowIdx int) string {
+	if rowIdx%2 == 0 {
+		return "blue"
+	}
+	return "grey"
+}
+
+// renderDeviceTableCard 渲染设备列表为飞书 schema 2.0 table 卡片。
+// 返回卡片(直接作 SendCard 的 card 参数);空列表 → 返回空(调用方回纯文本)。
 func renderDeviceTableCard(rows []deviceTableRow) (any, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	card := deviceCard{
-		Config: deviceCardConfig{WideScreenMode: true},
+	// 表头列:name 用 ASCII 键,display_name 中文展示。
+	cols := make([]deviceTableCol, 0, len(deviceColumns))
+	for i, c := range deviceColumns {
+		cols = append(cols, deviceTableCol{
+			Name:        fmt.Sprintf("c%d", i),
+			DisplayName: c.Title,
+			Width:       tableColWidth(i),
+		})
+	}
+	// 数据行 + 斑马纹;设备名列加粗(表头高亮的补充)。
+	tableRows := make([]deviceTableRowObj, 0, len(rows))
+	for i, r := range rows {
+		bg := zebraBG(i)
+		obj := deviceTableRowObj{}
+		for j := range deviceColumns {
+			content := ""
+			if j < len(r) {
+				content = r[j]
+			}
+			// 设备列(第 0 列)加粗,体现设备名是主信息。
+			md := escapeCellText(content)
+			if j == 0 {
+				md = "**" + md + "**"
+			}
+			obj[fmt.Sprintf("c%d", j)] = deviceTableCell{
+				Text: deviceCellText{
+					Tag:       "markdown",
+					Content:   md,
+					TextStyle: &deviceCellStyle{Background: bg},
+				},
+			}
+		}
+		tableRows = append(tableRows, obj)
+	}
+	card := deviceTableCard{
+		Schema: "2.0",
 		Header: deviceCardHeader{
 			Title:    deviceCardText{Tag: "plain_text", Content: "📱 在线设备"},
 			Template: "blue",
 		},
-		Elements: []deviceCardElement{},
-	}
-	// 表头行 + 数据行,全部用 column_set。
-	all := make([]deviceTableRow, 0, len(rows)+1)
-	header := make(deviceTableRow, 0, len(deviceColumns))
-	for _, c := range deviceColumns {
-		header = append(header, c.Title)
-	}
-	all = append(all, header)
-	all = append(all, rows...)
-
-	for _, r := range all {
-		card.Elements = append(card.Elements, buildColumnSetRow(r))
+		Body: deviceCardBody{Elements: []deviceTableEl{{
+			Tag:     "table",
+			Columns: cols,
+			Rows:    tableRows,
+		}}},
 	}
 	return card, nil
 }
 
-// buildColumnSetRow 把一行单元格渲染为一个 column_set。
-func buildColumnSetRow(row deviceTableRow) deviceCardElement {
-	cols := make([]deviceColumn, 0, len(deviceColumns))
-	for i, c := range deviceColumns {
-		content := ""
-		if i < len(row) {
-			content = row[i]
-		}
-		cols = append(cols, deviceColumn{
-			Tag: "column", Width: "weighted", Weight: c.Weight,
-			VerticalAlign: "top",
-			Elements: []deviceColElem{{
-				Tag:  "div",
-				Text: deviceCardText{Tag: "plain_text", Content: content},
-			}},
-		})
+// escapeCellText 转义 markdown 元字符(单元格内容动态,防注入/格式破坏)。
+func escapeCellText(s string) string {
+	r := strings.NewReplacer(
+		"*", "\\*", "`", "\\`", "[", "\\[", "]", "\\]",
+		"(", "\\(", ")", "\\)", "_", "\\_", "~", "\\~",
+	)
+	return r.Replace(s)
+}
+
+// tableColWidth 返回列的显示宽度(px;按内容量分配)。
+func tableColWidth(i int) string {
+	switch i {
+	case 0:
+		return "260px"
+	case 4: // 磁盘
+		return "180px"
+	default:
+		return "110px"
 	}
-	return deviceCardElement{Tag: "column_set", FlexMode: "none", Columns: cols}
 }
 
 // deviceRowFromStatus 把一台设备转成表格行(设备名/系统/架构/内存/磁盘)。
