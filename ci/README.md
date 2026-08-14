@@ -68,6 +68,17 @@ release_pack.sh → *.tar.gz
   ```
   变体名须与该变体的已登记名称一致(requirements.soc 决定派哪块板)。
   实测:264MB 真实 QCS6490 包经此脚本触发 → PASSED。
+- **Hermes 上传即测(2026-08-14,`deploy/hermes-upload-kick/`)**:宿主机 HTTP
+  服务让 Hermes 直接把本地 tar.gz 上传 → MinIO → kick,无需预登记、无需
+  Hermes 读 rock.lin(权限 0700 也不影响,文件走 HTTP 流):
+  ```bash
+  # Hermes(容器内)或服务器:
+  curl -s -m 600 -X POST --data-binary @/opt/data/workspace/gene_pm-tmp/xxx.tar.gz \
+    "http://172.17.0.1:18686/upload-kick?variant=aarch64_Linux_QCS6490_SNPE_2.21&pipeline_iid=1&pipeline_global_id=2"
+  ```
+  启动:`bash deploy/hermes-upload-kick/start.sh`。gene_pm 的
+  `devops-test-package` skill 已封装此用法(Hermes 收到"测这个包"自动走
+  这条链)。实测:264MB 真实包经 Hermes 上传触发 → QCS6490 PASSED。
 - 包内单一顶层目录布局时,`deploy.files[].src` 保留实际路径,`dst` 剥掉顶层目录。
 
 ## 测试
