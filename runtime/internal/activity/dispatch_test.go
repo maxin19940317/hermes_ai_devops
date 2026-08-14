@@ -90,8 +90,12 @@ func TestDispatchAuthScopedToGitLab(t *testing.T) {
 		t.Fatal(err)
 	}
 	auth = got["artifact"].(map[string]any)["auth"].(map[string]any)
-	if auth["type"] != "none" || auth["token"] != "" || auth["username"] != "" {
+	if auth["type"] != "none" {
 		t.Errorf("MinIO URL auth = %v, want type=none(匿名)", auth)
+	}
+	// 匿名 auth 不应携带 token/username(避免触发 schema token.minLength)
+	if _, hasTok := auth["token"]; hasTok {
+		t.Errorf("MinIO URL auth 不应有 token 字段: %v", auth)
 	}
 }
 

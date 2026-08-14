@@ -20,7 +20,7 @@ import (
 // 产物 auth 按来源区分:URL 属于 ArtifactAuthGitLabBase 时附加配置的
 // 凭据(GitLab Registry 需要);其余来源(MinIO 公开桶等)匿名下载。
 func (a *Acts) Dispatch(ctx context.Context, req wf.DispatchRequest) error {
-	auth := map[string]any{"type": "none", "token": "", "username": ""}
+	auth := map[string]any{"type": "none"} // 匿名:不含 token,避免触发 token.minLength
 	if a.Cfg.ArtifactAuthGitLabBase == "" ||
 		hasURLPrefix(req.PackageURL, strings.TrimRight(a.Cfg.ArtifactAuthGitLabBase, "/")) {
 		auth = map[string]any{
