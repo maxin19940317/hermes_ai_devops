@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -93,19 +94,11 @@ func (s *PGStore) ListArtifacts(
 	defer rows.Close()
 	out := []Artifact{}
 	for rows.Next() {
-		var a Artifact
-		var req *VariantRequirements
-		var sigs *[]VariantSignature
-		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
-			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest,
-			&req, &sigs); err != nil {
+		a, err := scanArtifact(rows)
+		if err != nil {
 			return nil, fmt.Errorf("list artifacts %s/%s/%d: scan: %w",
 				project, commitSHA, pipelineID, err)
 		}
-		if sigs != nil {
-			a.VariantSignatures = *sigs
-		}
-		a.VariantRequirements = req
 		out = append(out, a)
 	}
 	if err := rows.Err(); err != nil {
@@ -134,18 +127,10 @@ func (s *PGStore) ListArtifactsForVariant(
 	defer rows.Close()
 	out := []Artifact{}
 	for rows.Next() {
-		var a Artifact
-		var req *VariantRequirements
-		var sigs *[]VariantSignature
-		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
-			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest,
-			&req, &sigs); err != nil {
+		a, err := scanArtifact(rows)
+		if err != nil {
 			return nil, fmt.Errorf("list artifacts for variant %s: scan: %w", variant, err)
 		}
-		if sigs != nil {
-			a.VariantSignatures = *sigs
-		}
-		a.VariantRequirements = req
 		out = append(out, a)
 	}
 	if err := rows.Err(); err != nil {
@@ -166,15 +151,14 @@ func (s *PGStore) LatestArtifactForVariant(
 		ORDER BY created_at DESC, artifact_id DESC LIMIT 1`,
 		variant)
 	var a Artifact
-	var req *VariantRequirements
-	var sigs *[]VariantSignature
+	var req []byte
+	var sigs []byte
 	err := row.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
 		&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest,
 		&req, &sigs)
-	if sigs != nil {
-		a.VariantSignatures = *sigs
+	if err == nil {
+		a.VariantRequirements, a.VariantSignatures, err = decodeVariantMeta(req, sigs)
 	}
-	a.VariantRequirements = req
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -395,19 +379,48 @@ func (s *PGStore) AllVariants(ctx context.Context) ([]Artifact, error) {
 	defer rows.Close()
 	out := []Artifact{}
 	for rows.Next() {
-		var a Artifact
-		var req *VariantRequirements
-		var sigs *[]VariantSignature
-		if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
-			&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest,
-			&req, &sigs); err != nil {
+		a, err := scanArtifact(rows)
+		if err != nil {
 			return nil, fmt.Errorf("all variants: scan: %w", err)
 		}
-		if sigs != nil {
-			a.VariantSignatures = *sigs
-		}
-		a.VariantRequirements = req
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// scanArtifact 从一行查询结果扫描 Artifact。variant_requirements /
+// variant_signatures 是 JSONB,pgx v5 对 NULL 扫描到深层指针类型不可靠
+// (2026-08-14 实测:ListArtifactsForVariant/AllVariants 静默空),改扫 []byte
+// 再手动 JSON 解码:NIL bytes → nil / 空 slice,非空 → Unmarshal。
+func scanArtifact(rows interface{ Scan(...any) error }) (Artifact, error) {
+	var a Artifact
+	var req []byte
+	var sigs []byte
+	if err := rows.Scan(&a.Project, &a.CommitSHA, &a.PipelineID, &a.Variant,
+		&a.BuildType, &a.Version, &a.URL, &a.SHA256, &a.Size, &a.ManifestDigest,
+		&req, &sigs); err != nil {
+		return a, err
+	}
+	reqObj, sigsObj, err := decodeVariantMeta(req, sigs)
+	a.VariantRequirements = reqObj
+	a.VariantSignatures = sigsObj
+	return a, err
+}
+
+// decodeVariantMeta 把 JSONB 的 []byte 解码为类型化约束/签名。
+// NULL(无字节)返回 nil/空,不视为错误。
+func decodeVariantMeta(req, sigs []byte) (*VariantRequirements, []VariantSignature, error) {
+	var reqObj *VariantRequirements
+	var sigsObj []VariantSignature
+	if len(req) > 0 {
+		if err := json.Unmarshal(req, &reqObj); err != nil {
+			return nil, nil, fmt.Errorf("decode variant_requirements: %w", err)
+		}
+	}
+	if len(sigs) > 0 {
+		if err := json.Unmarshal(sigs, &sigsObj); err != nil {
+			return nil, nil, fmt.Errorf("decode variant_signatures: %w", err)
+		}
+	}
+	return reqObj, sigsObj, nil
 }
