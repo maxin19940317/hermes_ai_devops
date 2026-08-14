@@ -57,6 +57,17 @@ release_pack.sh → *.tar.gz
   可额外放行本机 MinIO。MinIO 产物桶 `hermes-packages` 公开读(匿名探活/下载,
   URL 稳定不随签名过期),生命周期默认 30 天。GitLab URL 探活带 token,
   其余来源匿名 Range 探活。
+- **本地包一条龙(2026-08-14,`ci/upload_kick.py`)**:服务器上的 tar.gz
+  未登记时,一条命令完成 上传 MinIO → 解析 manifest(requirements/
+  failure_signatures,原始字节算 manifest_digest)→ schema 校验 → kick 登记
+  并启动单变体 workflow。之后 Hermes `devops_test <variant>` 即命中该包:
+  ```bash
+  TRIGGER_WEBHOOK_SECRET=xxx python3 ci/upload_kick.py \
+    --package /tmp/xxx.tar.gz --variant aarch64_Linux_QCS6490_SNPE_2.21 \
+    --commit 5c885dbb --pipeline-iid 9991 --pipeline-global-id 88880
+  ```
+  变体名须与该变体的已登记名称一致(requirements.soc 决定派哪块板)。
+  实测:264MB 真实 QCS6490 包经此脚本触发 → PASSED。
 - 包内单一顶层目录布局时,`deploy.files[].src` 保留实际路径,`dst` 剥掉顶层目录。
 
 ## 测试
