@@ -40,6 +40,10 @@ type Config struct {
 	// GitLabBaseURL 用于校验 /kick 载荷中的产物 URL 必须指向本 GitLab
 	// (形如 https://gitlab.example,空 = 不校验,仅开发)。
 	GitLabBaseURL string
+	// AllowedPackageBases 是 /kick 产物 URL 允许的额外来源(在 GitLabBaseURL
+	// 之外),形如 http://10.88.118.251:9000(MinIO)。缺省 = 仅 GitLab。
+	// 空 = 不扩展,URL 仍须以 GitLabBaseURL 开头。
+	AllowedPackageBases []string
 	// PipelineWebhookDisabled 关闭 pipeline success webhook 的触发语义
 	// (变体级 /kick 上线后,避免同一变体被 bundle workflow 与 kick
 	// workflow 双跑;webhook 仍接收并 204,仅作记录)。缺省 false = 启用。

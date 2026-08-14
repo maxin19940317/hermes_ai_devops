@@ -10,6 +10,8 @@
 //	GITLAB_BASE_URL       如 https://gitlab.example(必填)
 //	GITLAB_TOKEN          read_api 访问令牌(必填)
 //	GITLAB_TOKEN_HEADER   缺省 PRIVATE-TOKEN(Deploy Token 用 Deploy-Token)
+//	PACKAGE_URL_BASES     逗号分隔的额外产物来源(在 GitLab 之外),如
+//	                      http://10.88.118.251:9000(MinIO);URL 白名单校验用
 //	PACKAGE_NAME          Generic 包名,缺省 algo-super-sdk
 //	TEMPORAL_ADDRESS      缺省 127.0.0.1:7233
 //	TEMPORAL_TASK_QUEUE   缺省 device-test
@@ -38,6 +40,17 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitNonEmpty 逗号分割并去空白/去空项,用于 PACKAGE_URL_BASES。
+func splitNonEmpty(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func main() {
@@ -89,6 +102,8 @@ func main() {
 		Refs:          strings.Split(env("TRIGGER_REFS", "master"), ","),
 		Logger:        &log,
 		GitLabBaseURL: gitlabBase,
+		// 额外产物来源(MinIO 等),URL 白名单校验用。
+		AllowedPackageBases: splitNonEmpty(env("PACKAGE_URL_BASES", "")),
 		// 变体级 /kick 上线后置 false:pipeline webhook 仅记录,不再起完整
 		// bundle workflow,避免同一变体双跑(§6.3)。
 		PipelineWebhookDisabled: env("TRIGGER_PIPELINE_WEBHOOK", "true") != "true",

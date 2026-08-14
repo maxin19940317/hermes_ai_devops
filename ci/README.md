@@ -52,6 +52,11 @@ release_pack.sh → *.tar.gz
   `TRIGGER_PIPELINE_WEBHOOK=false` 后 pipeline success webhook 仅记录不再起
   完整 workflow(防双跑)。触发与设备解耦:fleet 无匹配设备的变体由
   SelectTestSpecs 秒级跳过(任意 OS/板型,CI 不改)。
+- **产物来源白名单(2026-08-14)**:`/kick` 的 URL 默认必须指向本 GitLab
+  Registry;`PACKAGE_URL_BASES`(逗号分隔,compose 缺省取 `MINIO_PUBLIC_ENDPOINT`)
+  可额外放行本机 MinIO。MinIO 产物桶 `hermes-packages` 公开读(匿名探活/下载,
+  URL 稳定不随签名过期),生命周期默认 30 天。GitLab URL 探活带 token,
+  其余来源匿名 Range 探活。
 - 包内单一顶层目录布局时,`deploy.files[].src` 保留实际路径,`dst` 剥掉顶层目录。
 
 ## 测试

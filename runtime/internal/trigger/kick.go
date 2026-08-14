@@ -49,9 +49,39 @@ var (
 	kickSHA256Regexp = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
-// validate 校验载荷形态与自洽性;gitlabBase 非空时要求产物 URL 指向
-// 本 GitLab(防伪造 meta 把 Trigger 当任意 URL 的拉取代理)。
-func (p *kickPayload) validate(gitlabBase string) error {
+// hasPrefixAny 判断 s 以 bases 中任一为前缀,且必须在路径边界(base + "/" 或
+// 完全相等)处分割,防止 https://gitlab.example 被 https://gitlab.example.evil.com
+// 绕过。
+func hasPrefixAny(s string, bases []string) bool {
+	for _, b := range bases {
+		if s == b || strings.HasPrefix(s, b+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// allowedBases 返回 /kick 产物 URL 允许的来源前缀集合:GitLabBaseURL 恒允许,
+// 再加上配置的 AllowedPackageBases(如 MinIO)。空集合 = 不校验来源(仅开发)。
+func (c Config) allowedBases() []string {
+	if c.GitLabBaseURL == "" && len(c.AllowedPackageBases) == 0 {
+		return nil
+	}
+	bases := make([]string, 0, 1+len(c.AllowedPackageBases))
+	if c.GitLabBaseURL != "" {
+		bases = append(bases, strings.TrimRight(c.GitLabBaseURL, "/"))
+	}
+	for _, b := range c.AllowedPackageBases {
+		if b = strings.TrimRight(b, "/"); b != "" {
+			bases = append(bases, b)
+		}
+	}
+	return bases
+}
+
+// validate 校验载荷形态与自洽性;allowedBases 非空时要求产物 URL 以其中
+// 一个前缀开头(防伪造 meta 把 Trigger 当任意 URL 的拉取代理)。
+func (p *kickPayload) validate(allowedBases []string) error {
 	switch {
 	case !kickVariantRegexp.MatchString(p.Variant):
 		return errors.New("bad variant")
@@ -73,9 +103,8 @@ func (p *kickPayload) validate(gitlabBase string) error {
 	case p.PackageFile == "":
 		return errors.New("bad package_file")
 	}
-	if gitlabBase != "" &&
-		!strings.HasPrefix(p.URL, strings.TrimRight(gitlabBase, "/")+"/api/v4/projects/") {
-		return errors.New("url not under gitlab base")
+	if len(allowedBases) > 0 && !hasPrefixAny(p.URL, allowedBases) {
+		return errors.New("url not under allowed package base")
 	}
 	return nil
 }
@@ -87,17 +116,20 @@ type PackageProber interface {
 }
 
 // PackageExists 实现 PackageProber:GET Range bytes=0-0,2xx/206 即存在。
-// 只取首字节,不下载整包。
+// 只取首字节,不下载整包。URL 属于本 GitLab 时才附加访问令牌;其余来源
+// (如 MinIO 预签名 URL)做匿名探测。
 func (g *GitLabClient) PackageExists(ctx context.Context, url string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	header := g.TokenHeader
-	if header == "" {
-		header = "PRIVATE-TOKEN"
+	if hasPrefixAny(url, []string{g.BaseURL}) {
+		header := g.TokenHeader
+		if header == "" {
+			header = "PRIVATE-TOKEN"
+		}
+		req.Header.Set(header, g.Token)
 	}
-	req.Header.Set(header, g.Token)
 	req.Header.Set("Range", "bytes=0-0")
 	resp, err := g.http().Do(req)
 	if err != nil {
@@ -126,7 +158,7 @@ func (h *Handler) HandleKick(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad payload", http.StatusBadRequest)
 		return
 	}
-	if err := p.validate(h.cfg.GitLabBaseURL); err != nil {
+	if err := p.validate(h.cfg.allowedBases()); err != nil {
 		http.Error(w, "invalid kick: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}

@@ -106,6 +106,8 @@ services:
       GITLAB_TOKEN: ${GITLAB_TOKEN:?GITLAB_TOKEN is required}
       GITLAB_TOKEN_HEADER: ${GITLAB_TOKEN_HEADER:-PRIVATE-TOKEN}
       PACKAGE_NAME: ${PACKAGE_NAME:-algo-super-sdk}
+      # /kick 产物 URL 额外来源白名单(MinIO 等),逗号分隔;缺省仅 GitLab。
+      PACKAGE_URL_BASES: ${PACKAGE_URL_BASES:-${MINIO_PUBLIC_ENDPOINT:-}}
     ports:
       - "${TRIGGER_BIND_IP:-0.0.0.0}:${TRIGGER_HOST_PORT:-18090}:8090"
     healthcheck:
@@ -248,13 +250,22 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
       MINIO_BUCKET: ${MINIO_BUCKET:-hermes-evidence}
+      MINIO_PACKAGE_BUCKET: ${MINIO_PACKAGE_BUCKET:-hermes-packages}
       MINIO_RUNS_RETAIN_DAYS: ${MINIO_RUNS_RETAIN_DAYS:-90}
+      MINIO_PACKAGES_RETAIN_DAYS: ${MINIO_PACKAGES_RETAIN_DAYS:-30}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
         mc alias set hermes http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
         mc mb --ignore-existing "hermes/$$MINIO_BUCKET"
+        # 产物桶(§包源扩展):/kick 可引用本机 MinIO 上的包。
+        # 公开读(下载不需要签名;探活/Agent 均匿名 GET)。生命周期:产物短保留,
+        # 覆盖策略靠文件名唯一,失败包无生命周期规则说明已被新包覆盖。
+        mc mb --ignore-existing "hermes/$$MINIO_PACKAGE_BUCKET"
+        mc anonymous set download "hermes/$$MINIO_PACKAGE_BUCKET"
+        mc ilm rule rm --all --force "hermes/$$MINIO_PACKAGE_BUCKET" 2>/dev/null || true
+        mc ilm rule add --expire-days "$$MINIO_PACKAGES_RETAIN_DAYS" --prefix "/" "hermes/$$MINIO_PACKAGE_BUCKET"
         # 生命周期(§12 Phase 3)。两类对象保留语义不同,按前缀分开配:
         #   runs/      原始附件(logcat/stdout/junit/dump),体量大,到期清理
         #   evidence/  证据快照(≤96KB),保留周期随 decisions 行,故**不设过期规则**

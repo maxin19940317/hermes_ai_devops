@@ -27,6 +27,7 @@ func (f *fakeProber) PackageExists(_ context.Context, url string) error {
 }
 
 const kickGitLabBase = "https://gitlab.example"
+const kickMinIOBase = "http://10.88.118.251:9000"
 
 func validKick() map[string]any {
 	return map[string]any{
@@ -45,11 +46,16 @@ func validKick() map[string]any {
 }
 
 func newKickHandler(starter *fakeStarter, prober *fakeProber) (*Handler, *store.MemStore) {
+	return newKickHandlerBases(starter, prober, nil)
+}
+
+func newKickHandlerBases(starter *fakeStarter, prober *fakeProber, extra []string) (*Handler, *store.MemStore) {
 	st := store.NewMemStore()
 	h, err := New(Config{
-		WebhookSecret: testSecret,
-		Refs:          []string{"master"},
-		GitLabBaseURL: kickGitLabBase,
+		WebhookSecret:       testSecret,
+		Refs:                []string{"master"},
+		GitLabBaseURL:       kickGitLabBase,
+		AllowedPackageBases: extra,
 	}, &fakeFetcher{}, st, starter)
 	if err != nil {
 		panic(err)
@@ -201,6 +207,76 @@ func TestKickValidation(t *testing.T) {
 	}
 }
 
+// TestKickAllowsMinIOBase:AllowedPackageBases 内的 MinIO URL 可派发,
+// 且探活按非 GitLab 来源匿名探测(prober 仍收到原 URL)。
+func TestKickAllowsMinIOBase(t *testing.T) {
+	starter, prober := &fakeStarter{started: true}, &fakeProber{}
+	h, st := newKickHandlerBases(starter, prober, []string{kickMinIOBase})
+
+	m := validKick()
+	m["url"] = kickMinIOBase + "/bucket/algo-super-sdk-g8e981b96-p48.tar.gz"
+	rec := postKick(h, testSecret, mustJSON(t, m))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body)
+	}
+	if prober.calls != 1 || prober.gotURL != m["url"] {
+		t.Errorf("prober = %+v, want url %v", prober, m["url"])
+	}
+	if len(st.Artifacts()) != 1 || st.Artifacts()[0].URL != m["url"] {
+		t.Errorf("artifacts = %+v", st.Artifacts())
+	}
+}
+
+// TestKickRejectsURLOutsideBases:URL 不属于 GitLab 且不在额外白名单 → 422。
+func TestKickRejectsURLOutsideBases(t *testing.T) {
+	cases := []string{
+		"https://evil.example/api/v4/projects/1/x",        // 其他主机
+		"https://gitlab.example.evil.com/api/v4/projects/1/x", // 前缀绕过
+		"http://10.88.118.251:9001/bucket/pkg.tar.gz",     // MinIO 但不在白名单
+	}
+	for _, u := range cases {
+		t.Run(u, func(t *testing.T) {
+			starter, prober := &fakeStarter{}, &fakeProber{}
+			h, _ := newKickHandler(starter, prober) // 未配置 MinIO 白名单
+			m := validKick()
+			m["url"] = u
+			rec := postKick(h, testSecret, mustJSON(t, m))
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Errorf("code = %d, want 422", rec.Code)
+			}
+			if starter.calls != 0 || prober.calls != 0 {
+				t.Error("校验失败不得探活/启动")
+			}
+		})
+	}
+}
+
+// TestKickMinIOWithNoGitLabBase:未配置 GitLab 但配置了 MinIO 白名单,
+// GitLab URL 被拒、MinIO URL 放行。
+func TestKickMinIOWithNoGitLabBase(t *testing.T) {
+	starter, prober := &fakeStarter{started: true}, &fakeProber{}
+	st := store.NewMemStore()
+	h, err := New(Config{
+		WebhookSecret:       testSecret,
+		Refs:                []string{"master"},
+		AllowedPackageBases: []string{kickMinIOBase},
+	}, &fakeFetcher{}, st, starter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Prober = prober
+
+	m := validKick()
+	m["url"] = kickGitLabBase + "/api/v4/projects/651/packages/generic/algo-super-sdk/1.0.2/pkg.tar.gz"
+	if rec := postKick(h, testSecret, mustJSON(t, m)); rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("无 GitLabBaseURL: GitLab URL code = %d, want 422", rec.Code)
+	}
+	m["url"] = kickMinIOBase + "/bucket/pkg.tar.gz"
+	if rec := postKick(h, testSecret, mustJSON(t, m)); rec.Code != http.StatusAccepted {
+		t.Errorf("MinIO URL code = %d, want 202", rec.Code)
+	}
+}
+
 func TestKickRejectsUncommandableProject(t *testing.T) {
 	cases := []struct {
 		project string
@@ -256,5 +332,62 @@ func TestPipelineWebhookDisabledInKickMode(t *testing.T) {
 	}
 	if fetcher.calls != 0 || starter.calls != 0 {
 		t.Error("kick 模式下 webhook 不得拉 bundle/起 workflow")
+	}
+}
+
+// TestHasPrefixAnyBoundary:hasPrefixAny 必须按路径边界分割,防止主机名前缀绕过。
+func TestHasPrefixAnyBoundary(t *testing.T) {
+	bases := []string{"https://gitlab.example", kickMinIOBase}
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"https://gitlab.example/api/v4/projects/1/x", true},
+		{"https://gitlab.example", true},
+		{"https://gitlab.example/api", true},
+		{"https://gitlab.example.evil.com/x", false},
+		{"https://gitlab.exampleevil.com/x", false},
+		{"https://gitlab.example:8443/x", false},
+		{kickMinIOBase + "/bucket/pkg.tar.gz", true},
+		{kickMinIOBase + ":9000/bucket/x", false}, // 端口重写绕过
+		{"https://evil.example/x", false},
+	}
+	for _, tc := range cases {
+		if got := hasPrefixAny(tc.url, bases); got != tc.want {
+			t.Errorf("hasPrefixAny(%q) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
+// TestPackageExistsAnonymousProbe:非 GitLab 来源的 URL 不携带 GitLab token。
+func TestPackageExistsAnonymousProbe(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("PRIVATE-TOKEN")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	gl := &GitLabClient{BaseURL: srv.URL, Token: "secret-token"}
+
+	// URL 属于 GitLab base → 带 token
+	if err := gl.PackageExists(context.Background(), srv.URL+"/api/v4/projects/1/packages/generic/x/1/y.tar.gz"); err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "secret-token" {
+		t.Errorf("GitLab URL: token = %q, want secret-token", gotAuth)
+	}
+
+	// 非 GitLab URL(MinIO 起一个独立 server)→ 匿名
+	anon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("PRIVATE-TOKEN")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer anon.Close()
+	if err := gl.PackageExists(context.Background(), anon.URL+"/bucket/pkg.tar.gz"); err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "" {
+		t.Errorf("MinIO URL: token = %q, want empty", gotAuth)
 	}
 }
