@@ -91,8 +91,9 @@ func renderDeviceTableCard(rows []deviceTableRow) (any, error) {
 			Width:       tableColWidth(i),
 		})
 	}
-	// 数据行;设备名列加粗(markdown),其余列原样文本。
-	// 飞书 table cell 只接受字符串,故无对象 cell / 行底纹(实测见上)。
+	// 数据行;cell 纯字符串原样显示。
+	// ⚠️ 实测(2026-08-14):飞书 table cell 是纯文本,**不渲染 markdown**
+	// (星号加粗会字面显示)。故设备名不加粗,直接显示。
 	tableRows := make([]deviceTableRowObj, 0, len(rows))
 	for _, r := range rows {
 		obj := deviceTableRowObj{}
@@ -100,9 +101,6 @@ func renderDeviceTableCard(rows []deviceTableRow) (any, error) {
 			content := ""
 			if j < len(r) {
 				content = r[j]
-			}
-			if j == 0 {
-				content = "**" + escapeCellText(content) + "**"
 			}
 			obj[fmt.Sprintf("c%d", j)] = content
 		}
@@ -121,15 +119,6 @@ func renderDeviceTableCard(rows []deviceTableRow) (any, error) {
 		}}},
 	}
 	return card, nil
-}
-
-// escapeCellText 转义 markdown 元字符(单元格内容动态,防注入/格式破坏)。
-func escapeCellText(s string) string {
-	r := strings.NewReplacer(
-		"*", "\\*", "`", "\\`", "[", "\\[", "]", "\\]",
-		"(", "\\(", ")", "\\)", "_", "\\_", "~", "\\~",
-	)
-	return r.Replace(s)
 }
 
 // tableColWidth 返回列的显示宽度(px;按内容量分配)。

@@ -82,13 +82,10 @@ func TestRenderDeviceTableCard(t *testing.T) {
 	if !strings.Contains(js, "QCS6490-825485946") || !strings.Contains(js, "QCM6125-513cd3de") {
 		t.Errorf("卡片缺完整设备名(含 serial): %s", js[:400])
 	}
-	// 设备名列加粗(表头高亮的补充)
-	if !strings.Contains(js, "**QCS6490-825485946**") {
-		t.Errorf("卡片缺设备名列加粗: %s", js[:400])
-	}
-	// cell 是纯字符串(非对象)——对象 cell 在飞书渲染成 map 原始结构(实测)
-	if strings.Contains(js, `"text_style"`) || strings.Contains(js, `"background"`) {
-		t.Errorf("卡片不应含对象 cell / 背景样式(飞书 table 不支持): %s", js[:400])
+	// cell 是纯字符串(非对象)——对象 cell 在飞书渲染成 map 原始结构(实测);
+	// 且不渲染 markdown(星号会字面显示),故不加 ** 也不含 text_style。
+	if strings.Contains(js, "**") || strings.Contains(js, `"text_style"`) || strings.Contains(js, `"background"`) {
+		t.Errorf("卡片不应含 markdown 星号 / 对象 cell / 背景样式: %s", js[:400])
 	}
 	// 空列表 → 空卡片(调用方回纯文本)
 	empty, err := renderDeviceTableCard(nil)
