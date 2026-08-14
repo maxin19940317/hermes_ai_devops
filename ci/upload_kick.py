@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -112,7 +113,11 @@ def build_kick(*, package: Path, manifest: dict, manifest_bytes: bytes, variant:
     }
 
 
-def kick(payload: dict, trigger_url: str, token: str):
+class UploadKickError(Exception):
+    """upload_kick 业务错误(HTTP 服务映射为 4xx/5xx)。"""
+
+
+def kick(payload: dict, trigger_url: str, token: str) -> str:
     import urllib.error
     import urllib.request
 
@@ -124,9 +129,77 @@ def kick(payload: dict, trigger_url: str, token: str):
         with urllib.request.urlopen(req, timeout=30) as resp:
             return f"{resp.status} {resp.read().decode('utf-8', 'replace')}"
     except urllib.error.HTTPError as e:
-        raise SystemExit(f"kick: HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}")
+        raise UploadKickError(
+            f"kick: HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}")
     except urllib.error.URLError as e:
-        raise SystemExit(f"kick: 连接失败: {e.reason}")
+        raise UploadKickError(f"kick: 连接失败: {e.reason}")
+
+
+class UploadKickConfig:
+    """upload_kick 的输入参数(CLI 与 HTTP 服务共用)。"""
+
+    def __init__(self, *, package: Path, variant: str, project: Optional[str] = None,
+                 version: Optional[str] = None, commit: str = "",
+                 pipeline_iid: int = 0, pipeline_global_id: int = 0,
+                 minio_bucket: str = "hermes-packages",
+                 minio_public_base: str = "",
+                 schema: Optional[Path] = None,
+                 trigger_url: str = "",
+                 token_env: str = "TRIGGER_WEBHOOK_SECRET"):
+        self.package = package
+        self.variant = variant
+        self.project = project
+        self.version = version
+        self.commit = commit
+        self.pipeline_iid = pipeline_iid
+        self.pipeline_global_id = pipeline_global_id
+        self.minio_bucket = minio_bucket
+        self.minio_public_base = minio_public_base or os.environ.get(
+            "MINIO_PUBLIC_ENDPOINT", "http://10.88.118.251:9000")
+        self.schema = schema or (REPO_ROOT / "contracts/manifest.schema.json")
+        self.trigger_url = trigger_url or os.environ.get(
+            "TRIGGER_URL", "http://127.0.0.1:18090/kick")
+        self.token_env = token_env
+
+
+def do_upload_kick(cfg: UploadKickConfig) -> str:
+    """执行完整流程:校验 manifest → 上传 MinIO → kick。返回 kick 响应文本。
+
+    CLI 与 HTTP 服务共用;业务错误抛 UploadKickError。
+    """
+    if not cfg.package.exists():
+        raise UploadKickError(f"package 不存在: {cfg.package}")
+
+    manifest, manifest_bytes = extract_manifest(cfg.package)
+    validate_manifest(manifest, cfg.schema)
+    print("manifest OK (schema 校验通过)")
+
+    project = cfg.project or manifest.get("artifact", {}).get("project", "")
+    if not project:
+        raise UploadKickError("缺 project(传 --project 或 manifest.artifact.project)")
+    version = cfg.version or manifest.get("artifact", {}).get("version", "0.0.1")
+    if not cfg.commit:
+        commit = manifest.get("artifact", {}).get("commit", "")
+        if not commit:
+            raise UploadKickError("缺 commit(传 --commit 或 manifest.artifact.commit)")
+    else:
+        commit = cfg.commit
+    if cfg.pipeline_iid <= 0 or cfg.pipeline_global_id <= 0:
+        raise UploadKickError("缺 pipeline_iid / pipeline_global_id(均为正整数)")
+
+    target = f"hermes/{cfg.minio_bucket}/{cfg.package.name}"
+    minio_upload(cfg.package, "minio/mc", target)
+
+    payload = build_kick(
+        package=cfg.package, manifest=manifest, manifest_bytes=manifest_bytes,
+        variant=cfg.variant, project=project, version=version, commit=commit,
+        pipeline_iid=cfg.pipeline_iid, pipeline_global_id=cfg.pipeline_global_id,
+        minio_public_base=cfg.minio_public_base, bucket=cfg.minio_bucket)
+
+    token = os.environ.get(cfg.token_env, "")
+    if not token:
+        raise UploadKickError(f"缺少环境变量 {cfg.token_env}(Trigger 共享密钥)")
+    return kick(payload, cfg.trigger_url, token)
 
 
 def main(argv):
@@ -136,7 +209,7 @@ def main(argv):
     parser.add_argument("--variant", required=True)
     parser.add_argument("--project", default=None, help="缺省取 manifest.artifact.project")
     parser.add_argument("--version", default=None, help="缺省取 manifest.artifact.version(无则 0.0.1)")
-    parser.add_argument("--commit", required=True, help="short sha(8-40 hex)")
+    parser.add_argument("--commit", default="", help="short sha;缺省取 manifest.artifact.commit")
     parser.add_argument("--pipeline-iid", required=True, type=int)
     parser.add_argument("--pipeline-global-id", required=True, type=int)
     parser.add_argument("--minio-bucket", default="hermes-packages")
@@ -151,31 +224,16 @@ def main(argv):
                         help="承载 Trigger 共享密钥的环境变量名")
     args = parser.parse_args(argv)
 
-    if not args.package.exists():
-        raise SystemExit(f"package 不存在: {args.package}")
-
-    manifest, manifest_bytes = extract_manifest(args.package)
-    validate_manifest(manifest, args.schema)
-    print("manifest OK (schema 校验通过)")
-
-    project = args.project or manifest.get("artifact", {}).get("project", "")
-    if not project:
-        raise SystemExit("缺 project(传 --project 或 manifest.artifact.project)")
-    version = args.version or manifest.get("artifact", {}).get("version", "0.0.1")
-
-    target = f"hermes/{args.minio_bucket}/{args.package.name}"
-    minio_upload(args.package, "minio/mc", target)
-
-    payload = build_kick(
-        package=args.package, manifest=manifest, manifest_bytes=manifest_bytes,
-        variant=args.variant, project=project, version=version, commit=args.commit,
+    cfg = UploadKickConfig(
+        package=args.package, variant=args.variant, project=args.project,
+        version=args.version, commit=args.commit,
         pipeline_iid=args.pipeline_iid, pipeline_global_id=args.pipeline_global_id,
-        minio_public_base=args.minio_public_base, bucket=args.minio_bucket)
-
-    token = os.environ.get(args.token_env, "")
-    if not token:
-        raise SystemExit(f"缺少环境变量 {args.token_env}(Trigger 共享密钥)")
-    print("kick:", kick(payload, args.trigger_url, token))
+        minio_bucket=args.minio_bucket, minio_public_base=args.minio_public_base,
+        schema=args.schema, trigger_url=args.trigger_url, token_env=args.token_env)
+    try:
+        print("kick:", do_upload_kick(cfg))
+    except UploadKickError as e:
+        raise SystemExit(str(e))
 
 
 if __name__ == "__main__":
