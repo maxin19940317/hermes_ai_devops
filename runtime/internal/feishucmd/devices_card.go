@@ -137,16 +137,17 @@ func compactDeviceName(name string) string {
 }
 
 // tableColWidth 返回列的显示宽度(px;按内容量分配)。
-// 飞书 table 列宽下限约 80px(实测 2026-08-14);总宽控制在卡片可视区内,
-// 避免最后一列需要滑动才能看到。
+// 飞书 table 列宽下限约 80px(实测 2026-08-14)。平衡两轮用户反馈:
+// 770px 太宽(末列要滑动),510px 太窄(字段截断)。取 ~620px 中间值,
+// 使 5 列内容完整显示且不超出卡片可视区。
 func tableColWidth(i int) string {
 	switch i {
-	case 0: // 设备
-		return "160px"
-	case 4: // 磁盘
-		return "110px"
-	default:
-		return "80px"
+	case 0: // 设备(截断名 ≤20 字符)
+		return "200px"
+	case 4: // 磁盘("总/可用",最长)
+		return "140px"
+	default: // 系统/架构/内存
+		return "90px"
 	}
 }
 
