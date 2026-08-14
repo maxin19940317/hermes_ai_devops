@@ -2096,3 +2096,36 @@ func TestLeaseDeviceInfo(t *testing.T) {
 		}
 	}
 }
+
+// TestNotificationPassedReasonChinese:PASSED 时 reason "all criteria met"
+// 在文本与卡片中显示为中文"全部通过"(规则引擎返回值保持英文,展示层翻译)。
+func TestNotificationPassedReasonChinese(t *testing.T) {
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "aarch64_Android_SNPE_2.21", Verdict: "PASSED",
+			Reason: "all criteria met", DurationSec: 1.2, CasesTotal: 1, Attempt: 1},
+	}}
+	text := buildNotification(sampleInput(), out)
+	if !strings.Contains(text, "全部通过") {
+		t.Errorf("文本缺中文全部通过: %q", text)
+	}
+	if strings.Contains(text, "all criteria met") {
+		t.Errorf("文本不应含英文 all criteria met: %q", text)
+	}
+	card := buildNotificationCard(sampleInput(), out, "")
+	raw, _ := json.Marshal(card)
+	if !strings.Contains(string(raw), "全部通过") {
+		t.Errorf("卡片缺中文全部通过: %s", raw)
+	}
+}
+
+// TestNotificationReasonNonPassedKeepsOriginal:非 PASSED 的 reason 原样保留。
+func TestNotificationReasonNonPassedKeepsOriginal(t *testing.T) {
+	out := &DeviceTestOutput{Tasks: []TaskSummary{
+		{Variant: "aarch64_Android_SNPE_1.68", Verdict: "TEST_FAILED",
+			Reason: "three cases crashed", DurationSec: 1.2, CasesTotal: 3, CasesFailed: 2, Attempt: 1},
+	}}
+	text := buildNotification(sampleInput(), out)
+	if !strings.Contains(text, "three cases crashed") {
+		t.Errorf("非 PASSED 应保留原 reason: %q", text)
+	}
+}

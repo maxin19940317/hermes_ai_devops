@@ -1036,18 +1036,29 @@ func buildNotification(in DeviceTestInput, out *DeviceTestOutput) string {
 		}
 		b.WriteString("\n")
 		// 指标/原因/hermes 各占一行,主行保持一瞥可读(2026-08-06 排版);
-		// PASSED 的 reason 恒为 "all criteria met",与 verdict 重复,不展示
+		// PASSED 的 reason 由规则引擎恒给 "all criteria met",展示层译为
+		// 中文"全部通过"(规则引擎返回值是审计/回放依据,不改;2026-08-14)。
 		if len(tk.Metrics) > 0 {
 			fmt.Fprintf(&b, "  · %s\n", formatMetrics(tk.Metrics))
 		}
-		if tk.Verdict != string(rules.VerdictPassed) && tk.Reason != "" {
-			fmt.Fprintf(&b, "  · %s\n", tk.Reason)
+		if tk.Reason != "" {
+			fmt.Fprintf(&b, "  · %s\n", notificationReason(tk))
 		}
 		if tk.Analysis != nil && tk.Analysis.Summary != "" {
 			fmt.Fprintf(&b, "  · hermes: %s\n", tk.Analysis.Summary)
 		}
 	}
 	return b.String()
+}
+
+// notificationReason 是通知展示用的 reason 文本。
+// 规则引擎对 PASSED 恒返回 "all criteria met"(审计/回放语义,不改);
+// 展示层译为中文"全部通过",与 verdict 一起读更友好(2026-08-14)。
+func notificationReason(tk TaskSummary) string {
+	if tk.Verdict == string(rules.VerdictPassed) && tk.Reason == "all criteria met" {
+		return "全部通过"
+	}
+	return tk.Reason
 }
 
 // ---- 通知卡片(Phase 2,设计文档 §4.4)----
@@ -1368,7 +1379,7 @@ func buildCardVariantBlock(tk TaskSummary, workflowID string) cardVariantBlock {
 		blk.metrics = &md
 	}
 	if tk.Reason != "" {
-		blk.reason = cardReasonLines(tk.Reason)
+		blk.reason = cardReasonLines(notificationReason(tk))
 	}
 	if tk.Analysis != nil && tk.Analysis.Summary != "" {
 		h := mdCardDiv("hermes: " + escapeCardText(truncateRunes(tk.Analysis.Summary, cardReasonSummaryLimit)))
