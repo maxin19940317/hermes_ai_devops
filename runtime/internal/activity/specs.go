@@ -360,7 +360,10 @@ func deviceCN(d store.FleetDevice, sel wf.DeviceSelector) string {
 		case strings.HasPrefix(m, "soc="):
 			parts = append(parts, "非目标平台")
 		case strings.HasPrefix(m, "缺 "):
-			parts = append(parts, "无 "+capCN(strings.TrimPrefix(m, "缺 ")))
+			// "未声明 X 能力"比"无 X"准确:硬件可能支持(如 QCS6490 的 HTP v68),
+			// 只是服务端能力表(DEVICE_CAPABILITIES_MAP)未声明该能力
+			// (2026-08-18:原"无 X"会误导为硬件缺失)。
+			parts = append(parts, "未声明 "+capCN(strings.TrimPrefix(m, "缺 "))+" 能力")
 		default:
 			parts = append(parts, m)
 		}

@@ -111,7 +111,7 @@ func TestSelectTestSpecsFleetSkip(t *testing.T) {
 	reason := sel.Skipped[0].Reason
 	for _, want := range []string{
 		"RKNN 包需要瑞芯微 RK3568(Android 系统,RK NPU)",
-		"在线设备:\n- d1 是高通 QCM6125(非目标平台、无 RK NPU)",
+		"在线设备:\n- d1 是高通 QCM6125(非目标平台、未声明 RK NPU 能力)",
 		"\n\n接入瑞芯微 RK3568 的 Android 板即可调度",
 	} {
 		if !strings.Contains(reason, want) {
