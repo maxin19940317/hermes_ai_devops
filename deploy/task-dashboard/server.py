@@ -86,8 +86,34 @@ def live_tasks():
             """, (task_id,))
             events = cur.fetchall()
             stages = []
+            prev_at = None
             for fs, ts, at in events:
-                stages.append({"status": ts, "at": at.isoformat() if at else None})
+                dur = None
+                if prev_at is not None and at is not None:
+                    dur = max(0, (at - prev_at).total_seconds())
+                stages.append({"status": ts, "at": at.isoformat() if at else None,
+                               "dur": dur})
+                prev_at = at
+            # 终态任务的指标/退出码
+            metrics, exit_code = {}, None
+            cur.execute("SELECT result_json FROM results WHERE task_id = %s", (task_id,))
+            res_row = cur.fetchone()
+            if res_row:
+                try:
+                    # psycopg2 对 JSONB 列直接返回 dict(不再二次 loads)
+                    res = res_row[0]
+                    if isinstance(res, (str, bytes)):
+                        res = json.loads(res)
+                    metrics = res.get("metrics") or {}
+                    exit_code = res.get("exit_code")
+                except Exception:
+                    pass
+            # 总耗时
+            total_dur = None
+            if created and ended:
+                total_dur = max(0, (ended - created).total_seconds())
+            elif created:
+                total_dur = max(0, (datetime.now(timezone.utc) - created).total_seconds())
             tasks.append({
                 "task_id": task_id,
                 "workflow_id": wf,
@@ -101,7 +127,10 @@ def live_tasks():
                 "client_id": client_id,
                 "created_at": created.isoformat() if created else None,
                 "ended_at": ended.isoformat() if ended else None,
+                "total_dur": total_dur,
                 "stages": stages,
+                "metrics": metrics,
+                "exit_code": exit_code,
             })
         return tasks
 
@@ -151,71 +180,132 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
 
-# ---- HTML 页面(自刷新)----
+# ---- HTML 页面(自刷新,2026-08-18 增强)----
 PAGE = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DevOps 任务实时面板</title>
 <style>
-  body { font-family: -apple-system, 'Segoe UI', sans-serif; margin: 16px; background:#f5f6fa; }
-  h1 { font-size: 18px; }
-  .task { background:#fff; border:1px solid #e1e4ea; border-radius:8px; padding:12px 16px; margin-bottom:12px; }
-  .task-head { display:flex; justify-content:space-between; align-items:center; }
+  :root {
+    --bg:#0f172a; --card:#1e293b; --card2:#273449; --line:#334155;
+    --text:#e2e8f0; --muted:#94a3b8; --blue:#38bdf8; --green:#34d399;
+    --red:#f87171; --orange:#fbbf24; --purple:#a78bfa;
+  }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,'Segoe UI',system-ui,sans-serif; margin:0;
+         background:linear-gradient(135deg,#0f172a,#1e293b); color:var(--text);
+         min-height:100vh; }
+  header { padding:18px 24px; display:flex; align-items:center; gap:14px;
+           border-bottom:1px solid var(--line); background:rgba(15,23,42,.7);
+           position:sticky; top:0; backdrop-filter:blur(6px); z-index:10; }
+  h1 { font-size:19px; margin:0; font-weight:700; letter-spacing:.3px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--green);
+         box-shadow:0 0 8px var(--green); animation:pulse 1.6s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .gen { color:var(--muted); font-size:12px; margin-left:auto; }
+  .stats { display:flex; gap:10px; padding:14px 24px 0; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:8px 16px; min-width:110px; }
+  .stat .n { font-size:22px; font-weight:700; }
+  .stat .l { font-size:11px; color:var(--muted); }
+  .stat.running .n{color:var(--blue)} .stat.done .n{color:var(--green)}
+  .stat.fail .n{color:var(--red)}
+  main { padding:16px 24px; }
+  .task { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          margin-bottom:14px; overflow:hidden; }
+  .task.active-task { border-color:var(--blue); box-shadow:0 0 0 1px var(--blue), 0 8px 24px rgba(56,189,248,.12); }
+  .task-head { display:flex; align-items:center; gap:10px; padding:12px 16px;
+               border-bottom:1px solid var(--line); background:var(--card2); }
   .variant { font-weight:600; font-size:14px; }
-  .meta { color:#666; font-size:12px; margin-top:2px; }
-  .badge { padding:2px 8px; border-radius:10px; font-size:12px; color:#fff; }
-  .badge.COMPLETED,.badge.PASSED { background:#2ab371; }
-  .badge.FAILED,.badge.TIMEOUT { background:#d54545; }
-  .badge.RUNNING,.badge.ACCEPTED { background:#3574f0; }
-  .badge.DOWNLOADING,.badge.DEPLOYING,.badge.PREPARING,.badge.COLLECTING { background:#f5a623; }
-  .badge.QUEUED { background:#9aa4b2; }
-  .pipeline { display:flex; gap:6px; margin-top:10px; flex-wrap:wrap; }
-  .stage { font-size:11px; padding:4px 10px; border-radius:4px; background:#eef0f4; color:#8a93a3; }
-  .stage.active { background:#3574f0; color:#fff; font-weight:600; }
-  .stage.done { background:#2ab371; color:#fff; }
-  .stage.fail { background:#d54545; color:#fff; }
-  .empty { color:#8a93a3; padding:30px; text-align:center; }
-  .gen { color:#999; font-size:11px; }
+  .badge { padding:3px 10px; border-radius:12px; font-size:11px; font-weight:600; }
+  .badge.COMPLETED,.badge.PASSED { background:rgba(52,211,153,.15); color:var(--green); }
+  .badge.FAILED,.badge.TIMEOUT { background:rgba(248,113,113,.15); color:var(--red); }
+  .badge.RUNNING,.badge.ACCEPTED { background:rgba(56,189,248,.15); color:var(--blue); }
+  .badge.DOWNLOADING,.badge.PREPARING,.badge.DEPLOYING,.badge.COLLECTING { background:rgba(251,191,36,.15); color:var(--orange); }
+  .badge.QUEUED { background:rgba(148,163,184,.15); color:var(--muted); }
+  .task-meta { padding:8px 16px 0; font-size:12px; color:var(--muted);
+               display:flex; gap:16px; flex-wrap:wrap; }
+  .task-meta b { color:var(--text); font-weight:500; }
+  .pipeline { display:flex; padding:12px 16px; gap:0; overflow-x:auto; }
+  .stage { flex:1; min-width:70px; text-align:center; padding:8px 6px; font-size:11px;
+           position:relative; background:var(--card2); color:var(--muted);
+           border-top:2px solid var(--line); border-bottom:2px solid var(--line); }
+  .stage:first-child { border-radius:6px 0 0 6px; border-left:2px solid var(--line); }
+  .stage:last-child { border-radius:0 6px 6px 0; border-right:2px solid var(--line); }
+  .stage.done { background:rgba(52,211,153,.08); border-color:var(--green); color:var(--green); }
+  .stage.active { background:rgba(56,189,248,.12); border-color:var(--blue); color:var(--blue); font-weight:700; animation:pulse 1.6s infinite; }
+  .stage.fail { background:rgba(248,113,113,.12); border-color:var(--red); color:var(--red); }
+  .stage .dur { display:block; font-size:10px; opacity:.7; margin-top:2px; }
+  .task-foot { padding:0 16px 12px; font-size:11px; color:var(--muted);
+               display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  .metrics { display:flex; gap:8px; padding:0 16px 12px; flex-wrap:wrap; }
+  .metric { background:var(--card2); border:1px solid var(--line); border-radius:8px;
+            padding:4px 10px; font-size:11px; }
+  .metric b { color:var(--purple); }
+  .empty { color:var(--muted); text-align:center; padding:60px 0; font-size:14px; }
+  .task-id { font-family:ui-monospace,monospace; font-size:10px; word-break:break-all; }
 </style></head><body>
-<h1>📊 DevOps 任务实时面板 <span class="gen" id="gen"></span></h1>
-<div id="list"><div class="empty">加载中…</div></div>
+<header><span class="dot"></span><h1>DevOps 任务实时面板</h1><span class="gen" id="gen"></span></header>
+<div class="stats" id="stats"></div>
+<main><div id="list"><div class="empty">加载中…</div></div></main>
 <script>
-const PIPELINE = ["QUEUED","ACCEPTED","DOWNLOADING","PREPARING","DEPLOYING","RUNNING","COLLECTING","COMPLETED"];
-const CN = {"QUEUED":"排队","ACCEPTED":"已接受","DOWNLOADING":"下载中","PREPARING":"准备中","DEPLOYING":"部署中","RUNNING":"运行中","COLLECTING":"收集","COMPLETED":"完成","FAILED":"失败","TIMEOUT":"超时","CANCELED":"取消"};
-async function load() {
-  try {
-    const r = await fetch('/api/live');
-    const d = await r.json();
-    document.getElementById('gen').textContent = '更新于 ' + new Date(d.generated_at).toLocaleTimeString();
-    render(d.tasks || []);
-  } catch(e) { document.getElementById('list').innerHTML = '<div class="empty">加载失败: '+e+'</div>'; }
+const PIPELINE=["QUEUED","ACCEPTED","DOWNLOADING","PREPARING","DEPLOYING","RUNNING","COLLECTING","COMPLETED"];
+const CN={"QUEUED":"排队","ACCEPTED":"已接受","DOWNLOADING":"下载中","PREPARING":"准备中","DEPLOYING":"部署中","RUNNING":"运行中","COLLECTING":"收集","COMPLETED":"完成","FAILED":"失败","TIMEOUT":"超时","CANCELED":"取消"};
+function fmtDur(s){
+  if(s==null||isNaN(s))return'-';
+  if(s<1)return Math.round(s*1000)+'ms';
+  if(s<60)return s.toFixed(1)+'s';
+  return (s/60).toFixed(1)+'m';
 }
-function render(tasks) {
-  const el = document.getElementById('list');
-  if (!tasks.length) { el.innerHTML = '<div class="empty">当前无运行中任务</div>'; return; }
-  el.innerHTML = tasks.map(t => {
-    const lastIdx = PIPELINE.indexOf(t.last_stage);
-    const curIdx = PIPELINE.indexOf(t.status);
-    const activeIdx = curIdx >= 0 ? curIdx : (lastIdx >= 0 ? lastIdx : -1);
-    const stages = PIPELINE.map((s, i) => {
-      let cls = 'stage';
-      if (i < activeIdx) cls += ' done';
-      else if (i === activeIdx) cls += ' active';
-      if (t.status === 'FAILED' || t.status === 'TIMEOUT') cls = 'stage fail';
-      return `<span class="${cls}">${CN[s]}</span>`;
+function metricsHtml(t){
+  if(!t.metrics||!Object.keys(t.metrics).length)return'';
+  return '<div class="metrics">'+Object.entries(t.metrics).map(([k,v])=>
+    `<span class="metric">${esc(k.replace('.inference_ms_avg',''))} <b>${typeof v==='number'?v.toFixed(1):v}ms</b></span>`).join('')+'</div>';
+}
+function render(tasks){
+  const running=tasks.filter(t=>!['COMPLETED','FAILED','TIMEOUT','CANCELED'].includes(t.status));
+  const done=tasks.filter(t=>['COMPLETED'].includes(t.status));
+  const failed=tasks.filter(t=>['FAILED','TIMEOUT'].includes(t.status));
+  document.getElementById('stats').innerHTML=
+    `<div class="stat running"><div class="n">${running.length}</div><div class="l">运行中</div></div>`+
+    `<div class="stat done"><div class="n">${done.length}</div><div class="l">已完成</div></div>`+
+    `<div class="stat fail"><div class="n">${failed.length}</div><div class="l">失败</div></div>`;
+  const el=document.getElementById('list');
+  if(!tasks.length){el.innerHTML='<div class="empty">当前无运行中任务</div>';return;}
+  const sorted=[...tasks].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+  el.innerHTML=sorted.map(t=>{
+    const isActive=!['COMPLETED','FAILED','TIMEOUT','CANCELED'].includes(t.status);
+    const activeIdx=PIPELINE.indexOf(isActive?t.status:t.last_stage);
+    const stages=PIPELINE.map((s,i)=>{
+      let cls='stage';
+      const stage=t.stages.find(x=>x.status===s);
+      const dur=stage?stage.dur:null;
+      if(isActive){ if(i<activeIdx)cls+=' done'; else if(i===activeIdx)cls+=' active'; }
+      else { if(i<=activeIdx)cls+=' done'; }
+      if(t.status==='FAILED'||t.status==='TIMEOUT')cls='stage fail';
+      return `<span class="${cls}">${CN[s]}<span class="dur">${fmtDur(dur)}</span></span>`;
     }).join('');
-    const badge = `<span class="badge ${t.status}">${CN[t.status]||t.status}</span>`;
-    return `<div class="task">
-      <div class="task-head"><span class="variant">${esc(t.variant)} ${badge}</span>
-        <span class="meta">attempt ${t.attempt}</span></div>
-      <div class="meta">📱 ${esc(t.device_name||'-')} ${t.soc?esc(t.soc):''} ${t.os?esc(t.os):''} · client ${esc(t.client_id)}</div>
+    return `<div class="task ${isActive?'active-task':''}">
+      <div class="task-head"><span class="badge ${t.status}">${CN[t.status]||t.status}</span>
+        <span class="variant">${esc(t.variant)}</span>
+        <span class="gen" style="margin-left:auto">attempt ${t.attempt} · ${fmtDur(t.total_dur)}</span></div>
+      <div class="task-meta">
+        <span>📱 <b>${esc(t.device_name||'-')}</b>${t.soc?' · '+esc(t.soc):''}${t.os?' · '+esc(t.os):''}</span>
+        <span>🖥️ client <b>${esc(t.client_id)}</b></span>
+      </div>
       <div class="pipeline">${stages}</div>
-      <div class="meta" style="margin-top:6px">${esc(t.task_id)}</div>
+      ${metricsHtml(t)}
+      <div class="task-foot"><span class="task-id">${esc(t.task_id)}</span></div>
     </div>`;
   }).join('');
 }
-function esc(s){ return String(s||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-load();
-setInterval(load, 2000);
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function load(){
+  try{const r=await fetch('/api/live');const d=await r.json();
+    document.getElementById('gen').textContent='更新于 '+new Date(d.generated_at).toLocaleTimeString();
+    render(d.tasks||[]);}catch(e){document.getElementById('list').innerHTML='<div class="empty">加载失败: '+e+'</div>';}
+}
+load();setInterval(load,2000);
 </script></body></html>
 """
 
