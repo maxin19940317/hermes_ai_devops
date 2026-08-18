@@ -147,6 +147,9 @@ services:
       FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
       FEISHU_RECEIVE_ID: ${FEISHU_RECEIVE_ID:-}
       FEISHU_RECEIVE_ID_TYPE: ${FEISHU_RECEIVE_ID_TYPE:-}
+      # 按提交人分发的独立飞书应用(2026-08-18):JSON,键=提交人标识
+      # (open_id/profile),值={app_id,app_secret,receive_id,receive_id_type}。
+      FEISHU_SENDERS: ${FEISHU_SENDERS:-}
       FEISHU_CMD_WHITELIST: ${FEISHU_CMD_WHITELIST:-}
       ESCALATION_ENDPOINT: ${ESCALATION_ENDPOINT:-}
       ESCALATION_TOKEN: ${ESCALATION_TOKEN:-}
