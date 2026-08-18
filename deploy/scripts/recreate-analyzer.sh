@@ -62,6 +62,11 @@ for i in $(seq 1 15); do
   sleep 1
 done
 
+echo "==> 启动 analyze bridge(8643,翻译/分析/规划)..."
+# HERMES_ENDPOINT 指向 hermes-devops-analyzer:8643/analyze;容器重建后必须
+# 一并拉起,否则飞书自然语言指令降级为"翻译服务暂时不可用"。
+docker exec "$NAME" sh -c 'export HOME=/opt/data; bash /opt/data/bin/start-analyze-bridge 2>&1 | tail -1'
+
 echo "==> 启动 MCP bridge(8645 + 8646)..."
 # 幂等:按 pid 文件判断进程是否存活;存活则跳过(容器重建后 pid 失效会重新拉起)。
 docker exec "$NAME" sh -c '
