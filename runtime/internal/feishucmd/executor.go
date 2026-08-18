@@ -190,6 +190,9 @@ func (e *Executor) HandleMessage(ctx context.Context, openID, text string) {
 	}
 
 	cmd := Parse(trimmed)
+	// 提交人 = 飞书指令发送者(2026-08-18):test/rerun 启动 workflow 时携带,
+	// 按提交人分发通知。
+	cmd.Submitter = openID
 	if cmd.Name == "help" && trimmed != "" && e.Translator != nil {
 		e.reply(ctx, prefix+e.handleTranslated(ctx, openID, trimmed, superseded))
 		return
@@ -235,6 +238,8 @@ func (e *Executor) disposeSuperseded(ctx context.Context, openID, rawText string
 func (e *Executor) handleTranslated(ctx context.Context, openID, text string, superseded *pendingCmd) string {
 	log := e.log()
 	res := e.Translator.Translate(ctx, openID, text)
+	// 提交人 = 飞书指令发送者(2026-08-18):test/rerun 启动 workflow 时携带。
+	res.Cmd.Submitter = openID
 	log.Info().Str("open_id", openID).Str("outcome", res.Outcome).
 		Str("rendered", res.Rendered).Msg("feishu cmd translated")
 	if res.OK && res.NeedsConfirm {
@@ -343,9 +348,9 @@ func (e *Executor) execute(ctx context.Context, cmd Command) (string, error) {
 	case "devices":
 		return e.devices(ctx, cmd.Args)
 	case "test":
-		return e.testCmd(ctx, cmd.Args)
+		return e.testCmd(ctx, cmd.Args, cmd.Submitter)
 	case "rerun":
-		return e.rerun(ctx, cmd.Args)
+		return e.rerun(ctx, cmd.Args, cmd.Submitter)
 	case "unquarantine":
 		return e.unquarantine(ctx, cmd.Args)
 	case "quarantine":
@@ -501,7 +506,7 @@ func deviceDisplayName(d store.DeviceStatus) string {
 
 // rerun <source_workflow_id> [variant] 从 workflow_runs 与 Temporal 终态输出
 // 重建精确输入。无 variant 时只重试该次运行输出里的失败变体。
-func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
+func (e *Executor) rerun(ctx context.Context, args []string, submitter string) (string, error) {
 	if len(args) == 3 ||
 		(len(args) == 2 && validateSHA(strings.ToLower(args[0])) == nil &&
 			isPositiveInt(args[1])) {
@@ -586,6 +591,7 @@ func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
 		Project: source.Project, Commit: source.CommitSHA, PipelineID: source.PipelineID,
 		Version: source.Version, RuleVersion: source.RuleVersion,
 		SourceWorkflowID: source.WorkflowID, Packages: packages,
+		Submitter: submitter,
 	}
 	if explicit {
 		variant := targets[0]
@@ -624,7 +630,7 @@ func (e *Executor) rerun(ctx context.Context, args []string) (string, error) {
 // 或该变体最近构建)→ 启动单变体 workflow(scope=variant)。与 rerun 同链路
 // (NextWorkflowAttempt + StartDeviceTest)。设计见
 // docs/superpowers/specs/2026-08-07-feishu-test-command-design.md。
-func (e *Executor) testCmd(ctx context.Context, args []string) (string, error) {
+func (e *Executor) testCmd(ctx context.Context, args []string, submitter string) (string, error) {
 	if len(args) < 1 || len(args) > 2 {
 		return "用法: test <variant> [commit]", nil
 	}
@@ -709,6 +715,7 @@ func (e *Executor) testCmd(ctx context.Context, args []string) (string, error) {
 			Scope:       variant,
 			RuleVersion: rules.DefaultVersion,
 			Attempt:     n,
+			Submitter:   submitter,
 		}
 		id, started, err := e.Starter.StartDeviceTest(ctx, in)
 		if err != nil {
@@ -807,7 +814,7 @@ func (e *Executor) testInFlight(ctx context.Context, art *store.Artifact, varian
 // 返回空串。调用方据此判断要不要记 retry 决策,不要去反解析展示文本(A6:
 // 文案一改反解析就静默失效)。
 func (e *Executor) retryVariant(
-	ctx context.Context, source *store.WorkflowRun, variant string,
+	ctx context.Context, source *store.WorkflowRun, variant, submitter string,
 ) (text string, newWorkflowID string, err error) {
 	arts, err := e.Store.ListArtifacts(ctx, source.Project, source.CommitSHA, source.PipelineID)
 	if err != nil {
@@ -840,6 +847,7 @@ func (e *Executor) retryVariant(
 		Scope:    variant,
 		Attempt:  n,
 		Packages: []wf.PackageRef{ref},
+		Submitter: submitter,
 	}
 	id, started, err := e.Starter.StartDeviceTest(ctx, in)
 	if err != nil {
@@ -887,7 +895,7 @@ func (e *Executor) HandleCardAction(
 		if !closed {
 			return "workflow 尚未结束，无法重试", "info", nil
 		}
-		text, newWorkflowID, rerr := e.retryVariant(ctx, source, value.Variant)
+		text, newWorkflowID, rerr := e.retryVariant(ctx, source, value.Variant, openID)
 		if rerr != nil {
 			return "", "", rerr
 		}

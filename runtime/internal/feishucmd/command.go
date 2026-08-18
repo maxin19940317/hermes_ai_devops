@@ -14,6 +14,11 @@ import (
 type Command struct {
 	Name string   // status | devices | test | rerun | unquarantine | quarantine | runs | result | metrics | artifacts | cancel | plan | help
 	Args []string // rerun: <source_workflow_id> [variant];test: <variant> [commit]
+	// Submitter 是提交人标识(open_id / profile 名,2026-08-18):飞书 listener
+	// 填指令发送者 open_id;cmdapi 从 X-Submitter 头读(由 mcp_bridge 按 profile
+	// 注入)。test/rerun 启动 workflow 时写入 DeviceTestInput.Submitter,用于
+	// 按提交人分发飞书通知。空 = CI 或其他无身份来源。
+	Submitter string `json:"submitter,omitempty"`
 }
 
 // usage 是帮助文本(空/未知指令的应答)。

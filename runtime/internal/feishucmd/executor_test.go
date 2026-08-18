@@ -331,7 +331,7 @@ func newRerunFixture(t *testing.T, variants ...string) (*rerunStore, *fakeStarte
 
 func runRerun(t *testing.T, e *Executor, args ...string) string {
 	t.Helper()
-	got, err := e.rerun(ctx, args)
+	got, err := e.rerun(ctx, args, "")
 	if err != nil {
 		t.Fatalf("rerun(%v): %v", args, err)
 	}
@@ -1161,7 +1161,7 @@ func TestRerunExplicitVariantBlockedWhileInFlight(t *testing.T) {
 	starter := &fakeStarter{closedByID: map[string]bool{"w-1": true}} // r1 未关闭
 	exec := newExec(ms, starter, &fakeSender{})
 
-	text, err := exec.rerun(ctx, []string{"w-1", "v1"})
+	text, err := exec.rerun(ctx, []string{"w-1", "v1"}, "")
 	if err != nil || !strings.Contains(text, "重试正在进行中") {
 		t.Fatalf("rerun = %q err=%v, want 认领拦截", text, err)
 	}
@@ -1174,7 +1174,7 @@ func TestRerunExplicitVariantBlockedWhileInFlight(t *testing.T) {
 
 func runTest(t *testing.T, e *Executor, args ...string) string {
 	t.Helper()
-	got, err := e.testCmd(ctx, args)
+	got, err := e.testCmd(ctx, args, "")
 	if err != nil {
 		t.Fatalf("test(%v): %v", args, err)
 	}

@@ -432,6 +432,8 @@ func DeviceTestWorkflow(ctx workflow.Context, in DeviceTestInput) (*DeviceTestOu
 			req := NotifyCardRequest{
 				Card:         buildNotificationCard(in, out, actualID),
 				FallbackText: buildNotification(in, out),
+				// 按提交人分发通知(2026-08-18);CI 触发为空 → 默认 sender。
+				Submitter: in.Submitter,
 			}
 			if err := workflow.ExecuteActivity(ctx, "NotifyCard", req).Get(ctx, nil); err != nil {
 				workflow.GetLogger(ctx).Error("notify card failed", "error", err)
@@ -1138,6 +1140,9 @@ type ButtonValue struct {
 type NotifyCardRequest struct {
 	Card         NotificationCard `json:"card"`
 	FallbackText string           `json:"fallback_text"`
+	// Submitter 是提交人(open_id / profile 名);非空时 NotifyCard 用它选
+	// 对应该提交人的飞书 sender(2026-08-18 按提交人分发)。空 → 默认 sender。
+	Submitter string `json:"submitter,omitempty"`
 }
 
 // SyncWorkflowRunsRequest 是 SyncWorkflowRuns 活动的输入(2026-08-07 方案 B):

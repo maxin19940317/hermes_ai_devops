@@ -135,3 +135,41 @@ func TestNotifyCardFallbackTextIsVerbatim(t *testing.T) {
 		t.Errorf("降级文本 = %v, want 原样 %q", f.texts, want)
 	}
 }
+
+// TestNotifyCardRoutesBySubmitter:FeishuSenders 命中提交人时用该 sender;
+// 未命中/空提交人用默认 Feishu(2026-08-18 按提交人分发)。
+func TestNotifyCardRoutesBySubmitter(t *testing.T) {
+	small := cardOfExactSize(t, 512)
+	def := &cardFake{}
+	gene := &cardFake{}
+	a := &Acts{
+		Feishu: def,
+		FeishuSenders: map[string]feishu.Sender{
+			"ou_gene": gene,
+		},
+	}
+	// gene 提交 → gene sender 收到,默认 sender 不收
+	if err := a.NotifyCard(ctx, wf.NotifyCardRequest{
+		Card: small, FallbackText: "fb", Submitter: "ou_gene"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(gene.cards) != 1 || len(def.cards) != 0 {
+		t.Errorf("gene 提交: gene=%d def=%d, want gene=1 def=0", len(gene.cards), len(def.cards))
+	}
+	// 未知提交人 → 回退默认 sender
+	if err := a.NotifyCard(ctx, wf.NotifyCardRequest{
+		Card: small, FallbackText: "fb", Submitter: "ou_unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(def.cards) != 1 {
+		t.Errorf("未知提交人应回退默认 sender, def=%d want 1", len(def.cards))
+	}
+	// 空提交人(CI 触发)→ 默认 sender
+	if err := a.NotifyCard(ctx, wf.NotifyCardRequest{
+		Card: small, FallbackText: "fb"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(def.cards) != 2 {
+		t.Errorf("空提交人应走默认 sender, def=%d want 2", len(def.cards))
+	}
+}

@@ -62,6 +62,10 @@ type DeviceTestInput struct {
 	Attempt int `json:"attempt,omitempty"`
 	// SourceWorkflowID 指向触发本次重跑的权威 workflow run;普通触发为空。
 	SourceWorkflowID string `json:"source_workflow_id,omitempty"`
+	// Submitter 是提交本次测试的人(飞书 open_id / profile 名,2026-08-18):
+	// 手动触发(飞书指令/cmdapi)携带,用于按提交人分发飞书通知;
+	// CI 自动触发为空 → 通知发默认接收方。只影响通知路由,不影响调度。
+	Submitter string `json:"submitter,omitempty"`
 }
 
 // RecordWorkflowRunRequest 是 workflow 与持久化活动之间的稳定载荷。

@@ -37,6 +37,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 RUNTIME_CMD_API_URL = os.environ.get("RUNTIME_CMD_API_URL", "https://worker:8091/api/v1/cmd")
 RUNTIME_CMD_API_TOKEN = os.environ.get("RUNTIME_CMD_API_TOKEN", "")
+# 提交人身份(2026-08-18):每个 profile 的 bridge 实例配自己的标识
+# (飞书 open_id 或 profile 名),调 cmdapi 时加 X-Submitter 头。
+# Runtime 据此按提交人分发测试结果通知(workflow.NotifyCard 选对应
+# FEISHU_SENDERS 的 sender)。空 = 不带身份头(不分发,发默认接收方)。
+SUBMITTER_OPEN_ID = os.environ.get("SUBMITTER_OPEN_ID", "")
 # mTLS(Phase 3):Runtime callbacks listener 要求客户端证书(Agent→Runtime 方向
 # 18091 强制)。MCP bridge 用专用客户端证书(client-mcp-bridge)访问 worker:8091。
 # 两个配置项:MTLS_CA_FILE 用于校验服务端;MTLS_CLIENT_CERT 是客户端证书+私钥
@@ -74,6 +79,8 @@ def runtime_cmd(command: str, args: list[str] | None = None) -> str:
         return "Runtime 受控接口未配置(RUNTIME_CMD_API_TOKEN 空),无法执行。"
     payload = {"command": command, "args": args or []}
     headers = {"Authorization": "Bearer " + RUNTIME_CMD_API_TOKEN}
+    if SUBMITTER_OPEN_ID:
+        headers["X-Submitter"] = SUBMITTER_OPEN_ID
     try:
         # mTLS 证书(cert/verify)必须在 Client 级别配置,httpx.post 顶层不接受。
         # CA 是自签且缺 Authority Key Identifier,Python OpenSSL 默认

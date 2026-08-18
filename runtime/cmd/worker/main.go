@@ -46,12 +46,14 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -163,6 +165,11 @@ func main() {
 		WebhookURL:    cfg.Activity.FeishuWebhookURL,
 	})
 	acts.Feishu = feishuSender
+	// 按提交人分发的独立飞书应用(2026-08-18):FEISHU_SENDERS JSON,
+	// 键 = 提交人标识(open_id / profile),值 = {app_id,app_secret,receive_id,...}。
+	// test/rerun 的 DeviceTestInput.Submitter 命中映射时,NotifyCard 用该应用
+	// 发结果;未命中/空 → 默认 feishuSender。
+	acts.FeishuSenders = buildFeishuSenders(cfg.Activity.FeishuSendersJSON, &log)
 	log.Info().Str("mode", feishuMode).Msg("feishu notify mode")
 
 	// ---- 飞书指令执行器(飞书 listener 与受控命令接口 cmdapi 共用) ----
@@ -391,5 +398,42 @@ func variantNamesFromStore(ctx context.Context, st feishucmd.Store) []string {
 		out = append(out, a.Variant)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// buildFeishuSenders 解析 FEISHU_SENDERS JSON,构造"提交人 → 独立飞书应用
+// sender"映射(2026-08-18 按提交人分发通知)。JSON 为空/非法 → nil(不分发)。
+func buildFeishuSenders(raw string, log *zerolog.Logger) map[string]feishu.Sender {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var spec map[string]struct {
+		AppID         string `json:"app_id"`
+		AppSecret     string `json:"app_secret"`
+		ReceiveID     string `json:"receive_id"`
+		ReceiveIDType string `json:"receive_id_type"`
+		WebhookURL    string `json:"webhook_url"`
+	}
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		log.Warn().Err(err).Msg("FEISHU_SENDERS JSON 非法,按提交人分发禁用")
+		return nil
+	}
+	out := make(map[string]feishu.Sender, len(spec))
+	for submitter, s := range spec {
+		sender, mode := feishu.NewSender(feishu.Config{
+			AppID: s.AppID, AppSecret: s.AppSecret,
+			ReceiveID: s.ReceiveID, ReceiveIDType: s.ReceiveIDType,
+			WebhookURL: s.WebhookURL,
+		})
+		if sender == nil {
+			log.Warn().Str("submitter", submitter).Msg("FEISHU_SENDERS 项缺完整凭据,跳过")
+			continue
+		}
+		out[submitter] = sender
+		log.Info().Str("submitter", submitter).Str("mode", mode).Msg("feishu per-submitter sender")
+	}
+	if len(out) == 0 {
+		return nil
+	}
 	return out
 }

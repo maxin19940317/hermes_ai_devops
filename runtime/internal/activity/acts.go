@@ -56,6 +56,12 @@ type Config struct {
 	FeishuAppSecret     string
 	FeishuReceiveID     string // 接收方:open_id(个人单聊)或 chat_id(群)
 	FeishuReceiveIDType string // chat_id|open_id;空 → chat_id
+	// FeishuSendersJSON 是"提交人 → 独立飞书应用"JSON(2026-08-18 按提交人
+	// 分发通知)。形如:
+	//   {"<open_id|profile>": {"app_id":"...","app_secret":"...","receive_id":"...","receive_id_type":"..."}}
+	// 空 = 不分发(所有通知发默认 Feishu 接收方)。由 worker 启动时解析为
+	// Acts.FeishuSenders。
+	FeishuSendersJSON string
 	// FeishuCmdWhitelist 指令 listener 白名单(逗号分隔 open_id);
 	// 空 = listener 不启动。
 	FeishuCmdWhitelist string
@@ -121,6 +127,11 @@ type Acts struct {
 	// Feishu 通知发送方(feishu.NewSender 构造:app 优先,webhook 兜底);
 	// nil = 未配置,Notify 静默成功(开发模式)。
 	Feishu feishu.Sender
+	// FeishuSenders 是"提交人 → 独立飞书应用 sender"映射(2026-08-18):
+	// 按提交人分发通知(如 gene_pm 提交 → gene 自己的飞书应用发结果)。
+	// 键 = 提交人标识(open_id / profile 名),与 DeviceTestInput.Submitter 对应;
+	// 未命中的提交人回退 Feishu(默认)。
+	FeishuSenders map[string]feishu.Sender
 }
 
 // writeAudit writes an audit_log row; failures are logged but never returned

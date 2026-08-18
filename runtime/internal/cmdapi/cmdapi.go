@@ -78,8 +78,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 提交人身份(2026-08-18):mcp_bridge 按 profile 注入 X-Submitter 头
+	// (open_id / profile 名);test/rerun 启动 workflow 时携带,按提交人分发
+	// 飞书通知。空 = 无身份来源(CI 等)。
+	submitter := r.Header.Get("X-Submitter")
 	reply, err := h.Exec.ExecuteCommand(r.Context(), feishucmd.Command{
-		Name: req.Command, Args: req.Args,
+		Name: req.Command, Args: req.Args, Submitter: submitter,
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "execute_failed", err.Error())

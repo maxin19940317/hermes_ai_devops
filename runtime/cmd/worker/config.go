@@ -212,6 +212,8 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			FeishuAppSecret:     getenv("FEISHU_APP_SECRET"),
 			FeishuReceiveID:     getenv("FEISHU_RECEIVE_ID"),      // open_id 单聊 / chat_id 群
 			FeishuReceiveIDType: getenv("FEISHU_RECEIVE_ID_TYPE"), // 空 → chat_id
+			// 按提交人分发的独立飞书应用(2026-08-18);JSON,键=提交人标识。
+			FeishuSendersJSON: getenv("FEISHU_SENDERS"),
 			// 飞书指令 listener 白名单(逗号分隔 open_id;空 = listener 不启动)
 			FeishuCmdWhitelist: getenv("FEISHU_CMD_WHITELIST"),
 			// DevOps → PM 升级通道(设计 §8):空 = 升级禁用(现状)
