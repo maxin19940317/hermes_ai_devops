@@ -145,6 +145,43 @@ def fmt_dur(sec):
     return f"{sec/60:.1f}m"
 
 
+def live_devices():
+    """返回全部设备状态(含内存/磁盘/能力/租约)。"""
+    with conn() as c:
+        cur = c.cursor()
+        cur.execute("""
+            SELECT d.device_id, d.display_name, d.os, d.soc, d.abi, d.status,
+                   d.fail_streak, d.mem_total_mb, d.disk_total_mb, d.disk_free_mb,
+                   d.capabilities, d.client_id,
+                   l.task_id AS lease_task
+            FROM devices d
+            LEFT JOIN device_leases l ON l.device_id = d.device_id
+                AND l.released_at IS NULL
+            ORDER BY d.status = 'IDLE' DESC, d.soc
+        """)
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            (dev_id, name, os_, soc, abi, status, fail_streak,
+             mem, disk_t, disk_f, caps, client_id, lease_task) = r
+            out.append({
+                "device_id": dev_id,
+                "display_name": name or dev_id,
+                "os": os_ or "",
+                "soc": soc or "",
+                "abi": abi or "",
+                "status": status,
+                "fail_streak": fail_streak,
+                "mem_mb": mem,
+                "disk_total_mb": disk_t,
+                "disk_free_mb": disk_f,
+                "capabilities": caps or [],
+                "client_id": client_id,
+                "lease_task": lease_task,
+            })
+        return out
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[http] {self.address_string()} {fmt % args}", flush=True)
@@ -171,6 +208,13 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/live":
             try:
                 self._json(200, {"tasks": live_tasks(),
+                                 "devices": live_devices(),
+                                 "generated_at": datetime.now(timezone.utc).isoformat()})
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"error": str(e)})
+        elif self.path == "/api/devices":
+            try:
+                self._json(200, {"devices": live_devices(),
                                  "generated_at": datetime.now(timezone.utc).isoformat()})
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"error": str(e)})
@@ -244,10 +288,35 @@ PAGE = """<!DOCTYPE html>
   .metric b { color:var(--purple); }
   .empty { color:var(--muted); text-align:center; padding:60px 0; font-size:14px; }
   .task-id { font-family:ui-monospace,monospace; font-size:10px; word-break:break-all; }
+  /* 设备面板 */
+  .section-title { font-size:15px; font-weight:700; margin:20px 0 10px; color:var(--text);
+                   display:flex; align-items:center; gap:8px; }
+  .devices { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:12px; }
+  .dev { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
+  .dev.busy { border-color:var(--blue); }
+  .dev.offline { opacity:.55; }
+  .dev-head { display:flex; align-items:center; gap:8px; }
+  .dev-name { font-weight:600; font-size:13px; }
+  .dev .st { margin-left:auto; font-size:11px; padding:2px 8px; border-radius:10px; }
+  .st.IDLE,.st.ONLINE { background:rgba(52,211,153,.15); color:var(--green); }
+  .st.BUSY { background:rgba(56,189,248,.15); color:var(--blue); }
+  .st.OFFLINE { background:rgba(148,163,184,.15); color:var(--muted); }
+  .st.QUARANTINED { background:rgba(248,113,113,.15); color:var(--red); }
+  .dev-grid { display:grid; grid-template-columns:1fr 1fr; gap:4px 14px; margin-top:8px;
+              font-size:11px; color:var(--muted); }
+  .dev-grid b { color:var(--text); font-weight:500; }
+  .caps { margin-top:8px; display:flex; gap:5px; flex-wrap:wrap; }
+  .cap { font-size:10px; padding:2px 8px; border-radius:8px; background:var(--card2);
+         border:1px solid var(--line); color:var(--purple); }
 </style></head><body>
 <header><span class="dot"></span><h1>DevOps 任务实时面板</h1><span class="gen" id="gen"></span></header>
 <div class="stats" id="stats"></div>
-<main><div id="list"><div class="empty">加载中…</div></div></main>
+<main>
+  <div class="section-title">📋 任务流水线</div>
+  <div id="list"><div class="empty">加载中…</div></div>
+  <div class="section-title">📱 设备管理</div>
+  <div class="devices" id="devices"></div>
+</main>
 <script>
 const PIPELINE=["QUEUED","ACCEPTED","DOWNLOADING","PREPARING","DEPLOYING","RUNNING","COLLECTING","COMPLETED"];
 const CN={"QUEUED":"排队","ACCEPTED":"已接受","DOWNLOADING":"下载中","PREPARING":"准备中","DEPLOYING":"部署中","RUNNING":"运行中","COLLECTING":"收集","COMPLETED":"完成","FAILED":"失败","TIMEOUT":"超时","CANCELED":"取消"};
@@ -299,11 +368,32 @@ function render(tasks){
     </div>`;
   }).join('');
 }
+function fmtSize(mb){ if(mb==null)return'-'; if(mb>=1024)return(mb/1024).toFixed(1)+'G'; return mb+'M'; }
+function renderDevices(devs){
+  const el=document.getElementById('devices');
+  if(!devs||!devs.length){el.innerHTML='<div class="empty">无设备</div>';return;}
+  el.innerHTML=devs.map(d=>{
+    const cls=d.status==='BUSY'?'busy':(d.status==='OFFLINE'?'offline':'');
+    const caps=(d.capabilities||[]).map(c=>`<span class="cap">${esc(c)}</span>`).join('');
+    return `<div class="dev ${cls}">
+      <div class="dev-head"><span class="dev-name">📱 ${esc(d.display_name)}</span>
+        <span class="st ${d.status}">${esc(d.status)}</span></div>
+      <div class="dev-grid">
+        <span>系统 <b>${esc(d.os)}</b></span><span>SoC <b>${esc(d.soc)}</b></span>
+        <span>架构 <b>${esc(d.abi)}</b></span><span>失败 <b>${d.fail_streak}</b></span>
+        <span>内存 <b>${fmtSize(d.mem_mb)}</b></span><span>磁盘 <b>${fmtSize(d.disk_total_mb)}/${fmtSize(d.disk_free_mb)}</b></span>
+        ${d.lease_task?`<span style="grid-column:1/3">占用: <b>${esc(String(d.lease_task).split(':').pop())}</b></span>`:''}
+      </div>
+      ${caps?`<div class="caps">${caps}</div>`:''}
+    </div>`;
+  }).join('');
+}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 async function load(){
   try{const r=await fetch('/api/live');const d=await r.json();
     document.getElementById('gen').textContent='更新于 '+new Date(d.generated_at).toLocaleTimeString();
-    render(d.tasks||[]);}catch(e){document.getElementById('list').innerHTML='<div class="empty">加载失败: '+e+'</div>';}
+    render(d.tasks||[]); renderDevices(d.devices||[]);}
+  catch(e){document.getElementById('list').innerHTML='<div class="empty">加载失败: '+e+'</div>';}
 }
 load();setInterval(load,2000);
 </script></body></html>
