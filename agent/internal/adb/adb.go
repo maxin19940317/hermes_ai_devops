@@ -195,6 +195,13 @@ func LogcatTail(t Target, lines int) []string {
 // 拿到 serial,-s 无从填起。输出必须经 ParseDevices 过滤后才可使用。
 func Devices() []string { return []string{"devices", "-l"} }
 
+// Reconnect 强制 adb server 重新枚举所有在线设备(等价 `adb reconnect`)。
+// 用于修复"adb server 在设备插入前启动,Windows USB 热插拔事件未送达
+// server,新设备不被枚举"的问题(2026-08-19 QCS6125 实机:5037 能看到但
+// agent 私有 5137 server 看不到)。server 收到 reconnect 后重扫 USB,
+// 新插入设备即出现在后续 devices -l 输出。
+func Reconnect() []string { return []string{"reconnect"} }
+
 // Device 是 `adb devices -l` 解析出的单台设备条目。
 // Serial 可能为 "?"(USB iSerial 丢失);此时 TransportID 非零,可用于
 // `adb -t <id>` 精确寻址——adb 官方寻址方式,支持多台 ? 设备共存。

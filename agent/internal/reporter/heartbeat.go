@@ -45,6 +45,25 @@ type Heartbeat struct {
 	// lastDevices 记录上次心跳的设备 serial 集合,用于 diff 日志(设备上下线感知)。
 	// nil 表示首次心跳,输出当前可寻址设备作为基线。
 	lastDevices map[string]bool
+
+	// ReconnectInterval 是强制 adb server 重新枚举设备的周期(2026-08-19):
+	// adb server 在设备插入前启动时,Windows USB 热插拔事件可能不送达 server,
+	// 新设备不被枚举(5037 能看到但 agent 私有 5137 server 看不到的实机场景)。
+	// 周期执行 `adb reconnect` 重扫 USB,插拔设备最多一个周期内被感知。
+	// 0 → DefaultReconnectInterval。
+	ReconnectInterval time.Duration
+	lastReconnect     time.Time
+}
+
+// DefaultReconnectInterval 是设备重枚举周期(§10 心跳 10s;15s 足够即时
+// 感知插拔且不频繁打断 server)。
+const DefaultReconnectInterval = 15 * time.Second
+
+func (h *Heartbeat) reconnectInterval() time.Duration {
+	if h.ReconnectInterval > 0 {
+		return h.ReconnectInterval
+	}
+	return DefaultReconnectInterval
 }
 
 func (h *Heartbeat) interval() time.Duration {
@@ -119,6 +138,15 @@ func (h *Heartbeat) once(ctx context.Context) error {
 	defer cancel()
 
 	activeIDs, busySerials := h.inflight(ctx)
+	// 周期重枚举:adb server 可能缓存启动时的设备列表,新插入设备不被发现
+	// (2026-08-19 实机)。周期执行 reconnect 重扫 USB,插拔即时感知。
+	// reconnect 失败不阻断探测(server 不可达时 devices 会自己报错)。
+	if time.Since(h.lastReconnect) >= h.reconnectInterval() {
+		if _, err := h.Runner.Run(ctx, adb.Reconnect()); err != nil {
+			h.logf("adb reconnect failed (ignored): %v", err)
+		}
+		h.lastReconnect = time.Now()
+	}
 	devices := h.prober().ProbeDevices(ctx, busySerials)
 
 	// 设备变化 diff 日志:与上次心跳对比,输出新增/移除的设备 serial。

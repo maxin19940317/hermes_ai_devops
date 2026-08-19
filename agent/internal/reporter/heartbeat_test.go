@@ -3,6 +3,7 @@ package reporter
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 // platform 为空回退 ro.product.board),SERIAL3 getprop 不可达(offline)。
 func heartbeatRunner() *fakeRunner {
 	return &fakeRunner{responses: map[string]adb.Result{
+		"reconnect": {Stdout: ""},
 		"devices -l": {Stdout: "List of devices attached\n" +
 			"SERIAL1 device product:p1 model:m1 device:d1 transport_id:1\n" +
 			"SERIAL2 device product:p2 model:m2 device:d2 transport_id:2\n" +
@@ -344,5 +346,31 @@ func TestHeartbeatDeviceDiffLogging(t *testing.T) {
 	h1.diffDevices(devs5)
 	if len(logs) != 0 {
 		t.Errorf("无变化时不应输出日志, got %v", logs)
+	}
+}
+
+// TestHeartbeatReconnectEnumerates:心跳间隔到期时执行 adb reconnect(重枚举
+// USB),让插拔设备即时被感知(2026-08-19)。
+func TestHeartbeatReconnectEnumerates(t *testing.T) {
+	_, srv := newFakeRuntime(t)
+	h := newTestHeartbeat(t, srv.URL)
+	h.Runner = heartbeatRunner()
+	h.ReconnectInterval = time.Millisecond // 每次都触发
+	if err := h.once(context.Background()); err != nil {
+		t.Fatalf("once: %v", err)
+	}
+	// 断言 fake runner 收到 reconnect 命令
+	rf := h.Runner.(*fakeRunner)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	found := false
+	for _, call := range rf.calls {
+		if strings.Join(call, " ") == "reconnect" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("心跳未执行 adb reconnect(重枚举),calls=%v", rf.calls)
 	}
 }
